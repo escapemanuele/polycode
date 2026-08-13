@@ -1,0 +1,23 @@
+[package]
+name = "polycode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Local-first orchestrator for native coding-agent CLIs"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/escapemanuele/polycode"
+exclude = [".project-meta.yaml", "PROJECT.md", "ZSHRC-FUNCTION.txt"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

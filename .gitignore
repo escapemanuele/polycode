@@ -1,0 +1,8 @@
+/target/
+.DS_Store
+*.swp
+
+# Local Dragon Lodge project integration (contains machine-specific paths).
+/.project-meta.yaml
+/PROJECT.md
+/ZSHRC-FUNCTION.txt
