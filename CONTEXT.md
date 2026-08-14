@@ -76,6 +76,30 @@ _Avoid_: Current configuration, config copy
 A versioned persisted representation of current run state, accepted into the domain only after migration and full invariant validation.
 _Avoid_: Serialized run, event replay
 
+**Run workspace**:
+The separately persisted physical Git resource assigned to one run: source repository identity, immutable base commit, managed worktree, and optional owned branch. It is infrastructure state, not part of the run snapshot.
+_Avoid_: Repository fields in Run, execution directory
+
+**Workspace mode**:
+The explicit Git shape of a run workspace: branch-backed for implementation work or detached for review-only work.
+_Avoid_: Mode inferred from branch text
+
+**Workspace status**:
+The recoverable lifecycle of the physical Git resource: preparing, ready, removing, removed, or broken. It does not determine run status.
+_Avoid_: Run status, filesystem existence alone
+
+**Workspace intent**:
+A durable declaration of an intended Git resource change recorded before its non-transactional filesystem effect.
+_Avoid_: Best-effort metadata, open database transaction around Git
+
+**Workspace reconciliation**:
+Validation of persisted workspace intent against current Git/filesystem evidence, followed only by a safe idempotent completion or an explicit broken outcome.
+_Avoid_: Blind retry, filesystem inference
+
+**Base commit**:
+The immutable commit from which a run workspace was created and against which its apply delta is generated.
+_Avoid_: Current source HEAD, mutable branch tip
+
 **Rehydration data**:
 Persistence-neutral, untrusted current-state input consumed by `Run::rehydrate`; it is not a valid run until all workflow, lifecycle, ownership, attention, suspension, and timeline invariants pass.
 _Avoid_: Deserialized run, trusted snapshot
@@ -115,6 +139,18 @@ _Avoid_: Role, provider
 **Apply**:
 The explicit act of transferring a completed implementation run's changes back to its source checkout.
 _Avoid_: Merge, commit
+
+**Apply operation**:
+A persisted recoverable intent identifying one exact patch transfer and whether its Git effect is prepared, present in the source, recorded, or failed.
+_Avoid_: Generic job, implicit retry
+
+**Patch hash**:
+A SHA-256 identity of exact apply bytes used to detect changed workspace output across crash recovery; it is evidence of operation identity, not authentication.
+_Avoid_: Content signature, run revision
+
+**Branch ownership**:
+Persisted and revalidated evidence that a managed branch was created for one run and may be deleted only while its expected tip still matches.
+_Avoid_: Prefix-only deletion permission
 
 **Discard**:
 The explicit terminal disposition that abandons a run's working changes while retaining its recorded history.
