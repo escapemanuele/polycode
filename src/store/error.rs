@@ -96,6 +96,11 @@ pub enum StoreError {
     ApplyOperationConcurrentModification { run_id: RunId, expected: u64 },
     #[error("run {0} cannot change while an apply operation is active")]
     RunFrozenForApply(RunId),
+    #[error("run {run_id} execution requires a ready workspace, found {status:?}")]
+    ExecutionWorkspaceNotReady {
+        run_id: RunId,
+        status: Option<String>,
+    },
     #[error("stored workspace record is invalid: {0}")]
     InvalidWorkspaceRecord(String),
     #[error("workspace path is not valid UTF-8: {0}")]

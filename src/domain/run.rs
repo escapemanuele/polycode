@@ -502,6 +502,62 @@ impl Run {
         self.close_attention(request_id, metadata, true)
     }
 
+    /// Records one provider checkpoint against its matching stage lifecycle.
+    ///
+    /// Provider checkpoints advance `updated_at`, making consumption atomic
+    /// with the run snapshot and event append at the persistence boundary.
+    ///
+    /// # Errors
+    /// Rejects non-provider event kinds, unknown stages, inactive runs,
+    /// lifecycle mismatches, or empty progress messages.
+    pub fn record_provider_event(
+        &mut self,
+        stage_id: &StageId,
+        kind: DomainEventKind,
+        metadata: EventMetadata,
+    ) -> Result<DomainEvent, RunProviderEventError> {
+        if !matches!(self.status, RunStatus::Running | RunStatus::NeedsUser) {
+            return Err(RunProviderEventError::RunNotActive(self.status));
+        }
+        let stage = self
+            .stage(stage_id)
+            .ok_or_else(|| RunProviderEventError::UnknownStage(stage_id.clone()))?;
+        let expected = match &kind {
+            DomainEventKind::ProviderStarted { .. }
+            | DomainEventKind::ProviderResumed { .. }
+            | DomainEventKind::ProviderProgress { .. }
+            | DomainEventKind::ProviderUsageUpdated { .. }
+            | DomainEventKind::UsageUpdated => StageStatus::Running,
+            DomainEventKind::ProviderNeedsUser { .. } => StageStatus::NeedsUser,
+            DomainEventKind::ProviderPaused { .. } => StageStatus::Paused,
+            DomainEventKind::ProviderInterrupted { .. } => StageStatus::Interrupted,
+            DomainEventKind::ProviderCompleted { .. } => StageStatus::Completed,
+            DomainEventKind::ProviderFailed { .. } => StageStatus::Failed,
+            _ => return Err(RunProviderEventError::InvalidEventKind),
+        };
+        if matches!(
+            &kind,
+            DomainEventKind::ProviderProgress { message, .. } if message.trim().is_empty()
+        ) {
+            return Err(RunProviderEventError::EmptyProgress);
+        }
+        if stage.status() != expected {
+            return Err(RunProviderEventError::StageStatusMismatch {
+                stage_id: stage_id.clone(),
+                expected,
+                actual: stage.status(),
+            });
+        }
+
+        self.updated_at = metadata.occurred_at();
+        Ok(DomainEvent::new(
+            metadata,
+            self.id,
+            Some(stage_id.clone()),
+            kind,
+        ))
+    }
+
     /// Checks cross-aggregate invariants used by rehydration and persistence.
     ///
     /// # Errors
@@ -976,6 +1032,24 @@ pub enum RunAttentionError {
     StageLifecycle(#[from] StageTransitionError),
     #[error(transparent)]
     Attention(#[from] AttentionError),
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RunProviderEventError {
+    #[error("run is not active for provider events: {0:?}")]
+    RunNotActive(RunStatus),
+    #[error("unknown provider-event stage: {0}")]
+    UnknownStage(StageId),
+    #[error("event kind is not a provider checkpoint")]
+    InvalidEventKind,
+    #[error("provider progress message must not be empty")]
+    EmptyProgress,
+    #[error("provider event for stage {stage_id} requires {expected:?}, found {actual:?}")]
+    StageStatusMismatch {
+        stage_id: StageId,
+        expected: StageStatus,
+        actual: StageStatus,
+    },
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
