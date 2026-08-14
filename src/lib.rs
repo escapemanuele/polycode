@@ -2,6 +2,7 @@ mod cli;
 mod config;
 
 pub mod domain;
+pub mod engine;
 pub mod git;
 pub mod store;
 pub mod workspace;

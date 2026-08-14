@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 3 adds native Git repository discovery, isolated branch/detached worktrees, explicit apply/discard/cleanup, and reconciliation across SQLite↔Git crash windows. Logical run snapshots remain unchanged; physical workspace and apply intent use separate schema-v2 records. Providers, scheduling, process backends, async runtime, and TUI remain deliberately absent.
+Milestone 4 adds synchronous DAG scheduling and a scriptable `FakeProvider` above validated domain, SQLite, and Git-workspace boundaries. Runs now advance from persisted dependency state, provider signals become atomic semantic checkpoints, and restart recovery resumes after the last committed signal. Real coding-agent providers, process backends, async runtime, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -106,7 +106,7 @@ WHERE id = ? AND revision = ?
 
 Zero changed rows means `ConcurrentModification`. Snapshot update precedes event inserts inside one `BEGIN IMMEDIATE` transaction; any event constraint failure rolls back snapshot, revision, and event changes together. Store allocates contiguous event sequence values from the prior per-run maximum. Event timestamps must be non-decreasing, may be equal, and final event time must equal persisted `run.updated_at`.
 
-Current aggregate snapshot excludes artifact metadata and provider-session state because `Run` does not own either in Milestone 2. Provider-neutral session events remain durable history. Later milestones may add separately owned records through new schema/snapshot versions.
+Current aggregate snapshot excludes artifact metadata and provider-session state because `Run` does not own either. Provider-neutral session/checkpoint events remain durable history. `FakeProvider` reconstructs its deterministic cursor from those events; real process providers may later add separately owned session records without weakening `Run::rehydrate`.
 
 ## Run lifecycle
 
@@ -154,13 +154,30 @@ A stage kind describes work such as implementation or synthesis. A role describe
 workflow stage -> engineering role -> provider -> model
 ```
 
-Workflow definitions are validated DAGs with unique stage IDs and known, non-self, non-duplicate required or optional dependencies. Milestone 1 validates representation and local readiness only; it does not schedule or traverse workflows for execution.
+Workflow definitions are validated DAGs with unique stage IDs and known, non-self, non-duplicate required or optional dependencies. Built-in Fast, Standard, Deep, and Review workflows are ordinary Rust graph data.
 
-## Future workflow execution
+## Milestone 4 workflow execution
 
-Built-in workflows will be Rust data, scheduled as dependency DAGs rather than hard-coded procedural sequences. Stage definitions will carry role, dependencies, optional dependencies, artifact type, retry policy, and fallback policy as each concept becomes executable.
+Scheduler loop is graph-driven:
 
-FakeProvider is the first provider. Core scheduling, interruption, attention, recovery, and concurrency must work deterministically without installed agents, network access, or subscriptions.
+```text
+load validated Run + Ready workspace
+    -> reject active apply intent
+    -> evaluate every Pending stage dependency set
+    -> atomically mark all newly Ready or blocked stages
+    -> resolve stage role against provider capability
+    -> consume at most one provider signal
+    -> atomically commit Run state + complete event batch
+    -> evaluate graph again
+```
+
+No branch checks `WorkflowKind` during scheduling. Review fan-out makes `deep_analysis` and `independent_review` Ready in one dependency pass after research; synthesis joins their terminal outcomes through optional edges. Initial scheduler executes one eligible stage at a time even when several are Ready, preserving deterministic tests while retaining DAG parallelism for a later process backend.
+
+`FakeProvider` is first provider. Scenarios script start, progress, usage, human attention, pause, interruption, completion, failure, and explicit delay gates. Every consumed signal has one identifying semantic event (`ProviderStarted`, `ProviderProgress`, `ProviderNeedsUser`, `ProviderUsageUpdated`, `ProviderPaused`, `ProviderInterrupted`, `ProviderCompleted`, or `ProviderFailed`). Signal index and attempt derive from per-stage event history, resetting only after explicit `StageRetryScheduled`; restart therefore cannot silently replay an already committed fake signal. `ProviderNeedsUser` links provider/session to the independently persisted `NeedsUser` lifecycle event and attention request.
+
+Execution commits recheck `WorkspaceStatus::Ready` inside same `BEGIN IMMEDIATE` transaction used for run compare-and-swap and event append. Active `Prepared` or `AppliedToSource` apply intent rejects execution through existing store guard. Preflight checks provide typed engine errors; transactional checks close race windows.
+
+Attention resolution, stage resume, interruption recovery, and retry are scheduler-boundary commands. They use same workspace/apply guards and atomic run commit as automatic advancement.
 
 ## Process and recovery
 
@@ -225,6 +242,11 @@ src/
 │   ├── role.rs      provider/model-independent responsibility
 │   ├── rehydration.rs persistence-neutral reconstruction data
 │   └── ids.rs       strong domain identities
+├── engine/
+│   ├── scheduler.rs deterministic DAG evaluation and guarded commits
+│   ├── provider.rs  provider-neutral synchronous signal boundary
+│   ├── fake.rs      validated scripts and restart-stable FakeProvider
+│   └── error.rs     typed execution/protocol failures
 ├── store/
 │   ├── sqlite.rs    transactional store and indexed projections
 │   ├── snapshot.rs  versioned RunSnapshotV1 codec
@@ -264,3 +286,6 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Git effects use intent/effect/finalize sagas with explicit reconciliation; SQLite transactions never span subprocess execution.
 - Apply uses patch transfer instead of merge/cherry-pick and never stages or commits source changes.
 - Discard is a logical disposition; cleanup is an independent physical-resource operation.
+- Built-in workflows are validated DAG data; scheduler contains no workflow-specific execution branches.
+- One consumed provider signal produces one durable checkpoint event in same atomic run commit as any lifecycle mutation it causes.
+- Scheduler is synchronous and single-stage deterministic in Milestone 4; async/process concurrency remains a backend concern.

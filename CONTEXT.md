@@ -120,6 +120,18 @@ _Avoid_: Timestamp order, global sequence
 An opinionated identity plus a validated dependency graph describing which stages belong to a run.
 _Avoid_: Pipeline script, custom graph
 
+**Workflow scheduler**:
+The execution service that repeatedly evaluates a workflow graph and advances eligible stages without workflow-specific procedures.
+_Avoid_: Pipeline runner, stage script
+
+**Provider signal**:
+One provider-neutral report accepted from a provider while a stage executes, such as progress, usage, human attention, suspension, interruption, failure, or completion.
+_Avoid_: Log line, provider callback
+
+**Provider checkpoint**:
+A durable semantic record proving one provider signal was consumed, from which provider progress can continue without silently repeating accepted work.
+_Avoid_: In-memory cursor, artifact presence
+
 **Role**:
 An engineering responsibility assigned to a stage, independent from provider and model selection.
 _Avoid_: Agent, model

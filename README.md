@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository currently contains **Milestone 3: Git workspaces**: validated domain state, synchronous restart-safe SQLite persistence, and crash-reconcilable isolated Git worktrees with explicit apply/discard. Workflow execution remains future work.
+Polycode is early-stage software. This repository currently contains **Milestone 4: workflow engine + FakeProvider**: validated domain state, synchronous restart-safe SQLite persistence, crash-reconcilable isolated Git worktrees, data-driven DAG scheduling, and deterministic scripted provider execution. Real coding-agent processes and UI remain future work.
 
 ## Principles
 
@@ -24,7 +24,7 @@ polycode doctor
 polycode runs
 ```
 
-`doctor` reports resolved config/database paths and existing schema version without creating a missing database. `runs` opens the local store and lists indexed run summaries. Domain, persistence, Git, and workspace APIs are importable as `polycode::domain`, `polycode::store`, `polycode::git`, and `polycode::workspace`; provider detection arrives with provider work. M3 workspace behavior is library/test-driven; dedicated apply/discard CLI commands remain later integration work.
+`doctor` reports resolved config/database paths and existing schema version without creating a missing database. `runs` opens local store and lists indexed run summaries. Domain, execution, persistence, Git, and workspace APIs are importable as `polycode::domain`, `polycode::engine`, `polycode::store`, `polycode::git`, and `polycode::workspace`. M4 behavior remains library/test-driven; real provider and dedicated run-control CLI commands arrive later.
 
 ## Build
 
@@ -76,7 +76,7 @@ Managed worktrees default to:
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Milestone 4+ descriptions are design constraints, not claims of implemented behavior.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Milestone 5+ descriptions are design constraints, not claims of implemented behavior.
 
 ## License
 

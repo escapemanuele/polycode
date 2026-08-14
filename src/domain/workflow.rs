@@ -136,6 +136,108 @@ impl WorkflowDefinition {
         Ok(Self { kind, stages })
     }
 
+    /// Returns one validated built-in workflow definition.
+    ///
+    /// Built-ins are ordinary DAG data. The scheduler never branches on
+    /// [`WorkflowKind`] and therefore treats user-defined definitions with the
+    /// same graph shape identically.
+    ///
+    /// # Panics
+    /// Panics only when a source-controlled built-in definition violates DAG
+    /// invariants. Tests cover every built-in definition.
+    #[must_use]
+    pub fn built_in(kind: WorkflowKind) -> Self {
+        let stages = match kind {
+            WorkflowKind::Fast => vec![stage(
+                "implementation",
+                StageKind::Implementation,
+                Role::Implementer,
+                vec![],
+            )],
+            WorkflowKind::Standard => vec![
+                stage(
+                    "architecture",
+                    StageKind::Architecture,
+                    Role::Architect,
+                    vec![],
+                ),
+                stage(
+                    "implementation",
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    vec![required("architecture")],
+                ),
+                stage(
+                    "review",
+                    StageKind::Review,
+                    Role::Reviewer,
+                    vec![required("implementation")],
+                ),
+                stage(
+                    "decision",
+                    StageKind::Decision,
+                    Role::EngineeringLead,
+                    vec![required("review")],
+                ),
+            ],
+            WorkflowKind::Deep => vec![
+                stage("research", StageKind::Research, Role::Researcher, vec![]),
+                stage(
+                    "architecture",
+                    StageKind::Architecture,
+                    Role::Architect,
+                    vec![required("research")],
+                ),
+                stage(
+                    "implementation",
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    vec![required("architecture")],
+                ),
+                stage(
+                    "review",
+                    StageKind::Review,
+                    Role::Reviewer,
+                    vec![required("implementation")],
+                ),
+                stage(
+                    "decision",
+                    StageKind::Decision,
+                    Role::EngineeringLead,
+                    vec![required("review")],
+                ),
+            ],
+            WorkflowKind::Review => vec![
+                stage("research", StageKind::Research, Role::Researcher, vec![]),
+                stage(
+                    "deep_analysis",
+                    StageKind::DeepAnalysis,
+                    Role::Reviewer,
+                    vec![required("research")],
+                ),
+                stage(
+                    "independent_review",
+                    StageKind::IndependentReview,
+                    Role::Reviewer,
+                    vec![required("research")],
+                ),
+                stage(
+                    "synthesis",
+                    StageKind::Synthesis,
+                    Role::EngineeringLead,
+                    vec![optional("deep_analysis"), optional("independent_review")],
+                ),
+                stage(
+                    "decision",
+                    StageKind::Decision,
+                    Role::EngineeringLead,
+                    vec![required("synthesis")],
+                ),
+            ],
+        };
+        Self::new(kind, stages).expect("built-in workflow must remain a valid DAG")
+    }
+
     #[must_use]
     pub const fn kind(&self) -> WorkflowKind {
         self.kind
@@ -150,6 +252,23 @@ impl WorkflowDefinition {
     pub fn stage(&self, stage_id: &StageId) -> Option<&StageDefinition> {
         self.stages.iter().find(|stage| stage.id == *stage_id)
     }
+}
+
+fn stage(id: &str, kind: StageKind, role: Role, dependencies: Vec<Dependency>) -> StageDefinition {
+    StageDefinition::new(
+        StageId::new(id).expect("built-in stage ID must remain valid"),
+        kind,
+        role,
+        dependencies,
+    )
+}
+
+fn required(id: &str) -> Dependency {
+    Dependency::required(StageId::new(id).expect("built-in dependency ID must remain valid"))
+}
+
+fn optional(id: &str) -> Dependency {
+    Dependency::optional(StageId::new(id).expect("built-in dependency ID must remain valid"))
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -360,5 +479,40 @@ mod tests {
             ),
             Err(WorkflowDefinitionError::DependencyCycle)
         );
+    }
+
+    #[test]
+    fn built_in_review_is_a_data_driven_fan_out_and_join() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        let deep = workflow.stage(&id("deep_analysis")).unwrap();
+        let independent = workflow.stage(&id("independent_review")).unwrap();
+        let synthesis = workflow.stage(&id("synthesis")).unwrap();
+
+        assert_eq!(deep.dependencies(), &[Dependency::required(id("research"))]);
+        assert_eq!(
+            independent.dependencies(),
+            &[Dependency::required(id("research"))]
+        );
+        assert_eq!(
+            synthesis.dependencies(),
+            &[
+                Dependency::optional(id("deep_analysis")),
+                Dependency::optional(id("independent_review")),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_built_in_is_a_valid_nonempty_dag() {
+        for kind in [
+            WorkflowKind::Fast,
+            WorkflowKind::Standard,
+            WorkflowKind::Deep,
+            WorkflowKind::Review,
+        ] {
+            let workflow = WorkflowDefinition::built_in(kind);
+            assert_eq!(workflow.kind(), kind);
+            assert!(!workflow.stages().is_empty());
+        }
     }
 }

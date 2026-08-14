@@ -1,0 +1,1121 @@
+use chrono::{DateTime, Utc};
+
+use crate::domain::{
+    AttentionRequest, AttentionRequestId, AttentionStatus, DomainEvent, DomainEventKind, EventId,
+    EventMetadata, ProviderId, ProviderSessionId, Run, RunId, RunStageError, RunStatus,
+    RunTransition, RunTransitionError, StageId, StageStatus, StageTransition,
+};
+use crate::store::{LoadedRun, RunRevision, SequencedEvent, SqliteStore};
+use crate::workspace::{ApplyStatus, RunWorkspace, WorkspaceStatus};
+
+use super::{EngineError, Provider, ProviderPoll, ProviderRequest, ProviderSignal};
+
+const DEFAULT_DRIVE_LIMIT: usize = 10_000;
+
+/// Supplies IDs and monotonic event timestamps without coupling domain logic to
+/// wall clock access. Tests can inject exact deterministic values.
+pub trait ExecutionContext {
+    fn next_event_metadata(&mut self, not_before: DateTime<Utc>) -> EventMetadata;
+    fn next_attention_id(&mut self) -> AttentionRequestId;
+}
+
+#[derive(Default)]
+pub struct SystemExecutionContext;
+
+impl ExecutionContext for SystemExecutionContext {
+    fn next_event_metadata(&mut self, not_before: DateTime<Utc>) -> EventMetadata {
+        let now: DateTime<Utc> = std::time::SystemTime::now().into();
+        EventMetadata::new(EventId::new(), now.max(not_before))
+    }
+
+    fn next_attention_id(&mut self) -> AttentionRequestId {
+        AttentionRequestId::new()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineStatus {
+    Advanced { run_status: RunStatus },
+    WaitingForProvider { stage_id: StageId },
+    NeedsUser { requests: Vec<AttentionRequestId> },
+    Paused { stages: Vec<StageId> },
+    Interrupted { stages: Vec<StageId> },
+    Finished { run_status: RunStatus },
+}
+
+/// Deterministic synchronous DAG scheduler for one resolved provider.
+pub struct WorkflowEngine<P, C = SystemExecutionContext> {
+    provider: P,
+    context: C,
+    drive_limit: usize,
+}
+
+impl<P> WorkflowEngine<P, SystemExecutionContext>
+where
+    P: Provider,
+{
+    #[must_use]
+    pub fn new(provider: P) -> Self {
+        Self::with_context(provider, SystemExecutionContext)
+    }
+}
+
+impl<P, C> WorkflowEngine<P, C>
+where
+    P: Provider,
+    C: ExecutionContext,
+{
+    #[must_use]
+    pub const fn with_context(provider: P, context: C) -> Self {
+        Self {
+            provider,
+            context,
+            drive_limit: DEFAULT_DRIVE_LIMIT,
+        }
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    #[must_use]
+    pub fn provider_mut(&mut self) -> &mut P {
+        &mut self.provider
+    }
+
+    /// Executes at most one persisted scheduler/provider transition.
+    ///
+    /// # Errors
+    /// Rejects invalid infrastructure state, active apply intent, unsupported
+    /// roles, provider protocol violations, stale writes, and domain failures.
+    pub fn tick(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<EngineStatus, EngineError> {
+        let (loaded, workspace) = load_execution_boundary(store, run_id)?;
+        match loaded.run.status() {
+            RunStatus::Ready => self.start_run(store, loaded),
+            RunStatus::Running => self.tick_running(store, loaded, &workspace),
+            RunStatus::NeedsUser => Ok(needs_user_status(&loaded.run)),
+            RunStatus::Paused => Ok(EngineStatus::Paused { stages: Vec::new() }),
+            RunStatus::Interrupted => Ok(EngineStatus::Interrupted { stages: Vec::new() }),
+            status if status.is_execution_finished() => {
+                Ok(EngineStatus::Finished { run_status: status })
+            }
+            status => Err(EngineError::RunNotPrepared(status)),
+        }
+    }
+
+    /// Runs deterministic ticks until work blocks or run execution finishes.
+    ///
+    /// # Errors
+    /// Returns first tick failure or a safety-limit error for a malformed
+    /// provider that never reaches a blocking/finished condition.
+    pub fn drive(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<EngineStatus, EngineError> {
+        for _ in 0..self.drive_limit {
+            let status = self.tick(store, run_id)?;
+            if !matches!(status, EngineStatus::Advanced { .. }) {
+                return Ok(status);
+            }
+        }
+        Err(EngineError::DriveLimit(self.drive_limit))
+    }
+
+    /// Resolves one persisted request through same guarded execution boundary.
+    ///
+    /// # Errors
+    /// Returns infrastructure, domain, concurrency, or persistence failures.
+    pub fn resolve_attention(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        request_id: AttentionRequestId,
+    ) -> Result<EngineStatus, EngineError> {
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let metadata = self.metadata_for(&loaded.run);
+        let event = loaded.run.resolve_attention(request_id, metadata)?;
+        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
+    /// Resumes one provider-paused stage through guarded execution boundary.
+    ///
+    /// # Errors
+    /// Returns infrastructure, lifecycle, concurrency, or persistence failures.
+    pub fn resume_stage(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        stage_id: &StageId,
+    ) -> Result<EngineStatus, EngineError> {
+        self.transition_stage(store, run_id, stage_id, StageTransition::Resume)
+    }
+
+    /// Recovers one provider-interrupted stage through guarded boundary.
+    ///
+    /// # Errors
+    /// Returns infrastructure, lifecycle, concurrency, or persistence failures.
+    pub fn recover_stage(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        stage_id: &StageId,
+    ) -> Result<EngineStatus, EngineError> {
+        self.transition_stage(store, run_id, stage_id, StageTransition::Recover)
+    }
+
+    /// Schedules explicit safe retry for one failed stage.
+    ///
+    /// # Errors
+    /// Returns infrastructure, retry-safety, concurrency, or persistence failures.
+    pub fn retry_stage(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        stage_id: &StageId,
+    ) -> Result<EngineStatus, EngineError> {
+        self.transition_stage(store, run_id, stage_id, StageTransition::Retry)
+    }
+
+    fn transition_stage(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        stage_id: &StageId,
+        transition: StageTransition,
+    ) -> Result<EngineStatus, EngineError> {
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let metadata = self.metadata_for(&loaded.run);
+        let event = loaded
+            .run
+            .transition_stage(stage_id, transition, metadata)?;
+        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
+    fn start_run(
+        &mut self,
+        store: &mut SqliteStore,
+        mut loaded: LoadedRun,
+    ) -> Result<EngineStatus, EngineError> {
+        let metadata = self.metadata_for(&loaded.run);
+        let event = loaded.run.transition(RunTransition::Start, metadata)?;
+        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
+    fn tick_running(
+        &mut self,
+        store: &mut SqliteStore,
+        mut loaded: LoadedRun,
+        workspace: &RunWorkspace,
+    ) -> Result<EngineStatus, EngineError> {
+        let readiness_events = self.evaluate_dependencies(&mut loaded.run)?;
+        if !readiness_events.is_empty() {
+            commit_execution(store, &loaded.run, loaded.revision, &readiness_events)?;
+            return Ok(EngineStatus::Advanced {
+                run_status: loaded.run.status(),
+            });
+        }
+
+        let stage = loaded
+            .run
+            .stages()
+            .iter()
+            .find(|stage| stage.status() == StageStatus::Running)
+            .or_else(|| {
+                loaded
+                    .run
+                    .stages()
+                    .iter()
+                    .find(|stage| stage.status() == StageStatus::Ready)
+            })
+            .cloned();
+        if let Some(stage) = stage {
+            return self.poll_stage(store, loaded, workspace, stage.id());
+        }
+
+        if loaded
+            .run
+            .stages()
+            .iter()
+            .all(|stage| stage.status().is_terminal_outcome())
+        {
+            return self.finish_run(store, loaded);
+        }
+
+        let paused = stages_with_status(&loaded.run, StageStatus::Paused);
+        if !paused.is_empty() {
+            return Ok(EngineStatus::Paused { stages: paused });
+        }
+        let interrupted = stages_with_status(&loaded.run, StageStatus::Interrupted);
+        if !interrupted.is_empty() {
+            return Ok(EngineStatus::Interrupted {
+                stages: interrupted,
+            });
+        }
+        Err(EngineError::NoProgress(loaded.run.id()))
+    }
+
+    fn evaluate_dependencies(&mut self, run: &mut Run) -> Result<Vec<DomainEvent>, EngineError> {
+        let pending = run
+            .stages()
+            .iter()
+            .filter(|stage| stage.status() == StageStatus::Pending)
+            .map(|stage| stage.id().clone())
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for stage_id in pending {
+            let metadata = self.metadata_for(run);
+            match run.transition_stage(&stage_id, StageTransition::MarkReady, metadata) {
+                Ok(event) => events.push(event),
+                Err(RunStageError::DependenciesNotFinished { .. }) => {}
+                Err(RunStageError::RequiredDependenciesBlocked { .. }) => {
+                    let metadata = self.metadata_for(run);
+                    events.push(run.transition_stage(
+                        &stage_id,
+                        StageTransition::Skip,
+                        metadata,
+                    )?);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(events)
+    }
+
+    fn poll_stage(
+        &mut self,
+        store: &mut SqliteStore,
+        mut loaded: LoadedRun,
+        workspace: &RunWorkspace,
+        stage_id: &StageId,
+    ) -> Result<EngineStatus, EngineError> {
+        let events = store.load_events(loaded.run.id())?;
+        let checkpoint = reduce_checkpoint(&events, stage_id)?;
+        let provider_id = self.provider.id().clone();
+        if let Some(previous) = checkpoint
+            .provider_id
+            .as_ref()
+            .filter(|previous| *previous != &provider_id)
+        {
+            return Err(EngineError::ProviderChanged {
+                stage_id: stage_id.clone(),
+                previous: previous.to_string(),
+                current: provider_id.to_string(),
+            });
+        }
+        let stage = loaded
+            .run
+            .stage(stage_id)
+            .expect("selected stage must remain in loaded run");
+        if !self.provider.supports_role(stage.role()) {
+            return Err(EngineError::UnsupportedRole(stage.role()));
+        }
+        let request = ProviderRequest::new(
+            loaded.run.id(),
+            stage.id().clone(),
+            stage.kind(),
+            stage.status(),
+            stage.role(),
+            loaded.run.task().to_owned(),
+            workspace.worktree_path().to_path_buf(),
+            checkpoint.attempt,
+            checkpoint.signal_index,
+            checkpoint.session_id.clone(),
+        );
+        match self.provider.poll(&request)? {
+            ProviderPoll::Pending => Ok(EngineStatus::WaitingForProvider {
+                stage_id: stage_id.clone(),
+            }),
+            ProviderPoll::Signal(signal) => {
+                let emitted = self.consume_signal(
+                    &mut loaded.run,
+                    stage_id,
+                    &provider_id,
+                    checkpoint.session_id,
+                    signal,
+                )?;
+                commit_execution(store, &loaded.run, loaded.revision, &emitted)?;
+                Ok(EngineStatus::Advanced {
+                    run_status: loaded.run.status(),
+                })
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single exhaustive provider protocol match keeps lifecycle mapping auditable"
+    )]
+    fn consume_signal(
+        &mut self,
+        run: &mut Run,
+        stage_id: &StageId,
+        provider_id: &ProviderId,
+        session_id: Option<ProviderSessionId>,
+        signal: ProviderSignal,
+    ) -> Result<Vec<DomainEvent>, EngineError> {
+        let stage_status = run
+            .stage(stage_id)
+            .ok_or_else(|| EngineError::ProviderProtocol {
+                stage_id: stage_id.clone(),
+                message: "stage disappeared before signal consumption".to_owned(),
+            })?
+            .status();
+        let mut events = Vec::new();
+        match signal {
+            ProviderSignal::Started {
+                model_id,
+                session_id,
+            } if stage_status == StageStatus::Ready => {
+                let metadata = self.metadata_for(run);
+                events.push(run.transition_stage(stage_id, StageTransition::Start, metadata)?);
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderStarted {
+                        provider_id: provider_id.clone(),
+                        model_id,
+                        session_id,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::Progress(message) if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderProgress {
+                        provider_id: provider_id.clone(),
+                        message,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::Usage(usage) if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderUsageUpdated {
+                        provider_id: provider_id.clone(),
+                        input_units: usage.input_units,
+                        output_units: usage.output_units,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::NeedsUser { kind, summary } if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                let request = AttentionRequest::new(
+                    self.context.next_attention_id(),
+                    run.id(),
+                    stage_id.clone(),
+                    kind,
+                    summary,
+                    metadata.occurred_at(),
+                )?;
+                let request_id = request.id();
+                events.push(run.request_attention(request, metadata)?);
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderNeedsUser {
+                        provider_id: provider_id.clone(),
+                        session_id,
+                        attention_request_id: request_id,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::Paused if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                events.push(run.transition_stage(stage_id, StageTransition::Pause, metadata)?);
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderPaused {
+                        provider_id: provider_id.clone(),
+                        session_id,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::Interrupted if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                events.push(run.transition_stage(
+                    stage_id,
+                    StageTransition::Interrupt,
+                    metadata,
+                )?);
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderInterrupted {
+                        provider_id: provider_id.clone(),
+                        session_id,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::Completed if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                events.push(run.transition_stage(stage_id, StageTransition::Complete, metadata)?);
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderCompleted {
+                        provider_id: provider_id.clone(),
+                        session_id,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::Failed(reason) if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                events.push(run.transition_stage(stage_id, StageTransition::Fail, metadata)?);
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderFailed {
+                        provider_id: provider_id.clone(),
+                        session_id,
+                        reason: Some(reason),
+                    },
+                    metadata,
+                )?);
+            }
+            signal => {
+                return Err(EngineError::ProviderProtocol {
+                    stage_id: stage_id.clone(),
+                    message: format!("signal {signal:?} is invalid from {stage_status:?}"),
+                });
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish_run(
+        &mut self,
+        store: &mut SqliteStore,
+        mut loaded: LoadedRun,
+    ) -> Result<EngineStatus, EngineError> {
+        let metadata = self.metadata_for(&loaded.run);
+        let event = match loaded.run.transition(RunTransition::Complete, metadata) {
+            Ok(event) => event,
+            Err(RunTransitionError::CompletionBlocked(_)) => {
+                let metadata = self.metadata_for(&loaded.run);
+                loaded.run.transition(RunTransition::Fail, metadata)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
+    fn metadata_for(&mut self, run: &Run) -> EventMetadata {
+        self.context.next_event_metadata(*run.updated_at())
+    }
+}
+
+fn load_execution_boundary(
+    store: &mut SqliteStore,
+    run_id: RunId,
+) -> Result<(LoadedRun, RunWorkspace), EngineError> {
+    let loaded = store.load_run(run_id)?;
+    let workspace = store
+        .load_workspace(run_id)?
+        .ok_or(EngineError::MissingWorkspace(run_id))?;
+    if workspace.status() != WorkspaceStatus::Ready {
+        return Err(EngineError::WorkspaceNotReady {
+            run_id,
+            status: workspace.status(),
+        });
+    }
+    if let Some(operation) = store.load_apply_operation(run_id)?.filter(|operation| {
+        matches!(
+            operation.status(),
+            ApplyStatus::Prepared | ApplyStatus::AppliedToSource
+        )
+    }) {
+        return Err(EngineError::ApplyInProgress {
+            run_id,
+            status: operation.status(),
+        });
+    }
+    Ok((loaded, workspace))
+}
+
+fn commit_execution(
+    store: &mut SqliteStore,
+    run: &Run,
+    revision: RunRevision,
+    events: &[DomainEvent],
+) -> Result<(), EngineError> {
+    store.commit_run_execution_update(run, revision, events)?;
+    Ok(())
+}
+
+fn needs_user_status(run: &Run) -> EngineStatus {
+    EngineStatus::NeedsUser {
+        requests: run
+            .attention_requests()
+            .iter()
+            .filter(|request| request.status() == &AttentionStatus::Pending)
+            .map(AttentionRequest::id)
+            .collect(),
+    }
+}
+
+fn stages_with_status(run: &Run, status: StageStatus) -> Vec<StageId> {
+    run.stages()
+        .iter()
+        .filter(|stage| stage.status() == status)
+        .map(|stage| stage.id().clone())
+        .collect()
+}
+
+#[derive(Default)]
+struct ProviderCheckpoint {
+    attempt: u32,
+    signal_index: usize,
+    provider_id: Option<ProviderId>,
+    session_id: Option<ProviderSessionId>,
+}
+
+fn reduce_checkpoint(
+    events: &[SequencedEvent],
+    stage_id: &StageId,
+) -> Result<ProviderCheckpoint, EngineError> {
+    let mut checkpoint = ProviderCheckpoint {
+        attempt: 1,
+        ..ProviderCheckpoint::default()
+    };
+    for sequenced in events {
+        let event = &sequenced.event;
+        if event.stage_id() != Some(stage_id) {
+            continue;
+        }
+        match event.kind() {
+            DomainEventKind::StageRetryScheduled => {
+                checkpoint.attempt = checkpoint
+                    .attempt
+                    .checked_add(1)
+                    .ok_or(EngineError::CheckpointOverflow)?;
+                checkpoint.signal_index = 0;
+                checkpoint.provider_id = None;
+                checkpoint.session_id = None;
+            }
+            DomainEventKind::ProviderStarted {
+                provider_id,
+                session_id,
+                ..
+            } => {
+                register_provider(&mut checkpoint, stage_id, provider_id)?;
+                checkpoint.session_id.clone_from(session_id);
+                advance_checkpoint(&mut checkpoint)?;
+            }
+            DomainEventKind::ProviderProgress { provider_id, .. }
+            | DomainEventKind::ProviderNeedsUser { provider_id, .. }
+            | DomainEventKind::ProviderPaused { provider_id, .. }
+            | DomainEventKind::ProviderInterrupted { provider_id, .. }
+            | DomainEventKind::ProviderCompleted { provider_id, .. }
+            | DomainEventKind::ProviderFailed { provider_id, .. }
+            | DomainEventKind::ProviderUsageUpdated { provider_id, .. } => {
+                register_provider(&mut checkpoint, stage_id, provider_id)?;
+                advance_checkpoint(&mut checkpoint)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(checkpoint)
+}
+
+fn register_provider(
+    checkpoint: &mut ProviderCheckpoint,
+    stage_id: &StageId,
+    provider_id: &ProviderId,
+) -> Result<(), EngineError> {
+    if let Some(previous) = checkpoint
+        .provider_id
+        .as_ref()
+        .filter(|previous| *previous != provider_id)
+    {
+        return Err(EngineError::ProviderChanged {
+            stage_id: stage_id.clone(),
+            previous: previous.to_string(),
+            current: provider_id.to_string(),
+        });
+    }
+    checkpoint.provider_id = Some(provider_id.clone());
+    Ok(())
+}
+
+fn advance_checkpoint(checkpoint: &mut ProviderCheckpoint) -> Result<(), EngineError> {
+    checkpoint.signal_index = checkpoint
+        .signal_index
+        .checked_add(1)
+        .ok_or(EngineError::CheckpointOverflow)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use chrono::Duration;
+    use rusqlite::params;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::domain::{
+        AttentionKind, ConfigSnapshotId, DomainEventKind, WorkflowDefinition, WorkflowKind,
+    };
+    use crate::engine::{FakeEvent, FakeProvider, FakeScenario, UsageDelta};
+    use crate::store::ResolvedConfigSnapshot;
+    use crate::workspace::WorkspaceManager;
+
+    struct TestContext {
+        next_event: u128,
+        next_attention: u128,
+    }
+
+    impl TestContext {
+        const fn new(base: u128) -> Self {
+            Self {
+                next_event: base,
+                next_attention: base + 50_000,
+            }
+        }
+    }
+
+    impl ExecutionContext for TestContext {
+        fn next_event_metadata(&mut self, not_before: DateTime<Utc>) -> EventMetadata {
+            let id = EventId::from_u128(self.next_event);
+            self.next_event += 1;
+            EventMetadata::new(id, not_before + Duration::milliseconds(1))
+        }
+
+        fn next_attention_id(&mut self) -> AttentionRequestId {
+            let id = AttentionRequestId::from_u128(self.next_attention);
+            self.next_attention += 1;
+            id
+        }
+    }
+
+    struct Fixture {
+        _temp: TempDir,
+        database: PathBuf,
+        store: SqliteStore,
+        run_id: RunId,
+    }
+
+    impl Fixture {
+        fn new(kind: WorkflowKind, run_value: u128) -> Self {
+            let temp = TempDir::new().unwrap();
+            let source = temp.path().join("source repo");
+            init_repository(&source);
+            let database = temp.path().join("polycode.sqlite3");
+            let worktrees = temp.path().join("worktrees");
+            let mut store = SqliteStore::open(&database).unwrap();
+            let run_id = RunId::from_u128(run_value);
+            let created_at: DateTime<Utc> = std::time::SystemTime::now().into();
+            let config_id = ConfigSnapshotId::new(format!("config-{run_value}")).unwrap();
+            let workflow = WorkflowDefinition::built_in(kind);
+            let run = Run::new(
+                run_id,
+                "exercise deterministic workflow",
+                workflow,
+                config_id.clone(),
+                created_at,
+            )
+            .unwrap();
+            let config =
+                ResolvedConfigSnapshot::new(config_id, 1, json!({"provider": "fake"}), created_at)
+                    .unwrap();
+            let created = run.created_event(EventMetadata::new(
+                EventId::from_u128(run_value + 1),
+                created_at,
+            ));
+            store.create_run(&run, &config, &[created]).unwrap();
+            WorkspaceManager::new(&worktrees)
+                .prepare_run_workspace(&mut store, run_id, &source)
+                .unwrap();
+            Self {
+                _temp: temp,
+                database,
+                store,
+                run_id,
+            }
+        }
+    }
+
+    #[test]
+    fn deep_run_completes_and_rehydrates_exactly_after_reopen() {
+        let mut fixture = Fixture::new(WorkflowKind::Deep, 100_000);
+        let scenario = FakeScenario::new()
+            .stage("research")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::progress("Inspecting repository"),
+                FakeEvent::Completed,
+            ])
+            .stage("architecture")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("implementation")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::Usage(UsageDelta {
+                    input_units: 120,
+                    output_units: 45,
+                }),
+                FakeEvent::Completed,
+            ])
+            .stage("review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let provider = FakeProvider::new(scenario).unwrap();
+        let mut engine = WorkflowEngine::with_context(provider, TestContext::new(200_000));
+
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Completed
+            }
+        );
+        let original = fixture.store.load_run(fixture.run_id).unwrap().run;
+        assert!(
+            original
+                .stages()
+                .iter()
+                .all(|stage| stage.status() == StageStatus::Completed)
+        );
+        let events = fixture.store.load_events(fixture.run_id).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.event.kind(),
+            DomainEventKind::ProviderUsageUpdated {
+                input_units: 120,
+                output_units: 45,
+                ..
+            }
+        )));
+
+        drop(fixture.store);
+        let mut reopened = SqliteStore::open(&fixture.database).unwrap();
+        assert_eq!(reopened.load_run(fixture.run_id).unwrap().run, original);
+    }
+
+    #[test]
+    fn needs_user_checkpoint_survives_restart_and_continues_same_stage() {
+        let mut fixture = Fixture::new(WorkflowKind::Fast, 300_000);
+        let make_scenario = || {
+            FakeScenario::new().stage("implementation").events([
+                FakeEvent::Started,
+                FakeEvent::needs_user(AttentionKind::Decision, "Choose API shape"),
+                FakeEvent::progress("Applying decision"),
+                FakeEvent::Completed,
+            ])
+        };
+        let mut engine = WorkflowEngine::with_context(
+            FakeProvider::new(make_scenario()).unwrap(),
+            TestContext::new(400_000),
+        );
+        let blocked = engine.drive(&mut fixture.store, fixture.run_id).unwrap();
+        let request_id = match blocked {
+            EngineStatus::NeedsUser { requests } => requests[0],
+            other => panic!("expected attention, found {other:?}"),
+        };
+        assert_eq!(
+            fixture.store.load_run(fixture.run_id).unwrap().run.status(),
+            RunStatus::NeedsUser
+        );
+
+        drop(engine);
+        drop(fixture.store);
+        fixture.store = SqliteStore::open(&fixture.database).unwrap();
+        let mut restarted = WorkflowEngine::with_context(
+            FakeProvider::new(make_scenario()).unwrap(),
+            TestContext::new(500_000),
+        );
+        restarted
+            .resolve_attention(&mut fixture.store, fixture.run_id, request_id)
+            .unwrap();
+        assert_eq!(
+            restarted.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Completed
+            }
+        );
+
+        let events = fixture.store.load_events(fixture.run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event.kind(), DomainEventKind::NeedsUser { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event.kind(),
+                    DomainEventKind::ProviderStarted { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn review_fan_out_becomes_ready_without_workflow_specific_scheduler_code() {
+        let mut fixture = Fixture::new(WorkflowKind::Review, 600_000);
+        let scenario = FakeScenario::new()
+            .stage("research")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("deep_analysis")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("independent_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("synthesis")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let mut engine = WorkflowEngine::with_context(
+            FakeProvider::new(scenario).unwrap(),
+            TestContext::new(700_000),
+        );
+
+        for _ in 0..5 {
+            assert!(matches!(
+                engine.tick(&mut fixture.store, fixture.run_id).unwrap(),
+                EngineStatus::Advanced { .. }
+            ));
+        }
+        let run = fixture.store.load_run(fixture.run_id).unwrap().run;
+        assert_eq!(
+            run.stage(&StageId::new("deep_analysis").unwrap())
+                .unwrap()
+                .status(),
+            StageStatus::Ready
+        );
+        assert_eq!(
+            run.stage(&StageId::new("independent_review").unwrap())
+                .unwrap()
+                .status(),
+            StageStatus::Ready
+        );
+    }
+
+    #[test]
+    fn optional_failure_degrades_join_but_review_run_completes() {
+        let mut fixture = Fixture::new(WorkflowKind::Review, 800_000);
+        let scenario = FakeScenario::new()
+            .stage("research")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("deep_analysis")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::failed("analysis unavailable"),
+            ])
+            .stage("independent_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("synthesis")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let mut engine = WorkflowEngine::with_context(
+            FakeProvider::new(scenario).unwrap(),
+            TestContext::new(900_000),
+        );
+
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Completed
+            }
+        );
+        assert!(
+            fixture
+                .store
+                .load_events(fixture.run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.event.kind(),
+                    DomainEventKind::StageReady { degraded: true }
+                ))
+        );
+    }
+
+    #[test]
+    fn pause_interruption_and_delay_are_explicitly_controlled() {
+        let mut fixture = Fixture::new(WorkflowKind::Fast, 1_000_000);
+        let make_scenario = || {
+            FakeScenario::new().stage("implementation").events([
+                FakeEvent::Started,
+                FakeEvent::Paused,
+                FakeEvent::progress("resumed"),
+                FakeEvent::Interrupted,
+                FakeEvent::delay("process-ready"),
+                FakeEvent::Completed,
+            ])
+        };
+        let mut engine = WorkflowEngine::with_context(
+            FakeProvider::new(make_scenario()).unwrap(),
+            TestContext::new(1_100_000),
+        );
+        let stage_id = StageId::new("implementation").unwrap();
+
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Paused {
+                stages: vec![stage_id.clone()]
+            }
+        );
+        engine
+            .resume_stage(&mut fixture.store, fixture.run_id, &stage_id)
+            .unwrap();
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Interrupted {
+                stages: vec![stage_id.clone()]
+            }
+        );
+
+        drop(engine);
+        drop(fixture.store);
+        fixture.store = SqliteStore::open(&fixture.database).unwrap();
+        let mut engine = WorkflowEngine::with_context(
+            FakeProvider::new(make_scenario()).unwrap(),
+            TestContext::new(1_150_000),
+        );
+        engine
+            .recover_stage(&mut fixture.store, fixture.run_id, &stage_id)
+            .unwrap();
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::WaitingForProvider {
+                stage_id: stage_id.clone()
+            }
+        );
+        engine
+            .provider_mut()
+            .release("implementation", "process-ready")
+            .unwrap();
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Completed
+            }
+        );
+    }
+
+    #[test]
+    fn failed_leaf_fails_run_and_execution_guards_workspace_and_apply() {
+        let mut fixture = Fixture::new(WorkflowKind::Fast, 1_200_000);
+        let scenario = FakeScenario::new()
+            .stage("implementation")
+            .events([FakeEvent::Started, FakeEvent::failed("compile failed")]);
+        let mut engine = WorkflowEngine::with_context(
+            FakeProvider::new(scenario).unwrap(),
+            TestContext::new(1_300_000),
+        );
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Failed
+            }
+        );
+
+        let missing_id = RunId::from_u128(1_400_000);
+        let created_at: DateTime<Utc> = std::time::SystemTime::now().into();
+        let config_id = ConfigSnapshotId::new("missing-workspace-config").unwrap();
+        let run = Run::new(
+            missing_id,
+            "missing workspace",
+            WorkflowDefinition::built_in(WorkflowKind::Fast),
+            config_id.clone(),
+            created_at,
+        )
+        .unwrap();
+        let config = ResolvedConfigSnapshot::new(config_id, 1, json!({}), created_at).unwrap();
+        let created = run.created_event(EventMetadata::new(
+            EventId::from_u128(1_400_001),
+            created_at,
+        ));
+        fixture.store.create_run(&run, &config, &[created]).unwrap();
+        assert!(matches!(
+            engine.tick(&mut fixture.store, missing_id),
+            Err(EngineError::MissingWorkspace(id)) if id == missing_id
+        ));
+
+        let mut apply_fixture = Fixture::new(WorkflowKind::Fast, 1_500_000);
+        let loaded = apply_fixture.store.load_run(apply_fixture.run_id).unwrap();
+        let timestamp = loaded.run.updated_at().to_rfc3339();
+        apply_fixture
+            .store
+            .connection
+            .execute(
+                "INSERT INTO run_apply_operations (
+                    run_id, status, patch_hash, run_revision, last_error, revision,
+                    created_at, updated_at
+                 ) VALUES (?1, 'prepared', ?2, ?3, NULL, 0, ?4, ?4)",
+                params![
+                    apply_fixture.run_id.to_string(),
+                    "0".repeat(64),
+                    i64::try_from(loaded.revision.value()).unwrap(),
+                    timestamp,
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.tick(&mut apply_fixture.store, apply_fixture.run_id),
+            Err(EngineError::ApplyInProgress {
+                run_id,
+                status: ApplyStatus::Prepared
+            }) if run_id == apply_fixture.run_id
+        ));
+    }
+
+    fn init_repository(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-b", "main"]);
+        git(path, &["config", "user.name", "Polycode Test"]);
+        git(path, &["config", "user.email", "polycode@example.invalid"]);
+        fs::write(path.join("README.md"), "fixture\n").unwrap();
+        git(path, &["add", "README.md"]);
+        git(path, &["commit", "-m", "fixture"]);
+    }
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

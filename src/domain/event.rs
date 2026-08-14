@@ -132,6 +132,23 @@ pub enum DomainEventKind {
         provider_id: ProviderId,
         session_id: ProviderSessionId,
     },
+    ProviderProgress {
+        provider_id: ProviderId,
+        message: String,
+    },
+    ProviderNeedsUser {
+        provider_id: ProviderId,
+        session_id: Option<ProviderSessionId>,
+        attention_request_id: AttentionRequestId,
+    },
+    ProviderPaused {
+        provider_id: ProviderId,
+        session_id: Option<ProviderSessionId>,
+    },
+    ProviderInterrupted {
+        provider_id: ProviderId,
+        session_id: Option<ProviderSessionId>,
+    },
     ProviderCompleted {
         provider_id: ProviderId,
         session_id: Option<ProviderSessionId>,
@@ -139,8 +156,15 @@ pub enum DomainEventKind {
     ProviderFailed {
         provider_id: ProviderId,
         session_id: Option<ProviderSessionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     UsageUpdated,
+    ProviderUsageUpdated {
+        provider_id: ProviderId,
+        input_units: u64,
+        output_units: u64,
+    },
 }
 
 #[cfg(test)]

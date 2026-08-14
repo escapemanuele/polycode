@@ -287,6 +287,40 @@ impl SqliteStore {
         Ok(result)
     }
 
+    /// Atomically rechecks execution infrastructure, updates run state, and
+    /// appends its semantic event batch.
+    ///
+    /// # Errors
+    /// Rejects missing/non-ready workspaces, active apply intent, stale run
+    /// revisions, invalid aggregates/events, and `SQLite` failures.
+    pub(crate) fn commit_run_execution_update(
+        &mut self,
+        run: &Run,
+        expected_revision: RunRevision,
+        events: &[DomainEvent],
+    ) -> Result<CommitResult, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let workspace_status = transaction
+            .query_row(
+                "SELECT status FROM run_workspaces WHERE run_id = ?1",
+                [run.id().to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if workspace_status.as_deref() != Some("ready") {
+            return Err(StoreError::ExecutionWorkspaceNotReady {
+                run_id: run.id(),
+                status: workspace_status,
+            });
+        }
+        let result =
+            commit_run_update_transaction(&transaction, run, expected_revision, events, false)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Loads authoritative per-run event sequence and validates row projections.
     ///
     /// # Errors
