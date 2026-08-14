@@ -11,7 +11,7 @@ use crate::domain::{
 
 use super::migrations;
 use super::snapshot::{decode_run, encode_run};
-use super::{RUN_SNAPSHOT_SCHEMA_VERSION, ResolvedConfigSnapshot, StoreError};
+use super::{RUN_SNAPSHOT_SCHEMA_VERSION, ResolvedConfigSnapshot, RunInput, StoreError};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RunRevision(u64);
@@ -58,6 +58,8 @@ pub struct RunSummary {
     pub id: RunId,
     pub status: RunStatus,
     pub workflow: WorkflowKind,
+    pub task: Option<String>,
+    pub repository_path: Option<String>,
     pub revision: RunRevision,
     pub updated_at: DateTime<Utc>,
 }
@@ -153,11 +155,47 @@ impl SqliteStore {
         config_snapshot: &ResolvedConfigSnapshot,
         events: &[DomainEvent],
     ) -> Result<CommitResult, StoreError> {
+        self.create_run_internal(run, config_snapshot, None, events)
+    }
+
+    /// Atomically inserts immutable input, config, initial run, and events.
+    ///
+    /// # Errors
+    /// Rejects identity mismatches, invalid state, duplicate run, or invalid events.
+    pub fn create_run_with_input(
+        &mut self,
+        run: &Run,
+        input: &RunInput,
+        config_snapshot: &ResolvedConfigSnapshot,
+        events: &[DomainEvent],
+    ) -> Result<CommitResult, StoreError> {
+        self.create_run_internal(run, config_snapshot, Some(input), events)
+    }
+
+    fn create_run_internal(
+        &mut self,
+        run: &Run,
+        config_snapshot: &ResolvedConfigSnapshot,
+        input: Option<&RunInput>,
+        events: &[DomainEvent],
+    ) -> Result<CommitResult, StoreError> {
         run.validate_invariants()?;
         if run.config_snapshot_id() != config_snapshot.id() {
             return Err(StoreError::SnapshotProjectionMismatch(
                 "run config_snapshot_id differs from supplied config",
             ));
+        }
+        if let Some(input) = input {
+            if input.run_id() != run.id() {
+                return Err(StoreError::SnapshotProjectionMismatch(
+                    "run input belongs to another run",
+                ));
+            }
+            if input.created_at() != run.created_at() {
+                return Err(StoreError::SnapshotProjectionMismatch(
+                    "run input created_at differs from run",
+                ));
+            }
         }
         validate_event_batch(run, events, None)?;
         if !matches!(
@@ -197,6 +235,9 @@ impl SqliteStore {
                 format_timestamp(run.updated_at()),
             ],
         )?;
+        if let Some(input) = input {
+            insert_run_input(&transaction, input)?;
+        }
         insert_events(&transaction, run, events, 1)?;
         transaction.commit()?;
 
@@ -205,6 +246,14 @@ impl SqliteStore {
             last_sequence: u64::try_from(events.len())
                 .map_err(|_| StoreError::IntegerRange("event count"))?,
         })
+    }
+
+    /// Loads immutable user input. `None` identifies a pre-v3 legacy run.
+    ///
+    /// # Errors
+    /// Returns malformed input, timestamp, identity, or `SQLite` errors.
+    pub fn load_run_input(&self, run_id: RunId) -> Result<Option<RunInput>, StoreError> {
+        load_run_input_optional(&self.connection, run_id)
     }
 
     /// Loads one snapshot, validates projections, then calls `Run::rehydrate`.
@@ -239,27 +288,35 @@ impl SqliteStore {
     /// Returns typed projection, timestamp, or `SQLite` errors.
     pub fn list_runs(&self) -> Result<Vec<RunSummary>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, status, workflow, revision, updated_at
-             FROM runs ORDER BY updated_at DESC, id",
+            "SELECT runs.id, runs.status, runs.workflow, run_inputs.task,
+                    run_workspaces.source_repo_path, runs.revision, runs.updated_at
+             FROM runs
+             LEFT JOIN run_inputs ON run_inputs.run_id = runs.id
+             LEFT JOIN run_workspaces ON run_workspaces.run_id = runs.id
+             ORDER BY runs.updated_at DESC, runs.id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
         let mut summaries = Vec::new();
         for row in rows {
-            let (id, status, workflow, revision, updated_at) = row?;
+            let (id, status, workflow, task, repository_path, revision, updated_at) = row?;
             summaries.push(RunSummary {
                 id: id
                     .parse()
                     .map_err(|_| StoreError::SnapshotProjectionMismatch("invalid run ID"))?,
                 status: enum_from_text(&status)?,
                 workflow: enum_from_text(&workflow)?,
+                task,
+                repository_path,
                 revision: RunRevision(i64_to_u64(revision, "run revision")?),
                 updated_at: parse_timestamp(&updated_at)?,
             });
@@ -395,9 +452,6 @@ pub(crate) fn commit_run_update_transaction(
         return Err(StoreError::RunFrozenForApply(run.id()));
     }
     let current = load_commit_state(transaction, run.id())?;
-    if current.run.task() != run.task() {
-        return Err(StoreError::ImmutableRunFieldChanged("task"));
-    }
     if current.run.workflow() != run.workflow() {
         return Err(StoreError::ImmutableRunFieldChanged("workflow"));
     }
@@ -485,6 +539,56 @@ struct CommitState {
     run: Run,
     last_sequence: u64,
     last_occurred_at: Option<DateTime<Utc>>,
+}
+
+fn insert_run_input(connection: &Connection, input: &RunInput) -> Result<(), StoreError> {
+    let existing = load_run_input_optional(connection, input.run_id())?;
+    if let Some(existing) = existing {
+        if &existing == input {
+            return Ok(());
+        }
+        return Err(StoreError::RunInputConflict(input.run_id()));
+    }
+    connection.execute(
+        "INSERT INTO run_inputs (run_id, schema_version, task, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            input.run_id().to_string(),
+            i64::from(input.schema_version()),
+            input.task(),
+            format_timestamp(input.created_at()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_run_input_optional(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<RunInput>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT schema_version, task, created_at FROM run_inputs WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(schema_version, task, created_at)| {
+        RunInput::from_stored(
+            run_id,
+            i64_to_u32(schema_version, "run input schema version")?,
+            task,
+            parse_timestamp(&created_at)?,
+        )
+        .map_err(StoreError::from)
+    })
+    .transpose()
 }
 
 fn insert_config(
@@ -835,12 +939,10 @@ mod tests {
     fn complex_run(run_value: u128, config_id: &str, event_base: u128) -> (Run, Vec<DomainEvent>) {
         let mut run = Run::new(
             RunId::from_u128(run_value),
-            "persist a complex aggregate",
             workflow(),
             ConfigSnapshotId::new(config_id).unwrap(),
             at(0),
-        )
-        .unwrap();
+        );
         let mut events = vec![run.created_event(metadata(event_base, 0))];
         events.push(
             run.transition(RunTransition::BeginPreparation, metadata(event_base + 1, 1))
@@ -1087,6 +1189,97 @@ mod tests {
         assert_eq!(store.load_events(second.id()).unwrap()[0].sequence, 1);
         assert_eq!(store.load_run(first.id()).unwrap().run, first);
         assert_eq!(store.load_run(second.id()).unwrap().run, second);
+    }
+
+    #[test]
+    fn run_input_is_created_atomically_and_database_immutable() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, events) = complex_run(202, "input-config", 3_500);
+        let config = config("input-config");
+        let input = RunInput::new(run.id(), "  Unicode α\nsecond line  ", at(0)).unwrap();
+
+        store
+            .create_run_with_input(&run, &input, &config, &events)
+            .unwrap();
+
+        assert_eq!(store.load_run_input(run.id()).unwrap(), Some(input));
+        let update = store.connection.execute(
+            "UPDATE run_inputs SET task = 'changed' WHERE run_id = ?1",
+            [run.id().to_string()],
+        );
+        assert!(matches!(
+            update,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == ErrorCode::ConstraintViolation
+        ));
+        let delete = store.connection.execute(
+            "DELETE FROM run_inputs WHERE run_id = ?1",
+            [run.id().to_string()],
+        );
+        assert!(matches!(
+            delete,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == ErrorCode::ConstraintViolation
+        ));
+    }
+
+    #[test]
+    fn initial_event_failure_rolls_back_run_input_run_and_config() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (first, first_events) = complex_run(204, "first-atomic", 3_600);
+        let first_config = config("first-atomic");
+        let first_input = RunInput::new(first.id(), "first task", at(0)).unwrap();
+        store
+            .create_run_with_input(&first, &first_input, &first_config, &first_events)
+            .unwrap();
+
+        let (second, duplicate_events) = complex_run(205, "second-atomic", 3_600);
+        let second_config = config("second-atomic");
+        let second_input = RunInput::new(second.id(), "second task", at(0)).unwrap();
+        assert!(matches!(
+            store.create_run_with_input(&second, &second_input, &second_config, &duplicate_events),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert!(matches!(
+            store.load_run(second.id()),
+            Err(StoreError::RunNotFound(id)) if id == second.id()
+        ));
+        assert!(store.load_run_input(second.id()).unwrap().is_none());
+        assert!(matches!(
+            store.load_config_snapshot(second_config.id()),
+            Err(StoreError::ConfigSnapshotNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn current_snapshot_excludes_task_and_legacy_v1_snapshot_still_loads() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 203, "legacy-v1", 3_700);
+        let snapshot_json: String = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM runs WHERE id = ?1",
+                [run.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+        assert!(snapshot.get("task").is_none());
+        snapshot["schema_version"] = json!(1);
+        snapshot["task"] = json!("legacy task ignored by aggregate");
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET snapshot_schema_version = 1, snapshot_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&snapshot).unwrap(),
+                    run.id().to_string()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(store.load_run(run.id()).unwrap().run, run);
+        assert!(store.load_run_input(run.id()).unwrap().is_none());
     }
 
     #[test]

@@ -5,8 +5,12 @@ Polycode coordinates recoverable engineering work performed by native coding-age
 ## Language
 
 **Run**:
-A recoverable orchestration effort for one task, bound for its lifetime to one effective configuration snapshot.
+A recoverable orchestration effort bound for its lifetime to one immutable input and one effective configuration snapshot.
 _Avoid_: Job, execution
+
+**Run input**:
+Immutable normalized user intent for one run, stored separately from mutable lifecycle state and effective configuration. Leading/trailing whitespace is removed; internal Unicode and line breaks are preserved.
+_Avoid_: Task field in Run, provider prompt, mutable description
 
 **Stage**:
 A resumable unit of engineering work within a run, with declared dependencies and one terminal outcome.
@@ -71,6 +75,14 @@ _Avoid_: Partial success
 **Configuration snapshot**:
 The immutable effective configuration selected when a run is created and reused for every recovery or resume of that run.
 _Avoid_: Current configuration, config copy
+
+**Application service**:
+The use-case boundary coordinating repository discovery, atomic creation, workspace lifecycle, provider reconstruction, scheduler commands, and committed query results.
+_Avoid_: CLI command handler, domain aggregate
+
+**Quiescence**:
+A durable condition where synchronous execution has no immediate legal work: completed, awaiting attention, paused, interrupted, failed, applied, discarded, or provider-delayed.
+_Avoid_: Every stop is an error, busy polling
 
 **Run snapshot**:
 A versioned persisted representation of current run state, accepted into the domain only after migration and full invariant validation.

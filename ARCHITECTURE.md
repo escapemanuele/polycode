@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 4 adds synchronous DAG scheduling and a scriptable `FakeProvider` above validated domain, SQLite, and Git-workspace boundaries. Runs now advance from persisted dependency state, provider signals become atomic semantic checkpoints, and restart recovery resumes after the last committed signal. Real coding-agent providers, process backends, async runtime, and TUI remain deliberately absent.
+Milestone 5 adds first complete synchronous CLI vertical slice above validated domain, SQLite, Git-workspace, scheduler, and `FakeProvider` boundaries. Users can create all four built-in workflows, inspect, resume, resolve attention, retry failed stages, apply, and discard. Restart reconstruction uses immutable input/configuration plus committed provider checkpoints. Real coding-agent providers, process backends, async runtime, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -21,9 +21,9 @@ Workflow definitions depend on roles. A profile resolver will later select a pro
 ## System boundaries
 
 ```text
-CLI / TUI
+CLI
     |
-run manager
+application service + query DTOs
     |
 workflow engine ---- domain state/events ---- SQLite store
     |
@@ -49,7 +49,7 @@ Implemented flow:
 ```text
 SQLite snapshot JSON
     -> inspect schema_version
-    -> decode RunSnapshotV1
+    -> decode RunSnapshotV1 or RunSnapshotV2
     -> migrate/normalize to RunRehydrationData
     -> Run::rehydrate
     -> full current-state invariant validation
@@ -81,7 +81,7 @@ events(run_id, sequence, event_id, event_type,
 
 Snapshot JSON holds aggregate reconstruction state; selected run columns are indexed projections and checked against decoded state on load. `events` has primary key `(run_id, sequence)` and globally unique `event_id`. Foreign keys are enabled on every connection. File-backed stores use WAL, normal synchronous mode, and a five-second busy timeout.
 
-Schema v2 adds infrastructure records without changing `RunSnapshotV1`:
+Schema v2 adds infrastructure records:
 
 ```text
 run_workspaces(run_id, source_repo_path, git_common_dir, base_commit,
@@ -93,6 +93,14 @@ run_apply_operations(run_id, status, patch_hash, run_revision,
 ```
 
 `RunSnapshot` remains logical orchestration state. `RunWorkspace` is a one-to-one physical resource record; it can be broken by external Git/filesystem changes without making domain rehydration depend on path existence. Existing v1 databases migrate forward without rewriting snapshots, events, or configuration.
+
+Schema v3 adds immutable user intent:
+
+```text
+run_inputs(run_id, schema_version, task, created_at)
+```
+
+`RunInput` owns normalized task text outside `Run`, configuration, workspace, and events. New-run transaction inserts `RunInput`, configuration, `RunSnapshotV2`, and initial event atomically. Database triggers reject input update/delete. Legacy v1/v2 databases gain empty input table without fabricated task data; old `RunSnapshotV1.task` remains readable but is intentionally ignored by aggregate rehydration. `RunSnapshotV2` no longer contains task text.
 
 Resolved config payloads are recursively key-sorted and compact-encoded before SHA-256 hashing. An existing config ID accepts an exact idempotent insert only; different content or metadata is rejected. Database triggers reject update and delete operations, enforcing insert-only storage beneath the Rust API.
 
@@ -106,7 +114,7 @@ WHERE id = ? AND revision = ?
 
 Zero changed rows means `ConcurrentModification`. Snapshot update precedes event inserts inside one `BEGIN IMMEDIATE` transaction; any event constraint failure rolls back snapshot, revision, and event changes together. Store allocates contiguous event sequence values from the prior per-run maximum. Event timestamps must be non-decreasing, may be equal, and final event time must equal persisted `run.updated_at`.
 
-Current aggregate snapshot excludes artifact metadata and provider-session state because `Run` does not own either. Provider-neutral session/checkpoint events remain durable history. `FakeProvider` reconstructs its deterministic cursor from those events; real process providers may later add separately owned session records without weakening `Run::rehydrate`.
+Current aggregate snapshot excludes task input, artifact metadata, and provider-session state because `Run` does not own them. Provider-neutral session/checkpoint events remain durable history. `FakeProvider` reconstructs its deterministic cursor from those events; real process providers may later add separately owned session records without weakening `Run::rehydrate`.
 
 ## Run lifecycle
 
@@ -179,6 +187,29 @@ Execution commits recheck `WorkspaceStatus::Ready` inside same `BEGIN IMMEDIATE`
 
 Attention resolution, stage resume, interruption recovery, and retry are scheduler-boundary commands. They use same workspace/apply guards and atomic run commit as automatic advancement.
 
+## Milestone 5 application and CLI
+
+`RunService` is application boundary. CLI parses and prints only; service owns use-case ordering:
+
+```text
+validate RunInput + discover repository
+    -> resolve immutable development config
+    -> atomic Run + RunInput + config + created event
+    -> prepare graph-selected workspace
+    -> reconstruct provider from config + workflow + events
+    -> drive scheduler to quiescence
+    -> reload committed events and query DTO
+    -> print
+```
+
+Provider construction sits behind small `ProviderFactory`. M5 factory accepts only explicit `fake` and persists `development_fake/default_success_v1`. Default scenario derives scripts from workflow graph: each stage emits started, progress, provider-neutral usage, and completed. Durable M4 checkpoints determine signal cursor after restart; process memory is never authoritative.
+
+Before continuation, application reconciles workspace. Engine/store guards still require `WorkspaceStatus::Ready` and reject active apply intent at mutation transaction. Resume policy continues Ready/Running, resumes deliberate suspension, recovers interruption, preserves `NeedsUser`, refuses implicit retry from Failed, reports Completed/Applied, and rejects Discarded. `resolve` and `retry` perform exact explicit action then drive again.
+
+Query DTOs (`RunListItem`, `RunDetails`, `StageSummary`, `AttentionSummary`, `UsageSummary`) isolate CLI formatting from mutable domain/store internals. List query uses indexed run columns with `run_inputs`/workspace joins and does not decode every snapshot. Detail query rehydrates one run and aggregates committed usage events. Read-only commands perform no lifecycle mutation; `runs` does not create missing database.
+
+Execution reports contain only event rows reloaded after successful commits. CLI therefore never publishes speculative provider signals. Needs-user, pause, interruption, and failed outcomes use exit 0 as valid quiescent states; operational failures use exit 1 and Clap parse failures use exit 2.
+
 ## Process and recovery
 
 Provider logic will depend on a process-backend interface, not tmux. TmuxBackend remains the first concrete implementation. Provider output must be consumed and persisted independently of attached clients so terminal or TUI disconnection cannot cause broken pipes or lost events.
@@ -229,7 +260,12 @@ src/
 ├── main.rs          thin process entry
 ├── cli/
 │   ├── mod.rs       CLI schema
-│   └── commands.rs  command dispatch and store inspection
+│   └── commands.rs  thin use-case dispatch and committed-state rendering
+├── app/
+│   ├── run_service.rs orchestration use cases and quiescence policy
+│   ├── provider_factory.rs restart-stable provider construction
+│   ├── query.rs      CLI-facing read models
+│   └── error.rs      typed application failures
 ├── config/
 │   └── mod.rs       side-effect-free configuration path resolution
 ├── domain/
@@ -249,9 +285,10 @@ src/
 │   └── error.rs     typed execution/protocol failures
 ├── store/
 │   ├── sqlite.rs    transactional store and indexed projections
-│   ├── snapshot.rs  versioned RunSnapshotV1 codec
+│   ├── snapshot.rs  RunSnapshotV1/V2 migration and codec
 │   ├── migrations.rs SQLite schema lifecycle
 │   ├── config_snapshot.rs immutable config and canonical hash
+│   ├── run_input.rs immutable normalized task input
 │   ├── workspace.rs workspace/apply intent persistence and CAS
 │   ├── path.rs      data and worktree path resolution
 │   └── error.rs     typed persistence failures
@@ -289,3 +326,7 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Built-in workflows are validated DAG data; scheduler contains no workflow-specific execution branches.
 - One consumed provider signal produces one durable checkpoint event in same atomic run commit as any lifecycle mutation it causes.
 - Scheduler is synchronous and single-stage deterministic in Milestone 4; async/process concurrency remains a backend concern.
+- User task is immutable `RunInput`, not aggregate lifecycle state or provider configuration.
+- Workflow workspace mutability derives from stage kinds (`Implementation`/`Fix`), not workflow-name branches.
+- CLI provider choice is explicit; M5 `FakeProvider` profile is development-only and restart-stable.
+- Application commands run scheduler to durable quiescence and render only reloaded committed state/events.

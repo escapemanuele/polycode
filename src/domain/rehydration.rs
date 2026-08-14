@@ -41,7 +41,6 @@ pub struct StageRehydrationData {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunRehydrationData {
     pub id: RunId,
-    pub task: String,
     pub workflow_kind: WorkflowKind,
     pub stage_definitions: Vec<StageDefinition>,
     pub config_snapshot_id: ConfigSnapshotId,

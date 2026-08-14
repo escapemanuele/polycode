@@ -252,6 +252,14 @@ impl WorkflowDefinition {
     pub fn stage(&self, stage_id: &StageId) -> Option<&StageDefinition> {
         self.stages.iter().find(|stage| stage.id == *stage_id)
     }
+
+    /// Whether any stage can modify repository content.
+    #[must_use]
+    pub fn requires_writable_workspace(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|stage| matches!(stage.kind(), StageKind::Implementation | StageKind::Fix))
+    }
 }
 
 fn stage(id: &str, kind: StageKind, role: Role, dependencies: Vec<Dependency>) -> StageDefinition {
@@ -514,5 +522,24 @@ mod tests {
             assert_eq!(workflow.kind(), kind);
             assert!(!workflow.stages().is_empty());
         }
+    }
+
+    #[test]
+    fn writable_workspace_capability_depends_on_stage_semantics_not_workflow_name() {
+        let read_only =
+            WorkflowDefinition::new(WorkflowKind::Standard, vec![stage("review", vec![])]).unwrap();
+        let mutating = WorkflowDefinition::new(
+            WorkflowKind::Review,
+            vec![StageDefinition::new(
+                id("fix"),
+                StageKind::Fix,
+                Role::Implementer,
+                vec![],
+            )],
+        )
+        .unwrap();
+
+        assert!(!read_only.requires_writable_workspace());
+        assert!(mutating.requires_writable_workspace());
     }
 }

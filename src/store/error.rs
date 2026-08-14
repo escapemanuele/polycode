@@ -7,6 +7,8 @@ use crate::domain::{
     ConfigSnapshotId, EventId, RunId, RunInvariantError, RunRehydrationError, StageId,
 };
 
+use super::RunInputError;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("SQLite operation failed: {0}")]
@@ -21,6 +23,8 @@ pub enum StoreError {
     Rehydration(#[from] RunRehydrationError),
     #[error("run is invalid before persistence: {0}")]
     InvalidRun(#[from] RunInvariantError),
+    #[error("stored run input is invalid: {0}")]
+    RunInput(#[from] RunInputError),
     #[error("database schema version {0} is newer than this Polycode build supports")]
     UnsupportedDatabaseVersion(u32),
     #[error("run snapshot schema version {0} is unsupported")]
@@ -33,6 +37,10 @@ pub enum StoreError {
     RunNotFound(RunId),
     #[error("run {0} already exists")]
     RunAlreadyExists(RunId),
+    #[error("run input for {0} does not exist")]
+    RunInputNotFound(RunId),
+    #[error("run input for {0} is immutable and stored content differs")]
+    RunInputConflict(RunId),
     #[error("config snapshot {0} does not exist")]
     ConfigSnapshotNotFound(ConfigSnapshotId),
     #[error("config snapshot {0} is immutable and stored content differs")]

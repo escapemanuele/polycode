@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
-use crate::domain::{AttentionKind, ModelId, ProviderId, ProviderSessionId, StageId};
+use crate::domain::{
+    AttentionKind, ModelId, ProviderId, ProviderSessionId, StageId, WorkflowDefinition,
+};
 
 use super::{Provider, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal, UsageDelta};
 
@@ -75,6 +77,24 @@ impl FakeScenario {
             scenario: self,
             stage_id: stage_id.into(),
         }
+    }
+
+    /// Builds restart-stable success scripts from graph data only.
+    #[must_use]
+    pub fn successful(workflow: &WorkflowDefinition) -> Self {
+        let mut scenario = Self::new();
+        for stage in workflow.stages() {
+            scenario = scenario.stage(stage.id().as_str()).events([
+                FakeEvent::Started,
+                FakeEvent::progress(format!("Executing {}", stage.id())),
+                FakeEvent::Usage(UsageDelta {
+                    input_units: 10,
+                    output_units: 5,
+                }),
+                FakeEvent::Completed,
+            ]);
+        }
+        scenario
     }
 }
 
