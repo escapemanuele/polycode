@@ -88,7 +88,6 @@ impl TryFrom<RunStatus> for ResumableRunStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Run {
     id: RunId,
-    task: String,
     workflow: WorkflowDefinition,
     config_snapshot_id: ConfigSnapshotId,
     status: RunStatus,
@@ -101,28 +100,20 @@ pub struct Run {
 
 impl Run {
     /// Creates one run from a validated workflow definition.
-    ///
-    /// # Errors
-    /// Returns [`RunCreationError::EmptyTask`] when task has no content.
+    #[must_use]
     pub fn new(
         id: RunId,
-        task: impl Into<String>,
         workflow: WorkflowDefinition,
         config_snapshot_id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
-    ) -> Result<Self, RunCreationError> {
-        let task = task.into();
-        if task.trim().is_empty() {
-            return Err(RunCreationError::EmptyTask);
-        }
+    ) -> Self {
         let stages = workflow
             .stages()
             .iter()
             .map(|definition| Stage::from_definition(id, definition))
             .collect();
-        Ok(Self {
+        Self {
             id,
-            task,
             workflow,
             config_snapshot_id,
             status: RunStatus::Created,
@@ -131,7 +122,7 @@ impl Run {
             attention_requests: Vec::new(),
             created_at,
             updated_at: created_at,
-        })
+        }
     }
 
     /// Reconstructs one existing aggregate and validates current-state invariants.
@@ -143,9 +134,6 @@ impl Run {
     /// Rejects malformed workflows, mismatched stage state, and inconsistent
     /// lifecycle, attention, suspension, or timestamp state.
     pub fn rehydrate(data: RunRehydrationData) -> Result<Self, RunRehydrationError> {
-        if data.task.trim().is_empty() {
-            return Err(RunRehydrationError::EmptyTask);
-        }
         let workflow = WorkflowDefinition::new(data.workflow_kind, data.stage_definitions)?;
         let mut stage_states = HashMap::new();
         for stage in data.stages {
@@ -175,7 +163,6 @@ impl Run {
 
         let run = Self {
             id: data.id,
-            task: data.task,
             workflow,
             config_snapshot_id: data.config_snapshot_id,
             status: data.status,
@@ -197,7 +184,6 @@ impl Run {
     pub fn rehydration_data(&self) -> RunRehydrationData {
         RunRehydrationData {
             id: self.id,
-            task: self.task.clone(),
             workflow_kind: self.workflow.kind(),
             stage_definitions: self.workflow.stages().to_vec(),
             config_snapshot_id: self.config_snapshot_id.clone(),
@@ -216,11 +202,6 @@ impl Run {
     #[must_use]
     pub const fn id(&self) -> RunId {
         self.id
-    }
-
-    #[must_use]
-    pub fn task(&self) -> &str {
-        &self.task
     }
 
     #[must_use]
@@ -392,7 +373,10 @@ impl Run {
         transition: StageTransition,
         metadata: EventMetadata,
     ) -> Result<DomainEvent, RunStageError> {
-        if !matches!(self.status, RunStatus::Running | RunStatus::NeedsUser) {
+        let retries_failed_run =
+            self.status == RunStatus::Failed && transition == StageTransition::Retry;
+        if !matches!(self.status, RunStatus::Running | RunStatus::NeedsUser) && !retries_failed_run
+        {
             return Err(RunStageError::RunNotActive(self.status));
         }
         let index = self.stage_index(stage_id)?;
@@ -406,6 +390,9 @@ impl Run {
         }
 
         self.stages[index].transition(transition)?;
+        if retries_failed_run {
+            self.status = RunStatus::Running;
+        }
         self.updated_at = metadata.occurred_at();
         let kind = match transition {
             StageTransition::MarkReady => DomainEventKind::StageReady {
@@ -927,15 +914,7 @@ impl Run {
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum RunCreationError {
-    #[error("run task must not be empty")]
-    EmptyTask,
-}
-
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RunRehydrationError {
-    #[error("run task must not be empty")]
-    EmptyTask,
     #[error(transparent)]
     Workflow(#[from] WorkflowDefinitionError),
     #[error("duplicate rehydrated stage state: {0}")]
@@ -1131,12 +1110,10 @@ mod tests {
     fn new_run(workflow: WorkflowDefinition) -> Run {
         Run::new(
             RunId::from_u128(10),
-            "test task",
             workflow,
             ConfigSnapshotId::new("recommended-2026.08").unwrap(),
             at(0),
         )
-        .unwrap()
     }
 
     fn start_run(run: &mut Run) {

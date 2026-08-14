@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 
+pub mod app;
 pub mod domain;
 pub mod engine;
 pub mod git;

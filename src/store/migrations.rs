@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 2;
+pub const DATABASE_SCHEMA_VERSION: u32 = 3;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -11,9 +11,14 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
         DATABASE_SCHEMA_VERSION => Ok(()),
         0 => {
             migrate_v1(connection)?;
-            migrate_v2(connection)
+            migrate_v2(connection)?;
+            migrate_v3(connection)
         }
-        1 => migrate_v2(connection),
+        1 => {
+            migrate_v2(connection)?;
+            migrate_v3(connection)
+        }
+        2 => migrate_v3(connection),
         unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
     }
 }
@@ -120,6 +125,32 @@ fn migrate_v2(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn migrate_v3(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE run_inputs (
+             run_id TEXT PRIMARY KEY NOT NULL,
+             schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+             task TEXT NOT NULL CHECK (length(trim(task)) > 0),
+             created_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT
+         );
+         CREATE TRIGGER run_inputs_no_update
+         BEFORE UPDATE ON run_inputs
+         BEGIN
+             SELECT RAISE(ABORT, 'run inputs are immutable');
+         END;
+         CREATE TRIGGER run_inputs_no_delete
+         BEFORE DELETE ON run_inputs
+         BEGIN
+             SELECT RAISE(ABORT, 'run inputs are immutable');
+         END;
+         PRAGMA user_version = 3;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
@@ -152,14 +183,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let run = Run::new(
-            RunId::from_u128(900),
-            "survive migration",
-            workflow,
-            config_id.clone(),
-            at,
-        )
-        .unwrap();
+        let run = Run::new(RunId::from_u128(900), workflow, config_id.clone(), at);
         let config = ResolvedConfigSnapshot::new(config_id, 1, json!({"v": 1}), at).unwrap();
         let event = run.created_event(EventMetadata::new(EventId::from_u128(901), at));
         store.create_run(&run, &config, &[event]).unwrap();
@@ -177,5 +201,31 @@ mod tests {
         );
         assert!(store.load_workspace(run.id()).unwrap().is_none());
         assert!(store.load_apply_operation(run.id()).unwrap().is_none());
+        assert!(store.load_run_input(run.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn v2_database_adds_input_table_without_fabricating_legacy_input() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        migrate_v1(&connection).unwrap();
+        migrate_v2(&connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+
+        migrate(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
     }
 }

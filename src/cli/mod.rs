@@ -1,6 +1,10 @@
 pub mod commands;
 
-use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+
+use crate::domain::{AttentionRequestId, RunId, StageId};
 
 /// Orchestrate native coding agents as a specialized engineering team.
 #[derive(Debug, Parser)]
@@ -12,28 +16,70 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub enum Command {
-    /// Check Polycode's local environment.
-    Doctor,
+    /// Run implementation-only workflow.
+    Fast(RunArgs),
+    /// Run architecture, implementation, review, and decision workflow.
+    Standard(RunArgs),
+    /// Run full research-to-decision workflow.
+    Deep(RunArgs),
+    /// Run read-only parallel review workflow.
+    Review(RunArgs),
     /// List known runs.
     Runs,
+    /// Inspect one run.
+    Status { run_id: RunId },
+    /// Continue one prepared or suspended run.
+    Resume { run_id: RunId },
+    /// Retry one failed stage explicitly.
+    Retry { run_id: RunId, stage_id: StageId },
+    /// Resolve one pending attention request and continue.
+    Resolve {
+        run_id: RunId,
+        attention_id: AttentionRequestId,
+    },
+    /// Apply completed workspace changes to source repository.
+    Apply { run_id: RunId },
+    /// Discard run and remove owned workspace resources.
+    Discard { run_id: RunId },
+    /// Check Polycode's local environment.
+    Doctor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Args)]
+pub struct RunArgs {
+    /// Task sent unchanged to each provider stage after outer trim normalization.
+    pub task: String,
+    /// Git repository; defaults to current directory.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    /// Development provider. M5 supports only explicit `fake`.
+    #[arg(long)]
+    pub provider: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
-    use clap::Parser;
+    use super::*;
 
     #[test]
-    fn parses_doctor_command() {
-        let cli = Cli::try_parse_from(["polycode", "doctor"]).expect("doctor should parse");
+    fn parses_workflow_and_control_commands() {
+        let cli = Cli::try_parse_from([
+            "polycode",
+            "deep",
+            "inspect repository",
+            "--repo",
+            "/tmp/repo",
+            "--provider",
+            "fake",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Deep(RunArgs { provider: Some(ref provider), .. })) if provider == "fake"
+        ));
 
-        assert_eq!(cli.command, Some(Command::Doctor));
-    }
-
-    #[test]
-    fn parses_runs_command() {
-        let cli = Cli::try_parse_from(["polycode", "runs"]).expect("runs should parse");
-
-        assert_eq!(cli.command, Some(Command::Runs));
+        let run = RunId::from_u128(1);
+        let cli = Cli::try_parse_from(["polycode", "status", &run.to_string()]).unwrap();
+        assert_eq!(cli.command, Some(Command::Status { run_id: run }));
     }
 }

@@ -9,13 +9,28 @@ use crate::domain::{
 
 use super::StoreError;
 
-pub const RUN_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const RUN_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RunSnapshotV1 {
     schema_version: u32,
     id: RunId,
     task: String,
+    workflow_kind: WorkflowKind,
+    stage_definitions: Vec<StageDefinition>,
+    config_snapshot_id: ConfigSnapshotId,
+    status: RunStatus,
+    suspended_from: Option<RunResumeStatusV1>,
+    stages: Vec<StageSnapshotV1>,
+    attention_requests: Vec<AttentionRequest>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSnapshotV2 {
+    schema_version: u32,
+    id: RunId,
     workflow_kind: WorkflowKind,
     stage_definitions: Vec<StageDefinition>,
     config_snapshot_id: ConfigSnapshotId,
@@ -63,10 +78,9 @@ enum StageResumeStatusV1 {
 
 pub(crate) fn encode_run(run: &Run) -> Result<String, StoreError> {
     let data = run.rehydration_data();
-    let snapshot = RunSnapshotV1 {
+    let snapshot = RunSnapshotV2 {
         schema_version: RUN_SNAPSHOT_SCHEMA_VERSION,
         id: data.id,
-        task: data.task,
         workflow_kind: data.workflow_kind,
         stage_definitions: data.stage_definitions,
         config_snapshot_id: data.config_snapshot_id,
@@ -120,24 +134,67 @@ pub(crate) fn decode_run(snapshot_json: &str, column_version: u32) -> Result<Run
             column: column_version,
         });
     }
-    if version != RUN_SNAPSHOT_SCHEMA_VERSION {
-        return Err(StoreError::UnsupportedSnapshotVersion(version));
-    }
+    let data = match version {
+        1 => {
+            let snapshot: RunSnapshotV1 = serde_json::from_value(envelope)?;
+            drop(snapshot.task);
+            snapshot_data(
+                snapshot.id,
+                snapshot.workflow_kind,
+                snapshot.stage_definitions,
+                snapshot.config_snapshot_id,
+                snapshot.status,
+                snapshot.suspended_from,
+                snapshot.stages,
+                snapshot.attention_requests,
+                snapshot.created_at,
+                snapshot.updated_at,
+            )
+        }
+        2 => {
+            let snapshot: RunSnapshotV2 = serde_json::from_value(envelope)?;
+            snapshot_data(
+                snapshot.id,
+                snapshot.workflow_kind,
+                snapshot.stage_definitions,
+                snapshot.config_snapshot_id,
+                snapshot.status,
+                snapshot.suspended_from,
+                snapshot.stages,
+                snapshot.attention_requests,
+                snapshot.created_at,
+                snapshot.updated_at,
+            )
+        }
+        _ => return Err(StoreError::UnsupportedSnapshotVersion(version)),
+    };
+    Ok(Run::rehydrate(data)?)
+}
 
-    let snapshot: RunSnapshotV1 = serde_json::from_value(envelope)?;
-    let data = RunRehydrationData {
-        id: snapshot.id,
-        task: snapshot.task,
-        workflow_kind: snapshot.workflow_kind,
-        stage_definitions: snapshot.stage_definitions,
-        config_snapshot_id: snapshot.config_snapshot_id,
-        status: snapshot.status,
-        suspended_from: snapshot.suspended_from.map(|status| match status {
+#[allow(clippy::too_many_arguments)]
+fn snapshot_data(
+    id: RunId,
+    workflow_kind: WorkflowKind,
+    stage_definitions: Vec<StageDefinition>,
+    config_snapshot_id: ConfigSnapshotId,
+    status: RunStatus,
+    suspended_from: Option<RunResumeStatusV1>,
+    stages: Vec<StageSnapshotV1>,
+    attention_requests: Vec<AttentionRequest>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> RunRehydrationData {
+    RunRehydrationData {
+        id,
+        workflow_kind,
+        stage_definitions,
+        config_snapshot_id,
+        status,
+        suspended_from: suspended_from.map(|status| match status {
             RunResumeStatusV1::Running => RunResumeStatus::Running,
             RunResumeStatusV1::NeedsUser => RunResumeStatus::NeedsUser,
         }),
-        stages: snapshot
-            .stages
+        stages: stages
             .into_iter()
             .map(|stage| {
                 let (suspension_owner, resume_to) =
@@ -160,9 +217,8 @@ pub(crate) fn decode_run(snapshot_json: &str, column_version: u32) -> Result<Run
                 }
             })
             .collect(),
-        attention_requests: snapshot.attention_requests,
-        created_at: snapshot.created_at,
-        updated_at: snapshot.updated_at,
-    };
-    Ok(Run::rehydrate(data)?)
+        attention_requests,
+        created_at,
+        updated_at,
+    }
 }

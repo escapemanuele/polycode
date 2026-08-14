@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository currently contains **Milestone 4: workflow engine + FakeProvider**: validated domain state, synchronous restart-safe SQLite persistence, crash-reconcilable isolated Git worktrees, data-driven DAG scheduling, and deterministic scripted provider execution. Real coding-agent processes and UI remain future work.
+Polycode is early-stage software. This repository currently contains **Milestone 5: basic CLI run experience**: validated domain state, synchronous restart-safe SQLite persistence, crash-reconcilable isolated Git worktrees, data-driven DAG scheduling, deterministic `FakeProvider` execution, and end-to-end run controls. Real coding-agent processes and UI remain future work.
 
 ## Principles
 
@@ -21,10 +21,26 @@ Polycode is early-stage software. This repository currently contains **Milestone
 polycode --help
 polycode --version
 polycode doctor
+polycode fast "Fix the parser" --provider fake
+polycode standard "Add export support" --repo /path/to/repo --provider fake
+polycode deep "Redesign authentication" --provider fake
+polycode review "Review the error boundary" --provider fake
 polycode runs
+polycode status <run-id>
+polycode resume <run-id>
+polycode resolve <run-id> <attention-id>
+polycode retry <run-id> <stage-id>
+polycode apply <run-id>
+polycode discard <run-id>
 ```
 
-`doctor` reports resolved config/database paths and existing schema version without creating a missing database. `runs` opens local store and lists indexed run summaries. Domain, execution, persistence, Git, and workspace APIs are importable as `polycode::domain`, `polycode::engine`, `polycode::store`, `polycode::git`, and `polycode::workspace`. M4 behavior remains library/test-driven; real provider and dedicated run-control CLI commands arrive later.
+Workflow commands use current directory unless `--repo` is supplied. Milestone 5 requires explicit `--provider fake`; no production provider is implied. Default fake scenario emits deterministic start, progress, usage, and completion signals for every graph stage. It does not edit files.
+
+`resume`, `resolve`, and `retry` reconcile persisted workspace first, reconstruct provider from immutable configuration, then execute to next quiescent condition. `resume` never bypasses attention or retries failure. `resolve` and `retry` perform requested explicit transition then continue. `apply` transfers actual completed workspace changes; empty diff is successful no-op. `discard` records logical disposition before owned-resource cleanup.
+
+Normal blocked states (`needs_user`, paused, interrupted, failed) exit successfully because command completed and durable state remains inspectable. Operational failures exit 1; Clap argument errors exit 2. CLI progress comes only from committed semantic events.
+
+`doctor` reports paths/schema without creating missing database. `runs` also leaves missing database untouched and uses indexed projections plus immutable input/workspace joins. Public application, domain, execution, persistence, Git, and workspace APIs are available under `polycode::app`, `polycode::domain`, `polycode::engine`, `polycode::store`, `polycode::git`, and `polycode::workspace`.
 
 ## Build
 
@@ -64,7 +80,7 @@ Default SQLite path:
 ~/.polycode/polycode.db
 ```
 
-Set `POLYCODE_DATA_DIR` to override its parent directory. Path resolution is side-effect free; opening the store creates the directory/database and applies schema migrations. SQLite stores immutable resolved configuration separately from versioned run snapshots and semantic events.
+Set `POLYCODE_DATA_DIR` to override its parent directory. Path resolution is side-effect free; opening the store creates the directory/database and applies schema migrations. SQLite stores immutable user input and resolved configuration separately from versioned run snapshots and semantic events. New tasks are outer-trimmed, preserve Unicode and line breaks, and cannot be updated or deleted. Pre-M5 runs remain inspectable but cannot resume through CLI when immutable input or reconstructible execution configuration is absent.
 
 Managed worktrees default to:
 

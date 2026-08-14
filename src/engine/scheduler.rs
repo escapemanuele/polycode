@@ -46,6 +46,7 @@ pub enum EngineStatus {
 /// Deterministic synchronous DAG scheduler for one resolved provider.
 pub struct WorkflowEngine<P, C = SystemExecutionContext> {
     provider: P,
+    task: String,
     context: C,
     drive_limit: usize,
 }
@@ -55,8 +56,8 @@ where
     P: Provider,
 {
     #[must_use]
-    pub fn new(provider: P) -> Self {
-        Self::with_context(provider, SystemExecutionContext)
+    pub fn new(provider: P, task: impl Into<String>) -> Self {
+        Self::with_context(provider, task.into(), SystemExecutionContext)
     }
 }
 
@@ -66,9 +67,10 @@ where
     C: ExecutionContext,
 {
     #[must_use]
-    pub const fn with_context(provider: P, context: C) -> Self {
+    pub const fn with_context(provider: P, task: String, context: C) -> Self {
         Self {
             provider,
+            task,
             context,
             drive_limit: DEFAULT_DRIVE_LIMIT,
         }
@@ -172,6 +174,30 @@ where
         self.transition_stage(store, run_id, stage_id, StageTransition::Recover)
     }
 
+    /// Resumes one run-level pause through guarded execution boundary.
+    ///
+    /// # Errors
+    /// Returns infrastructure, lifecycle, concurrency, or persistence failures.
+    pub fn resume_run(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<EngineStatus, EngineError> {
+        self.transition_run(store, run_id, RunTransition::Resume)
+    }
+
+    /// Recovers one run-level interruption through guarded execution boundary.
+    ///
+    /// # Errors
+    /// Returns infrastructure, lifecycle, concurrency, or persistence failures.
+    pub fn recover_run(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<EngineStatus, EngineError> {
+        self.transition_run(store, run_id, RunTransition::Recover)
+    }
+
     /// Schedules explicit safe retry for one failed stage.
     ///
     /// # Errors
@@ -197,6 +223,21 @@ where
         let event = loaded
             .run
             .transition_stage(stage_id, transition, metadata)?;
+        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
+    fn transition_run(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        transition: RunTransition,
+    ) -> Result<EngineStatus, EngineError> {
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let metadata = self.metadata_for(&loaded.run);
+        let event = loaded.run.transition(transition, metadata)?;
         commit_execution(store, &loaded.run, loaded.revision, &[event])?;
         Ok(EngineStatus::Advanced {
             run_status: loaded.run.status(),
@@ -330,7 +371,7 @@ where
             stage.kind(),
             stage.status(),
             stage.role(),
-            loaded.run.task().to_owned(),
+            self.task.clone(),
             workspace.worktree_path().to_path_buf(),
             checkpoint.attempt,
             checkpoint.signal_index,
@@ -739,14 +780,7 @@ mod tests {
             let created_at: DateTime<Utc> = std::time::SystemTime::now().into();
             let config_id = ConfigSnapshotId::new(format!("config-{run_value}")).unwrap();
             let workflow = WorkflowDefinition::built_in(kind);
-            let run = Run::new(
-                run_id,
-                "exercise deterministic workflow",
-                workflow,
-                config_id.clone(),
-                created_at,
-            )
-            .unwrap();
+            let run = Run::new(run_id, workflow, config_id.clone(), created_at);
             let config =
                 ResolvedConfigSnapshot::new(config_id, 1, json!({"provider": "fake"}), created_at)
                     .unwrap();
@@ -793,7 +827,11 @@ mod tests {
             .stage("decision")
             .events([FakeEvent::Started, FakeEvent::Completed]);
         let provider = FakeProvider::new(scenario).unwrap();
-        let mut engine = WorkflowEngine::with_context(provider, TestContext::new(200_000));
+        let mut engine = WorkflowEngine::with_context(
+            provider,
+            "exercise deterministic workflow".to_owned(),
+            TestContext::new(200_000),
+        );
 
         assert_eq!(
             engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
@@ -836,6 +874,7 @@ mod tests {
         };
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(make_scenario()).unwrap(),
+            "exercise deterministic workflow".to_owned(),
             TestContext::new(400_000),
         );
         let blocked = engine.drive(&mut fixture.store, fixture.run_id).unwrap();
@@ -853,6 +892,7 @@ mod tests {
         fixture.store = SqliteStore::open(&fixture.database).unwrap();
         let mut restarted = WorkflowEngine::with_context(
             FakeProvider::new(make_scenario()).unwrap(),
+            "exercise deterministic workflow".to_owned(),
             TestContext::new(500_000),
         );
         restarted
@@ -901,6 +941,7 @@ mod tests {
             .events([FakeEvent::Started, FakeEvent::Completed]);
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(scenario).unwrap(),
+            "exercise deterministic workflow".to_owned(),
             TestContext::new(700_000),
         );
 
@@ -944,6 +985,7 @@ mod tests {
             .events([FakeEvent::Started, FakeEvent::Completed]);
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(scenario).unwrap(),
+            "exercise deterministic workflow".to_owned(),
             TestContext::new(900_000),
         );
 
@@ -981,6 +1023,7 @@ mod tests {
         };
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(make_scenario()).unwrap(),
+            "exercise deterministic workflow".to_owned(),
             TestContext::new(1_100_000),
         );
         let stage_id = StageId::new("implementation").unwrap();
@@ -1006,6 +1049,7 @@ mod tests {
         fixture.store = SqliteStore::open(&fixture.database).unwrap();
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(make_scenario()).unwrap(),
+            "exercise deterministic workflow".to_owned(),
             TestContext::new(1_150_000),
         );
         engine
@@ -1037,6 +1081,7 @@ mod tests {
             .events([FakeEvent::Started, FakeEvent::failed("compile failed")]);
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(scenario).unwrap(),
+            "exercise deterministic workflow".to_owned(),
             TestContext::new(1_300_000),
         );
         assert_eq!(
@@ -1051,12 +1096,10 @@ mod tests {
         let config_id = ConfigSnapshotId::new("missing-workspace-config").unwrap();
         let run = Run::new(
             missing_id,
-            "missing workspace",
             WorkflowDefinition::built_in(WorkflowKind::Fast),
             config_id.clone(),
             created_at,
-        )
-        .unwrap();
+        );
         let config = ResolvedConfigSnapshot::new(config_id, 1, json!({}), created_at).unwrap();
         let created = run.created_event(EventMetadata::new(
             EventId::from_u128(1_400_001),

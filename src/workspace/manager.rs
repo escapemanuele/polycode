@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-use crate::domain::{EventId, EventMetadata, Run, RunId, RunStatus, RunTransition, WorkflowKind};
+use crate::domain::{EventId, EventMetadata, Run, RunId, RunStatus, RunTransition};
 use crate::git::{
     GitRepository, apply_patch, branch_exists, branch_tip, check_patch, create_worktree,
     delete_owned_branch, generate_patch, inspect_worktree, remove_worktree, source_is_clean,
@@ -76,10 +76,10 @@ impl WorkspaceManager {
             return Err(invalid_run_status(&loaded.run, "workspace preparation"));
         }
         let repository = GitRepository::discover(repository_path)?;
-        let mode = if loaded.run.workflow_kind() == WorkflowKind::Review {
-            WorkspaceMode::Detached
-        } else {
+        let mode = if loaded.run.workflow().requires_writable_workspace() {
             WorkspaceMode::Branch
+        } else {
+            WorkspaceMode::Detached
         };
         let branch = (mode == WorkspaceMode::Branch).then(|| format!("polycode/run-{run_id}"));
         if let Some(branch) = branch.as_deref() {
@@ -805,7 +805,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         ConfigSnapshotId, Role, StageDefinition, StageId, StageKind, StageTransition,
-        WorkflowDefinition,
+        WorkflowDefinition, WorkflowKind,
     };
     use crate::store::ResolvedConfigSnapshot;
 
@@ -1693,27 +1693,27 @@ mod tests {
 
     fn create_run(store: &mut SqliteStore, kind: WorkflowKind, id: u128) -> RunId {
         let run_id = RunId::from_u128(id);
-        let stage_id = StageId::new("implementation").unwrap();
-        let workflow = WorkflowDefinition::new(
-            kind,
-            vec![StageDefinition::new(
-                stage_id,
+        let (stage_id, stage_kind, role) = if kind == WorkflowKind::Review {
+            (
+                StageId::new("review").unwrap(),
+                StageKind::Review,
+                Role::Reviewer,
+            )
+        } else {
+            (
+                StageId::new("implementation").unwrap(),
                 StageKind::Implementation,
                 Role::Implementer,
-                vec![],
-            )],
+            )
+        };
+        let workflow = WorkflowDefinition::new(
+            kind,
+            vec![StageDefinition::new(stage_id, stage_kind, role, vec![])],
         )
         .unwrap();
         let created_at = now();
         let config_id = ConfigSnapshotId::new(format!("config-{id}")).unwrap();
-        let run = Run::new(
-            run_id,
-            "test workspace",
-            workflow,
-            config_id.clone(),
-            created_at,
-        )
-        .unwrap();
+        let run = Run::new(run_id, workflow, config_id.clone(), created_at);
         let config = ResolvedConfigSnapshot::new(config_id, 1, json!({}), created_at).unwrap();
         let event = run.created_event(metadata(created_at));
         store.create_run(&run, &config, &[event]).unwrap();
@@ -1730,7 +1730,7 @@ mod tests {
             .commit_run_update(&run, revision, &[event])
             .unwrap()
             .revision();
-        let stage = StageId::new("implementation").unwrap();
+        let stage = run.stages()[0].id().clone();
         for transition in [
             StageTransition::MarkReady,
             StageTransition::Start,
