@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -6,8 +6,9 @@ use thiserror::Error;
 
 use super::{
     AttentionError, AttentionRequest, AttentionRequestId, AttentionStatus, ConfigSnapshotId,
-    DependencyKind, DomainEvent, DomainEventKind, EventMetadata, RunId, Stage, StageId,
-    StageStatus, StageTransition, StageTransitionError, WorkflowDefinition, WorkflowKind,
+    DependencyKind, DomainEvent, DomainEventKind, EventMetadata, RunId, RunRehydrationData,
+    RunResumeStatus, Stage, StageId, StageRehydrationError, StageStatus, StageTransition,
+    StageTransitionError, WorkflowDefinition, WorkflowDefinitionError, WorkflowKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -131,6 +132,85 @@ impl Run {
             created_at,
             updated_at: created_at,
         })
+    }
+
+    /// Reconstructs one existing aggregate and validates current-state invariants.
+    ///
+    /// This intentionally does not replay lifecycle transitions. Persisted data
+    /// remains untrusted until this method returns successfully.
+    ///
+    /// # Errors
+    /// Rejects malformed workflows, mismatched stage state, and inconsistent
+    /// lifecycle, attention, suspension, or timestamp state.
+    pub fn rehydrate(data: RunRehydrationData) -> Result<Self, RunRehydrationError> {
+        if data.task.trim().is_empty() {
+            return Err(RunRehydrationError::EmptyTask);
+        }
+        let workflow = WorkflowDefinition::new(data.workflow_kind, data.stage_definitions)?;
+        let mut stage_states = HashMap::new();
+        for stage in data.stages {
+            let stage_id = stage.id.clone();
+            if stage_states.insert(stage_id.clone(), stage).is_some() {
+                return Err(RunRehydrationError::DuplicateStageState(stage_id));
+            }
+        }
+        let mut stages = Vec::with_capacity(workflow.stages().len());
+        for definition in workflow.stages() {
+            let stage_id = definition.id().clone();
+            let state = stage_states
+                .remove(&stage_id)
+                .ok_or_else(|| RunRehydrationError::MissingStageState(stage_id.clone()))?;
+            stages.push(
+                Stage::rehydrate(data.id, definition, &state).map_err(|source| {
+                    RunRehydrationError::InvalidStageState {
+                        stage_id: stage_id.clone(),
+                        source,
+                    }
+                })?,
+            );
+        }
+        if let Some(stage_id) = stage_states.into_keys().next() {
+            return Err(RunRehydrationError::UnknownStageState(stage_id));
+        }
+
+        let run = Self {
+            id: data.id,
+            task: data.task,
+            workflow,
+            config_snapshot_id: data.config_snapshot_id,
+            status: data.status,
+            suspended_from: data.suspended_from.map(|status| match status {
+                RunResumeStatus::Running => ResumableRunStatus::Running,
+                RunResumeStatus::NeedsUser => ResumableRunStatus::NeedsUser,
+            }),
+            stages,
+            attention_requests: data.attention_requests,
+            created_at: data.created_at,
+            updated_at: data.updated_at,
+        };
+        run.validate_invariants()?;
+        Ok(run)
+    }
+
+    /// Captures persistence-neutral state for a versioned external snapshot.
+    #[must_use]
+    pub fn rehydration_data(&self) -> RunRehydrationData {
+        RunRehydrationData {
+            id: self.id,
+            task: self.task.clone(),
+            workflow_kind: self.workflow.kind(),
+            stage_definitions: self.workflow.stages().to_vec(),
+            config_snapshot_id: self.config_snapshot_id.clone(),
+            status: self.status,
+            suspended_from: self.suspended_from.map(|status| match status {
+                ResumableRunStatus::Running => RunResumeStatus::Running,
+                ResumableRunStatus::NeedsUser => RunResumeStatus::NeedsUser,
+            }),
+            stages: self.stages.iter().map(Stage::rehydration_data).collect(),
+            attention_requests: self.attention_requests.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
     }
 
     #[must_use]
@@ -422,12 +502,15 @@ impl Run {
         self.close_attention(request_id, metadata, true)
     }
 
-    /// Checks cross-aggregate invariants used by future validated rehydration.
+    /// Checks cross-aggregate invariants used by rehydration and persistence.
     ///
     /// # Errors
     /// Returns a typed invariant violation when owned stages, attention, or
     /// lifecycle aggregates contradict one another.
     pub fn validate_invariants(&self) -> Result<(), RunInvariantError> {
+        if self.updated_at < self.created_at {
+            return Err(RunInvariantError::UpdatedBeforeCreated);
+        }
         let mut stage_ids = HashSet::new();
         for stage in &self.stages {
             if stage.run_id() != self.id {
@@ -457,6 +540,16 @@ impl Run {
             if request.run_id() != self.id || self.stage(request.stage_id()).is_none() {
                 return Err(RunInvariantError::InvalidAttentionOwner(request.id()));
             }
+            let closed_at = match request.status() {
+                AttentionStatus::Pending => None,
+                AttentionStatus::Resolved(at) | AttentionStatus::Cancelled(at) => Some(at),
+            };
+            if request.created_at() < &self.created_at
+                || request.created_at() > &self.updated_at
+                || closed_at.is_some_and(|at| at > &self.updated_at)
+            {
+                return Err(RunInvariantError::AttentionOutsideRunTimeline(request.id()));
+            }
         }
 
         let pending = self.pending_attention_count();
@@ -475,12 +568,18 @@ impl Run {
             return Err(RunInvariantError::RunAttentionMismatch);
         }
         for stage in &self.stages {
-            let has_pending = self.pending_for_stage(stage.id());
-            if stage.expects_attention() != has_pending {
-                return Err(RunInvariantError::StageAttentionMismatch(
-                    stage.id().clone(),
-                ));
-            }
+            self.validate_stage_current_state(stage)?;
+        }
+        if matches!(
+            self.status,
+            RunStatus::Created | RunStatus::Preparing | RunStatus::Ready
+        ) && (self
+            .stages
+            .iter()
+            .any(|stage| stage.status() != StageStatus::Pending)
+            || !self.attention_requests.is_empty())
+        {
+            return Err(RunInvariantError::PreExecutionStateContainsHistory);
         }
         if matches!(self.status, RunStatus::Completed | RunStatus::Applied) {
             self.ensure_completion_allowed()
@@ -488,6 +587,63 @@ impl Run {
         }
         if self.status.is_lifecycle_closed() && pending > 0 {
             return Err(RunInvariantError::ClosedRunHasPendingAttention);
+        }
+        Ok(())
+    }
+
+    fn validate_stage_current_state(&self, stage: &Stage) -> Result<(), RunInvariantError> {
+        if stage.expects_attention() != self.pending_for_stage(stage.id()) {
+            return Err(RunInvariantError::StageAttentionMismatch(
+                stage.id().clone(),
+            ));
+        }
+        let run_suspension_matches = matches!(
+            (self.status, stage.status()),
+            (RunStatus::Paused, StageStatus::Paused)
+                | (RunStatus::Interrupted, StageStatus::Interrupted)
+                | (RunStatus::Failed | RunStatus::Discarded, _)
+        );
+        if stage.has_run_owned_suspension() && !run_suspension_matches {
+            return Err(RunInvariantError::StageRunSuspensionMismatch(
+                stage.id().clone(),
+            ));
+        }
+        if matches!(self.status, RunStatus::Paused | RunStatus::Interrupted)
+            && matches!(
+                stage.status(),
+                StageStatus::Running | StageStatus::NeedsUser
+            )
+        {
+            return Err(RunInvariantError::SuspendedRunHasActiveStage(
+                stage.id().clone(),
+            ));
+        }
+        if !matches!(
+            stage.status(),
+            StageStatus::Running
+                | StageStatus::NeedsUser
+                | StageStatus::Paused
+                | StageStatus::Interrupted
+                | StageStatus::Completed
+                | StageStatus::Failed
+        ) {
+            return Ok(());
+        }
+        for dependency in stage.dependencies() {
+            let dependency_status = self
+                .stage(dependency.stage_id())
+                .ok_or(RunInvariantError::WorkflowStageSetMismatch)?
+                .status();
+            let valid = match dependency.kind() {
+                DependencyKind::Required => dependency_status == StageStatus::Completed,
+                DependencyKind::Optional => dependency_status.is_terminal_outcome(),
+            };
+            if !valid {
+                return Err(RunInvariantError::AdvancedStageHasInvalidDependency {
+                    stage_id: stage.id().clone(),
+                    dependency_id: dependency.stage_id().clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -720,6 +876,27 @@ pub enum RunCreationError {
     EmptyTask,
 }
 
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RunRehydrationError {
+    #[error("run task must not be empty")]
+    EmptyTask,
+    #[error(transparent)]
+    Workflow(#[from] WorkflowDefinitionError),
+    #[error("duplicate rehydrated stage state: {0}")]
+    DuplicateStageState(StageId),
+    #[error("missing rehydrated stage state: {0}")]
+    MissingStageState(StageId),
+    #[error("rehydrated state references unknown stage: {0}")]
+    UnknownStageState(StageId),
+    #[error("invalid rehydrated stage state for {stage_id}: {source}")]
+    InvalidStageState {
+        stage_id: StageId,
+        source: StageRehydrationError,
+    },
+    #[error(transparent)]
+    Invariant(#[from] RunInvariantError),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionBlockerReason {
@@ -803,6 +980,8 @@ pub enum RunAttentionError {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RunInvariantError {
+    #[error("run updated_at precedes created_at")]
+    UpdatedBeforeCreated,
     #[error("stage {0} belongs to another run")]
     StageOwnedByDifferentRun(StageId),
     #[error("duplicate stage in run: {0}")]
@@ -813,12 +992,25 @@ pub enum RunInvariantError {
     DuplicateAttention(AttentionRequestId),
     #[error("attention request has invalid run or stage ownership: {0}")]
     InvalidAttentionOwner(AttentionRequestId),
+    #[error("attention request falls outside run timeline: {0}")]
+    AttentionOutsideRunTimeline(AttentionRequestId),
     #[error("run status and pending attention disagree")]
     RunAttentionMismatch,
     #[error("run status and suspension context disagree")]
     RunSuspensionMismatch,
     #[error("stage {0} status and pending attention disagree")]
     StageAttentionMismatch(StageId),
+    #[error("stage {0} has run-owned suspension inconsistent with run status")]
+    StageRunSuspensionMismatch(StageId),
+    #[error("suspended run contains active stage {0}")]
+    SuspendedRunHasActiveStage(StageId),
+    #[error("advanced stage {stage_id} has invalid dependency outcome for {dependency_id}")]
+    AdvancedStageHasInvalidDependency {
+        stage_id: StageId,
+        dependency_id: StageId,
+    },
+    #[error("pre-execution run contains stage or attention history")]
+    PreExecutionStateContainsHistory,
     #[error("completed/applied run contains invalid stage outcomes")]
     InvalidCompletedRun,
     #[error("closed run contains pending attention")]

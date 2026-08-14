@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{Dependency, Role, RunId, StageDefinition, StageId, StageKind};
+use super::{
+    Dependency, Role, RunId, StageDefinition, StageId, StageKind, StageRehydrationData,
+    StageResumeStatus, StageSuspensionOwner,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +109,68 @@ impl Stage {
             status: StageStatus::Pending,
             suspension: None,
         }
+    }
+
+    pub(crate) fn rehydrate(
+        run_id: RunId,
+        definition: &StageDefinition,
+        data: &StageRehydrationData,
+    ) -> Result<Self, StageRehydrationError> {
+        let suspension = match (data.suspension_owner, data.resume_to) {
+            (None, None) => None,
+            (Some(owner), Some(resume_to)) => Some(Suspension {
+                owner: match owner {
+                    StageSuspensionOwner::Stage => SuspensionOwner::Stage,
+                    StageSuspensionOwner::Run => SuspensionOwner::Run,
+                },
+                resume_to: match resume_to {
+                    StageResumeStatus::Running => ResumableStageStatus::Running,
+                    StageResumeStatus::NeedsUser => ResumableStageStatus::NeedsUser,
+                },
+            }),
+            _ => return Err(StageRehydrationError::PartialSuspensionContext),
+        };
+        let is_suspended = matches!(data.status, StageStatus::Paused | StageStatus::Interrupted);
+        if is_suspended != suspension.is_some() {
+            return Err(StageRehydrationError::StatusSuspensionMismatch);
+        }
+
+        Ok(Self {
+            run_id,
+            id: definition.id().clone(),
+            kind: definition.kind(),
+            role: definition.role(),
+            dependencies: definition.dependencies().to_vec(),
+            status: data.status,
+            suspension,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn rehydration_data(&self) -> StageRehydrationData {
+        let (suspension_owner, resume_to) = self.suspension.map_or((None, None), |suspension| {
+            let owner = match suspension.owner {
+                SuspensionOwner::Stage => StageSuspensionOwner::Stage,
+                SuspensionOwner::Run => StageSuspensionOwner::Run,
+            };
+            let resume_to = match suspension.resume_to {
+                ResumableStageStatus::Running => StageResumeStatus::Running,
+                ResumableStageStatus::NeedsUser => StageResumeStatus::NeedsUser,
+            };
+            (Some(owner), Some(resume_to))
+        });
+        StageRehydrationData {
+            id: self.id.clone(),
+            status: self.status,
+            suspension_owner,
+            resume_to,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn has_run_owned_suspension(&self) -> bool {
+        self.suspension
+            .is_some_and(|suspension| suspension.owner == SuspensionOwner::Run)
     }
 
     #[must_use]
@@ -297,6 +362,14 @@ pub enum StageTransitionError {
     MissingSuspensionContext,
     #[error("stage suspension belongs to a different lifecycle owner")]
     WrongSuspensionOwner,
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum StageRehydrationError {
+    #[error("stage suspension owner and resume target must both be present or absent")]
+    PartialSuspensionContext,
+    #[error("stage status and suspension context disagree")]
+    StatusSuspensionMismatch,
 }
 
 #[cfg(test)]

@@ -76,6 +76,18 @@ _Avoid_: Current configuration, config copy
 A versioned persisted representation of current run state, accepted into the domain only after migration and full invariant validation.
 _Avoid_: Serialized run, event replay
 
+**Rehydration data**:
+Persistence-neutral, untrusted current-state input consumed by `Run::rehydrate`; it is not a valid run until all workflow, lifecycle, ownership, attention, suspension, and timeline invariants pass.
+_Avoid_: Deserialized run, trusted snapshot
+
+**Run revision**:
+A per-run compare-and-swap counter changed by every committed state mutation. A stale expected revision means concurrent modification, not retryable success.
+_Avoid_: Event sequence, schema version
+
+**Atomic run commit**:
+One SQLite transaction containing a run snapshot/revision update and its complete semantic-event batch, so neither side can become durable alone.
+_Avoid_: Save then log, eventual event write
+
 **Event sequence**:
 A per-run ordinal defining authoritative semantic-event order independently from wall-clock timestamps.
 _Avoid_: Timestamp order, global sequence
