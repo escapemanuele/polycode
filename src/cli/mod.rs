@@ -16,6 +16,9 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub enum Command {
+    /// Internal managed-process runner.
+    #[command(name = "__run-process", hide = true)]
+    RunProcess { manifest: PathBuf },
     /// Run implementation-only workflow.
     Fast(RunArgs),
     /// Run architecture, implementation, review, and decision workflow.
@@ -81,5 +84,13 @@ mod tests {
         let run = RunId::from_u128(1);
         let cli = Cli::try_parse_from(["polycode", "status", &run.to_string()]).unwrap();
         assert_eq!(cli.command, Some(Command::Status { run_id: run }));
+
+        let cli = Cli::try_parse_from(["polycode", "__run-process", "/tmp/spec.json"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::RunProcess {
+                manifest: PathBuf::from("/tmp/spec.json")
+            })
+        );
     }
 }

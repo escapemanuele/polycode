@@ -5,6 +5,7 @@ use super::StoreError;
 
 const DATABASE_FILE: &str = "polycode.db";
 const WORKTREE_DIRECTORY: &str = "worktrees";
+const RUN_DIRECTORY: &str = "runs";
 
 /// Resolves default database path without creating directories or files.
 ///
@@ -22,6 +23,15 @@ pub fn database_file() -> Result<PathBuf, StoreError> {
 /// directory is available.
 pub fn worktree_root() -> Result<PathBuf, StoreError> {
     Ok(data_directory_with(|name| std::env::var_os(name))?.join(WORKTREE_DIRECTORY))
+}
+
+/// Resolves durable per-run infrastructure root without creating it.
+///
+/// # Errors
+/// Returns [`StoreError::DataPathUnavailable`] when neither override nor home
+/// directory is available.
+pub fn process_root() -> Result<PathBuf, StoreError> {
+    Ok(data_directory_with(|name| std::env::var_os(name))?.join(RUN_DIRECTORY))
 }
 
 #[cfg(test)]

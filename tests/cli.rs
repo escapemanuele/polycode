@@ -86,6 +86,17 @@ fn current_directory_is_default_repository_and_empty_runs_is_side_effect_free() 
     assert!(stdout.contains(fixture.repo.to_str().unwrap()));
 }
 
+#[test]
+fn doctor_reports_real_tmux_availability_without_creating_database() {
+    let fixture = Fixture::new();
+    let output = fixture.polycode(&["doctor"]);
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Milestone 6 managed process infrastructure"));
+    assert!(stdout.contains("tmux: available (tmux "));
+    assert!(!fixture.data.join("polycode.db").exists());
+}
+
 struct Fixture {
     _temp: TempDir,
     repo: std::path::PathBuf,

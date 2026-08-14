@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 5 adds first complete synchronous CLI vertical slice above validated domain, SQLite, Git-workspace, scheduler, and `FakeProvider` boundaries. Users can create all four built-in workflows, inspect, resume, resolve attention, retry failed stages, apply, and discard. Restart reconstruction uses immutable input/configuration plus committed provider checkpoints. Real coding-agent providers, process backends, async runtime, and TUI remain deliberately absent.
+Milestone 6 adds managed external-process infrastructure below provider adapters while preserving Milestone 5's synchronous CLI, domain, scheduler, workspace, and application semantics. Tmux now supervises exact external commands through a shell-free hidden runner; SQLite persists immutable process intent, lifecycle revisions, and acknowledged output cursors. Real coding-agent providers, async runtime, native PTY backend, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -101,6 +101,19 @@ run_inputs(run_id, schema_version, task, created_at)
 ```
 
 `RunInput` owns normalized task text outside `Run`, configuration, workspace, and events. New-run transaction inserts `RunInput`, configuration, `RunSnapshotV2`, and initial event atomically. Database triggers reject input update/delete. Legacy v1/v2 databases gain empty input table without fabricated task data; old `RunSnapshotV1.task` remains readable but is intentionally ignored by aggregate rehydration. `RunSnapshotV2` no longer contains task text.
+
+Schema v4 adds separately owned process infrastructure:
+
+```text
+managed_processes(id, run_id, stage_id, attempt,
+                  backend_kind, backend_session_id, status,
+                  spec_schema_version, spec_json, command_fingerprint,
+                  stdout_offset, stdout_cursor_revision,
+                  stderr_offset, stderr_cursor_revision,
+                  exit summary, interrupt_requested, revision, timestamps)
+```
+
+Launch identity is immutable and unique per `(run_id, stage_id, attempt)`. Lifecycle and each output cursor use independent compare-and-swap revisions. Process rows reference runs but never enter `RunSnapshot`; existing v1-v3 state migrates without rewriting run, event, configuration, input, workspace, or apply data.
 
 Resolved config payloads are recursively key-sorted and compact-encoded before SHA-256 hashing. An existing config ID accepts an exact idempotent insert only; different content or metadata is rejected. Database triggers reject update and delete operations, enforcing insert-only storage beneath the Rust API.
 
@@ -212,11 +225,38 @@ Execution reports contain only event rows reloaded after successful commits. CLI
 
 ## Process and recovery
 
-Provider logic will depend on a process-backend interface, not tmux. TmuxBackend remains the first concrete implementation. Provider output must be consumed and persisted independently of attached clients so terminal or TUI disconnection cannot cause broken pipes or lost events.
+Future provider adapters depend on `ProcessBackend`, not tmux. `TmuxBackend` implements availability, exact launch, owned-session inspection, raw output reads, graceful interruption, and ownership-safe cleanup. Scheduler-facing `Provider` and `ProviderRequest` remain unchanged.
 
-SQLite will be canonical for resumable state. Completed stages will not be inferred from artifact presence and will not be silently repeated after restart.
+Process launch uses intent/effect/finalize:
 
-Each run also snapshots its resolved configuration. Resume must use that immutable snapshot rather than silently adopting later user or repository configuration changes.
+```text
+Preparing persisted
+    -> immutable spec/output files materialized
+    -> Starting claimed by lifecycle CAS
+    -> tmux direct-argv runner launch
+    -> owned session or valid exit evidence observed
+    -> Running / Exited finalized
+```
+
+Tmux receives hidden runner executable, subcommand, and manifest path as separate arguments. No launch path uses `sh -c`, quoting, `eval`, or interpolated command text. Session environment carries non-secret process ID and fingerprint ownership markers. Existing sessions are reusable or removable only when both markers match persisted identity.
+
+Runner validates its manifest and ownership, creates a separate child process group, redirects stdout/stderr to regular append-only files, persists live runner/child identity in atomic `runtime.json`, waits for exact child exit, then publishes atomic `exit.json`. Backend interruption validates session ownership, runner pane PID, runtime fingerprint, and child process group before sending SIGINT. Cleanup is separate and retains all process files.
+
+Process state is reconciled from independent evidence:
+
+```text
+Preparing + no session/no exit       -> safe to start
+Preparing + owned session            -> Running
+Starting/Running + owned session      -> Running
+active + no session + valid exit      -> Exited or Interrupted
+active + no session + no exit         -> Missing
+mismatched/corrupt evidence           -> Broken
+terminal + owned cleanup              -> Cleaned, files retained
+```
+
+Absence never implies success. Tmux sessions survive client detachment/process exit, but not reboot or tmux server loss. Without valid exit evidence, lost supervisor state becomes `Missing`; M6 does not guess provider-session recovery.
+
+Output files live under `runs/<run>/processes/<process>/`. Reads return raw byte chunks with start/end offsets and do not mutate SQLite. Consumer explicitly acknowledges any consumed prefix through per-stream cursor CAS. Crash before acknowledgement replays bytes rather than losing them; reads remain available after exit. M7 must combine parsed provider signal/checkpoint and output acknowledgement in one SQLite transaction before claiming semantic exactly-once delivery.
 
 ## Git safety
 
@@ -283,12 +323,21 @@ src/
 │   ├── provider.rs  provider-neutral synchronous signal boundary
 │   ├── fake.rs      validated scripts and restart-stable FakeProvider
 │   └── error.rs     typed execution/protocol failures
+├── process/
+│   ├── backend.rs   provider-independent process supervisor contract
+│   ├── manager.rs   persisted intent/effect/finalize and reconciliation
+│   ├── tmux.rs      ownership-safe shell-free tmux backend
+│   ├── runner.rs    hidden exact-argv child runner and durable evidence
+│   ├── model.rs     process spec/status/output/exit records
+│   ├── ids.rs       managed-process and backend-session identities
+│   └── error.rs     typed process/backend failures
 ├── store/
 │   ├── sqlite.rs    transactional store and indexed projections
 │   ├── snapshot.rs  RunSnapshotV1/V2 migration and codec
 │   ├── migrations.rs SQLite schema lifecycle
 │   ├── config_snapshot.rs immutable config and canonical hash
 │   ├── run_input.rs immutable normalized task input
+│   ├── process.rs   process lifecycle and output-cursor CAS persistence
 │   ├── workspace.rs workspace/apply intent persistence and CAS
 │   ├── path.rs      data and worktree path resolution
 │   └── error.rs     typed persistence failures
@@ -330,3 +379,7 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Workflow workspace mutability derives from stage kinds (`Implementation`/`Fix`), not workflow-name branches.
 - CLI provider choice is explicit; M5 `FakeProvider` profile is development-only and restart-stable.
 - Application commands run scheduler to durable quiescence and render only reloaded committed state/events.
+- Managed processes are separate infrastructure attempts; process exit does not directly mutate semantic run/stage state.
+- Exact external argv is preserved end to end; tmux launches multiple command arguments directly rather than a shell command string.
+- Process launch, interrupt, and cleanup require persisted intent plus fingerprint-bound ownership evidence.
+- Raw output read and acknowledgement are separate; M6 guarantees replay instead of loss, while M7 owns atomic semantic checkpoint plus cursor advancement.

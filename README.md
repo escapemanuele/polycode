@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository currently contains **Milestone 5: basic CLI run experience**: validated domain state, synchronous restart-safe SQLite persistence, crash-reconcilable isolated Git worktrees, data-driven DAG scheduling, deterministic `FakeProvider` execution, and end-to-end run controls. Real coding-agent processes and UI remain future work.
+Polycode is early-stage software. This repository currently contains **Milestone 6: managed external-process infrastructure**: validated domain state, synchronous restart-safe SQLite persistence, crash-reconcilable isolated Git worktrees, data-driven DAG scheduling, deterministic `FakeProvider` execution, end-to-end run controls, and a shell-safe `ProcessBackend` with real tmux supervision. Real coding-agent adapters and UI remain future work.
 
 ## Principles
 
@@ -40,11 +40,14 @@ Workflow commands use current directory unless `--repo` is supplied. Milestone 5
 
 Normal blocked states (`needs_user`, paused, interrupted, failed) exit successfully because command completed and durable state remains inspectable. Operational failures exit 1; Clap argument errors exit 2. CLI progress comes only from committed semantic events.
 
-`doctor` reports paths/schema without creating missing database. `runs` also leaves missing database untouched and uses indexed projections plus immutable input/workspace joins. Public application, domain, execution, persistence, Git, and workspace APIs are available under `polycode::app`, `polycode::domain`, `polycode::engine`, `polycode::store`, `polycode::git`, and `polycode::workspace`.
+`doctor` reports paths/schema and tmux availability without creating missing database. `runs` also leaves missing database untouched and uses indexed projections plus immutable input/workspace joins. Public application, domain, execution, process, persistence, Git, and workspace APIs are available under `polycode::app`, `polycode::domain`, `polycode::engine`, `polycode::process`, `polycode::store`, `polycode::git`, and `polycode::workspace`.
 
 ## Build
 
-Prerequisite: Rust stable 1.85 or newer.
+Prerequisites:
+
+- Rust stable 1.85 or newer.
+- tmux on macOS or Linux for managed external processes and process integration tests.
 
 ```bash
 cargo build
@@ -88,11 +91,24 @@ Managed worktrees default to:
 ~/.polycode/worktrees/<sanitized-repository>-<common-dir-hash>/<run-id>
 ```
 
-`POLYCODE_DATA_DIR` relocates both database and managed worktree root. Implementation workflows use deterministic `polycode/run-<run-id>` branches; review workflows use detached worktrees. Source changes occur only through explicit apply, which requires a clean source checkout, generates a binary patch from persisted base commit, runs `git apply --check`, then applies without staging or committing.
+`POLYCODE_DATA_DIR` relocates database, managed worktree root, and managed process data. Implementation workflows use deterministic `polycode/run-<run-id>` branches; review workflows use detached worktrees. Source changes occur only through explicit apply, which requires a clean source checkout, generates a binary patch from persisted base commit, runs `git apply --check`, then applies without staging or committing.
+
+Managed process attempts use separately persisted infrastructure below future provider adapters. Each attempt gets a durable directory:
+
+```text
+~/.polycode/runs/<run-id>/processes/<process-id>/
+├── spec.json
+├── runtime.json
+├── stdout.log
+├── stderr.log
+└── exit.json
+```
+
+Tmux launches Polycode's hidden runner with an exact argument vector, never a shell command string. Runner redirects provider stdout/stderr to regular append-only files, so CLI/TUI detachment cannot break provider output. SQLite owns acknowledged byte offsets; reads do not advance them. Exit and runtime evidence are identity-checked against immutable launch fingerprint. This infrastructure is public for future provider adapters but has no user-facing process commands in M6.
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Milestone 5+ descriptions are design constraints, not claims of implemented behavior.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Real-provider and UI descriptions remain future design constraints, not claims of implemented behavior.
 
 ## License
 

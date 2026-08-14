@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 3;
+pub const DATABASE_SCHEMA_VERSION: u32 = 4;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -12,13 +12,19 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
         0 => {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
-            migrate_v3(connection)
+            migrate_v3(connection)?;
+            migrate_v4(connection)
         }
         1 => {
             migrate_v2(connection)?;
-            migrate_v3(connection)
+            migrate_v3(connection)?;
+            migrate_v4(connection)
         }
-        2 => migrate_v3(connection),
+        2 => {
+            migrate_v3(connection)?;
+            migrate_v4(connection)
+        }
+        3 => migrate_v4(connection),
         unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
     }
 }
@@ -151,6 +157,75 @@ fn migrate_v3(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn migrate_v4(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE managed_processes (
+             id TEXT PRIMARY KEY NOT NULL,
+             run_id TEXT NOT NULL,
+             stage_id TEXT NOT NULL,
+             attempt INTEGER NOT NULL CHECK (attempt >= 0),
+             backend_kind TEXT NOT NULL CHECK (length(backend_kind) > 0),
+             backend_session_id TEXT NOT NULL UNIQUE,
+             status TEXT NOT NULL CHECK (
+                 status IN (
+                     'preparing', 'starting', 'running', 'interrupting', 'exited',
+                     'interrupted', 'missing', 'broken', 'cleaned'
+                 )
+             ),
+             spec_schema_version INTEGER NOT NULL CHECK (spec_schema_version > 0),
+             spec_json TEXT NOT NULL,
+             command_fingerprint TEXT NOT NULL CHECK (length(command_fingerprint) = 64),
+             stdout_offset INTEGER NOT NULL DEFAULT 0 CHECK (stdout_offset >= 0),
+             stdout_cursor_revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (stdout_cursor_revision >= 0),
+             stderr_offset INTEGER NOT NULL DEFAULT 0 CHECK (stderr_offset >= 0),
+             stderr_cursor_revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (stderr_cursor_revision >= 0),
+             exit_code INTEGER,
+             term_signal INTEGER,
+             runner_error TEXT,
+             interrupt_requested INTEGER NOT NULL DEFAULT 0
+                 CHECK (interrupt_requested IN (0, 1)),
+             last_error TEXT,
+             revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             started_at TEXT,
+             finished_at TEXT,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             UNIQUE (run_id, stage_id, attempt),
+             CHECK (
+                 (exit_code IS NOT NULL) +
+                 (term_signal IS NOT NULL) +
+                 (runner_error IS NOT NULL) <= 1
+             )
+         );
+         CREATE TRIGGER managed_processes_identity_immutable
+         BEFORE UPDATE ON managed_processes
+         WHEN OLD.id IS NOT NEW.id
+           OR OLD.run_id IS NOT NEW.run_id
+           OR OLD.stage_id IS NOT NEW.stage_id
+           OR OLD.attempt IS NOT NEW.attempt
+           OR OLD.backend_kind IS NOT NEW.backend_kind
+           OR OLD.backend_session_id IS NOT NEW.backend_session_id
+           OR OLD.spec_schema_version IS NOT NEW.spec_schema_version
+           OR OLD.spec_json IS NOT NEW.spec_json
+           OR OLD.command_fingerprint IS NOT NEW.command_fingerprint
+           OR OLD.created_at IS NOT NEW.created_at
+         BEGIN
+             SELECT RAISE(ABORT, 'managed process launch identity is immutable');
+         END;
+         CREATE INDEX managed_processes_run_status_idx
+             ON managed_processes(run_id, status, updated_at);
+         CREATE INDEX managed_processes_session_idx
+             ON managed_processes(backend_session_id);
+         PRAGMA user_version = 4;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
@@ -161,7 +236,8 @@ mod tests {
         ConfigSnapshotId, EventId, EventMetadata, Role, Run, RunId, StageDefinition, StageId,
         StageKind, WorkflowDefinition, WorkflowKind,
     };
-    use crate::store::{ResolvedConfigSnapshot, SqliteStore};
+    use crate::store::{ResolvedConfigSnapshot, RunInput, SqliteStore};
+    use crate::workspace::{ApplyStatus, WorkspaceStatus};
 
     #[test]
     fn v1_database_upgrades_without_changing_existing_run() {
@@ -223,6 +299,90 @@ mod tests {
 
         assert_eq!(
             connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v3_database_adds_process_infrastructure_without_changing_existing_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        migrate_v1(&connection).unwrap();
+        migrate_v2(&connection).unwrap();
+        migrate_v3(&connection).unwrap();
+        let mut store = SqliteStore { connection };
+        let at: DateTime<Utc> = std::time::SystemTime::now().into();
+        let run_id = RunId::from_u128(950);
+        let config_id = ConfigSnapshotId::new("v3-config").unwrap();
+        let run = Run::new(
+            run_id,
+            WorkflowDefinition::built_in(WorkflowKind::Fast),
+            config_id.clone(),
+            at,
+        );
+        let input = RunInput::new(run_id, "v3 input", at).unwrap();
+        let config =
+            ResolvedConfigSnapshot::new(config_id.clone(), 1, json!({"v": 3}), at).unwrap();
+        let event = run.created_event(EventMetadata::new(EventId::from_u128(951), at));
+        store
+            .create_run_with_input(&run, &input, &config, &[event])
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO run_workspaces (
+                     run_id, source_repo_path, git_common_dir, base_commit, worktree_path,
+                     branch_name, mode, status, branch_owned, removal_head, last_error,
+                     revision, created_at, updated_at
+                 ) VALUES (?1, '/tmp/v3-source', '/tmp/v3-source/.git', ?2,
+                           '/tmp/v3-worktree', 'polycode/run-v3', 'branch', 'preparing',
+                           0, NULL, NULL, 5, ?3, ?3)",
+                rusqlite::params![run_id.to_string(), "a".repeat(40), at.to_rfc3339()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO run_apply_operations (
+                     run_id, status, patch_hash, run_revision, last_error, revision,
+                     created_at, updated_at
+                 ) VALUES (?1, 'recorded', ?2, 0, NULL, 2, ?3, ?3)",
+                rusqlite::params![run_id.to_string(), "b".repeat(64), at.to_rfc3339()],
+            )
+            .unwrap();
+
+        migrate(&store.connection).unwrap();
+
+        let process_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM managed_processes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(process_count, 0);
+        assert_eq!(store.load_run(run_id).unwrap().run, run);
+        assert_eq!(store.load_events(run_id).unwrap().len(), 1);
+        assert_eq!(store.load_config_snapshot(&config_id).unwrap(), config);
+        assert_eq!(store.load_run_input(run_id).unwrap(), Some(input));
+        assert_eq!(
+            store.load_workspace(run_id).unwrap().unwrap().status(),
+            WorkspaceStatus::Preparing
+        );
+        assert_eq!(
+            store
+                .load_apply_operation(run_id)
+                .unwrap()
+                .unwrap()
+                .status(),
+            ApplyStatus::Recorded
+        );
+        assert_eq!(
+            store
+                .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
             DATABASE_SCHEMA_VERSION
