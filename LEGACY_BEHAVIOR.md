@@ -123,3 +123,13 @@ Polycode preserves behavior above but does not copy these implementation choices
 - Treat `Cleaned` as an artifact-retention operation, not core run lifecycle status.
 - Optional dependency outcomes can produce degraded readiness after optional predecessors fail or skip; required dependencies still require completion.
 - Each run owns an immutable effective configuration snapshot identity, separate from mutable user/repository configuration.
+
+## Milestone 3 resolutions
+
+- Logical `RunSnapshot` excludes repository/worktree identity; `RunWorkspace` persists physical Git state separately.
+- Native Git CLI commands use direct argument arrays, deterministic central worktree paths, and explicit branch/detached modes.
+- Workspace creation/removal and patch apply use persisted intent, external effect, validation, and finalization rather than pretending SQLite and Git are atomic.
+- Source checkout may be dirty during worktree creation but must be clean at apply.
+- Apply generates a binary patch from persisted base commit through a temporary index, includes tracked/untracked/deleted files, runs `git apply --check`, and neither stages nor commits.
+- Apply recovery persists exact patch SHA-256 and uses forward/reverse checks to prevent duplicate application; ambiguity fails closed.
+- Discard records logical history before cleanup. Cleanup removes only validated owned resources; branch deletion requires expected-tip ownership evidence, not prefix alone.

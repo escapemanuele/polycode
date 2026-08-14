@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
@@ -82,4 +84,20 @@ pub enum StoreError {
     IntegerRange(&'static str),
     #[error("cannot resolve data path: set POLYCODE_DATA_DIR or HOME")]
     DataPathUnavailable,
+    #[error("workspace for run {0} already exists")]
+    WorkspaceAlreadyExists(RunId),
+    #[error("workspace for run {run_id} changed since revision {expected}")]
+    WorkspaceConcurrentModification { run_id: RunId, expected: u64 },
+    #[error("apply operation for run {0} already exists")]
+    ApplyOperationAlreadyExists(RunId),
+    #[error("apply operation for run {0} does not exist")]
+    ApplyOperationNotFound(RunId),
+    #[error("apply operation for run {run_id} changed since revision {expected}")]
+    ApplyOperationConcurrentModification { run_id: RunId, expected: u64 },
+    #[error("run {0} cannot change while an apply operation is active")]
+    RunFrozenForApply(RunId),
+    #[error("stored workspace record is invalid: {0}")]
+    InvalidWorkspaceRecord(String),
+    #[error("workspace path is not valid UTF-8: {0}")]
+    NonUtf8WorkspacePath(PathBuf),
 }

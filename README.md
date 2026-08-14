@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository currently contains **Milestone 2: Persistence / SQLite**: validated domain state from Milestone 1 plus synchronous, restart-safe local persistence. Workflow execution remains future work.
+Polycode is early-stage software. This repository currently contains **Milestone 3: Git workspaces**: validated domain state, synchronous restart-safe SQLite persistence, and crash-reconcilable isolated Git worktrees with explicit apply/discard. Workflow execution remains future work.
 
 ## Principles
 
@@ -12,7 +12,7 @@ Polycode is early-stage software. This repository currently contains **Milestone
 - Role, provider, and model are separate concepts.
 - Workflow behavior is explicit and testable.
 - Machine state is canonical in local SQLite; artifacts remain human-readable.
-- Every implementation run will use an isolated Git worktree and require explicit apply.
+- Every implementation run uses an isolated Git worktree and requires explicit apply.
 - Defaults should be useful without turning Polycode into a generic agent framework.
 
 ## Current CLI
@@ -24,7 +24,7 @@ polycode doctor
 polycode runs
 ```
 
-`doctor` reports resolved config/database paths and existing schema version without creating a missing database. `runs` opens the local store and lists indexed run summaries. Domain and persistence APIs are importable as `polycode::domain` and `polycode::store`; provider detection arrives with provider work.
+`doctor` reports resolved config/database paths and existing schema version without creating a missing database. `runs` opens the local store and lists indexed run summaries. Domain, persistence, Git, and workspace APIs are importable as `polycode::domain`, `polycode::store`, `polycode::git`, and `polycode::workspace`; provider detection arrives with provider work. M3 workspace behavior is library/test-driven; dedicated apply/discard CLI commands remain later integration work.
 
 ## Build
 
@@ -66,9 +66,17 @@ Default SQLite path:
 
 Set `POLYCODE_DATA_DIR` to override its parent directory. Path resolution is side-effect free; opening the store creates the directory/database and applies schema migrations. SQLite stores immutable resolved configuration separately from versioned run snapshots and semantic events.
 
+Managed worktrees default to:
+
+```text
+~/.polycode/worktrees/<sanitized-repository>-<common-dir-hash>/<run-id>
+```
+
+`POLYCODE_DATA_DIR` relocates both database and managed worktree root. Implementation workflows use deterministic `polycode/run-<run-id>` branches; review workflows use detached worktrees. Source changes occur only through explicit apply, which requires a clean source checkout, generates a binary patch from persisted base commit, runs `git apply --check`, then applies without staging or committing.
+
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Milestone 3+ descriptions are design constraints, not claims of implemented behavior.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Milestone 4+ descriptions are design constraints, not claims of implemented behavior.
 
 ## License
 

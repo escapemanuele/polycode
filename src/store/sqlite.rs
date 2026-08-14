@@ -69,7 +69,7 @@ pub struct SequencedEvent {
 }
 
 pub struct SqliteStore {
-    connection: Connection,
+    pub(crate) connection: Connection,
 }
 
 impl SqliteStore {
@@ -278,80 +278,13 @@ impl SqliteStore {
         expected_revision: RunRevision,
         events: &[DomainEvent],
     ) -> Result<CommitResult, StoreError> {
-        run.validate_invariants()?;
-        let snapshot_json = encode_run(run)?;
-        let status = enum_text(&run.status())?;
-        let workflow = enum_text(&run.workflow_kind())?;
-        let next_revision = expected_revision
-            .value()
-            .checked_add(1)
-            .ok_or(StoreError::IntegerRange("next run revision"))?;
-
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = load_commit_state(&transaction, run.id())?;
-        if current.run.task() != run.task() {
-            return Err(StoreError::ImmutableRunFieldChanged("task"));
-        }
-        if current.run.workflow() != run.workflow() {
-            return Err(StoreError::ImmutableRunFieldChanged("workflow"));
-        }
-        if current.run.config_snapshot_id() != run.config_snapshot_id() {
-            return Err(StoreError::ImmutableRunFieldChanged(
-                "config snapshot binding",
-            ));
-        }
-        if current.run.created_at() != run.created_at() {
-            return Err(StoreError::ImmutableRunFieldChanged("created_at"));
-        }
-        validate_event_batch(run, events, current.last_occurred_at)?;
-        if events
-            .iter()
-            .any(|event| matches!(event.kind(), DomainEventKind::RunCreated { .. }))
-        {
-            return Err(StoreError::UnexpectedRunCreatedEvent);
-        }
-
-        let changed = transaction.execute(
-            "UPDATE runs
-             SET status = ?1, workflow = ?2, snapshot_schema_version = ?3,
-                 snapshot_json = ?4, revision = ?5, updated_at = ?6
-             WHERE id = ?7 AND revision = ?8",
-            params![
-                status,
-                workflow,
-                i64::from(RUN_SNAPSHOT_SCHEMA_VERSION),
-                snapshot_json,
-                u64_to_i64(next_revision, "next run revision")?,
-                format_timestamp(run.updated_at()),
-                run.id().to_string(),
-                u64_to_i64(expected_revision.value(), "expected run revision")?,
-            ],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::ConcurrentModification {
-                run_id: run.id(),
-                expected: expected_revision.value(),
-            });
-        }
-
-        let first_sequence = current
-            .last_sequence
-            .checked_add(1)
-            .ok_or(StoreError::IntegerRange("next event sequence"))?;
-        insert_events(&transaction, run, events, first_sequence)?;
-        let event_count =
-            u64::try_from(events.len()).map_err(|_| StoreError::IntegerRange("event count"))?;
-        let last_sequence = first_sequence
-            .checked_add(event_count - 1)
-            .ok_or(StoreError::IntegerRange("last event sequence"))?;
+        let result =
+            commit_run_update_transaction(&transaction, run, expected_revision, events, false)?;
         transaction.commit()?;
-
-        Ok(CommitResult {
-            revision: RunRevision(next_revision),
-            last_sequence,
-        })
+        Ok(result)
     }
 
     /// Loads authoritative per-run event sequence and validates row projections.
@@ -407,6 +340,99 @@ impl SqliteStore {
         }
         Ok(events)
     }
+}
+
+pub(crate) fn commit_run_update_transaction(
+    transaction: &Transaction<'_>,
+    run: &Run,
+    expected_revision: RunRevision,
+    events: &[DomainEvent],
+    allow_active_apply: bool,
+) -> Result<CommitResult, StoreError> {
+    run.validate_invariants()?;
+    let snapshot_json = encode_run(run)?;
+    let status = enum_text(&run.status())?;
+    let workflow = enum_text(&run.workflow_kind())?;
+    let next_revision = expected_revision
+        .value()
+        .checked_add(1)
+        .ok_or(StoreError::IntegerRange("next run revision"))?;
+    if !allow_active_apply && active_apply_exists(transaction, run.id())? {
+        return Err(StoreError::RunFrozenForApply(run.id()));
+    }
+    let current = load_commit_state(transaction, run.id())?;
+    if current.run.task() != run.task() {
+        return Err(StoreError::ImmutableRunFieldChanged("task"));
+    }
+    if current.run.workflow() != run.workflow() {
+        return Err(StoreError::ImmutableRunFieldChanged("workflow"));
+    }
+    if current.run.config_snapshot_id() != run.config_snapshot_id() {
+        return Err(StoreError::ImmutableRunFieldChanged(
+            "config snapshot binding",
+        ));
+    }
+    if current.run.created_at() != run.created_at() {
+        return Err(StoreError::ImmutableRunFieldChanged("created_at"));
+    }
+    validate_event_batch(run, events, current.last_occurred_at)?;
+    if events
+        .iter()
+        .any(|event| matches!(event.kind(), DomainEventKind::RunCreated { .. }))
+    {
+        return Err(StoreError::UnexpectedRunCreatedEvent);
+    }
+
+    let changed = transaction.execute(
+        "UPDATE runs
+         SET status = ?1, workflow = ?2, snapshot_schema_version = ?3,
+             snapshot_json = ?4, revision = ?5, updated_at = ?6
+         WHERE id = ?7 AND revision = ?8",
+        params![
+            status,
+            workflow,
+            i64::from(RUN_SNAPSHOT_SCHEMA_VERSION),
+            snapshot_json,
+            u64_to_i64(next_revision, "next run revision")?,
+            format_timestamp(run.updated_at()),
+            run.id().to_string(),
+            u64_to_i64(expected_revision.value(), "expected run revision")?,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(StoreError::ConcurrentModification {
+            run_id: run.id(),
+            expected: expected_revision.value(),
+        });
+    }
+
+    let first_sequence = current
+        .last_sequence
+        .checked_add(1)
+        .ok_or(StoreError::IntegerRange("next event sequence"))?;
+    insert_events(transaction, run, events, first_sequence)?;
+    let event_count =
+        u64::try_from(events.len()).map_err(|_| StoreError::IntegerRange("event count"))?;
+    let last_sequence = first_sequence
+        .checked_add(event_count - 1)
+        .ok_or(StoreError::IntegerRange("last event sequence"))?;
+
+    Ok(CommitResult {
+        revision: RunRevision(next_revision),
+        last_sequence,
+    })
+}
+
+fn active_apply_exists(connection: &Connection, run_id: RunId) -> Result<bool, StoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM run_apply_operations
+             WHERE run_id = ?1 AND status IN ('prepared', 'applied_to_source')",
+            [run_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 struct StoredRunRow {
@@ -670,15 +696,15 @@ fn event_type_text(event: &DomainEvent) -> Result<String, StoreError> {
         .ok_or(StoreError::EventProjectionMismatch("serialized event type"))
 }
 
-fn format_timestamp(timestamp: &DateTime<Utc>) -> String {
+pub(crate) fn format_timestamp(timestamp: &DateTime<Utc>) -> String {
     timestamp.to_rfc3339()
 }
 
-fn parse_timestamp(timestamp: &str) -> Result<DateTime<Utc>, StoreError> {
+pub(crate) fn parse_timestamp(timestamp: &str) -> Result<DateTime<Utc>, StoreError> {
     Ok(DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc))
 }
 
-fn i64_to_u64(value: i64, field: &'static str) -> Result<u64, StoreError> {
+pub(crate) fn i64_to_u64(value: i64, field: &'static str) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::IntegerRange(field))
 }
 
@@ -686,7 +712,7 @@ fn i64_to_u32(value: i64, field: &'static str) -> Result<u32, StoreError> {
     u32::try_from(value).map_err(|_| StoreError::IntegerRange(field))
 }
 
-fn u64_to_i64(value: u64, field: &'static str) -> Result<i64, StoreError> {
+pub(crate) fn u64_to_i64(value: u64, field: &'static str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::IntegerRange(field))
 }
 
@@ -939,7 +965,10 @@ mod tests {
             .connection
             .prepare(
                 "SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('runs', 'events', 'config_snapshots')
+                 WHERE type = 'table' AND name IN (
+                     'runs', 'events', 'config_snapshots', 'run_workspaces',
+                     'run_apply_operations'
+                 )
                  ORDER BY name",
             )
             .unwrap()
@@ -947,11 +976,23 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(tables, vec!["config_snapshots", "events", "runs"]);
+        assert_eq!(
+            tables,
+            vec![
+                "config_snapshots",
+                "events",
+                "run_apply_operations",
+                "run_workspaces",
+                "runs"
+            ]
+        );
         drop(store);
 
         let reopened = SqliteStore::open(path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 1);
+        assert_eq!(
+            reopened.schema_version().unwrap(),
+            migrations::DATABASE_SCHEMA_VERSION
+        );
     }
 
     #[test]

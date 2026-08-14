@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 2 implements synchronous SQLite persistence around the validated Milestone 1 domain: versioned snapshots, validated rehydration, immutable resolved configuration, atomic semantic events, per-run event sequence, and optimistic revision checks. Providers, scheduling, process backends, Git worktrees, async runtime, and TUI remain deliberately absent.
+Milestone 3 adds native Git repository discovery, isolated branch/detached worktrees, explicit apply/discard/cleanup, and reconciliation across SQLite↔Git crash windows. Logical run snapshots remain unchanged; physical workspace and apply intent use separate schema-v2 records. Providers, scheduling, process backends, async runtime, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -81,7 +81,18 @@ events(run_id, sequence, event_id, event_type,
 
 Snapshot JSON holds aggregate reconstruction state; selected run columns are indexed projections and checked against decoded state on load. `events` has primary key `(run_id, sequence)` and globally unique `event_id`. Foreign keys are enabled on every connection. File-backed stores use WAL, normal synchronous mode, and a five-second busy timeout.
 
-`repository_path` is intentionally absent from schema v1 because Milestone 1 `Run` does not own repository identity yet. It belongs in a later migration when Git/worktree lifecycle defines that domain boundary.
+Schema v2 adds infrastructure records without changing `RunSnapshotV1`:
+
+```text
+run_workspaces(run_id, source_repo_path, git_common_dir, base_commit,
+               worktree_path, branch_name, mode, status, branch_owned,
+               removal_head, last_error, revision, created_at, updated_at)
+
+run_apply_operations(run_id, status, patch_hash, run_revision,
+                     last_error, revision, created_at, updated_at)
+```
+
+`RunSnapshot` remains logical orchestration state. `RunWorkspace` is a one-to-one physical resource record; it can be broken by external Git/filesystem changes without making domain rehydration depend on path existence. Existing v1 databases migrate forward without rewriting snapshots, events, or configuration.
 
 Resolved config payloads are recursively key-sorted and compact-encoded before SHA-256 hashing. An existing config ID accepts an exact idempotent insert only; different content or metadata is rejected. Database triggers reject update and delete operations, enforcing insert-only storage beneath the Rust API.
 
@@ -161,9 +172,39 @@ Each run also snapshots its resolved configuration. Resume must use that immutab
 
 ## Git safety
 
-Every run will execute in an isolated worktree. Implementation runs use dedicated branches; review-only runs may be detached. Applying changes is explicit, validates source-checkout safety and patch applicability, preserves untracked run files, avoids automatic commits, and retains run data after apply or discard.
+Git runs through `std::process::Command` with direct argument arrays; no shell command interpolation is used. Repository discovery persists canonical source path, canonical Git common directory, and immutable base commit. Paths are passed as OS arguments, while NUL-delimited Git output is used where records must be parsed. Binary patches use short-lived temporary files so large input cannot deadlock subprocess pipes; files are removed automatically after each command.
 
-## Milestone 2 layout
+Managed worktrees live under:
+
+```text
+~/.polycode/worktrees/<sanitized repository + short common-dir hash>/<run-id>
+```
+
+Implementation worktrees use deterministic `polycode/run-<run-id>` branches. Review worktrees are explicitly detached. Source checkout may be dirty during preparation because worktree starts from committed `HEAD`; source must be fully clean during apply.
+
+SQLite and Git cannot share a transaction. Workspace lifecycle therefore uses durable intent and reconciliation:
+
+```text
+Preparing persisted -> git worktree add -> identity validation
+    -> workspace Ready + Run Ready committed atomically
+
+Removing persisted -> ownership validation -> git worktree remove
+    -> compare-and-delete owned branch -> Removed persisted
+```
+
+Reconciliation retries absent `Preparing` resources, finalizes already-created valid resources, continues `Removing`, and leaves repeated terminal operations idempotent. Missing ready resources, relocated repositories, foreign paths, branch collisions, moved branch tips, or other ambiguous evidence become `Broken`; Polycode does not guess or delete foreign data.
+
+Workspace status changes are infrastructure control state, not new domain events. Existing `RunPreparationStarted`, `RunPrepared`, `RunApplied`, and `RunDiscarded` events capture semantic behavior; individual Git commands and cleanup progress stay out of domain history.
+
+Apply computes exact delta from persisted base commit using a temporary Git index. `read-tree`, `git add -A`, and `git diff --cached --binary --full-index` include tracked edits, untracked files, deletions, file modes, unusual UTF-8 filenames, and binary data without touching source or worktree index. Apply then requires clean source, persists SHA-256 patch intent and run revision, runs `git apply --check`, and runs `git apply` without staging or committing.
+
+Git apply and SQLite lifecycle finalization form another intent/effect/finalize boundary. Recovery regenerates patch and requires identical hash. Forward-check success means effect may proceed; reverse-check success with forward failure proves expected patch is already present and permits exactly-once logical finalization. Ambiguous evidence fails closed. Apply retains worktree for inspection.
+
+Creating apply intent uses run revision compare-and-swap. While status is `Prepared` or `AppliedToSource`, ordinary run commits and workspace cleanup are rejected; final apply records operation, run snapshot, revision, and `RunApplied` event in one SQLite transaction.
+
+Discard commits `RunStatus::Discarded` before cleanup. Cleanup independently removes worktree resources for completed, applied, or discarded runs without changing logical status. Branch deletion requires persisted ownership, no remaining checkout, and atomic expected-tip deletion; movement after removal intent produces `Broken` and preserves branch.
+
+## Current layout
 
 ```text
 src/
@@ -175,22 +216,33 @@ src/
 ├── config/
 │   └── mod.rs       side-effect-free configuration path resolution
 ├── domain/
-    ├── run.rs       aggregate, lifecycle, dependency and attention rules
-    ├── stage.rs     stage state machine
-    ├── workflow.rs  workflow identity and validated DAG definition
-    ├── attention.rs human-attention lifecycle
-    ├── event.rs     provider-neutral semantic events
-    ├── artifact.rs  typed artifact metadata
-    ├── role.rs      provider/model-independent responsibility
-    ├── rehydration.rs persistence-neutral reconstruction data
-    └── ids.rs       strong domain identities
-└── store/
-    ├── sqlite.rs    transactional store and indexed projections
-    ├── snapshot.rs  versioned RunSnapshotV1 codec
-    ├── migrations.rs SQLite schema lifecycle
-    ├── config_snapshot.rs immutable config and canonical hash
-    ├── path.rs      side-effect-free data path resolution
-    └── error.rs     typed persistence failures
+│   ├── run.rs       aggregate, lifecycle, dependency and attention rules
+│   ├── stage.rs     stage state machine
+│   ├── workflow.rs  workflow identity and validated DAG definition
+│   ├── attention.rs human-attention lifecycle
+│   ├── event.rs     provider-neutral semantic events
+│   ├── artifact.rs  typed artifact metadata
+│   ├── role.rs      provider/model-independent responsibility
+│   ├── rehydration.rs persistence-neutral reconstruction data
+│   └── ids.rs       strong domain identities
+├── store/
+│   ├── sqlite.rs    transactional store and indexed projections
+│   ├── snapshot.rs  versioned RunSnapshotV1 codec
+│   ├── migrations.rs SQLite schema lifecycle
+│   ├── config_snapshot.rs immutable config and canonical hash
+│   ├── workspace.rs workspace/apply intent persistence and CAS
+│   ├── path.rs      data and worktree path resolution
+│   └── error.rs     typed persistence failures
+├── git/
+│   ├── command.rs    native Git command runner
+│   ├── repository.rs canonical repository identity
+│   ├── worktree.rs   create/inspect/remove and branch ownership
+│   ├── patch.rs      temporary-index patch generation and apply
+│   └── error.rs      typed Git failures
+└── workspace/
+    ├── manager.rs    intent/effect/finalize orchestration
+    ├── model.rs      workspace and apply-operation records
+    └── error.rs      typed lifecycle/reconciliation failures
 ```
 
 Domain operations are deterministic: callers supply UTC timestamps. Invalid transitions and persistence failures return typed `thiserror` errors; `anyhow` remains at the application boundary. Serde uses inspectable snake-case values. Aggregate deserialization is prohibited; versioned DTO decoding always ends at validated rehydration.
@@ -208,3 +260,7 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Cleanup is resource retention, not a run lifecycle state.
 - `rusqlite` uses bundled SQLite for deterministic local availability; persistence remains synchronous until orchestration needs async boundaries.
 - JSON snapshots avoid premature normalization while indexed projection columns support current list/inspection needs.
+- Run workspace state stays outside logical run snapshots; filesystem availability never participates in `Run::rehydrate`.
+- Git effects use intent/effect/finalize sagas with explicit reconciliation; SQLite transactions never span subprocess execution.
+- Apply uses patch transfer instead of merge/cherry-pick and never stages or commits source changes.
+- Discard is a logical disposition; cleanup is an independent physical-resource operation.

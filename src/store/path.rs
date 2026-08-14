@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use super::StoreError;
 
 const DATABASE_FILE: &str = "polycode.db";
+const WORKTREE_DIRECTORY: &str = "worktrees";
 
 /// Resolves default database path without creating directories or files.
 ///
@@ -11,17 +12,33 @@ const DATABASE_FILE: &str = "polycode.db";
 /// Returns [`StoreError::DataPathUnavailable`] when neither override nor home
 /// directory is available.
 pub fn database_file() -> Result<PathBuf, StoreError> {
-    database_file_with(|name| std::env::var_os(name))
+    Ok(data_directory_with(|name| std::env::var_os(name))?.join(DATABASE_FILE))
 }
 
+/// Resolves central managed worktree root without creating it.
+///
+/// # Errors
+/// Returns [`StoreError::DataPathUnavailable`] when neither override nor home
+/// directory is available.
+pub fn worktree_root() -> Result<PathBuf, StoreError> {
+    Ok(data_directory_with(|name| std::env::var_os(name))?.join(WORKTREE_DIRECTORY))
+}
+
+#[cfg(test)]
 fn database_file_with(
     mut get_var: impl FnMut(&str) -> Option<OsString>,
 ) -> Result<PathBuf, StoreError> {
+    Ok(data_directory_with(&mut get_var)?.join(DATABASE_FILE))
+}
+
+fn data_directory_with(
+    mut get_var: impl FnMut(&str) -> Option<OsString>,
+) -> Result<PathBuf, StoreError> {
     if let Some(directory) = non_empty(get_var("POLYCODE_DATA_DIR")) {
-        return Ok(PathBuf::from(directory).join(DATABASE_FILE));
+        return Ok(PathBuf::from(directory));
     }
     let home = non_empty(get_var("HOME")).ok_or(StoreError::DataPathUnavailable)?;
-    Ok(PathBuf::from(home).join(".polycode").join(DATABASE_FILE))
+    Ok(PathBuf::from(home).join(".polycode"))
 }
 
 fn non_empty(value: Option<OsString>) -> Option<OsString> {

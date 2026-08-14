@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 1;
+pub const DATABASE_SCHEMA_VERSION: u32 = 2;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -10,7 +10,16 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     match version {
         DATABASE_SCHEMA_VERSION => Ok(()),
         0 => {
-            connection.execute_batch(
+            migrate_v1(connection)?;
+            migrate_v2(connection)
+        }
+        1 => migrate_v2(connection),
+        unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
+    }
+}
+
+fn migrate_v1(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
                 "BEGIN IMMEDIATE;
                  CREATE TABLE config_snapshots (
                      id TEXT PRIMARY KEY NOT NULL,
@@ -57,9 +66,116 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
                  CREATE INDEX events_run_occurred_idx ON events(run_id, occurred_at);
                  PRAGMA user_version = 1;
                  COMMIT;",
-            )?;
-            Ok(())
-        }
-        unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
+    )?;
+    Ok(())
+}
+
+fn migrate_v2(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE run_workspaces (
+             run_id TEXT PRIMARY KEY NOT NULL,
+             source_repo_path TEXT NOT NULL,
+             git_common_dir TEXT NOT NULL,
+             base_commit TEXT NOT NULL CHECK (length(base_commit) IN (40, 64)),
+             worktree_path TEXT NOT NULL UNIQUE,
+             branch_name TEXT,
+             mode TEXT NOT NULL CHECK (mode IN ('branch', 'detached')),
+             status TEXT NOT NULL CHECK (
+                 status IN ('preparing', 'ready', 'removing', 'removed', 'broken')
+             ),
+             branch_owned INTEGER NOT NULL DEFAULT 0 CHECK (branch_owned IN (0, 1)),
+             removal_head TEXT CHECK (removal_head IS NULL OR length(removal_head) IN (40, 64)),
+             last_error TEXT,
+             revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             CHECK (
+                 (mode = 'branch' AND branch_name IS NOT NULL) OR
+                 (mode = 'detached' AND branch_name IS NULL)
+             )
+         );
+         CREATE TABLE run_apply_operations (
+             run_id TEXT PRIMARY KEY NOT NULL,
+             status TEXT NOT NULL CHECK (
+                 status IN ('prepared', 'applied_to_source', 'recorded', 'failed')
+             ),
+             patch_hash TEXT NOT NULL CHECK (length(patch_hash) = 64),
+             run_revision INTEGER NOT NULL CHECK (run_revision >= 0),
+             last_error TEXT,
+             revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             FOREIGN KEY (run_id) REFERENCES run_workspaces(run_id) ON DELETE RESTRICT
+         );
+         CREATE INDEX run_workspaces_status_idx ON run_workspaces(status, updated_at);
+         CREATE INDEX run_workspaces_common_dir_idx ON run_workspaces(git_common_dir);
+         CREATE INDEX run_apply_operations_status_idx
+             ON run_apply_operations(status, updated_at);
+         PRAGMA user_version = 2;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::{
+        ConfigSnapshotId, EventId, EventMetadata, Role, Run, RunId, StageDefinition, StageId,
+        StageKind, WorkflowDefinition, WorkflowKind,
+    };
+    use crate::store::{ResolvedConfigSnapshot, SqliteStore};
+
+    #[test]
+    fn v1_database_upgrades_without_changing_existing_run() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        migrate_v1(&connection).unwrap();
+        let mut store = SqliteStore { connection };
+        let at: DateTime<Utc> = std::time::SystemTime::now().into();
+        let config_id = ConfigSnapshotId::new("v1-config").unwrap();
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Fast,
+            vec![StageDefinition::new(
+                StageId::new("implementation").unwrap(),
+                StageKind::Implementation,
+                Role::Implementer,
+                vec![],
+            )],
+        )
+        .unwrap();
+        let run = Run::new(
+            RunId::from_u128(900),
+            "survive migration",
+            workflow,
+            config_id.clone(),
+            at,
+        )
+        .unwrap();
+        let config = ResolvedConfigSnapshot::new(config_id, 1, json!({"v": 1}), at).unwrap();
+        let event = run.created_event(EventMetadata::new(EventId::from_u128(901), at));
+        store.create_run(&run, &config, &[event]).unwrap();
+
+        migrate(&store.connection).unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), DATABASE_SCHEMA_VERSION);
+        assert_eq!(store.load_run(run.id()).unwrap().run, run);
+        assert_eq!(store.load_events(run.id()).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .load_config_snapshot(run.config_snapshot_id())
+                .unwrap(),
+            config
+        );
+        assert!(store.load_workspace(run.id()).unwrap().is_none());
+        assert!(store.load_apply_operation(run.id()).unwrap().is_none());
     }
 }
