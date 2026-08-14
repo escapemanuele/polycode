@@ -2,6 +2,7 @@ mod cli;
 mod config;
 
 pub mod domain;
+pub mod store;
 
 use anyhow::{Context, Result};
 use clap::Parser;

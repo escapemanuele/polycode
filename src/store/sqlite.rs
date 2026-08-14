@@ -1,0 +1,1338 @@
+use std::path::Path;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
+
+use crate::domain::{
+    ConfigSnapshotId, DomainEvent, DomainEventKind, Run, RunId, RunStatus, WorkflowKind,
+};
+
+use super::migrations;
+use super::snapshot::{decode_run, encode_run};
+use super::{RUN_SNAPSHOT_SCHEMA_VERSION, ResolvedConfigSnapshot, StoreError};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RunRevision(u64);
+
+impl RunRevision {
+    #[must_use]
+    pub const fn initial() -> Self {
+        Self(0)
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitResult {
+    revision: RunRevision,
+    last_sequence: u64,
+}
+
+impl CommitResult {
+    #[must_use]
+    pub const fn revision(self) -> RunRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn last_sequence(self) -> u64 {
+        self.last_sequence
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedRun {
+    pub run: Run,
+    pub revision: RunRevision,
+    pub config_snapshot: ResolvedConfigSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSummary {
+    pub id: RunId,
+    pub status: RunStatus,
+    pub workflow: WorkflowKind,
+    pub revision: RunRevision,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequencedEvent {
+    pub sequence: u64,
+    pub event: DomainEvent,
+}
+
+pub struct SqliteStore {
+    connection: Connection,
+}
+
+impl SqliteStore {
+    /// Opens one database, creating its parent directory and applying migrations.
+    ///
+    /// # Errors
+    /// Returns typed filesystem, `SQLite`, or migration errors.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(path)?;
+        Self::initialize(connection)
+    }
+
+    /// Opens a process-local database with the same schema and constraints.
+    ///
+    /// # Errors
+    /// Returns typed `SQLite` or migration errors.
+    pub fn open_in_memory() -> Result<Self, StoreError> {
+        Self::initialize(Connection::open_in_memory()?)
+    }
+
+    fn initialize(connection: Connection) -> Result<Self, StoreError> {
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        migrations::migrate(&connection)?;
+        Ok(Self { connection })
+    }
+
+    /// Returns applied `SQLite` schema version.
+    ///
+    /// # Errors
+    /// Returns a `SQLite` error when the pragma cannot be read.
+    pub fn schema_version(&self) -> Result<u32, StoreError> {
+        Ok(self
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Inserts immutable resolved configuration, allowing exact idempotent insert.
+    ///
+    /// # Errors
+    /// Rejects a reused ID with different content.
+    pub fn insert_config_snapshot(
+        &mut self,
+        snapshot: &ResolvedConfigSnapshot,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_config(&transaction, snapshot)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads and revalidates immutable resolved configuration.
+    ///
+    /// # Errors
+    /// Returns not-found, malformed JSON, invalid hash, timestamp, or `SQLite` errors.
+    pub fn load_config_snapshot(
+        &self,
+        id: &ConfigSnapshotId,
+    ) -> Result<ResolvedConfigSnapshot, StoreError> {
+        load_config(&self.connection, id)
+    }
+
+    /// Atomically inserts config, initial run snapshot, and initial event batch.
+    ///
+    /// # Errors
+    /// Rejects invalid aggregates, mismatched config, duplicate run, or invalid events.
+    pub fn create_run(
+        &mut self,
+        run: &Run,
+        config_snapshot: &ResolvedConfigSnapshot,
+        events: &[DomainEvent],
+    ) -> Result<CommitResult, StoreError> {
+        run.validate_invariants()?;
+        if run.config_snapshot_id() != config_snapshot.id() {
+            return Err(StoreError::SnapshotProjectionMismatch(
+                "run config_snapshot_id differs from supplied config",
+            ));
+        }
+        validate_event_batch(run, events, None)?;
+        if !matches!(
+            events.first().map(DomainEvent::kind),
+            Some(DomainEventKind::RunCreated { workflow }) if *workflow == run.workflow_kind()
+        ) || events
+            .iter()
+            .skip(1)
+            .any(|event| matches!(event.kind(), DomainEventKind::RunCreated { .. }))
+        {
+            return Err(StoreError::InvalidInitialEvent);
+        }
+        let snapshot_json = encode_run(run)?;
+        let status = enum_text(&run.status())?;
+        let workflow = enum_text(&run.workflow_kind())?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if run_exists(&transaction, run.id())? {
+            return Err(StoreError::RunAlreadyExists(run.id()));
+        }
+        insert_config(&transaction, config_snapshot)?;
+        transaction.execute(
+            "INSERT INTO runs (
+                 id, status, workflow, config_snapshot_id, snapshot_schema_version,
+                 snapshot_json, revision, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+            params![
+                run.id().to_string(),
+                status,
+                workflow,
+                run.config_snapshot_id().as_str(),
+                i64::from(RUN_SNAPSHOT_SCHEMA_VERSION),
+                snapshot_json,
+                format_timestamp(run.created_at()),
+                format_timestamp(run.updated_at()),
+            ],
+        )?;
+        insert_events(&transaction, run, events, 1)?;
+        transaction.commit()?;
+
+        Ok(CommitResult {
+            revision: RunRevision::initial(),
+            last_sequence: u64::try_from(events.len())
+                .map_err(|_| StoreError::IntegerRange("event count"))?,
+        })
+    }
+
+    /// Loads one snapshot, validates projections, then calls `Run::rehydrate`.
+    ///
+    /// # Errors
+    /// Invalid or corrupt persisted state never produces a `Run`.
+    pub fn load_run(&mut self, run_id: RunId) -> Result<LoadedRun, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let row = load_run_row(&transaction, run_id)?;
+        let config_id = ConfigSnapshotId::new(row.config_snapshot_id.clone())
+            .map_err(|_| StoreError::SnapshotProjectionMismatch("invalid config snapshot ID"))?;
+        let config_snapshot = load_config(&transaction, &config_id)?;
+        let run = decode_run(
+            &row.snapshot_json,
+            i64_to_u32(row.snapshot_schema_version, "snapshot schema version")?,
+        )?;
+        validate_run_projection(&run, &row)?;
+        let revision = RunRevision(i64_to_u64(row.revision, "run revision")?);
+        transaction.commit()?;
+        Ok(LoadedRun {
+            run,
+            revision,
+            config_snapshot,
+        })
+    }
+
+    /// Returns lightweight indexed run projections without decoding snapshots.
+    ///
+    /// # Errors
+    /// Returns typed projection, timestamp, or `SQLite` errors.
+    pub fn list_runs(&self) -> Result<Vec<RunSummary>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, status, workflow, revision, updated_at
+             FROM runs ORDER BY updated_at DESC, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            let (id, status, workflow, revision, updated_at) = row?;
+            summaries.push(RunSummary {
+                id: id
+                    .parse()
+                    .map_err(|_| StoreError::SnapshotProjectionMismatch("invalid run ID"))?,
+                status: enum_from_text(&status)?,
+                workflow: enum_from_text(&workflow)?,
+                revision: RunRevision(i64_to_u64(revision, "run revision")?),
+                updated_at: parse_timestamp(&updated_at)?,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Atomically updates snapshot and appends semantic events using CAS revision.
+    ///
+    /// # Errors
+    /// Returns `ConcurrentModification` when expected revision is stale. Any
+    /// later event failure rolls the state update back.
+    pub fn commit_run_update(
+        &mut self,
+        run: &Run,
+        expected_revision: RunRevision,
+        events: &[DomainEvent],
+    ) -> Result<CommitResult, StoreError> {
+        run.validate_invariants()?;
+        let snapshot_json = encode_run(run)?;
+        let status = enum_text(&run.status())?;
+        let workflow = enum_text(&run.workflow_kind())?;
+        let next_revision = expected_revision
+            .value()
+            .checked_add(1)
+            .ok_or(StoreError::IntegerRange("next run revision"))?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = load_commit_state(&transaction, run.id())?;
+        if current.run.task() != run.task() {
+            return Err(StoreError::ImmutableRunFieldChanged("task"));
+        }
+        if current.run.workflow() != run.workflow() {
+            return Err(StoreError::ImmutableRunFieldChanged("workflow"));
+        }
+        if current.run.config_snapshot_id() != run.config_snapshot_id() {
+            return Err(StoreError::ImmutableRunFieldChanged(
+                "config snapshot binding",
+            ));
+        }
+        if current.run.created_at() != run.created_at() {
+            return Err(StoreError::ImmutableRunFieldChanged("created_at"));
+        }
+        validate_event_batch(run, events, current.last_occurred_at)?;
+        if events
+            .iter()
+            .any(|event| matches!(event.kind(), DomainEventKind::RunCreated { .. }))
+        {
+            return Err(StoreError::UnexpectedRunCreatedEvent);
+        }
+
+        let changed = transaction.execute(
+            "UPDATE runs
+             SET status = ?1, workflow = ?2, snapshot_schema_version = ?3,
+                 snapshot_json = ?4, revision = ?5, updated_at = ?6
+             WHERE id = ?7 AND revision = ?8",
+            params![
+                status,
+                workflow,
+                i64::from(RUN_SNAPSHOT_SCHEMA_VERSION),
+                snapshot_json,
+                u64_to_i64(next_revision, "next run revision")?,
+                format_timestamp(run.updated_at()),
+                run.id().to_string(),
+                u64_to_i64(expected_revision.value(), "expected run revision")?,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::ConcurrentModification {
+                run_id: run.id(),
+                expected: expected_revision.value(),
+            });
+        }
+
+        let first_sequence = current
+            .last_sequence
+            .checked_add(1)
+            .ok_or(StoreError::IntegerRange("next event sequence"))?;
+        insert_events(&transaction, run, events, first_sequence)?;
+        let event_count =
+            u64::try_from(events.len()).map_err(|_| StoreError::IntegerRange("event count"))?;
+        let last_sequence = first_sequence
+            .checked_add(event_count - 1)
+            .ok_or(StoreError::IntegerRange("last event sequence"))?;
+        transaction.commit()?;
+
+        Ok(CommitResult {
+            revision: RunRevision(next_revision),
+            last_sequence,
+        })
+    }
+
+    /// Loads authoritative per-run event sequence and validates row projections.
+    ///
+    /// # Errors
+    /// Returns corrupt JSON, non-contiguous sequence, projection, or `SQLite` errors.
+    pub fn load_events(&self, run_id: RunId) -> Result<Vec<SequencedEvent>, StoreError> {
+        if !run_exists(&self.connection, run_id)? {
+            return Err(StoreError::RunNotFound(run_id));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, event_id, event_type, payload_json, occurred_at
+             FROM events WHERE run_id = ?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([run_id.to_string()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        let mut expected = 1_u64;
+        for row in rows {
+            let (sequence, event_id, event_type, payload_json, occurred_at) = row?;
+            let sequence = i64_to_u64(sequence, "event sequence")?;
+            if sequence != expected {
+                return Err(StoreError::EventSequenceGap {
+                    run_id,
+                    expected,
+                    actual: sequence,
+                });
+            }
+            let event: DomainEvent = serde_json::from_str(&payload_json)?;
+            if event.id().to_string() != event_id {
+                return Err(StoreError::EventProjectionMismatch("event ID"));
+            }
+            if event.run_id() != run_id {
+                return Err(StoreError::EventProjectionMismatch("run ID"));
+            }
+            if event_type_text(&event)? != event_type {
+                return Err(StoreError::EventProjectionMismatch("event type"));
+            }
+            if format_timestamp(event.occurred_at()) != occurred_at {
+                return Err(StoreError::EventProjectionMismatch("occurred_at"));
+            }
+            events.push(SequencedEvent { sequence, event });
+            expected = expected
+                .checked_add(1)
+                .ok_or(StoreError::IntegerRange("event sequence"))?;
+        }
+        Ok(events)
+    }
+}
+
+struct StoredRunRow {
+    id: String,
+    status: String,
+    workflow: String,
+    config_snapshot_id: String,
+    snapshot_schema_version: i64,
+    snapshot_json: String,
+    revision: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+struct CommitState {
+    run: Run,
+    last_sequence: u64,
+    last_occurred_at: Option<DateTime<Utc>>,
+}
+
+fn insert_config(
+    connection: &Connection,
+    snapshot: &ResolvedConfigSnapshot,
+) -> Result<(), StoreError> {
+    let existing = load_config_optional(connection, snapshot.id())?;
+    if let Some(existing) = existing {
+        if &existing == snapshot {
+            return Ok(());
+        }
+        return Err(StoreError::ConfigSnapshotConflict(snapshot.id().clone()));
+    }
+    connection.execute(
+        "INSERT INTO config_snapshots (
+             id, schema_version, payload_json, content_hash, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            snapshot.id().as_str(),
+            i64::from(snapshot.schema_version()),
+            snapshot.payload_json()?,
+            snapshot.content_hash(),
+            format_timestamp(snapshot.created_at()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_config(
+    connection: &Connection,
+    id: &ConfigSnapshotId,
+) -> Result<ResolvedConfigSnapshot, StoreError> {
+    load_config_optional(connection, id)?
+        .ok_or_else(|| StoreError::ConfigSnapshotNotFound(id.clone()))
+}
+
+fn load_config_optional(
+    connection: &Connection,
+    id: &ConfigSnapshotId,
+) -> Result<Option<ResolvedConfigSnapshot>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT schema_version, payload_json, content_hash, created_at
+             FROM config_snapshots WHERE id = ?1",
+            [id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(schema_version, payload_json, content_hash, created_at)| {
+        ResolvedConfigSnapshot::from_stored(
+            id.clone(),
+            i64_to_u32(schema_version, "config schema version")?,
+            serde_json::from_str(&payload_json)?,
+            &content_hash,
+            parse_timestamp(&created_at)?,
+        )
+    })
+    .transpose()
+}
+
+fn load_run_row(connection: &Connection, run_id: RunId) -> Result<StoredRunRow, StoreError> {
+    connection
+        .query_row(
+            "SELECT id, status, workflow, config_snapshot_id, snapshot_schema_version,
+                    snapshot_json, revision, created_at, updated_at
+             FROM runs WHERE id = ?1",
+            [run_id.to_string()],
+            |row| {
+                Ok(StoredRunRow {
+                    id: row.get(0)?,
+                    status: row.get(1)?,
+                    workflow: row.get(2)?,
+                    config_snapshot_id: row.get(3)?,
+                    snapshot_schema_version: row.get(4)?,
+                    snapshot_json: row.get(5)?,
+                    revision: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::RunNotFound(run_id))
+}
+
+fn load_commit_state(connection: &Connection, run_id: RunId) -> Result<CommitState, StoreError> {
+    let row = load_run_row(connection, run_id)?;
+    let run = decode_run(
+        &row.snapshot_json,
+        i64_to_u32(row.snapshot_schema_version, "snapshot schema version")?,
+    )?;
+    validate_run_projection(&run, &row)?;
+    let event = connection
+        .query_row(
+            "SELECT sequence, occurred_at FROM events
+             WHERE run_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            [run_id.to_string()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (last_sequence, last_occurred_at) = event.map_or(Ok((0, None)), |(sequence, at)| {
+        Ok::<_, StoreError>((
+            i64_to_u64(sequence, "event sequence")?,
+            Some(parse_timestamp(&at)?),
+        ))
+    })?;
+    Ok(CommitState {
+        run,
+        last_sequence,
+        last_occurred_at,
+    })
+}
+
+fn validate_run_projection(run: &Run, row: &StoredRunRow) -> Result<(), StoreError> {
+    if run.id().to_string() != row.id {
+        return Err(StoreError::SnapshotProjectionMismatch("run ID"));
+    }
+    if enum_text(&run.status())? != row.status {
+        return Err(StoreError::SnapshotProjectionMismatch("status"));
+    }
+    if enum_text(&run.workflow_kind())? != row.workflow {
+        return Err(StoreError::SnapshotProjectionMismatch("workflow"));
+    }
+    if run.config_snapshot_id().as_str() != row.config_snapshot_id {
+        return Err(StoreError::SnapshotProjectionMismatch("config snapshot ID"));
+    }
+    if format_timestamp(run.created_at()) != row.created_at {
+        return Err(StoreError::SnapshotProjectionMismatch("created_at"));
+    }
+    if format_timestamp(run.updated_at()) != row.updated_at {
+        return Err(StoreError::SnapshotProjectionMismatch("updated_at"));
+    }
+    Ok(())
+}
+
+fn validate_event_batch(
+    run: &Run,
+    events: &[DomainEvent],
+    previous: Option<DateTime<Utc>>,
+) -> Result<(), StoreError> {
+    if events.is_empty() {
+        return Err(StoreError::EmptyEventBatch);
+    }
+    let mut last = previous.unwrap_or(*run.created_at());
+    for event in events {
+        if event.run_id() != run.id() {
+            return Err(StoreError::EventRunMismatch {
+                event_id: event.id(),
+                expected: run.id(),
+                actual: event.run_id(),
+            });
+        }
+        if let Some(stage_id) = event.stage_id() {
+            if run.stage(stage_id).is_none() {
+                return Err(StoreError::EventStageMismatch {
+                    event_id: event.id(),
+                    stage_id: stage_id.clone(),
+                });
+            }
+        }
+        if event.occurred_at() < &last {
+            return Err(StoreError::EventTimestampRegression {
+                event_id: event.id(),
+                previous: last,
+                occurred_at: *event.occurred_at(),
+            });
+        }
+        last = *event.occurred_at();
+    }
+    if &last != run.updated_at() {
+        return Err(StoreError::EventStateTimestampMismatch);
+    }
+    Ok(())
+}
+
+fn insert_events(
+    transaction: &Transaction<'_>,
+    run: &Run,
+    events: &[DomainEvent],
+    first_sequence: u64,
+) -> Result<(), StoreError> {
+    for (offset, event) in events.iter().enumerate() {
+        let offset = u64::try_from(offset).map_err(|_| StoreError::IntegerRange("event offset"))?;
+        let sequence = first_sequence
+            .checked_add(offset)
+            .ok_or(StoreError::IntegerRange("event sequence"))?;
+        let payload_json = serde_json::to_string(event)?;
+        transaction.execute(
+            "INSERT INTO events (
+                 run_id, sequence, event_id, event_type, payload_json, occurred_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run.id().to_string(),
+                u64_to_i64(sequence, "event sequence")?,
+                event.id().to_string(),
+                event_type_text(event)?,
+                payload_json,
+                format_timestamp(event.occurred_at()),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn run_exists(connection: &Connection, run_id: RunId) -> Result<bool, StoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM runs WHERE id = ?1",
+            [run_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn enum_text(value: &impl Serialize) -> Result<String, StoreError> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or(StoreError::SnapshotProjectionMismatch(
+            "enum did not serialize as text",
+        ))
+}
+
+fn enum_from_text<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, StoreError> {
+    Ok(serde_json::from_value(serde_json::Value::String(
+        value.to_owned(),
+    ))?)
+}
+
+fn event_type_text(event: &DomainEvent) -> Result<String, StoreError> {
+    serde_json::to_value(event)?
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or(StoreError::EventProjectionMismatch("serialized event type"))
+}
+
+fn format_timestamp(timestamp: &DateTime<Utc>) -> String {
+    timestamp.to_rfc3339()
+}
+
+fn parse_timestamp(timestamp: &str) -> Result<DateTime<Utc>, StoreError> {
+    Ok(DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc))
+}
+
+fn i64_to_u64(value: i64, field: &'static str) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| StoreError::IntegerRange(field))
+}
+
+fn i64_to_u32(value: i64, field: &'static str) -> Result<u32, StoreError> {
+    u32::try_from(value).map_err(|_| StoreError::IntegerRange(field))
+}
+
+fn u64_to_i64(value: u64, field: &'static str) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| StoreError::IntegerRange(field))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use rusqlite::ErrorCode;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::domain::{
+        AttentionKind, AttentionRequest, AttentionRequestId, Dependency, EventId, EventMetadata,
+        Role, RunTransition, StageDefinition, StageId, StageKind, StageTransition,
+        WorkflowDefinition,
+    };
+
+    fn at(second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 14, 8, 0, second)
+            .single()
+            .unwrap()
+    }
+
+    fn metadata(id: u128, second: u32) -> EventMetadata {
+        EventMetadata::new(EventId::from_u128(id), at(second))
+    }
+
+    fn stage_id(value: &str) -> StageId {
+        StageId::new(value).unwrap()
+    }
+
+    fn config(id: &str) -> ResolvedConfigSnapshot {
+        ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new(id).unwrap(),
+            1,
+            json!({
+                "providers": {"review": "fake"},
+                "limits": {"parallel": 2, "budget": 1000}
+            }),
+            at(0),
+        )
+        .unwrap()
+    }
+
+    fn workflow() -> WorkflowDefinition {
+        WorkflowDefinition::new(
+            WorkflowKind::Deep,
+            vec![
+                StageDefinition::new(
+                    stage_id("research"),
+                    StageKind::Research,
+                    Role::Researcher,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    stage_id("probe"),
+                    StageKind::DeepAnalysis,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    stage_id("optional_review"),
+                    StageKind::Review,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    stage_id("implementation"),
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    vec![
+                        Dependency::required(stage_id("research")),
+                        Dependency::optional(stage_id("probe")),
+                        Dependency::optional(stage_id("optional_review")),
+                    ],
+                ),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "acceptance fixture intentionally shows every persisted lifecycle transition"
+    )]
+    fn complex_run(run_value: u128, config_id: &str, event_base: u128) -> (Run, Vec<DomainEvent>) {
+        let mut run = Run::new(
+            RunId::from_u128(run_value),
+            "persist a complex aggregate",
+            workflow(),
+            ConfigSnapshotId::new(config_id).unwrap(),
+            at(0),
+        )
+        .unwrap();
+        let mut events = vec![run.created_event(metadata(event_base, 0))];
+        events.push(
+            run.transition(RunTransition::BeginPreparation, metadata(event_base + 1, 1))
+                .unwrap(),
+        );
+        events.push(
+            run.transition(
+                RunTransition::FinishPreparation,
+                metadata(event_base + 2, 2),
+            )
+            .unwrap(),
+        );
+        events.push(
+            run.transition(RunTransition::Start, metadata(event_base + 3, 3))
+                .unwrap(),
+        );
+
+        let research = stage_id("research");
+        events.push(
+            run.transition_stage(
+                &research,
+                StageTransition::MarkReady,
+                metadata(event_base + 4, 4),
+            )
+            .unwrap(),
+        );
+        events.push(
+            run.transition_stage(
+                &research,
+                StageTransition::Start,
+                metadata(event_base + 5, 5),
+            )
+            .unwrap(),
+        );
+        events.push(
+            run.transition_stage(
+                &research,
+                StageTransition::Complete,
+                metadata(event_base + 6, 6),
+            )
+            .unwrap(),
+        );
+
+        let probe = stage_id("probe");
+        events.push(
+            run.transition_stage(
+                &probe,
+                StageTransition::MarkReady,
+                metadata(event_base + 7, 7),
+            )
+            .unwrap(),
+        );
+        events.push(
+            run.transition_stage(&probe, StageTransition::Start, metadata(event_base + 8, 8))
+                .unwrap(),
+        );
+        events.push(
+            run.transition_stage(&probe, StageTransition::Fail, metadata(event_base + 9, 9))
+                .unwrap(),
+        );
+
+        events.push(
+            run.transition_stage(
+                &stage_id("optional_review"),
+                StageTransition::Skip,
+                metadata(event_base + 10, 10),
+            )
+            .unwrap(),
+        );
+        let implementation = stage_id("implementation");
+        events.push(
+            run.transition_stage(
+                &implementation,
+                StageTransition::MarkReady,
+                metadata(event_base + 11, 11),
+            )
+            .unwrap(),
+        );
+        events.push(
+            run.transition_stage(
+                &implementation,
+                StageTransition::Start,
+                metadata(event_base + 12, 12),
+            )
+            .unwrap(),
+        );
+        let request_id = AttentionRequestId::from_u128(run_value + 500);
+        events.push(
+            run.request_attention(
+                AttentionRequest::new(
+                    request_id,
+                    run.id(),
+                    implementation,
+                    AttentionKind::Decision,
+                    "Choose recovery policy",
+                    at(13),
+                )
+                .unwrap(),
+                metadata(event_base + 13, 13),
+            )
+            .unwrap(),
+        );
+        events.push(
+            run.resolve_attention(request_id, metadata(event_base + 14, 14))
+                .unwrap(),
+        );
+        events.push(
+            run.transition(RunTransition::Pause, metadata(event_base + 15, 15))
+                .unwrap(),
+        );
+        events.push(
+            run.transition(RunTransition::Resume, metadata(event_base + 16, 16))
+                .unwrap(),
+        );
+        events.push(
+            run.transition(RunTransition::Interrupt, metadata(event_base + 17, 17))
+                .unwrap(),
+        );
+        (run, events)
+    }
+
+    fn database(temp: &TempDir) -> std::path::PathBuf {
+        temp.path().join("nested").join("polycode.db")
+    }
+
+    fn create_complex(
+        store: &mut SqliteStore,
+        run_value: u128,
+        config_id: &str,
+        event_base: u128,
+    ) -> (Run, Vec<DomainEvent>, ResolvedConfigSnapshot) {
+        let config = config(config_id);
+        let (run, events) = complex_run(run_value, config_id, event_base);
+        store.create_run(&run, &config, &events).unwrap();
+        (run, events, config)
+    }
+
+    #[test]
+    fn migration_enables_constraints_and_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let path = database(&temp);
+        let store = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(
+            store.schema_version().unwrap(),
+            migrations::DATABASE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let tables = store
+            .connection
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('runs', 'events', 'config_snapshots')
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(tables, vec!["config_snapshots", "events", "runs"]);
+        drop(store);
+
+        let reopened = SqliteStore::open(path).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), 1);
+    }
+
+    #[test]
+    fn future_database_schema_version_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let path = database(&temp);
+        let store = SqliteStore::open(&path).unwrap();
+        store
+            .connection
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        drop(store);
+
+        assert!(matches!(
+            SqliteStore::open(path),
+            Err(StoreError::UnsupportedDatabaseVersion(99))
+        ));
+    }
+
+    #[test]
+    fn complex_run_round_trips_after_reopen_with_event_history_and_config() {
+        let temp = TempDir::new().unwrap();
+        let path = database(&temp);
+        let (original, original_events, original_config) = {
+            let mut store = SqliteStore::open(&path).unwrap();
+            create_complex(&mut store, 100, "config-complex", 1_000)
+        };
+
+        let mut store = SqliteStore::open(path).unwrap();
+        let restored = store.load_run(original.id()).unwrap();
+        let stored_events = store.load_events(original.id()).unwrap();
+
+        assert_eq!(restored.run, original);
+        assert_eq!(restored.revision, RunRevision::initial());
+        assert_eq!(restored.config_snapshot, original_config);
+        assert_eq!(
+            stored_events
+                .iter()
+                .map(|item| item.event.clone())
+                .collect::<Vec<_>>(),
+            original_events
+        );
+        assert_eq!(stored_events.last().unwrap().sequence, 18);
+    }
+
+    #[test]
+    fn multiple_runs_list_and_sequence_independently() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (first, _, shared_config) = create_complex(&mut store, 200, "shared-config", 2_000);
+        let (second, second_events) = complex_run(201, "shared-config", 3_000);
+        store
+            .create_run(&second, &shared_config, &second_events)
+            .unwrap();
+
+        let summaries = store.list_runs().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(store.load_events(first.id()).unwrap()[0].sequence, 1);
+        assert_eq!(store.load_events(second.id()).unwrap()[0].sequence, 1);
+        assert_eq!(store.load_run(first.id()).unwrap().run, first);
+        assert_eq!(store.load_run(second.id()).unwrap().run, second);
+    }
+
+    #[test]
+    fn immutable_config_rejects_changed_payload_and_preserves_original() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let original = config("immutable");
+        store.insert_config_snapshot(&original).unwrap();
+        store.insert_config_snapshot(&original).unwrap();
+        let direct_update = store.connection.execute(
+            "UPDATE config_snapshots SET payload_json = '{}' WHERE id = ?1",
+            [original.id().as_str()],
+        );
+        assert!(matches!(
+            direct_update,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == ErrorCode::ConstraintViolation
+        ));
+        let changed = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("immutable").unwrap(),
+            1,
+            json!({"different": true}),
+            at(1),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.insert_config_snapshot(&changed),
+            Err(StoreError::ConfigSnapshotConflict(_))
+        ));
+        assert_eq!(
+            store
+                .load_config_snapshot(&ConfigSnapshotId::new("immutable").unwrap())
+                .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn corrupted_config_hash_is_rejected_on_load() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let original = config("bad-hash");
+        store.insert_config_snapshot(&original).unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER config_snapshots_no_update")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE config_snapshots SET content_hash = ?1 WHERE id = ?2",
+                params!["0".repeat(64), original.id().as_str()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.load_config_snapshot(original.id()),
+            Err(StoreError::InvalidConfigHash(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_snapshot_json_never_constructs_run() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 300, "corrupt-json", 4_000);
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET snapshot_json = '{' WHERE id = ?1",
+                [run.id().to_string()],
+            )
+            .unwrap();
+
+        assert!(matches!(store.load_run(run.id()), Err(StoreError::Json(_))));
+    }
+
+    #[test]
+    fn unknown_snapshot_version_is_rejected_before_rehydration() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 301, "future-version", 5_000);
+        let snapshot_json: String = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM runs WHERE id = ?1",
+                [run.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+        snapshot["schema_version"] = json!(99);
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET snapshot_schema_version = 99, snapshot_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&snapshot).unwrap(),
+                    run.id().to_string()
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.load_run(run.id()),
+            Err(StoreError::UnsupportedSnapshotVersion(99))
+        ));
+    }
+
+    #[test]
+    fn semantically_invalid_snapshot_is_rejected_by_domain_rehydration() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 302, "invalid-domain", 6_000);
+        let snapshot_json: String = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM runs WHERE id = ?1",
+                [run.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+        snapshot["status"] = json!("completed");
+        snapshot["suspended_from"] = serde_json::Value::Null;
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET status = 'completed', snapshot_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&snapshot).unwrap(),
+                    run.id().to_string()
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.load_run(run.id()),
+            Err(StoreError::Rehydration(_))
+        ));
+    }
+
+    #[test]
+    fn advanced_stage_with_invalid_dependency_is_rejected() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 303, "bad-dependency", 6_500);
+        let snapshot_json: String = store
+            .connection
+            .query_row(
+                "SELECT snapshot_json FROM runs WHERE id = ?1",
+                [run.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut snapshot: serde_json::Value = serde_json::from_str(&snapshot_json).unwrap();
+        let stages = snapshot["stages"].as_array_mut().unwrap();
+        let probe = stages
+            .iter_mut()
+            .find(|stage| stage["id"] == "probe")
+            .unwrap();
+        probe["status"] = json!("pending");
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET snapshot_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&snapshot).unwrap(),
+                    run.id().to_string()
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.load_run(run.id()),
+            Err(StoreError::Rehydration(_))
+        ));
+    }
+
+    #[test]
+    fn event_insert_failure_rolls_state_and_revision_back() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (original, _, _) = create_complex(&mut store, 400, "atomic", 7_000);
+        let loaded = store.load_run(original.id()).unwrap();
+        let before_events = store.load_events(original.id()).unwrap();
+        let duplicate_id = before_events[0].event.id();
+        let mut candidate = loaded.run.clone();
+        let duplicate_event = candidate
+            .transition(
+                RunTransition::Recover,
+                EventMetadata::new(duplicate_id, at(18)),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.commit_run_update(&candidate, loaded.revision, &[duplicate_event]),
+            Err(StoreError::Sqlite(_))
+        ));
+        let restored = store.load_run(original.id()).unwrap();
+        assert_eq!(restored.run, original);
+        assert_eq!(restored.revision, RunRevision::initial());
+        assert_eq!(store.load_events(original.id()).unwrap(), before_events);
+    }
+
+    #[test]
+    fn stale_writer_gets_concurrent_modification() {
+        let temp = TempDir::new().unwrap();
+        let path = database(&temp);
+        let run_id = {
+            let mut creator = SqliteStore::open(&path).unwrap();
+            create_complex(&mut creator, 500, "concurrent", 8_000)
+                .0
+                .id()
+        };
+        let mut first_store = SqliteStore::open(&path).unwrap();
+        let mut second_store = SqliteStore::open(&path).unwrap();
+        let first_loaded = first_store.load_run(run_id).unwrap();
+        let second_loaded = second_store.load_run(run_id).unwrap();
+        let mut first_candidate = first_loaded.run;
+        let first_event = first_candidate
+            .transition(RunTransition::Recover, metadata(8_100, 18))
+            .unwrap();
+        let mut second_candidate = second_loaded.run;
+        let second_event = second_candidate
+            .transition(RunTransition::Recover, metadata(8_101, 18))
+            .unwrap();
+
+        let committed = first_store
+            .commit_run_update(&first_candidate, first_loaded.revision, &[first_event])
+            .unwrap();
+        assert_eq!(committed.revision().value(), 1);
+        assert!(matches!(
+            second_store.commit_run_update(
+                &second_candidate,
+                second_loaded.revision,
+                &[second_event]
+            ),
+            Err(StoreError::ConcurrentModification { expected: 0, .. })
+        ));
+        assert_eq!(second_store.load_run(run_id).unwrap().run, first_candidate);
+    }
+
+    #[test]
+    fn equal_timestamps_append_in_contiguous_order() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (original, _, _) = create_complex(&mut store, 600, "same-time", 9_000);
+        let loaded = store.load_run(original.id()).unwrap();
+        let mut candidate = loaded.run;
+        let recover = candidate
+            .transition(RunTransition::Recover, metadata(9_100, 18))
+            .unwrap();
+        let pause = candidate
+            .transition(RunTransition::Pause, metadata(9_101, 18))
+            .unwrap();
+
+        let committed = store
+            .commit_run_update(&candidate, loaded.revision, &[recover, pause])
+            .unwrap();
+        let events = store.load_events(original.id()).unwrap();
+        assert_eq!(committed.last_sequence(), 20);
+        assert_eq!(
+            events[18].event.occurred_at(),
+            events[19].event.occurred_at()
+        );
+        assert_eq!(events[18].sequence, 19);
+        assert_eq!(events[19].sequence, 20);
+    }
+
+    #[test]
+    fn timestamp_regression_is_rejected_even_when_domain_candidate_is_valid() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (original, _, _) = create_complex(&mut store, 601, "time-regression", 9_500);
+        let loaded = store.load_run(original.id()).unwrap();
+        let mut candidate = loaded.run;
+        let backdated = candidate
+            .transition(RunTransition::Recover, metadata(9_600, 16))
+            .unwrap();
+
+        assert!(matches!(
+            store.commit_run_update(&candidate, loaded.revision, &[backdated]),
+            Err(StoreError::EventTimestampRegression { .. })
+        ));
+        assert_eq!(store.load_run(original.id()).unwrap().run, original);
+    }
+
+    #[test]
+    fn duplicate_sequence_and_missing_foreign_key_fail_at_database_boundary() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 700, "constraints", 10_000);
+        let first_payload: String = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM events WHERE run_id = ?1 AND sequence = 1",
+                [run.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let duplicate = store.connection.execute(
+            "INSERT INTO events (run_id, sequence, event_id, event_type, payload_json, occurred_at)
+             VALUES (?1, 1, ?2, 'run_created', ?3, ?4)",
+            params![
+                run.id().to_string(),
+                EventId::from_u128(99_999).to_string(),
+                first_payload,
+                format_timestamp(&at(0)),
+            ],
+        );
+        assert!(matches!(
+            duplicate,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == ErrorCode::ConstraintViolation
+        ));
+
+        let foreign_key = store.connection.execute(
+            "INSERT INTO events (run_id, sequence, event_id, event_type, payload_json, occurred_at)
+             VALUES (?1, 1, ?2, 'run_created', '{}', ?3)",
+            params![
+                RunId::from_u128(999).to_string(),
+                EventId::from_u128(100_000).to_string(),
+                format_timestamp(&at(0)),
+            ],
+        );
+        assert!(matches!(
+            foreign_key,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == ErrorCode::ConstraintViolation
+        ));
+    }
+}

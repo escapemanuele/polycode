@@ -4,14 +4,14 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository currently contains **Milestone 1: Domain Model and State Machine**. Execution and persistence remain future work.
+Polycode is early-stage software. This repository currently contains **Milestone 2: Persistence / SQLite**: validated domain state from Milestone 1 plus synchronous, restart-safe local persistence. Workflow execution remains future work.
 
 ## Principles
 
 - Native coding-agent CLIs remain first-class providers.
 - Role, provider, and model are separate concepts.
 - Workflow behavior is explicit and testable.
-- Machine state will be canonical in local SQLite; artifacts remain human-readable.
+- Machine state is canonical in local SQLite; artifacts remain human-readable.
 - Every implementation run will use an isolated Git worktree and require explicit apply.
 - Defaults should be useful without turning Polycode into a generic agent framework.
 
@@ -24,7 +24,7 @@ polycode doctor
 polycode runs
 ```
 
-`doctor` and `runs` expose honest bootstrap placeholders. Milestone 1 is importable as `polycode::domain`; provider detection arrives with provider work and run persistence arrives in Milestone 2.
+`doctor` reports resolved config/database paths and existing schema version without creating a missing database. `runs` opens the local store and lists indexed run summaries. Domain and persistence APIs are importable as `polycode::domain` and `polycode::store`; provider detection arrives with provider work.
 
 ## Build
 
@@ -58,9 +58,17 @@ Resolution order:
 
 Repository overrides will eventually live at `<repo>/.polycode.toml`. Current code resolves paths but does not read or create configuration files.
 
+Default SQLite path:
+
+```text
+~/.polycode/polycode.db
+```
+
+Set `POLYCODE_DATA_DIR` to override its parent directory. Path resolution is side-effect free; opening the store creates the directory/database and applies schema migrations. SQLite stores immutable resolved configuration separately from versioned run snapshots and semantic events.
+
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Future milestone descriptions are design constraints, not claims of implemented behavior.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Milestone 3+ descriptions are design constraints, not claims of implemented behavior.
 
 ## License
 

@@ -6,6 +6,7 @@ mod artifact;
 mod attention;
 mod event;
 mod ids;
+mod rehydration;
 mod role;
 mod run;
 mod stage;
@@ -18,12 +19,17 @@ pub use ids::{
     ArtifactId, AttentionRequestId, ConfigSnapshotId, EventId, IdError, ModelId, ProviderId,
     ProviderSessionId, RunId, StageId,
 };
+pub use rehydration::{
+    RunRehydrationData, RunResumeStatus, StageRehydrationData, StageResumeStatus,
+    StageSuspensionOwner,
+};
 pub use role::Role;
 pub use run::{
     CompletionBlocker, CompletionBlockerReason, Run, RunAttentionError, RunCreationError,
-    RunInvariantError, RunStageError, RunStatus, RunTransition, RunTransitionError,
+    RunInvariantError, RunRehydrationError, RunStageError, RunStatus, RunTransition,
+    RunTransitionError,
 };
-pub use stage::{Stage, StageStatus, StageTransition, StageTransitionError};
+pub use stage::{Stage, StageRehydrationError, StageStatus, StageTransition, StageTransitionError};
 pub use workflow::{
     Dependency, DependencyKind, StageDefinition, StageKind, WorkflowDefinition,
     WorkflowDefinitionError, WorkflowKind,
