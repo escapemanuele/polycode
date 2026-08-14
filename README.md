@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository currently contains **Milestone 0: Bootstrap** only.
+Polycode is early-stage software. This repository currently contains **Milestone 1: Domain Model and State Machine**. Execution and persistence remain future work.
 
 ## Principles
 
@@ -24,7 +24,7 @@ polycode doctor
 polycode runs
 ```
 
-`doctor` and `runs` expose honest bootstrap placeholders. Provider detection arrives with provider work; run persistence arrives in Milestone 2.
+`doctor` and `runs` expose honest bootstrap placeholders. Milestone 1 is importable as `polycode::domain`; provider detection arrives with provider work and run persistence arrives in Milestone 2.
 
 ## Build
 
@@ -56,7 +56,7 @@ Resolution order:
 2. `$XDG_CONFIG_HOME/polycode/config.toml`
 3. `$HOME/.config/polycode/config.toml`
 
-Repository overrides will eventually live at `<repo>/.polycode.toml`. Milestone 0 resolves paths but does not read or create configuration files.
+Repository overrides will eventually live at `<repo>/.polycode.toml`. Current code resolves paths but does not read or create configuration files.
 
 ## Architecture
 

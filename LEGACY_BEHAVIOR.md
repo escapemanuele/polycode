@@ -116,10 +116,10 @@ Polycode preserves behavior above but does not copy these implementation choices
 - generated provider hook files as cross-system event source of truth
 - broad shell cleanup based on generated-file globs
 
-## Milestone 1 decisions surfaced
+## Milestone 1 resolutions
 
-- Model explicit `Paused` run status, or document why user-requested stop maps to `Interrupted`. They carry different intent; explicit `Paused` is preferred.
-- Decide whether `Ready` is persisted run state or derived from prepared stages. Prefer deriving readiness unless recovery needs an atomic prepared boundary.
+- `Paused` and `Interrupted` are explicit at run and stage level. They preserve deliberate-resume versus unexpected-recovery intent.
+- `Ready` is explicit for both runs and stages, providing atomic prepared and dependency-validated boundaries for recovery.
 - Treat `Cleaned` as an artifact-retention operation, not core run lifecycle status.
-- Encode optional dependency outcomes so synthesis can proceed after unavailable, skipped, or failed optional reviewers while retaining evidence of degradation.
-- Persist immutable effective run configuration separately from mutable user/repository configuration.
+- Optional dependency outcomes can produce degraded readiness after optional predecessors fail or skip; required dependencies still require completion.
+- Each run owns an immutable effective configuration snapshot identity, separate from mutable user/repository configuration.

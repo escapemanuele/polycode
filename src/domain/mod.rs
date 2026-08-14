@@ -1,0 +1,30 @@
+//! Explicit, provider-neutral state for recoverable orchestration.
+//!
+//! Domain types contain no persistence, process, network, Git, or UI behavior.
+
+mod artifact;
+mod attention;
+mod event;
+mod ids;
+mod role;
+mod run;
+mod stage;
+mod workflow;
+
+pub use artifact::{ArtifactKind, ArtifactMetadata, ArtifactStatus};
+pub use attention::{AttentionError, AttentionKind, AttentionRequest, AttentionStatus};
+pub use event::{DomainEvent, DomainEventKind, EventMetadata};
+pub use ids::{
+    ArtifactId, AttentionRequestId, ConfigSnapshotId, EventId, IdError, ModelId, ProviderId,
+    ProviderSessionId, RunId, StageId,
+};
+pub use role::Role;
+pub use run::{
+    CompletionBlocker, CompletionBlockerReason, Run, RunAttentionError, RunCreationError,
+    RunInvariantError, RunStageError, RunStatus, RunTransition, RunTransitionError,
+};
+pub use stage::{Stage, StageStatus, StageTransition, StageTransitionError};
+pub use workflow::{
+    Dependency, DependencyKind, StageDefinition, StageKind, WorkflowDefinition,
+    WorkflowDefinitionError, WorkflowKind,
+};
