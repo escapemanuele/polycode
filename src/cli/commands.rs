@@ -6,11 +6,16 @@ use crate::app::{
     RunService,
 };
 use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
+use crate::process::ProcessBackend;
 
 use super::{Cli, Command, RunArgs};
 
 pub fn execute(command: Option<&Command>) -> Result<()> {
     match command {
+        Some(Command::RunProcess { manifest }) => {
+            crate::process::run_managed_process(manifest)?;
+            Ok(())
+        }
         Some(Command::Doctor) => doctor(),
         Some(Command::Runs) => runs(),
         Some(Command::Fast(args)) => start(WorkflowKind::Fast, args),
@@ -79,7 +84,7 @@ fn doctor() -> Result<()> {
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
-    println!("  status: Milestone 5 CLI vertical slice");
+    println!("  status: Milestone 6 managed process infrastructure");
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {
@@ -89,6 +94,12 @@ fn doctor() -> Result<()> {
         println!("  database schema: not initialized");
     }
     println!("  provider: fake (development only; explicit selection required)");
+    let tmux = crate::process::TmuxBackend::new(std::env::current_exe()?);
+    match tmux.availability() {
+        Ok(availability) => println!("  tmux: available ({})", availability.version),
+        Err(crate::process::ProcessError::TmuxNotFound) => println!("  tmux: unavailable"),
+        Err(error) => println!("  tmux: error ({error})"),
+    }
     Ok(())
 }
 

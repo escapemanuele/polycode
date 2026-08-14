@@ -1,0 +1,494 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+
+use crate::domain::{RunId, StageId};
+use crate::store::{SqliteStore, process_root};
+
+use super::{
+    BackendSessionState, ExitResult, ManagedProcess, ManagedProcessId, ManagedProcessStatus,
+    OutputChunk, OutputCursor, OutputStream, ProcessBackend, ProcessError, ProcessInspection,
+    ProcessSpec, TmuxBackend,
+};
+
+const INTERRUPT_POLLS: usize = 100;
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+pub struct ProcessManager<B> {
+    root: PathBuf,
+    backend: B,
+}
+
+impl<B: ProcessBackend> ProcessManager<B> {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>, backend: B) -> Self {
+        Self {
+            root: root.into(),
+            backend,
+        }
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Persists one launch intent before creating files or backend resources.
+    ///
+    /// # Errors
+    /// Rejects invalid run/stage/workspace/apply state, duplicate attempts,
+    /// malformed commands, or filesystem/persistence failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        stage_id: StageId,
+        attempt: u32,
+        executable: impl Into<PathBuf>,
+        argv: Vec<OsString>,
+        environment: BTreeMap<OsString, OsString>,
+    ) -> Result<ManagedProcess, ProcessError> {
+        let workspace = store.load_workspace(run_id)?.ok_or(
+            crate::store::StoreError::ExecutionWorkspaceNotReady {
+                run_id,
+                status: None,
+            },
+        )?;
+        let process_id = ManagedProcessId::new();
+        let directory = self.process_directory(run_id, process_id);
+        let spec = ProcessSpec::new(
+            executable,
+            argv,
+            workspace.worktree_path(),
+            environment,
+            directory.join("stdout.log"),
+            directory.join("stderr.log"),
+        )?;
+        let process = ManagedProcess::preparing(
+            process_id,
+            run_id,
+            stage_id,
+            attempt,
+            self.backend.kind().to_owned(),
+            self.backend.session_id(process_id),
+            spec,
+            now(),
+        )?;
+        let persisted = store.insert_managed_process_intent(&process)?;
+        Self::materialize(&persisted)?;
+        Ok(persisted)
+    }
+
+    /// Claims and starts one prepared process exactly once per observed revision.
+    ///
+    /// # Errors
+    /// Returns concurrency, ownership, backend, or reconciliation failures.
+    pub fn start(
+        &self,
+        store: &mut SqliteStore,
+        process_id: ManagedProcessId,
+    ) -> Result<ProcessInspection, ProcessError> {
+        let inspection = self.reconcile(store, process_id)?;
+        let process = inspection.process;
+        if process.backend_kind() != self.backend.kind() {
+            return Err(ProcessError::InvalidStoredProcess("backend kind mismatch"));
+        }
+        if process.status() != ManagedProcessStatus::Preparing {
+            return self.inspection(
+                process,
+                inspection.backend_session,
+                inspection.exit_evidence,
+            );
+        }
+        Self::materialize(&process)?;
+        let expected = process.revision();
+        let mut starting = process;
+        starting.transition(ManagedProcessStatus::Starting, now(), None, None)?;
+        let starting = store.update_managed_process(&starting, expected, true)?;
+        if let Err(error) = self
+            .backend
+            .start(&starting, &Self::manifest_path(&starting)?)
+        {
+            Self::persist_broken(store, &starting, "backend start failed")?;
+            return Err(error);
+        }
+        self.reconcile(store, process_id)
+    }
+
+    /// Returns reconciled process and infrastructure evidence.
+    ///
+    /// # Errors
+    /// Returns persistence, ownership, backend, evidence, or filesystem failures.
+    pub fn inspect(
+        &self,
+        store: &mut SqliteStore,
+        process_id: ManagedProcessId,
+    ) -> Result<ProcessInspection, ProcessError> {
+        self.reconcile(store, process_id)
+    }
+
+    /// Reconciles persisted intent against exit file and owned backend session.
+    ///
+    /// # Errors
+    /// Persists safe broken state for corrupt/foreign evidence, then returns typed failure.
+    pub fn reconcile(
+        &self,
+        store: &mut SqliteStore,
+        process_id: ManagedProcessId,
+    ) -> Result<ProcessInspection, ProcessError> {
+        let mut process = store.load_managed_process(process_id)?;
+        if process.backend_kind() != self.backend.kind() {
+            return Err(ProcessError::InvalidStoredProcess("backend kind mismatch"));
+        }
+        if process.status() == ManagedProcessStatus::Preparing {
+            if let Err(error) = Self::materialize(&process) {
+                Self::persist_broken(store, &process, "process files conflict")?;
+                return Err(error);
+            }
+        }
+
+        let exit = match self.backend.read_exit_evidence(&process) {
+            Ok(exit) => exit,
+            Err(error) => {
+                Self::persist_broken(store, &process, "invalid exit evidence")?;
+                return Err(error);
+            }
+        };
+        let backend_session = match self.backend.inspect_session(&process) {
+            Ok(session) => session,
+            Err(error) => {
+                Self::persist_broken(store, &process, "backend ownership mismatch")?;
+                return Err(error);
+            }
+        };
+
+        if let Some(evidence) = exit.as_ref() {
+            let target = match evidence.result() {
+                ExitResult::RunnerError { message } => {
+                    if can_mark_broken(process.status()) {
+                        let expected = process.revision();
+                        process.transition(
+                            ManagedProcessStatus::Broken,
+                            now(),
+                            None,
+                            Some(message.clone()),
+                        )?;
+                        process = store.update_managed_process(&process, expected, false)?;
+                    }
+                    ManagedProcessStatus::Broken
+                }
+                ExitResult::ExitCode { .. } | ExitResult::Signal { .. } => {
+                    if process.interrupt_requested() {
+                        ManagedProcessStatus::Interrupted
+                    } else {
+                        ManagedProcessStatus::Exited
+                    }
+                }
+            };
+            if target != ManagedProcessStatus::Broken
+                && !matches!(
+                    process.status(),
+                    ManagedProcessStatus::Exited
+                        | ManagedProcessStatus::Interrupted
+                        | ManagedProcessStatus::Cleaned
+                )
+            {
+                let expected = process.revision();
+                process.transition(target, now(), Some(evidence), None)?;
+                process = store.update_managed_process(&process, expected, false)?;
+            }
+        } else {
+            match (process.status(), backend_session) {
+                (
+                    ManagedProcessStatus::Preparing | ManagedProcessStatus::Starting,
+                    BackendSessionState::Owned,
+                ) => {
+                    let expected = process.revision();
+                    process.transition(ManagedProcessStatus::Running, now(), None, None)?;
+                    process = store.update_managed_process(&process, expected, false)?;
+                }
+                (ManagedProcessStatus::Missing, BackendSessionState::Owned) => {
+                    let expected = process.revision();
+                    let target = if process.interrupt_requested() {
+                        ManagedProcessStatus::Interrupting
+                    } else {
+                        ManagedProcessStatus::Running
+                    };
+                    process.transition(target, now(), None, None)?;
+                    process = store.update_managed_process(&process, expected, false)?;
+                }
+                (
+                    ManagedProcessStatus::Starting
+                    | ManagedProcessStatus::Running
+                    | ManagedProcessStatus::Interrupting,
+                    BackendSessionState::Absent,
+                ) => {
+                    let expected = process.revision();
+                    process.transition(
+                        ManagedProcessStatus::Missing,
+                        now(),
+                        None,
+                        Some("owned tmux session absent without exit evidence".to_owned()),
+                    )?;
+                    process = store.update_managed_process(&process, expected, false)?;
+                }
+                _ => {}
+            }
+        }
+        self.inspection(process, backend_session, exit)
+    }
+
+    /// Reads raw unacknowledged bytes. Durable cursor is unchanged.
+    ///
+    /// # Errors
+    /// Rejects invalid sizes, truncation, or I/O failures.
+    pub fn read_output(
+        &self,
+        store: &SqliteStore,
+        process_id: ManagedProcessId,
+        stream: OutputStream,
+        max_bytes: usize,
+    ) -> Result<OutputChunk, ProcessError> {
+        let process = store.load_managed_process(process_id)?;
+        let cursor = process.cursor(stream);
+        self.backend
+            .read_output(&process, stream, cursor.offset(), max_bytes)
+    }
+
+    /// Advances one stream cursor after consumer durably accepts bytes.
+    ///
+    /// # Errors
+    /// Rejects stale cursors, out-of-chunk offsets, output truncation, or `SQLite` failures.
+    pub fn acknowledge_output(
+        &self,
+        store: &mut SqliteStore,
+        chunk: &OutputChunk,
+        acknowledged_end: u64,
+    ) -> Result<OutputCursor, ProcessError> {
+        let process = store.load_managed_process(chunk.process_id())?;
+        let length = self.backend.output_length(&process, chunk.stream())?;
+        if length < acknowledged_end {
+            return Err(ProcessError::OutputTruncated(process.id()));
+        }
+        store.acknowledge_process_output(chunk, acknowledged_end)
+    }
+
+    /// Persists interrupt intent, sends Ctrl-C, and waits bounded time for evidence.
+    ///
+    /// # Errors
+    /// Rejects invalid status, foreign ownership, persistence failures, or timeout.
+    pub fn interrupt(
+        &self,
+        store: &mut SqliteStore,
+        process_id: ManagedProcessId,
+    ) -> Result<ProcessInspection, ProcessError> {
+        let mut inspection = self.reconcile(store, process_id)?;
+        if matches!(
+            inspection.process.status(),
+            ManagedProcessStatus::Exited
+                | ManagedProcessStatus::Interrupted
+                | ManagedProcessStatus::Missing
+                | ManagedProcessStatus::Broken
+                | ManagedProcessStatus::Cleaned
+        ) {
+            return Ok(inspection);
+        }
+        if inspection.process.status() != ManagedProcessStatus::Running {
+            return Err(ProcessError::InvalidTransition {
+                from: inspection.process.status(),
+                to: ManagedProcessStatus::Interrupting,
+            });
+        }
+        let expected = inspection.process.revision();
+        inspection
+            .process
+            .transition(ManagedProcessStatus::Interrupting, now(), None, None)?;
+        let process = store.update_managed_process(&inspection.process, expected, false)?;
+        self.backend.interrupt(&process)?;
+
+        for _ in 0..INTERRUPT_POLLS {
+            inspection = self.reconcile(store, process_id)?;
+            if matches!(
+                inspection.process.status(),
+                ManagedProcessStatus::Interrupted
+                    | ManagedProcessStatus::Exited
+                    | ManagedProcessStatus::Broken
+            ) && !(inspection.process.status() == ManagedProcessStatus::Interrupted
+                && inspection.backend_session == BackendSessionState::Owned)
+            {
+                return Ok(inspection);
+            }
+            std::thread::sleep(INTERRUPT_POLL_INTERVAL);
+        }
+        inspection = self.reconcile(store, process_id)?;
+        if inspection.process.status() == ManagedProcessStatus::Missing {
+            return Ok(inspection);
+        }
+        Err(ProcessError::InterruptTimeout(process_id))
+    }
+
+    /// Removes owned backend session while preserving manifest and output history.
+    ///
+    /// # Errors
+    /// Rejects active processes, foreign sessions, or persistence/backend failures.
+    pub fn cleanup(
+        &self,
+        store: &mut SqliteStore,
+        process_id: ManagedProcessId,
+    ) -> Result<ProcessInspection, ProcessError> {
+        let inspection = self.reconcile(store, process_id)?;
+        if inspection.process.status() == ManagedProcessStatus::Cleaned {
+            return Ok(inspection);
+        }
+        if inspection.process.status().is_active() {
+            return Err(ProcessError::InvalidTransition {
+                from: inspection.process.status(),
+                to: ManagedProcessStatus::Cleaned,
+            });
+        }
+        self.backend.cleanup(&inspection.process)?;
+        let expected = inspection.process.revision();
+        let mut process = inspection.process;
+        process.transition(ManagedProcessStatus::Cleaned, now(), None, None)?;
+        let process = store.update_managed_process(&process, expected, false)?;
+        self.inspection(
+            process,
+            BackendSessionState::Absent,
+            inspection.exit_evidence,
+        )
+    }
+
+    fn process_directory(&self, run_id: RunId, process_id: ManagedProcessId) -> PathBuf {
+        self.root
+            .join(run_id.to_string())
+            .join("processes")
+            .join(process_id.to_string())
+    }
+
+    fn manifest_path(process: &ManagedProcess) -> Result<PathBuf, ProcessError> {
+        process
+            .spec()
+            .stdout_path()
+            .parent()
+            .map(|directory| directory.join("spec.json"))
+            .ok_or(ProcessError::InvalidSpec("stdout path has no parent"))
+    }
+
+    fn materialize(process: &ManagedProcess) -> Result<(), ProcessError> {
+        let manifest_path = Self::manifest_path(process)?;
+        let directory = manifest_path
+            .parent()
+            .ok_or(ProcessError::InvalidSpec("manifest path has no parent"))?;
+        std::fs::create_dir_all(directory)?;
+        let manifest = process.manifest_json()?;
+        write_immutable_file(&manifest_path, manifest.as_bytes())?;
+        touch_append_only(process.spec().stdout_path())?;
+        touch_append_only(process.spec().stderr_path())?;
+        Ok(())
+    }
+
+    fn inspection(
+        &self,
+        process: ManagedProcess,
+        backend_session: BackendSessionState,
+        exit_evidence: Option<super::ExitEvidence>,
+    ) -> Result<ProcessInspection, ProcessError> {
+        let stdout_length = self.backend.output_length(&process, OutputStream::Stdout)?;
+        let stderr_length = self.backend.output_length(&process, OutputStream::Stderr)?;
+        Ok(ProcessInspection {
+            process,
+            backend_session,
+            stdout_length,
+            stderr_length,
+            exit_evidence,
+        })
+    }
+
+    fn persist_broken(
+        store: &mut SqliteStore,
+        process: &ManagedProcess,
+        reason: &str,
+    ) -> Result<(), ProcessError> {
+        if !can_mark_broken(process.status()) {
+            return Ok(());
+        }
+        let expected = process.revision();
+        let mut broken = process.clone();
+        broken.transition(
+            ManagedProcessStatus::Broken,
+            now(),
+            None,
+            Some(reason.to_owned()),
+        )?;
+        store.update_managed_process(&broken, expected, false)?;
+        Ok(())
+    }
+}
+
+impl ProcessManager<TmuxBackend> {
+    /// Builds default tmux manager from Polycode data path and current executable.
+    ///
+    /// # Errors
+    /// Returns data-path or current-executable failures.
+    pub fn from_environment() -> Result<Self, ProcessError> {
+        Ok(Self::new(
+            process_root()?,
+            TmuxBackend::new(std::env::current_exe()?),
+        ))
+    }
+}
+
+fn write_immutable_file(path: &Path, bytes: &[u8]) -> Result<(), ProcessError> {
+    if path.exists() {
+        if std::fs::read(path)? == bytes {
+            return Ok(());
+        }
+        return Err(ProcessError::InvalidSpec(
+            "existing manifest differs from persisted intent",
+        ));
+    }
+    let directory = path
+        .parent()
+        .ok_or(ProcessError::InvalidSpec("manifest path has no parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(path) {
+        Ok(file) => file.sync_all()?,
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read(path)? != bytes {
+                return Err(ProcessError::InvalidSpec(
+                    "existing manifest differs from persisted intent",
+                ));
+            }
+        }
+        Err(error) => return Err(error.error.into()),
+    }
+    Ok(())
+}
+
+fn touch_append_only(path: &Path) -> Result<(), ProcessError> {
+    OpenOptions::new().create(true).append(true).open(path)?;
+    Ok(())
+}
+
+fn can_mark_broken(status: ManagedProcessStatus) -> bool {
+    matches!(
+        status,
+        ManagedProcessStatus::Preparing
+            | ManagedProcessStatus::Starting
+            | ManagedProcessStatus::Running
+            | ManagedProcessStatus::Interrupting
+            | ManagedProcessStatus::Missing
+    )
+}
+
+fn now() -> DateTime<Utc> {
+    std::time::SystemTime::now().into()
+}

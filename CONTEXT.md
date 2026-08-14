@@ -144,6 +144,38 @@ _Avoid_: Log line, provider callback
 A durable semantic record proving one provider signal was consumed, from which provider progress can continue without silently repeating accepted work.
 _Avoid_: In-memory cursor, artifact presence
 
+**Managed process**:
+A separately persisted infrastructure attempt that supervises one exact external command for one run stage without becoming run or stage state.
+_Avoid_: Provider session, stage execution, child handle
+
+**Managed process status**:
+The recoverable infrastructure condition of one external-command attempt. It does not determine semantic stage success or failure.
+_Avoid_: Stage status, provider outcome
+
+**Process backend**:
+A provider-independent supervisor boundary for starting, inspecting, interrupting, reading, and cleaning managed external processes.
+_Avoid_: Provider adapter, scheduler, tmux API in provider request
+
+**Backend session**:
+An opaque supervisor resource identity whose ownership must be proven before reuse, interruption, or cleanup.
+_Avoid_: Provider session, tmux name as domain identity
+
+**Command fingerprint**:
+An immutable SHA-256 identity of one managed launch specification and its run/stage/attempt binding, used for recovery evidence rather than authentication.
+_Avoid_: Secret hash, provider checkpoint
+
+**Output cursor**:
+A per-stream acknowledged byte offset advanced explicitly after durable consumption; reading alone never changes it.
+_Avoid_: File position, line number, provider checkpoint
+
+**Exit evidence**:
+An identity-bound durable record written when the supervised command ends, distinct from absence of its backend session.
+_Avoid_: Sentinel completion, tmux disappearance, stage outcome
+
+**Process reconciliation**:
+Validation of persisted process intent against owned backend session, output, runtime, and exit evidence, producing a safe current infrastructure status.
+_Avoid_: Blind relaunch, session-name inference
+
 **Role**:
 An engineering responsibility assigned to a stage, independent from provider and model selection.
 _Avoid_: Agent, model

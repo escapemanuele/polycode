@@ -17,6 +17,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install tmux process-backend prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+          tmux -V
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --test process_tmux --no-fail-fast
       - run: cargo test
