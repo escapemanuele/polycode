@@ -58,25 +58,27 @@ impl SqliteStore {
         ensure_execution_guard(&transaction, process.run_id())?;
         let inserted = transaction.execute(
             "INSERT INTO managed_processes (
-                 id, run_id, stage_id, attempt, backend_kind, backend_session_id,
+                 id, run_id, stage_id, attempt, invocation, backend_kind, backend_session_id,
                  status, spec_schema_version, spec_json, command_fingerprint,
                  stdout_offset, stdout_cursor_revision, stderr_offset,
                  stderr_cursor_revision, exit_code, term_signal, runner_error,
                  interrupt_requested, last_error, revision, created_at, updated_at,
                  started_at, finished_at
              ) VALUES (
-                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9,
-                 ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                 ?22, ?23
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                 ?24, ?25
              ) ON CONFLICT DO NOTHING",
             params![
                 process.id().to_string(),
                 process.run_id().to_string(),
                 process.stage_id().as_str(),
                 i64::from(process.attempt()),
+                i64::from(process.invocation()),
                 process.backend_kind(),
                 process.backend_session_id().as_str(),
                 process.status().as_str(),
+                i64::from(process.spec_schema_version()),
                 manifest,
                 process.command_fingerprint(),
                 u64_to_i64(
@@ -116,11 +118,13 @@ impl SqliteStore {
                 process.run_id(),
                 process.stage_id(),
                 process.attempt(),
+                process.invocation(),
             )? {
                 return Err(ProcessError::AttemptConflict {
                     run_id: process.run_id(),
                     stage_id: process.stage_id().clone(),
                     attempt: process.attempt(),
+                    invocation: process.invocation(),
                 });
             }
             return Err(ProcessError::InvalidStoredProcess(
@@ -157,7 +161,8 @@ impl SqliteStore {
             .connection
             .query_row(
                 "SELECT id FROM managed_processes
-                 WHERE run_id = ?1 AND stage_id = ?2 AND attempt = ?3",
+                 WHERE run_id = ?1 AND stage_id = ?2 AND attempt = ?3
+                 ORDER BY invocation DESC LIMIT 1",
                 params![run_id.to_string(), stage_id.as_str(), i64::from(attempt)],
                 |row| row.get::<_, String>(0),
             )
@@ -247,44 +252,52 @@ impl SqliteStore {
         chunk: &OutputChunk,
         acknowledged_end: u64,
     ) -> Result<OutputCursor, ProcessError> {
-        if acknowledged_end < chunk.start_offset() || acknowledged_end > chunk.end_offset() {
-            return Err(ProcessError::InvalidAcknowledgement);
-        }
-        let next_revision = chunk
-            .cursor_revision()
-            .checked_add(1)
-            .ok_or(StoreError::IntegerRange("next output cursor revision"))?;
-        let (offset_column, revision_column) = match chunk.stream() {
-            OutputStream::Stdout => ("stdout_offset", "stdout_cursor_revision"),
-            OutputStream::Stderr => ("stderr_offset", "stderr_cursor_revision"),
-        };
-        let sql = format!(
-            "UPDATE managed_processes
-             SET {offset_column} = ?1, {revision_column} = ?2
-             WHERE id = ?3 AND {offset_column} = ?4 AND {revision_column} = ?5"
-        );
-        let changed = self.connection.execute(
-            &sql,
-            params![
-                u64_to_i64(acknowledged_end, "acknowledged output offset")?,
-                u64_to_i64(next_revision, "next output cursor revision")?,
-                chunk.process_id().to_string(),
-                u64_to_i64(chunk.start_offset(), "expected output offset")?,
-                u64_to_i64(chunk.cursor_revision(), "expected output cursor revision")?,
-            ],
-        )?;
-        if changed == 0 {
-            return Err(ProcessError::CursorConcurrentModification {
-                process_id: chunk.process_id(),
-                stream: chunk.stream(),
-                expected: chunk.cursor_revision(),
-            });
-        }
-        Ok(OutputCursor::new(acknowledged_end, next_revision))
+        acknowledge_process_output_row(&self.connection, chunk, acknowledged_end)
     }
 }
 
-fn ensure_execution_guard(
+pub(crate) fn acknowledge_process_output_row(
+    connection: &rusqlite::Connection,
+    chunk: &OutputChunk,
+    acknowledged_end: u64,
+) -> Result<OutputCursor, ProcessError> {
+    if acknowledged_end < chunk.start_offset() || acknowledged_end > chunk.end_offset() {
+        return Err(ProcessError::InvalidAcknowledgement);
+    }
+    let next_revision = chunk
+        .cursor_revision()
+        .checked_add(1)
+        .ok_or(StoreError::IntegerRange("next output cursor revision"))?;
+    let (offset_column, revision_column) = match chunk.stream() {
+        OutputStream::Stdout => ("stdout_offset", "stdout_cursor_revision"),
+        OutputStream::Stderr => ("stderr_offset", "stderr_cursor_revision"),
+    };
+    let sql = format!(
+        "UPDATE managed_processes
+         SET {offset_column} = ?1, {revision_column} = ?2
+         WHERE id = ?3 AND {offset_column} = ?4 AND {revision_column} = ?5"
+    );
+    let changed = connection.execute(
+        &sql,
+        params![
+            u64_to_i64(acknowledged_end, "acknowledged output offset")?,
+            u64_to_i64(next_revision, "next output cursor revision")?,
+            chunk.process_id().to_string(),
+            u64_to_i64(chunk.start_offset(), "expected output offset")?,
+            u64_to_i64(chunk.cursor_revision(), "expected output cursor revision")?,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(ProcessError::CursorConcurrentModification {
+            process_id: chunk.process_id(),
+            stream: chunk.stream(),
+            expected: chunk.cursor_revision(),
+        });
+    }
+    Ok(OutputCursor::new(acknowledged_end, next_revision))
+}
+
+pub(crate) fn ensure_execution_guard(
     connection: &rusqlite::Connection,
     run_id: RunId,
 ) -> Result<(), ProcessError> {
@@ -332,7 +345,7 @@ fn load_process_from(
     let row = connection
         .query_row(
             "SELECT run_id, stage_id, attempt, backend_kind, backend_session_id,
-                    status, spec_schema_version, spec_json, command_fingerprint,
+                    invocation, status, spec_schema_version, spec_json, command_fingerprint,
                     stdout_offset, stdout_cursor_revision, stderr_offset,
                     stderr_cursor_revision, exit_code, term_signal, runner_error,
                     interrupt_requested, last_error, revision, created_at, updated_at,
@@ -346,24 +359,25 @@ fn load_process_from(
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
                     row.get::<_, String>(8)?,
-                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
                     row.get::<_, i64>(12)?,
-                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, i64>(13)?,
                     row.get::<_, Option<i64>>(14)?,
-                    row.get::<_, Option<String>>(15)?,
-                    row.get::<_, bool>(16)?,
-                    row.get::<_, Option<String>>(17)?,
-                    row.get::<_, i64>(18)?,
-                    row.get::<_, String>(19)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, bool>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, i64>(19)?,
                     row.get::<_, String>(20)?,
-                    row.get::<_, Option<String>>(21)?,
+                    row.get::<_, String>(21)?,
                     row.get::<_, Option<String>>(22)?,
+                    row.get::<_, Option<String>>(23)?,
                 ))
             },
         )
@@ -375,6 +389,7 @@ fn load_process_from(
             attempt,
             backend_kind,
             backend_session_id,
+            invocation,
             status,
             spec_schema_version,
             spec_json,
@@ -394,7 +409,9 @@ fn load_process_from(
             started_at,
             finished_at,
         )| {
-            if u32::try_from(spec_schema_version).ok() != Some(1) {
+            let spec_schema_version = u32::try_from(spec_schema_version)
+                .map_err(|_| ProcessError::InvalidStoredProcess("invalid spec schema version"))?;
+            if !matches!(spec_schema_version, 1 | 2) {
                 return Err(ProcessError::InvalidStoredProcess(
                     "unsupported spec schema version",
                 ));
@@ -406,6 +423,8 @@ fn load_process_from(
                 .map_err(|_| ProcessError::InvalidStoredProcess("invalid stage ID"))?;
             let attempt = u32::try_from(attempt)
                 .map_err(|_| ProcessError::InvalidStoredProcess("invalid attempt"))?;
+            let invocation = u32::try_from(invocation)
+                .map_err(|_| ProcessError::InvalidStoredProcess("invalid invocation"))?;
             let backend_session_id = BackendSessionId::new(backend_session_id)?;
             let status = ManagedProcessStatus::from_str(&status)?;
             let exit_result = decode_exit_result(exit_code, term_signal, runner_error)?;
@@ -414,9 +433,11 @@ fn load_process_from(
                 run_id,
                 stage_id,
                 attempt,
+                invocation,
                 backend_kind,
                 backend_session_id,
                 status,
+                spec_schema_version,
                 &spec_json,
                 command_fingerprint,
                 OutputCursor::new(
@@ -491,12 +512,18 @@ fn attempt_exists(
     run_id: RunId,
     stage_id: &StageId,
     attempt: u32,
+    invocation: u32,
 ) -> Result<bool, ProcessError> {
     Ok(connection
         .query_row(
             "SELECT 1 FROM managed_processes
-             WHERE run_id = ?1 AND stage_id = ?2 AND attempt = ?3",
-            params![run_id.to_string(), stage_id.as_str(), i64::from(attempt)],
+             WHERE run_id = ?1 AND stage_id = ?2 AND attempt = ?3 AND invocation = ?4",
+            params![
+                run_id.to_string(),
+                stage_id.as_str(),
+                i64::from(attempt),
+                i64::from(invocation)
+            ],
             |_| Ok(()),
         )
         .optional()?
@@ -568,6 +595,7 @@ mod tests {
             run_id,
             StageId::new("implementation").unwrap(),
             0,
+            1,
             "tmux".to_owned(),
             BackendSessionId::for_process(process_id),
             spec,

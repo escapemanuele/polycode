@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 6 adds managed external-process infrastructure below provider adapters while preserving Milestone 5's synchronous CLI, domain, scheduler, workspace, and application semantics. Tmux now supervises exact external commands through a shell-free hidden runner; SQLite persists immutable process intent, lifecycle revisions, and acknowledged output cursors. Real coding-agent providers, async runtime, native PTY backend, and TUI remain deliberately absent.
+Milestone 7 adds first real provider adapter: native Claude Code CLI. Adapter discovers installed `claude`, verifies supported read-only auth status, launches structured non-interactive execution in isolated worktree, parses JSONL, persists native session separately from managed processes, maps provider-neutral signals, resumes same native session after explicit attention resolution, and writes verified artifacts. Existing native Claude authentication/configuration remains authoritative; no direct Anthropic API is used. Codex/Gemini providers, async runtime, native process backend, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -113,7 +113,22 @@ managed_processes(id, run_id, stage_id, attempt,
                   exit summary, interrupt_requested, revision, timestamps)
 ```
 
-Launch identity is immutable and unique per `(run_id, stage_id, attempt)`. Lifecycle and each output cursor use independent compare-and-swap revisions. Process rows reference runs but never enter `RunSnapshot`; existing v1-v3 state migrates without rewriting run, event, configuration, input, workspace, or apply data.
+Schema v5 extends process identity with positive invocation number and immutable stdin path/hash, then adds provider sessions and artifacts:
+
+```text
+provider_sessions(id, run_id, stage_id, attempt, provider_id,
+                  native_session_id, current_process_id, status,
+                  protocol_version, invocation, model_id, cli_version,
+                  pending attention range, revision, timestamps)
+
+artifacts(id, run_id, stage_id, attempt, kind, status, role,
+          provider_id, model_id, path, content_hash, content_size,
+          base_commit, timestamps)
+```
+
+Provider-session identity `(run, stage, attempt, provider)` is immutable and distinct from backend/process identity. One attempt may use multiple invocations while continuing one native conversation. Artifact rows are insert-only; bytes are written and fsynced before metadata commit, then hash/size verified on insertion and load.
+
+Launch identity is immutable and unique per `(run_id, stage_id, attempt, invocation)`. Lifecycle and each output cursor use independent compare-and-swap revisions. Process rows reference runs but never enter `RunSnapshot`; existing v1-v4 state migrates without rewriting run, event, configuration, input, workspace, or apply data.
 
 Resolved config payloads are recursively key-sorted and compact-encoded before SHA-256 hashing. An existing config ID accepts an exact idempotent insert only; different content or metadata is rejected. Database triggers reject update and delete operations, enforcing insert-only storage beneath the Rust API.
 
@@ -127,7 +142,7 @@ WHERE id = ? AND revision = ?
 
 Zero changed rows means `ConcurrentModification`. Snapshot update precedes event inserts inside one `BEGIN IMMEDIATE` transaction; any event constraint failure rolls back snapshot, revision, and event changes together. Store allocates contiguous event sequence values from the prior per-run maximum. Event timestamps must be non-decreasing, may be equal, and final event time must equal persisted `run.updated_at`.
 
-Current aggregate snapshot excludes task input, artifact metadata, and provider-session state because `Run` does not own them. Provider-neutral session/checkpoint events remain durable history. `FakeProvider` reconstructs its deterministic cursor from those events; real process providers may later add separately owned session records without weakening `Run::rehydrate`.
+Current aggregate snapshot excludes task input, artifact metadata, and provider-session state because `Run` does not own them. Provider-neutral session/checkpoint events remain durable history. `FakeProvider` reconstructs deterministic cursor from those events; Claude reconstructs separately owned provider-session/process/output state without weakening `Run::rehydrate`.
 
 ## Run lifecycle
 
@@ -200,13 +215,13 @@ Execution commits recheck `WorkspaceStatus::Ready` inside same `BEGIN IMMEDIATE`
 
 Attention resolution, stage resume, interruption recovery, and retry are scheduler-boundary commands. They use same workspace/apply guards and atomic run commit as automatic advancement.
 
-## Milestone 5 application and CLI
+## Milestone 7 application, provider, and CLI
 
 `RunService` is application boundary. CLI parses and prints only; service owns use-case ordering:
 
 ```text
 validate RunInput + discover repository
-    -> resolve immutable development config
+    -> resolve immutable provider config and verify availability
     -> atomic Run + RunInput + config + created event
     -> prepare graph-selected workspace
     -> reconstruct provider from config + workflow + events
@@ -215,7 +230,13 @@ validate RunInput + discover repository
     -> print
 ```
 
-Provider construction sits behind small `ProviderFactory`. M5 factory accepts only explicit `fake` and persists `development_fake/default_success_v1`. Default scenario derives scripts from workflow graph: each stage emits started, progress, provider-neutral usage, and completed. Durable M4 checkpoints determine signal cursor after restart; process memory is never authoritative.
+Provider construction sits behind `ProviderFactory`. Runtime factory accepts explicit `claude` or `fake`, persists choice in immutable run configuration, and reconstructs same provider on restart without fallback. Fake keeps `development_fake/default_success_v1`. Claude configuration persists safe selection/options only; native credentials and environment are never snapshotted. Installed Claude version and provider-confirmed model/session are stored as runtime metadata.
+
+`ClaudeProvider` uses native CLI structured print mode with `dontAsk`, never broad permission bypass. Initial prompt and continuations enter through immutable stdin. JSONL decoder accepts one complete record per poll; partial record waits, unknown valid records become non-semantic checkpoints, and invalid JSON fails without cursor advancement. System init binds opaque native session, assistant/result records map to provider-neutral usage/progress/attention/failure/completion.
+
+Denied native tool calls become typed permission attention. SQLite stores only attention identity and exact raw-record range; human resolution reconstructs structured denial from retained output, converts only safely representable exact rule to native `--allowedTools`, and starts new `--resume <same-session>` invocation. Ambiguous/wildcard rules fail closed. Native questions require explicit `resolve --response`; answer is immutable run-private stdin, not argv or SQLite event payload.
+
+On success, Claude result becomes human-readable stage artifact. Downstream prompt includes only direct dependency artifacts. Provider session CAS, raw-output cursor CAS, run snapshot/revision, complete semantic event batch, and artifact metadata share one `BEGIN IMMEDIATE` transaction. Fault before commit replays record; no accepted signal can exist without matching session/cursor checkpoint.
 
 Before continuation, application reconciles workspace. Engine/store guards still require `WorkspaceStatus::Ready` and reject active apply intent at mutation transaction. Resume policy continues Ready/Running, resumes deliberate suspension, recovers interruption, preserves `NeedsUser`, refuses implicit retry from Failed, reports Completed/Applied, and rejects Discarded. `resolve` and `retry` perform exact explicit action then drive again.
 
@@ -225,20 +246,22 @@ Execution reports contain only event rows reloaded after successful commits. CLI
 
 ## Process and recovery
 
-Future provider adapters depend on `ProcessBackend`, not tmux. `TmuxBackend` implements availability, exact launch, owned-session inspection, raw output reads, graceful interruption, and ownership-safe cleanup. Scheduler-facing `Provider` and `ProviderRequest` remain unchanged.
+Provider adapters depend on `ProcessBackend`, not tmux. `TmuxBackend` implements availability, exact launch, owned-session inspection, raw output reads, graceful interruption, and ownership-safe cleanup. `ProviderRequest` remains provider-neutral; `ProviderPoll` may carry signal plus neutral persistence checkpoint.
 
 Process launch uses intent/effect/finalize:
 
 ```text
 Preparing persisted
-    -> immutable spec/output files materialized
+    -> immutable spec/stdin/output files materialized
     -> Starting claimed by lifecycle CAS
     -> tmux direct-argv runner launch
     -> owned session or valid exit evidence observed
     -> Running / Exited finalized
 ```
 
-Tmux receives hidden runner executable, subcommand, and manifest path as separate arguments. No launch path uses `sh -c`, quoting, `eval`, or interpolated command text. Session environment carries non-secret process ID and fingerprint ownership markers. Existing sessions are reusable or removable only when both markers match persisted identity.
+Tmux receives hidden runner executable, subcommand, and manifest path as separate arguments. No launch path uses `sh -c`, quoting, `eval`, or interpolated command text. Each managed process uses isolated tmux server. Session environment carries safe operational variables plus non-secret process ID, fingerprint, and one-time socket path; existing sessions are reusable or removable only when both ownership markers match persisted identity.
+
+Parent environment is cleared before tmux server starts. Native provider variables excluded from safe session allowlist cross through bounded user-only (`0600`) Unix socket after launch, never argv, tmux environment, manifest, SQLite, or durable file. Runner receives bytes in memory, validates framing/size, clears inherited environment, and reconstructs provider environment before exact child exec. This preserves native environment-based authentication without credential persistence or command-line exposure.
 
 Runner validates its manifest and ownership, creates a separate child process group, redirects stdout/stderr to regular append-only files, persists live runner/child identity in atomic `runtime.json`, waits for exact child exit, then publishes atomic `exit.json`. Backend interruption validates session ownership, runner pane PID, runtime fingerprint, and child process group before sending SIGINT. Cleanup is separate and retains all process files.
 
@@ -254,9 +277,9 @@ mismatched/corrupt evidence           -> Broken
 terminal + owned cleanup              -> Cleaned, files retained
 ```
 
-Absence never implies success. Tmux sessions survive client detachment/process exit, but not reboot or tmux server loss. Without valid exit evidence, lost supervisor state becomes `Missing`; M6 does not guess provider-session recovery.
+Absence never implies success. Tmux sessions survive client detachment/process exit, but not reboot or tmux server loss. Without valid exit evidence, lost supervisor state becomes `Missing`; Claude maps loss to semantic interruption and may recover through same native session only after explicit run recovery.
 
-Output files live under `runs/<run>/processes/<process>/`. Reads return raw byte chunks with start/end offsets and do not mutate SQLite. Consumer explicitly acknowledges any consumed prefix through per-stream cursor CAS. Crash before acknowledgement replays bytes rather than losing them; reads remain available after exit. M7 must combine parsed provider signal/checkpoint and output acknowledgement in one SQLite transaction before claiming semantic exactly-once delivery.
+Output files live under `runs/<run>/processes/<process>/`. Reads return raw byte chunks with start/end offsets and do not mutate SQLite. Consumer explicitly acknowledges consumed prefix through per-stream cursor CAS. Claude semantic records combine run/events, provider session, artifact metadata, and acknowledgement in one transaction. Crash before commit replays bytes; reads remain available after exit.
 
 ## Git safety
 
@@ -331,6 +354,11 @@ src/
 │   ├── model.rs     process spec/status/output/exit records
 │   ├── ids.rs       managed-process and backend-session identities
 │   └── error.rs     typed process/backend failures
+├── providers/
+│   ├── session.rs   provider-neutral conversation identity and lifecycle
+│   ├── checkpoint.rs atomic provider commit payload
+│   ├── artifact.rs  immutable artifact record
+│   └── claude/      native discovery, argv, prompts, JSONL decoder, adapter
 ├── store/
 │   ├── sqlite.rs    transactional store and indexed projections
 │   ├── snapshot.rs  RunSnapshotV1/V2 migration and codec
@@ -338,6 +366,7 @@ src/
 │   ├── config_snapshot.rs immutable config and canonical hash
 │   ├── run_input.rs immutable normalized task input
 │   ├── process.rs   process lifecycle and output-cursor CAS persistence
+│   ├── provider.rs  provider-session/artifact persistence and atomic commits
 │   ├── workspace.rs workspace/apply intent persistence and CAS
 │   ├── path.rs      data and worktree path resolution
 │   └── error.rs     typed persistence failures
@@ -377,9 +406,12 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Scheduler is synchronous and single-stage deterministic in Milestone 4; async/process concurrency remains a backend concern.
 - User task is immutable `RunInput`, not aggregate lifecycle state or provider configuration.
 - Workflow workspace mutability derives from stage kinds (`Implementation`/`Fix`), not workflow-name branches.
-- CLI provider choice is explicit; M5 `FakeProvider` profile is development-only and restart-stable.
+- CLI provider choice is explicit; native Claude and development Fake profiles are restart-stable immutable run configuration.
 - Application commands run scheduler to durable quiescence and render only reloaded committed state/events.
 - Managed processes are separate infrastructure attempts; process exit does not directly mutate semantic run/stage state.
 - Exact external argv is preserved end to end; tmux launches multiple command arguments directly rather than a shell command string.
 - Process launch, interrupt, and cleanup require persisted intent plus fingerprint-bound ownership evidence.
-- Raw output read and acknowledgement are separate; M6 guarantees replay instead of loss, while M7 owns atomic semantic checkpoint plus cursor advancement.
+- Raw output read and acknowledgement are separate; provider semantic commit atomically joins cursor, session, artifact metadata, run state, and events.
+- Provider session, managed process, and backend session are distinct identities; continuation advances invocation without changing attempt/native conversation.
+- Native Claude default model is used unless immutable configuration supplies one; model shown to user comes from provider confirmation.
+- Permission continuation uses same Claude UUID and exact safely representable native allow rule; broad/ambiguous approval fails closed.

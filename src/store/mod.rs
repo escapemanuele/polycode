@@ -5,6 +5,7 @@ mod error;
 mod migrations;
 mod path;
 mod process;
+mod provider;
 mod run_input;
 mod snapshot;
 mod sqlite;

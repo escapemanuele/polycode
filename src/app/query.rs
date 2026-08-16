@@ -53,6 +53,10 @@ pub struct RunDetails {
     pub base_commit: Option<String>,
     pub provider: Option<String>,
     pub profile: Option<String>,
+    pub provider_model: Option<String>,
+    pub provider_session: Option<String>,
+    pub provider_session_status: Option<String>,
+    pub process_status: Option<String>,
     pub revision: RunRevision,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -98,6 +102,13 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     let usage = usage_summary(&events);
+    let provider_session = store.list_provider_sessions(run_id)?.pop();
+    let process_status = provider_session
+        .as_ref()
+        .and_then(crate::providers::ProviderSessionRecord::current_process_id)
+        .map(|process_id| store.load_managed_process(process_id))
+        .transpose()?
+        .map(|process| process.status().as_str().to_owned());
     Ok(RunDetails {
         id: loaded.run.id(),
         task: input.map(|input| input.task().to_owned()),
@@ -114,6 +125,18 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .map(|workspace| workspace.base_commit().to_owned()),
         provider,
         profile,
+        provider_model: provider_session
+            .as_ref()
+            .and_then(|session| session.model_id())
+            .map(ToString::to_string),
+        provider_session: provider_session
+            .as_ref()
+            .and_then(|session| session.native_session_id())
+            .map(ToString::to_string),
+        provider_session_status: provider_session
+            .as_ref()
+            .map(|session| session.status().as_str().to_owned()),
+        process_status,
         revision: loaded.revision,
         created_at: *loaded.run.created_at(),
         updated_at: *loaded.run.updated_at(),

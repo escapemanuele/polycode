@@ -29,11 +29,14 @@ pub enum ProcessError {
     ProcessNotFound(ManagedProcessId),
     #[error("managed process {0} already exists with different immutable identity")]
     ProcessConflict(ManagedProcessId),
-    #[error("run {run_id} stage {stage_id} attempt {attempt} already has another process")]
+    #[error(
+        "run {run_id} stage {stage_id} attempt {attempt} invocation {invocation} already has another process"
+    )]
     AttemptConflict {
         run_id: RunId,
         stage_id: StageId,
         attempt: u32,
+        invocation: u32,
     },
     #[error("managed process {process_id} changed since revision {expected}")]
     ConcurrentModification {

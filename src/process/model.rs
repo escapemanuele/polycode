@@ -11,7 +11,8 @@ use crate::domain::{RunId, StageId};
 
 use super::{BackendSessionId, ManagedProcessId, ProcessError};
 
-pub(crate) const PROCESS_SPEC_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROCESS_SPEC_SCHEMA_VERSION: u32 = 2;
+const LEGACY_PROCESS_SPEC_SCHEMA_VERSION: u32 = 1;
 pub(crate) const EXIT_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub(crate) const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
@@ -21,6 +22,8 @@ pub struct ProcessSpec {
     argv: Vec<OsString>,
     working_directory: PathBuf,
     environment: BTreeMap<OsString, OsString>,
+    stdin_path: Option<PathBuf>,
+    stdin_sha256: Option<String>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
 }
@@ -33,6 +36,8 @@ impl fmt::Debug for ProcessSpec {
             .field("argv_count", &self.argv.len())
             .field("working_directory", &self.working_directory)
             .field("environment_override_count", &self.environment.len())
+            .field("has_stdin", &self.stdin_path.is_some())
+            .field("stdin_sha256", &self.stdin_sha256)
             .field("stdout_path", &self.stdout_path)
             .field("stderr_path", &self.stderr_path)
             .finish()
@@ -63,11 +68,28 @@ impl ProcessSpec {
             argv,
             working_directory: working_directory.into(),
             environment,
+            stdin_path: None,
+            stdin_sha256: None,
             stdout_path: stdout_path.into(),
             stderr_path: stderr_path.into(),
         };
         spec.validate()?;
         Ok(spec)
+    }
+
+    /// Binds immutable stdin bytes by path and SHA-256 digest.
+    ///
+    /// # Errors
+    /// Rejects relative paths, malformed hashes, or conflicting paths.
+    pub(crate) fn with_stdin(
+        mut self,
+        path: impl Into<PathBuf>,
+        sha256: impl Into<String>,
+    ) -> Result<Self, ProcessError> {
+        self.stdin_path = Some(path.into());
+        self.stdin_sha256 = Some(sha256.into());
+        self.validate()?;
+        Ok(self)
     }
 
     fn validate(&self) -> Result<(), ProcessError> {
@@ -78,6 +100,10 @@ impl ProcessSpec {
             || !self.working_directory.is_absolute()
             || !self.stdout_path.is_absolute()
             || !self.stderr_path.is_absolute()
+            || self
+                .stdin_path
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
         {
             return Err(ProcessError::InvalidSpec("all paths must be absolute"));
         }
@@ -85,6 +111,21 @@ impl ProcessSpec {
             return Err(ProcessError::InvalidSpec(
                 "stdout and stderr paths must differ",
             ));
+        }
+        if self
+            .stdin_path
+            .as_ref()
+            .is_some_and(|path| path == &self.stdout_path || path == &self.stderr_path)
+        {
+            return Err(ProcessError::InvalidSpec(
+                "stdin and output paths must differ",
+            ));
+        }
+        match (&self.stdin_path, &self.stdin_sha256) {
+            (Some(_), Some(hash))
+                if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
+            (None, None) => {}
+            _ => return Err(ProcessError::InvalidSpec("invalid stdin binding")),
         }
         for value in self.argv.iter().chain(self.environment.values()) {
             if os_bytes(value)?.contains(&0) {
@@ -101,10 +142,20 @@ impl ProcessSpec {
                 return Err(ProcessError::InvalidSpec("OS values must not contain NUL"));
             }
         }
+        if let Some(path) = &self.stdin_path
+            && os_bytes(path.as_os_str())?.contains(&0)
+        {
+            return Err(ProcessError::InvalidSpec("OS values must not contain NUL"));
+        }
         for key in self.environment.keys() {
             let key = os_bytes(key)?;
             if key.is_empty() || key.contains(&b'=') || key.contains(&0) {
                 return Err(ProcessError::InvalidSpec("invalid environment key"));
+            }
+            if sensitive_environment_name(key) {
+                return Err(ProcessError::InvalidSpec(
+                    "sensitive environment overrides must not be persisted",
+                ));
             }
         }
         Ok(())
@@ -131,6 +182,16 @@ impl ProcessSpec {
     }
 
     #[must_use]
+    pub fn stdin_path(&self) -> Option<&Path> {
+        self.stdin_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn stdin_sha256(&self) -> Option<&str> {
+        self.stdin_sha256.as_deref()
+    }
+
+    #[must_use]
     pub fn stdout_path(&self) -> &Path {
         &self.stdout_path
     }
@@ -139,6 +200,22 @@ impl ProcessSpec {
     pub fn stderr_path(&self) -> &Path {
         &self.stderr_path
     }
+}
+
+fn sensitive_environment_name(name: &[u8]) -> bool {
+    let upper = name.iter().map(u8::to_ascii_uppercase).collect::<Vec<_>>();
+    [
+        b"TOKEN".as_slice(),
+        b"SECRET".as_slice(),
+        b"PASSWORD".as_slice(),
+        b"API_KEY".as_slice(),
+        b"AUTH".as_slice(),
+        b"COOKIE".as_slice(),
+        b"CREDENTIAL".as_slice(),
+        b"PRIVATE_KEY".as_slice(),
+    ]
+    .iter()
+    .any(|needle| upper.windows(needle.len()).any(|window| window == *needle))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,9 +522,11 @@ pub struct ManagedProcess {
     run_id: RunId,
     stage_id: StageId,
     attempt: u32,
+    invocation: u32,
     backend_kind: String,
     backend_session_id: BackendSessionId,
     status: ManagedProcessStatus,
+    spec_schema_version: u32,
     spec: ProcessSpec,
     command_fingerprint: String,
     stdout_cursor: OutputCursor,
@@ -472,20 +551,34 @@ impl ManagedProcess {
         run_id: RunId,
         stage_id: StageId,
         attempt: u32,
+        invocation: u32,
         backend_kind: String,
         backend_session_id: BackendSessionId,
         spec: ProcessSpec,
         now: DateTime<Utc>,
     ) -> Result<Self, ProcessError> {
-        let command_fingerprint = fingerprint(run_id, &stage_id, attempt, &backend_kind, &spec)?;
+        if invocation == 0 {
+            return Err(ProcessError::InvalidSpec("invocation must be positive"));
+        }
+        let command_fingerprint = fingerprint(
+            PROCESS_SPEC_SCHEMA_VERSION,
+            run_id,
+            &stage_id,
+            attempt,
+            invocation,
+            &backend_kind,
+            &spec,
+        )?;
         let process = Self {
             id,
             run_id,
             stage_id,
             attempt,
+            invocation,
             backend_kind,
             backend_session_id,
             status: ManagedProcessStatus::Preparing,
+            spec_schema_version: PROCESS_SPEC_SCHEMA_VERSION,
             spec,
             command_fingerprint,
             stdout_cursor: OutputCursor::default(),
@@ -509,9 +602,11 @@ impl ManagedProcess {
         run_id: RunId,
         stage_id: StageId,
         attempt: u32,
+        invocation: u32,
         backend_kind: String,
         backend_session_id: BackendSessionId,
         status: ManagedProcessStatus,
+        spec_schema_version: u32,
         manifest_json: &str,
         command_fingerprint: String,
         stdout_cursor: OutputCursor,
@@ -526,11 +621,12 @@ impl ManagedProcess {
         finished_at: Option<DateTime<Utc>>,
     ) -> Result<Self, ProcessError> {
         let manifest: LaunchManifestV1 = serde_json::from_str(manifest_json)?;
-        if manifest.schema_version != PROCESS_SPEC_SCHEMA_VERSION
+        if manifest.schema_version != spec_schema_version
             || manifest.process_id != id
             || manifest.run_id != run_id
             || manifest.stage_id != stage_id
             || manifest.attempt != attempt
+            || manifest.invocation() != invocation
             || manifest.backend_kind != backend_kind
             || manifest.backend_session_id != backend_session_id
             || manifest.command_fingerprint != command_fingerprint
@@ -545,9 +641,11 @@ impl ManagedProcess {
             run_id,
             stage_id,
             attempt,
+            invocation,
             backend_kind,
             backend_session_id,
             status,
+            spec_schema_version,
             spec,
             command_fingerprint,
             stdout_cursor,
@@ -576,9 +674,11 @@ impl ManagedProcess {
             return Err(ProcessError::InvalidStoredProcess("invalid backend kind"));
         }
         let expected = fingerprint(
+            self.spec_schema_version,
             self.run_id,
             &self.stage_id,
             self.attempt,
+            self.invocation,
             &self.backend_kind,
             &self.spec,
         )?;
@@ -709,6 +809,15 @@ impl ManagedProcess {
     }
 
     #[must_use]
+    pub const fn invocation(&self) -> u32 {
+        self.invocation
+    }
+
+    pub(crate) const fn spec_schema_version(&self) -> u32 {
+        self.spec_schema_version
+    }
+
+    #[must_use]
     pub fn backend_kind(&self) -> &str {
         &self.backend_kind
     }
@@ -798,6 +907,8 @@ pub(crate) struct LaunchManifestV1 {
     run_id: RunId,
     stage_id: StageId,
     attempt: u32,
+    #[serde(default = "default_invocation")]
+    invocation: u32,
     backend_kind: String,
     backend_session_id: BackendSessionId,
     command_fingerprint: String,
@@ -807,12 +918,19 @@ pub(crate) struct LaunchManifestV1 {
 impl LaunchManifestV1 {
     pub(crate) fn decode(json: &str) -> Result<Self, ProcessError> {
         let manifest: Self = serde_json::from_str(json)?;
-        if manifest.schema_version != PROCESS_SPEC_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            LEGACY_PROCESS_SPEC_SCHEMA_VERSION | PROCESS_SPEC_SCHEMA_VERSION
+        ) {
             return Err(ProcessError::InvalidSpec(
                 "unsupported process manifest schema",
             ));
         }
         Ok(manifest)
+    }
+
+    const fn invocation(&self) -> u32 {
+        self.invocation
     }
 
     pub(crate) fn process_id(&self) -> ManagedProcessId {
@@ -831,9 +949,11 @@ impl LaunchManifestV1 {
     pub(crate) fn validated_spec(&self) -> Result<ProcessSpec, ProcessError> {
         let spec = self.spec.decode()?;
         let expected = fingerprint(
+            self.schema_version,
             self.run_id,
             &self.stage_id,
             self.attempt,
+            self.invocation,
             &self.backend_kind,
             &spec,
         )?;
@@ -852,6 +972,7 @@ impl From<&ManagedProcess> for LaunchManifestV1 {
             run_id: process.run_id,
             stage_id: process.stage_id.clone(),
             attempt: process.attempt,
+            invocation: process.invocation,
             backend_kind: process.backend_kind.clone(),
             backend_session_id: process.backend_session_id.clone(),
             command_fingerprint: process.command_fingerprint.clone(),
@@ -866,6 +987,10 @@ struct ProcessSpecV1 {
     argv: Vec<EncodedOsValue>,
     working_directory: EncodedOsValue,
     environment: Vec<EnvironmentEntryV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdin_path: Option<EncodedOsValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdin_sha256: Option<String>,
     stdout_path: EncodedOsValue,
     stderr_path: EncodedOsValue,
 }
@@ -879,7 +1004,7 @@ impl ProcessSpecV1 {
                 return Err(ProcessError::InvalidSpec("duplicate environment override"));
             }
         }
-        ProcessSpec::new(
+        let spec = ProcessSpec::new(
             PathBuf::from(self.executable.decode()?),
             self.argv
                 .iter()
@@ -889,7 +1014,14 @@ impl ProcessSpecV1 {
             environment,
             PathBuf::from(self.stdout_path.decode()?),
             PathBuf::from(self.stderr_path.decode()?),
-        )
+        )?;
+        match (&self.stdin_path, &self.stdin_sha256) {
+            (Some(path), Some(hash)) => {
+                spec.with_stdin(PathBuf::from(path.decode()?), hash.clone())
+            }
+            (None, None) => Ok(spec),
+            _ => Err(ProcessError::InvalidSpec("invalid stdin binding")),
+        }
     }
 }
 
@@ -911,6 +1043,11 @@ impl From<&ProcessSpec> for ProcessSpecV1 {
                     value: EncodedOsValue::from(value.as_os_str()),
                 })
                 .collect(),
+            stdin_path: spec
+                .stdin_path
+                .as_ref()
+                .map(|path| EncodedOsValue::from(path.as_os_str())),
+            stdin_sha256: spec.stdin_sha256.clone(),
             stdout_path: EncodedOsValue::from(spec.stdout_path.as_os_str()),
             stderr_path: EncodedOsValue::from(spec.stderr_path.as_os_str()),
         }
@@ -949,17 +1086,30 @@ impl From<&OsStr> for EncodedOsValue {
 }
 
 fn fingerprint(
+    schema_version: u32,
     run_id: RunId,
     stage_id: &StageId,
     attempt: u32,
+    invocation: u32,
     backend_kind: &str,
     spec: &ProcessSpec,
 ) -> Result<String, ProcessError> {
     let mut hash = Sha256::new();
-    hash.update(b"polycode-managed-process/v1\0");
+    match schema_version {
+        LEGACY_PROCESS_SPEC_SCHEMA_VERSION => hash.update(b"polycode-managed-process/v1\0"),
+        PROCESS_SPEC_SCHEMA_VERSION => hash.update(b"polycode-managed-process/v2\0"),
+        _ => {
+            return Err(ProcessError::InvalidSpec(
+                "unsupported process manifest schema",
+            ));
+        }
+    }
     hash_part(&mut hash, run_id.to_string().as_bytes())?;
     hash_part(&mut hash, stage_id.as_str().as_bytes())?;
     hash_part(&mut hash, &attempt.to_be_bytes())?;
+    if schema_version >= PROCESS_SPEC_SCHEMA_VERSION {
+        hash_part(&mut hash, &invocation.to_be_bytes())?;
+    }
     hash_part(&mut hash, backend_kind.as_bytes())?;
     hash_os(&mut hash, spec.executable.as_os_str())?;
     for argument in &spec.argv {
@@ -972,10 +1122,25 @@ fn fingerprint(
         hash_os(&mut hash, value)?;
     }
     hash.update([0xfe]);
+    if schema_version >= PROCESS_SPEC_SCHEMA_VERSION {
+        match (&spec.stdin_path, &spec.stdin_sha256) {
+            (Some(path), Some(digest)) => {
+                hash.update([1]);
+                hash_os(&mut hash, path.as_os_str())?;
+                hash_part(&mut hash, digest.as_bytes())?;
+            }
+            (None, None) => hash.update([0]),
+            _ => return Err(ProcessError::InvalidSpec("invalid stdin binding")),
+        }
+    }
     hash_os(&mut hash, spec.stdout_path.as_os_str())?;
     hash_os(&mut hash, spec.stderr_path.as_os_str())?;
     let digest = hash.finalize();
     Ok(encode_hex(digest.as_ref()))
+}
+
+const fn default_invocation() -> u32 {
+    1
 }
 
 fn hash_os(hash: &mut Sha256, value: &OsStr) -> Result<(), ProcessError> {
@@ -1081,6 +1246,7 @@ mod tests {
             RunId::from_u128(2),
             StageId::new("implementation").unwrap(),
             0,
+            1,
             "tmux".to_owned(),
             BackendSessionId::for_process(ManagedProcessId::from_u128(1)),
             spec,
@@ -1100,9 +1266,11 @@ mod tests {
             process.run_id(),
             process.stage_id().clone(),
             process.attempt(),
+            process.invocation(),
             process.backend_kind().to_owned(),
             process.backend_session_id().clone(),
             process.status(),
+            process.spec_schema_version(),
             &json,
             process.command_fingerprint().to_owned(),
             process.cursor(OutputStream::Stdout),
@@ -1132,9 +1300,11 @@ mod tests {
             .argv
             .push(OsString::from_vec(vec![b'a', 0xff, b'b']));
         process.command_fingerprint = fingerprint(
+            process.spec_schema_version,
             process.run_id,
             &process.stage_id,
             process.attempt,
+            process.invocation,
             &process.backend_kind,
             &process.spec,
         )

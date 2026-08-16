@@ -39,6 +39,9 @@ pub enum Command {
     Resolve {
         run_id: RunId,
         attention_id: AttentionRequestId,
+        /// Answer for a provider question. Omit when approving a permission request.
+        #[arg(long)]
+        response: Option<String>,
     },
     /// Apply completed workspace changes to source repository.
     Apply { run_id: RunId },
@@ -55,7 +58,7 @@ pub struct RunArgs {
     /// Git repository; defaults to current directory.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
-    /// Development provider. M5 supports only explicit `fake`.
+    /// Native provider (`claude`) or deterministic development provider (`fake`).
     #[arg(long)]
     pub provider: Option<String>,
 }

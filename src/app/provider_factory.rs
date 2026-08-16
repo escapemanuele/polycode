@@ -1,8 +1,12 @@
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use crate::domain::{ConfigSnapshotId, RunId, WorkflowDefinition};
-use crate::engine::{FakeProvider, FakeScenario, Provider};
+use crate::domain::{ConfigSnapshotId, ModelId, Role, RunId, WorkflowDefinition};
+use crate::engine::{
+    FakeProvider, FakeScenario, Provider, ProviderError, ProviderPoll, ProviderRequest,
+};
+use crate::providers::claude::{ClaudeInstallation, ClaudeProvider};
+use crate::store::SqliteStore;
 use crate::store::{ResolvedConfigSnapshot, SequencedEvent};
 
 use super::AppError;
@@ -87,4 +91,153 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
         }
         Ok(FakeProvider::new(FakeScenario::successful(workflow))?)
     }
+}
+
+pub enum RuntimeProvider {
+    Fake(FakeProvider),
+    Claude(ClaudeProvider),
+}
+
+impl Provider for RuntimeProvider {
+    fn id(&self) -> &crate::domain::ProviderId {
+        match self {
+            Self::Fake(provider) => provider.id(),
+            Self::Claude(provider) => provider.id(),
+        }
+    }
+
+    fn supports_role(&self, role: Role) -> bool {
+        match self {
+            Self::Fake(provider) => provider.supports_role(role),
+            Self::Claude(provider) => provider.supports_role(role),
+        }
+    }
+
+    fn keep_attached(&self) -> bool {
+        match self {
+            Self::Fake(provider) => provider.keep_attached(),
+            Self::Claude(provider) => provider.keep_attached(),
+        }
+    }
+
+    fn stage_attention_response(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        request_id: crate::domain::AttentionRequestId,
+        response: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        match self {
+            Self::Fake(provider) => {
+                provider.stage_attention_response(store, run_id, request_id, response)
+            }
+            Self::Claude(provider) => {
+                provider.stage_attention_response(store, run_id, request_id, response)
+            }
+        }
+    }
+
+    fn poll(
+        &mut self,
+        store: &mut SqliteStore,
+        request: &ProviderRequest,
+    ) -> Result<ProviderPoll, ProviderError> {
+        match self {
+            Self::Fake(provider) => provider.poll(store, request),
+            Self::Claude(provider) => provider.poll(store, request),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuntimeProviderFactory;
+
+impl ProviderFactory for RuntimeProviderFactory {
+    type Provider = RuntimeProvider;
+
+    fn config_for_new_run(
+        &self,
+        provider: Option<&str>,
+        id: ConfigSnapshotId,
+        created_at: DateTime<Utc>,
+    ) -> Result<ResolvedConfigSnapshot, AppError> {
+        match provider {
+            Some("fake") => {
+                DevelopmentFakeProviderFactory.config_for_new_run(provider, id, created_at)
+            }
+            Some("claude") => {
+                let installation = ClaudeInstallation::discover()?;
+                if !installation.authenticated() {
+                    return Err(
+                        crate::providers::claude::ClaudeProviderError::NotAuthenticated.into(),
+                    );
+                }
+                Ok(ResolvedConfigSnapshot::new(
+                    id,
+                    1,
+                    json!({
+                        "schema_version": 1,
+                        "profile": "native_claude",
+                        "provider": "claude",
+                        "model": null,
+                        "provider_options": {}
+                    }),
+                    created_at,
+                )?)
+            }
+            None => Err(AppError::NoProductionProvider),
+            Some(other) => Err(AppError::UnsupportedProvider(other.to_owned())),
+        }
+    }
+
+    fn for_run(
+        &self,
+        run_id: RunId,
+        config: &ResolvedConfigSnapshot,
+        workflow: &WorkflowDefinition,
+        events: &[SequencedEvent],
+    ) -> Result<Self::Provider, AppError> {
+        let provider = config
+            .payload()
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(AppError::LegacyExecutionConfig(run_id))?;
+        match provider {
+            "fake" => Ok(RuntimeProvider::Fake(
+                DevelopmentFakeProviderFactory.for_run(run_id, config, workflow, events)?,
+            )),
+            "claude" if valid_claude_config(config) => {
+                let model = config
+                    .payload()
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ModelId::new)
+                    .transpose()?;
+                Ok(RuntimeProvider::Claude(ClaudeProvider::from_environment(
+                    model,
+                )?))
+            }
+            "claude" => Err(AppError::LegacyExecutionConfig(run_id)),
+            other => Err(AppError::UnsupportedProvider(other.to_owned())),
+        }
+    }
+}
+
+fn valid_claude_config(config: &ResolvedConfigSnapshot) -> bool {
+    config.schema_version() == 1
+        && config
+            .payload()
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+        && config
+            .payload()
+            .get("profile")
+            .and_then(serde_json::Value::as_str)
+            == Some("native_claude")
+        && config
+            .payload()
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            == Some("claude")
 }

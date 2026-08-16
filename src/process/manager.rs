@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::domain::{RunId, StageId};
 use crate::store::{SqliteStore, process_root};
@@ -54,6 +55,62 @@ impl<B: ProcessBackend> ProcessManager<B> {
         argv: Vec<OsString>,
         environment: BTreeMap<OsString, OsString>,
     ) -> Result<ManagedProcess, ProcessError> {
+        self.prepare_internal(
+            store,
+            run_id,
+            stage_id,
+            attempt,
+            1,
+            executable,
+            argv,
+            environment,
+            None,
+        )
+    }
+
+    /// Persists one exact invocation with immutable stdin bytes.
+    ///
+    /// # Errors
+    /// Rejects invalid identity, execution guards, input conflicts, or I/O failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_input(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        stage_id: StageId,
+        attempt: u32,
+        invocation: u32,
+        executable: impl Into<PathBuf>,
+        argv: Vec<OsString>,
+        environment: BTreeMap<OsString, OsString>,
+        input: &[u8],
+    ) -> Result<ManagedProcess, ProcessError> {
+        self.prepare_internal(
+            store,
+            run_id,
+            stage_id,
+            attempt,
+            invocation,
+            executable,
+            argv,
+            environment,
+            Some(input),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_internal(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        stage_id: StageId,
+        attempt: u32,
+        invocation: u32,
+        executable: impl Into<PathBuf>,
+        argv: Vec<OsString>,
+        environment: BTreeMap<OsString, OsString>,
+        input: Option<&[u8]>,
+    ) -> Result<ManagedProcess, ProcessError> {
         let workspace = store.load_workspace(run_id)?.ok_or(
             crate::store::StoreError::ExecutionWorkspaceNotReady {
                 run_id,
@@ -62,7 +119,7 @@ impl<B: ProcessBackend> ProcessManager<B> {
         )?;
         let process_id = ManagedProcessId::new();
         let directory = self.process_directory(run_id, process_id);
-        let spec = ProcessSpec::new(
+        let mut spec = ProcessSpec::new(
             executable,
             argv,
             workspace.worktree_path(),
@@ -70,11 +127,18 @@ impl<B: ProcessBackend> ProcessManager<B> {
             directory.join("stdout.log"),
             directory.join("stderr.log"),
         )?;
+        if let Some(input) = input {
+            let input_path = directory.join("stdin.jsonl");
+            std::fs::create_dir_all(&directory)?;
+            write_immutable_file(&input_path, input)?;
+            spec = spec.with_stdin(input_path, sha256(input))?;
+        }
         let process = ManagedProcess::preparing(
             process_id,
             run_id,
             stage_id,
             attempt,
+            invocation,
             self.backend.kind().to_owned(),
             self.backend.session_id(process_id),
             spec,
@@ -387,6 +451,7 @@ impl<B: ProcessBackend> ProcessManager<B> {
             .ok_or(ProcessError::InvalidSpec("manifest path has no parent"))?;
         std::fs::create_dir_all(directory)?;
         let manifest = process.manifest_json()?;
+        validate_input(process.spec())?;
         write_immutable_file(&manifest_path, manifest.as_bytes())?;
         touch_append_only(process.spec().stdout_path())?;
         touch_append_only(process.spec().stderr_path())?;
@@ -429,6 +494,28 @@ impl<B: ProcessBackend> ProcessManager<B> {
         store.update_managed_process(&broken, expected, false)?;
         Ok(())
     }
+}
+
+fn validate_input(spec: &ProcessSpec) -> Result<(), ProcessError> {
+    let (Some(path), Some(expected)) = (spec.stdin_path(), spec.stdin_sha256()) else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(path)?;
+    if sha256(&bytes) != expected {
+        return Err(ProcessError::InvalidSpec("stdin content hash mismatch"));
+    }
+    Ok(())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 impl ProcessManager<TmuxBackend> {

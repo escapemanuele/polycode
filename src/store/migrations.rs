@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 4;
+pub const DATABASE_SCHEMA_VERSION: u32 = 5;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -13,18 +13,25 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
             migrate_v3(connection)?;
-            migrate_v4(connection)
+            migrate_v4(connection)?;
+            migrate_v5(connection)
         }
         1 => {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
-            migrate_v4(connection)
+            migrate_v4(connection)?;
+            migrate_v5(connection)
         }
         2 => {
             migrate_v3(connection)?;
-            migrate_v4(connection)
+            migrate_v4(connection)?;
+            migrate_v5(connection)
         }
-        3 => migrate_v4(connection),
+        3 => {
+            migrate_v4(connection)?;
+            migrate_v5(connection)
+        }
+        4 => migrate_v5(connection),
         unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
     }
 }
@@ -221,6 +228,187 @@ fn migrate_v4(connection: &Connection) -> Result<(), StoreError> {
          CREATE INDEX managed_processes_session_idx
              ON managed_processes(backend_session_id);
          PRAGMA user_version = 4;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "single transactional schema migration keeps v4 rebuild and v5 tables atomic"
+)]
+fn migrate_v5(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         DROP INDEX managed_processes_run_status_idx;
+         DROP INDEX managed_processes_session_idx;
+         DROP TRIGGER managed_processes_identity_immutable;
+         ALTER TABLE managed_processes RENAME TO managed_processes_v4;
+         CREATE TABLE managed_processes (
+             id TEXT PRIMARY KEY NOT NULL,
+             run_id TEXT NOT NULL,
+             stage_id TEXT NOT NULL,
+             attempt INTEGER NOT NULL CHECK (attempt >= 0),
+             invocation INTEGER NOT NULL CHECK (invocation > 0),
+             backend_kind TEXT NOT NULL CHECK (length(backend_kind) > 0),
+             backend_session_id TEXT NOT NULL UNIQUE,
+             status TEXT NOT NULL CHECK (
+                 status IN (
+                     'preparing', 'starting', 'running', 'interrupting', 'exited',
+                     'interrupted', 'missing', 'broken', 'cleaned'
+                 )
+             ),
+             spec_schema_version INTEGER NOT NULL CHECK (spec_schema_version > 0),
+             spec_json TEXT NOT NULL,
+             command_fingerprint TEXT NOT NULL CHECK (length(command_fingerprint) = 64),
+             stdout_offset INTEGER NOT NULL DEFAULT 0 CHECK (stdout_offset >= 0),
+             stdout_cursor_revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (stdout_cursor_revision >= 0),
+             stderr_offset INTEGER NOT NULL DEFAULT 0 CHECK (stderr_offset >= 0),
+             stderr_cursor_revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (stderr_cursor_revision >= 0),
+             exit_code INTEGER,
+             term_signal INTEGER,
+             runner_error TEXT,
+             interrupt_requested INTEGER NOT NULL DEFAULT 0
+                 CHECK (interrupt_requested IN (0, 1)),
+             last_error TEXT,
+             revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             started_at TEXT,
+             finished_at TEXT,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             UNIQUE (run_id, stage_id, attempt, invocation),
+             CHECK (
+                 (exit_code IS NOT NULL) +
+                 (term_signal IS NOT NULL) +
+                 (runner_error IS NOT NULL) <= 1
+             )
+         );
+         INSERT INTO managed_processes (
+             id, run_id, stage_id, attempt, invocation, backend_kind,
+             backend_session_id, status, spec_schema_version, spec_json,
+             command_fingerprint, stdout_offset, stdout_cursor_revision,
+             stderr_offset, stderr_cursor_revision, exit_code, term_signal,
+             runner_error, interrupt_requested, last_error, revision, created_at,
+             updated_at, started_at, finished_at
+         )
+         SELECT id, run_id, stage_id, attempt, 1, backend_kind,
+                backend_session_id, status, spec_schema_version, spec_json,
+                command_fingerprint, stdout_offset, stdout_cursor_revision,
+                stderr_offset, stderr_cursor_revision, exit_code, term_signal,
+                runner_error, interrupt_requested, last_error, revision, created_at,
+                updated_at, started_at, finished_at
+         FROM managed_processes_v4;
+         DROP TABLE managed_processes_v4;
+         CREATE TRIGGER managed_processes_identity_immutable
+         BEFORE UPDATE ON managed_processes
+         WHEN OLD.id IS NOT NEW.id
+           OR OLD.run_id IS NOT NEW.run_id
+           OR OLD.stage_id IS NOT NEW.stage_id
+           OR OLD.attempt IS NOT NEW.attempt
+           OR OLD.invocation IS NOT NEW.invocation
+           OR OLD.backend_kind IS NOT NEW.backend_kind
+           OR OLD.backend_session_id IS NOT NEW.backend_session_id
+           OR OLD.spec_schema_version IS NOT NEW.spec_schema_version
+           OR OLD.spec_json IS NOT NEW.spec_json
+           OR OLD.command_fingerprint IS NOT NEW.command_fingerprint
+           OR OLD.created_at IS NOT NEW.created_at
+         BEGIN
+             SELECT RAISE(ABORT, 'managed process launch identity is immutable');
+         END;
+         CREATE INDEX managed_processes_run_status_idx
+             ON managed_processes(run_id, status, updated_at);
+         CREATE INDEX managed_processes_session_idx
+             ON managed_processes(backend_session_id);
+         CREATE TABLE provider_sessions (
+             id TEXT PRIMARY KEY NOT NULL,
+             run_id TEXT NOT NULL,
+             stage_id TEXT NOT NULL,
+             attempt INTEGER NOT NULL CHECK (attempt > 0),
+             provider_id TEXT NOT NULL CHECK (length(provider_id) > 0),
+             native_session_id TEXT,
+             current_process_id TEXT,
+             status TEXT NOT NULL CHECK (
+                 status IN ('created', 'starting', 'active', 'needs_user',
+                            'completed', 'failed', 'interrupted')
+             ),
+             protocol_version INTEGER NOT NULL CHECK (protocol_version > 0),
+             invocation INTEGER NOT NULL DEFAULT 0 CHECK (invocation >= 0),
+             model_id TEXT,
+             cli_version TEXT,
+             pending_attention_id TEXT,
+             pending_process_id TEXT,
+             pending_record_start INTEGER CHECK (
+                 pending_record_start IS NULL OR pending_record_start >= 0
+             ),
+             pending_record_end INTEGER CHECK (
+                 pending_record_end IS NULL OR pending_record_end >= 0
+             ),
+             revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             FOREIGN KEY (current_process_id) REFERENCES managed_processes(id) ON DELETE RESTRICT,
+             FOREIGN KEY (pending_process_id) REFERENCES managed_processes(id) ON DELETE RESTRICT,
+             UNIQUE (run_id, stage_id, attempt),
+             UNIQUE (provider_id, native_session_id),
+             CHECK (
+                 (pending_attention_id IS NULL AND pending_process_id IS NULL
+                  AND pending_record_start IS NULL AND pending_record_end IS NULL)
+                 OR
+                 (pending_attention_id IS NOT NULL AND pending_process_id IS NOT NULL
+                  AND pending_record_start IS NOT NULL AND pending_record_end IS NOT NULL
+                  AND pending_record_end > pending_record_start)
+             )
+         );
+         CREATE INDEX provider_sessions_run_status_idx
+             ON provider_sessions(run_id, status, updated_at);
+         CREATE TRIGGER provider_sessions_identity_immutable
+         BEFORE UPDATE ON provider_sessions
+         WHEN OLD.id IS NOT NEW.id
+           OR OLD.run_id IS NOT NEW.run_id
+           OR OLD.stage_id IS NOT NEW.stage_id
+           OR OLD.attempt IS NOT NEW.attempt
+           OR OLD.provider_id IS NOT NEW.provider_id
+           OR OLD.protocol_version IS NOT NEW.protocol_version
+           OR OLD.created_at IS NOT NEW.created_at
+         BEGIN
+             SELECT RAISE(ABORT, 'provider session identity is immutable');
+         END;
+         CREATE TABLE artifacts (
+             id TEXT PRIMARY KEY NOT NULL,
+             run_id TEXT NOT NULL,
+             stage_id TEXT NOT NULL,
+             attempt INTEGER NOT NULL CHECK (attempt > 0),
+             kind TEXT NOT NULL,
+             status TEXT NOT NULL CHECK (status IN ('complete', 'skipped', 'failed')),
+             role TEXT NOT NULL,
+             provider_id TEXT,
+             model_id TEXT,
+             path TEXT NOT NULL UNIQUE,
+             content_hash TEXT NOT NULL CHECK (length(content_hash) = 64),
+             content_size INTEGER NOT NULL CHECK (content_size >= 0),
+             base_commit TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             UNIQUE (run_id, stage_id, attempt, kind)
+         );
+         CREATE INDEX artifacts_run_stage_idx
+             ON artifacts(run_id, stage_id, attempt);
+         CREATE TRIGGER artifacts_no_update
+         BEFORE UPDATE ON artifacts
+         BEGIN
+             SELECT RAISE(ABORT, 'artifacts are immutable');
+         END;
+         CREATE TRIGGER artifacts_no_delete
+         BEFORE DELETE ON artifacts
+         BEGIN
+             SELECT RAISE(ABORT, 'artifacts are immutable');
+         END;
+         PRAGMA user_version = 5;
          COMMIT;",
     )?;
     Ok(())

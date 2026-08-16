@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::domain::{
     AttentionKind, ModelId, ProviderId, ProviderSessionId, StageId, WorkflowDefinition,
 };
+use crate::store::SqliteStore;
 
 use super::{Provider, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal, UsageDelta};
 
@@ -169,7 +170,11 @@ impl Provider for FakeProvider {
         true
     }
 
-    fn poll(&mut self, request: &ProviderRequest) -> Result<ProviderPoll, ProviderError> {
+    fn poll(
+        &mut self,
+        _store: &mut SqliteStore,
+        request: &ProviderRequest,
+    ) -> Result<ProviderPoll, ProviderError> {
         let events = self.scripts.get(request.stage_id()).ok_or_else(|| {
             ProviderError::new(format!("no fake script for stage {}", request.stage_id()))
         })?;
@@ -221,6 +226,7 @@ fn to_signal(
         FakeEvent::NeedsUser { kind, summary } => ProviderSignal::NeedsUser {
             kind: *kind,
             summary: summary.clone(),
+            request_id: None,
         },
         FakeEvent::Usage(usage) => ProviderSignal::Usage(*usage),
         FakeEvent::Paused => ProviderSignal::Paused,

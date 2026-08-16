@@ -2,8 +2,7 @@ use anyhow::Result;
 use clap::CommandFactory;
 
 use crate::app::{
-    ApplyOutcome, DevelopmentFakeProviderFactory, ExecutionReport, QuiescentState, RunDetails,
-    RunService,
+    ApplyOutcome, ExecutionReport, QuiescentState, RunDetails, RunService, RuntimeProviderFactory,
 };
 use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
@@ -37,8 +36,13 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
         Some(Command::Resolve {
             run_id,
             attention_id,
+            response,
         }) => {
-            print_report(&service()?.resolve_attention(*run_id, *attention_id)?);
+            print_report(&service()?.resolve_attention_with_response(
+                *run_id,
+                *attention_id,
+                response.as_deref(),
+            )?);
             Ok(())
         }
         Some(Command::Apply { run_id }) => {
@@ -62,10 +66,8 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
     }
 }
 
-fn service() -> Result<RunService<DevelopmentFakeProviderFactory>> {
-    Ok(RunService::from_environment(
-        DevelopmentFakeProviderFactory,
-    )?)
+fn service() -> Result<RunService<RuntimeProviderFactory>> {
+    Ok(RunService::from_environment(RuntimeProviderFactory)?)
 }
 
 fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
@@ -84,7 +86,7 @@ fn doctor() -> Result<()> {
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
-    println!("  status: Milestone 6 managed process infrastructure");
+    println!("  status: Milestone 7 native Claude Code provider");
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {
@@ -93,7 +95,39 @@ fn doctor() -> Result<()> {
     } else {
         println!("  database schema: not initialized");
     }
-    println!("  provider: fake (development only; explicit selection required)");
+    match crate::providers::claude::ClaudeInstallation::discover() {
+        Ok(installation) => {
+            println!("  Claude Code: available ({})", installation.version());
+            println!(
+                "  Claude auth: {}{}",
+                if installation.authenticated() {
+                    "ready"
+                } else {
+                    "not authenticated"
+                },
+                installation
+                    .auth_method()
+                    .map_or(String::new(), |method| format!(" ({method})"))
+            );
+        }
+        Err(crate::providers::claude::ClaudeProviderError::NotFound) => {
+            println!("  Claude Code: not found on PATH");
+            println!(
+                "  guidance: install/configure Claude Code, verify `claude` works, then rerun `polycode doctor`"
+            );
+        }
+        Err(error) => println!("  Claude Code: error ({error})"),
+    }
+    let suspicious = crate::providers::claude::suspicious_secret_environment();
+    if suspicious.is_empty() {
+        println!("  secret environment: no known provider credential overrides detected");
+    } else {
+        println!(
+            "  secret environment: set variables: {}",
+            suspicious.join(", ")
+        );
+    }
+    println!("  fake provider: available (deterministic development/testing)");
     let tmux = crate::process::TmuxBackend::new(std::env::current_exe()?);
     match tmux.availability() {
         Ok(availability) => println!("  tmux: available ({})", availability.version),
@@ -187,6 +221,25 @@ fn print_details(details: &RunDetails) {
     println!(
         "Profile    {}",
         details.profile.as_deref().unwrap_or("unavailable")
+    );
+    println!(
+        "Model      {}",
+        details.provider_model.as_deref().unwrap_or("unconfirmed")
+    );
+    println!(
+        "Session    {}",
+        details.provider_session.as_deref().unwrap_or("unavailable")
+    );
+    println!(
+        "Conversation {}",
+        details
+            .provider_session_status
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
+    println!(
+        "Process    {}",
+        details.process_status.as_deref().unwrap_or("unavailable")
     );
     println!(
         "Repository {}",

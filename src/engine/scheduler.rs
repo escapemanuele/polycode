@@ -139,7 +139,23 @@ where
         run_id: RunId,
         request_id: AttentionRequestId,
     ) -> Result<EngineStatus, EngineError> {
+        self.resolve_attention_with_response(store, run_id, request_id, None)
+    }
+
+    /// Resolves attention after provider safely stages optional response input.
+    ///
+    /// # Errors
+    /// Returns provider, infrastructure, domain, concurrency, or persistence failures.
+    pub fn resolve_attention_with_response(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        request_id: AttentionRequestId,
+        response: Option<&str>,
+    ) -> Result<EngineStatus, EngineError> {
         let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        self.provider
+            .stage_attention_response(store, run_id, request_id, response)?;
         let metadata = self.metadata_for(&loaded.run);
         let event = loaded.run.resolve_attention(request_id, metadata)?;
         commit_execution(store, &loaded.run, loaded.revision, &[event])?;
@@ -376,11 +392,22 @@ where
             checkpoint.attempt,
             checkpoint.signal_index,
             checkpoint.session_id.clone(),
+            stage
+                .dependencies()
+                .iter()
+                .map(|dependency| dependency.stage_id().clone())
+                .collect(),
         );
-        match self.provider.poll(&request)? {
+        match self.provider.poll(store, &request)? {
             ProviderPoll::Pending => Ok(EngineStatus::WaitingForProvider {
                 stage_id: stage_id.clone(),
             }),
+            ProviderPoll::Checkpoint(commit) => {
+                store.commit_provider_checkpoint(&commit)?;
+                Ok(EngineStatus::Advanced {
+                    run_status: loaded.run.status(),
+                })
+            }
             ProviderPoll::Signal(signal) => {
                 let emitted = self.consume_signal(
                     &mut loaded.run,
@@ -390,6 +417,24 @@ where
                     signal,
                 )?;
                 commit_execution(store, &loaded.run, loaded.revision, &emitted)?;
+                Ok(EngineStatus::Advanced {
+                    run_status: loaded.run.status(),
+                })
+            }
+            ProviderPoll::Emission { signal, commit } => {
+                let emitted = self.consume_signal(
+                    &mut loaded.run,
+                    stage_id,
+                    &provider_id,
+                    checkpoint.session_id,
+                    signal,
+                )?;
+                store.commit_provider_execution_update(
+                    &loaded.run,
+                    loaded.revision,
+                    &emitted,
+                    &commit,
+                )?;
                 Ok(EngineStatus::Advanced {
                     run_status: loaded.run.status(),
                 })
@@ -458,10 +503,14 @@ where
                     metadata,
                 )?);
             }
-            ProviderSignal::NeedsUser { kind, summary } if stage_status == StageStatus::Running => {
+            ProviderSignal::NeedsUser {
+                kind,
+                summary,
+                request_id,
+            } if stage_status == StageStatus::Running => {
                 let metadata = self.metadata_for(run);
                 let request = AttentionRequest::new(
-                    self.context.next_attention_id(),
+                    request_id.unwrap_or_else(|| self.context.next_attention_id()),
                     run.id(),
                     stage_id.clone(),
                     kind,
@@ -505,6 +554,21 @@ where
                 events.push(run.record_provider_event(
                     stage_id,
                     DomainEventKind::ProviderInterrupted {
+                        provider_id: provider_id.clone(),
+                        session_id,
+                    },
+                    metadata,
+                )?);
+            }
+            ProviderSignal::Resumed if stage_status == StageStatus::Running => {
+                let session_id = session_id.ok_or_else(|| EngineError::ProviderProtocol {
+                    stage_id: stage_id.clone(),
+                    message: "resumed provider has no native session ID".to_owned(),
+                })?;
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderResumed {
                         provider_id: provider_id.clone(),
                         session_id,
                     },
@@ -671,6 +735,7 @@ fn reduce_checkpoint(
                 advance_checkpoint(&mut checkpoint)?;
             }
             DomainEventKind::ProviderProgress { provider_id, .. }
+            | DomainEventKind::ProviderResumed { provider_id, .. }
             | DomainEventKind::ProviderNeedsUser { provider_id, .. }
             | DomainEventKind::ProviderPaused { provider_id, .. }
             | DomainEventKind::ProviderInterrupted { provider_id, .. }

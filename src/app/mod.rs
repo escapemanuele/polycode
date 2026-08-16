@@ -6,7 +6,9 @@ mod query;
 mod run_service;
 
 pub use error::AppError;
-pub use provider_factory::{DevelopmentFakeProviderFactory, ProviderFactory};
+pub use provider_factory::{
+    DevelopmentFakeProviderFactory, ProviderFactory, RuntimeProvider, RuntimeProviderFactory,
+};
 pub use query::{
     AttentionSummary, CommittedEvent, RunDetails, RunListItem, StageSummary, UsageSummary,
 };

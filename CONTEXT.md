@@ -144,6 +144,34 @@ _Avoid_: Log line, provider callback
 A durable semantic record proving one provider signal was consumed, from which provider progress can continue without silently repeating accepted work.
 _Avoid_: In-memory cursor, artifact presence
 
+**Provider session**:
+One logical provider conversation for one stage attempt, with opaque native identity independent from any individual process invocation.
+_Avoid_: Managed process, backend session, stage
+
+**Provider session status**:
+Current conversation/infrastructure condition: created, starting, active, awaiting user, completed, failed, or interrupted. It does not replace stage status.
+_Avoid_: Stage status, process status
+
+**Provider invocation**:
+One managed CLI process participating in a provider session. Permission resolution or recovery may create another invocation without creating another provider session.
+_Avoid_: Attempt, provider session, retry
+
+**Native session identity**:
+Opaque provider-issued conversation identity used only by its adapter to continue same logical provider session.
+_Avoid_: Managed process ID, backend session ID, fabricated provider checkpoint
+
+**Semantic provider commit**:
+One atomic acceptance boundary joining run state/events, provider-session revision, artifact metadata when produced, and exact raw-output acknowledgement.
+_Avoid_: Parse then save, independent cursor update
+
+**Provider artifact**:
+Human-readable stage output whose immutable metadata and content identity are persisted; downstream stages consume only declared dependency artifacts.
+_Avoid_: Completion sentinel, raw provider log, canonical run state
+
+**Permission continuation**:
+Explicit human resolution that continues same provider session with only safely representable native permission scope. Broad or ambiguous approval fails closed.
+_Avoid_: Global bypass, new attempt, generic resume
+
 **Managed process**:
 A separately persisted infrastructure attempt that supervises one exact external command for one run stage without becoming run or stage state.
 _Avoid_: Provider session, stage execution, child handle

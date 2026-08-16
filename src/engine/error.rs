@@ -4,6 +4,7 @@ use crate::domain::{
     AttentionError, Role, RunAttentionError, RunId, RunProviderEventError, RunStageError,
     RunStatus, RunTransitionError, StageId,
 };
+use crate::process::ProcessError;
 use crate::store::StoreError;
 use crate::workspace::{ApplyStatus, WorkspaceStatus};
 
@@ -15,6 +16,8 @@ pub enum EngineError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Process(#[from] ProcessError),
     #[error(transparent)]
     RunTransition(#[from] RunTransitionError),
     #[error(transparent)]

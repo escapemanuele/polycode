@@ -3,6 +3,8 @@ use thiserror::Error;
 use crate::domain::{IdError, RunId};
 use crate::engine::{EngineError, FakeScenarioError};
 use crate::git::GitError;
+use crate::process::ProcessError;
+use crate::providers::claude::ClaudeProviderError;
 use crate::store::{RunInputError, StoreError};
 use crate::workspace::WorkspaceError;
 
@@ -22,16 +24,18 @@ pub enum AppError {
     Identifier(#[from] IdError),
     #[error(transparent)]
     FakeScenario(#[from] FakeScenarioError),
-    #[error("no production provider is available yet; use --provider fake")]
+    #[error(transparent)]
+    Claude(#[from] ClaudeProviderError),
+    #[error(transparent)]
+    Process(#[from] ProcessError),
+    #[error("provider is required; use --provider claude or --provider fake")]
     NoProductionProvider,
-    #[error("unsupported provider {0:?}; Milestone 5 supports only --provider fake")]
+    #[error("unsupported provider {0:?}; supported providers: claude, fake")]
     UnsupportedProvider(String),
-    #[error(
-        "run {0} cannot be resumed through the Milestone 5 CLI because its input predates this schema"
-    )]
+    #[error("run {0} cannot be resumed because its input predates the executable schema")]
     LegacyRunInput(RunId),
     #[error(
-        "run {0} cannot be resumed through the Milestone 5 CLI because its execution configuration predates this schema"
+        "run {0} cannot be resumed because its execution configuration predates the executable schema"
     )]
     LegacyExecutionConfig(RunId),
     #[error("run {0} was discarded and cannot continue")]

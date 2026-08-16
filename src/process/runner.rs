@@ -1,10 +1,14 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
+use super::environment::{
+    HANDOFF_SOCKET_ENV, MAX_HANDOFF_BYTES, decode_forwarded_environment, safe_environment_name,
+};
 use super::model::{LaunchManifestV1, RuntimeEvidence};
 use super::tmux::{OWNER_FINGERPRINT_ENV, OWNER_PROCESS_ENV};
 use super::{ExitEvidence, ExitResult, ProcessError};
@@ -25,16 +29,23 @@ pub fn run_managed_process(manifest_path: &Path) -> Result<(), ProcessError> {
     let started_at = now();
     let stdout = append_file(spec.stdout_path())?;
     let stderr = append_file(spec.stderr_path())?;
+    let forwarded_environment = receive_forwarded_environment()?;
     let mut command = Command::new(spec.executable());
     command
         .args(spec.argv())
         .current_dir(spec.working_directory())
+        .env_clear()
+        .envs(safe_child_environment())
+        .envs(forwarded_environment)
         .envs(spec.environment())
+        .stdin(verified_stdin(&spec)?)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+
+        prepare_child_interrupt_disposition()?;
         command.process_group(0);
     }
 
@@ -76,6 +87,83 @@ pub fn run_managed_process(manifest_path: &Path) -> Result<(), ProcessError> {
         now(),
     );
     write_atomic_json(manifest_path, "exit.json", &evidence)
+}
+
+fn safe_child_environment() -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os().filter(|(key, _)| safe_environment_name(key))
+}
+
+#[cfg(unix)]
+fn receive_forwarded_environment()
+-> Result<std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>, ProcessError> {
+    use std::os::unix::net::UnixStream;
+
+    let Some(socket_path) = std::env::var_os(HANDOFF_SOCKET_ENV) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let stream = UnixStream::connect(socket_path)?;
+    let mut encoded = Vec::new();
+    stream
+        .take(u64::try_from(MAX_HANDOFF_BYTES + 1).expect("handoff limit fits u64"))
+        .read_to_end(&mut encoded)?;
+    if encoded.len() > MAX_HANDOFF_BYTES {
+        return Err(ProcessError::InvalidSpec(
+            "forwarded environment exceeds safe handoff limit",
+        ));
+    }
+    decode_forwarded_environment(&encoded)
+}
+
+#[cfg(not(unix))]
+fn receive_forwarded_environment()
+-> Result<std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>, ProcessError> {
+    Err(ProcessError::UnsupportedPlatform)
+}
+
+fn verified_stdin(spec: &super::ProcessSpec) -> Result<Stdio, ProcessError> {
+    let (Some(path), Some(expected)) = (spec.stdin_path(), spec.stdin_sha256()) else {
+        return Ok(Stdio::null());
+    };
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    let actual = hex(hash.finalize().as_ref());
+    if actual != expected {
+        return Err(ProcessError::InvalidSpec("stdin content hash mismatch"));
+    }
+    file.rewind()?;
+    Ok(Stdio::from(file))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[cfg(unix)]
+fn prepare_child_interrupt_disposition() -> Result<(), ProcessError> {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    // tmux may ignore SIGINT. Ignored dispositions survive exec, while caught
+    // dispositions reset to default. Registering a safe handler here ensures
+    // the managed child receives normal Ctrl-C semantics after exec.
+    signal_hook::flag::register(
+        signal_hook::consts::SIGINT,
+        Arc::new(AtomicBool::new(false)),
+    )?;
+    Ok(())
 }
 
 fn validate_tmux_ownership(manifest: &LaunchManifestV1) -> Result<(), ProcessError> {

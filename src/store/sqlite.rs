@@ -75,6 +75,26 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    #[cfg(test)]
+    pub(crate) fn install_event_insert_failure(&self) {
+        self.connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER polycode_test_fail_event_insert
+                 BEFORE INSERT ON events
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected event insert failure');
+                 END;",
+            )
+            .expect("test failure trigger should install");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_event_insert_failure(&self) {
+        self.connection
+            .execute_batch("DROP TRIGGER polycode_test_fail_event_insert;")
+            .expect("test failure trigger should be removed");
+    }
+
     /// Opens one database, creating its parent directory and applying migrations.
     ///
     /// # Errors

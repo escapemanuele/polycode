@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::domain::{
     ConfigSnapshotId, EventId, RunId, RunInvariantError, RunRehydrationError, StageId,
 };
+use crate::providers::{ArtifactRecordError, ProviderSessionRecordId};
 
 use super::RunInputError;
 
@@ -113,4 +114,29 @@ pub enum StoreError {
     InvalidWorkspaceRecord(String),
     #[error("workspace path is not valid UTF-8: {0}")]
     NonUtf8WorkspacePath(PathBuf),
+    #[error("stored provider session is invalid: {0}")]
+    InvalidProviderSession(String),
+    #[error("provider session {0} does not exist")]
+    ProviderSessionNotFound(ProviderSessionRecordId),
+    #[error("provider session for run {run_id} stage {stage_id} attempt {attempt} already exists")]
+    ProviderSessionConflict {
+        run_id: RunId,
+        stage_id: StageId,
+        attempt: u32,
+    },
+    #[error("provider session {id} changed since revision {expected}")]
+    ProviderSessionConcurrentModification {
+        id: ProviderSessionRecordId,
+        expected: u64,
+    },
+    #[error(transparent)]
+    ArtifactRecord(#[from] ArtifactRecordError),
+    #[error("artifact for run {run_id} stage {stage_id} attempt {attempt} already exists")]
+    ArtifactConflict {
+        run_id: RunId,
+        stage_id: StageId,
+        attempt: u32,
+    },
+    #[error("artifact file does not match persisted metadata: {0}")]
+    ArtifactIntegrity(PathBuf),
 }

@@ -1,6 +1,7 @@
 //! Crash-reconcilable external-process infrastructure below provider adapters.
 
 mod backend;
+mod environment;
 mod error;
 mod ids;
 mod manager;

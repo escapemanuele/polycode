@@ -4,6 +4,18 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+use super::environment::{HANDOFF_SOCKET_ENV, encode_forwarded_environment, safe_environment_name};
 use super::model::RuntimeEvidence;
 use super::{
     BackendAvailability, BackendSessionId, BackendSessionState, ExitEvidence, ManagedProcess,
@@ -50,16 +62,26 @@ impl TmuxBackend {
         self
     }
 
-    fn command(&self) -> Command {
+    fn command_for_session(&self, session: &BackendSessionId) -> Command {
         let mut command = Command::new(&self.executable);
-        if let Some(socket_name) = &self.socket_name {
-            command.arg("-L").arg(socket_name);
-        }
+        command
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(key, _)| safe_environment_name(key)));
+        let socket_name = self
+            .socket_name
+            .clone()
+            .unwrap_or_else(|| OsString::from(session.as_str()));
+        command.arg("-L").arg(socket_name);
         command
     }
 
-    fn output(&self, operation: &'static str, args: &[&OsStr]) -> Result<Output, ProcessError> {
-        let mut command = self.command();
+    fn output(
+        &self,
+        session: &BackendSessionId,
+        operation: &'static str,
+        args: &[&OsStr],
+    ) -> Result<Output, ProcessError> {
+        let mut command = self.command_for_session(session);
         command.args(args);
         Self::execute(operation, &mut command)
     }
@@ -79,10 +101,11 @@ impl TmuxBackend {
 
     fn require_success(
         &self,
+        session: &BackendSessionId,
         operation: &'static str,
         args: &[&OsStr],
     ) -> Result<Output, ProcessError> {
-        let output = self.output(operation, args)?;
+        let output = self.output(session, operation, args)?;
         if output.status.success() {
             Ok(output)
         } else {
@@ -108,6 +131,7 @@ impl TmuxBackend {
     ) -> Result<Option<String>, ProcessError> {
         let target = Self::exact_target(session);
         let output = self.output(
+            session,
             "inspect session environment",
             &[
                 OsStr::new("show-environment"),
@@ -131,6 +155,7 @@ impl TmuxBackend {
         let target = Self::exact_target(session);
         Ok(self
             .output(
+                session,
                 "inspect session",
                 &[OsStr::new("has-session"), OsStr::new("-t"), &target],
             )?
@@ -166,6 +191,7 @@ impl TmuxBackend {
     fn pane_pid(&self, process: &ManagedProcess) -> Result<u32, ProcessError> {
         let target = Self::pane_target(process.backend_session_id());
         let output = self.require_success(
+            process.backend_session_id(),
             "inspect runner PID",
             &[
                 OsStr::new("display-message"),
@@ -205,7 +231,18 @@ impl ProcessBackend for TmuxBackend {
     }
 
     fn availability(&self) -> Result<BackendAvailability, ProcessError> {
-        let output = self.require_success("version check", &[OsStr::new("-V")])?;
+        let mut command = Command::new(&self.executable);
+        command
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(key, _)| safe_environment_name(key)));
+        command.arg("-V");
+        let output = Self::execute("version check", &mut command)?;
+        if !output.status.success() {
+            return Err(ProcessError::TmuxCommand {
+                operation: "version check",
+                message: sanitized_stderr(&output.stderr),
+            });
+        }
         Ok(BackendAvailability {
             kind: self.kind(),
             version: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
@@ -217,7 +254,8 @@ impl ProcessBackend for TmuxBackend {
             BackendSessionState::Owned => return Ok(()),
             BackendSessionState::Absent => {}
         }
-        let mut command = self.command();
+        let environment_handoff = EnvironmentHandoff::prepare()?;
+        let mut command = self.command_for_session(process.backend_session_id());
         command
             .arg("new-session")
             .arg("-d")
@@ -225,8 +263,11 @@ impl ProcessBackend for TmuxBackend {
             .arg(process.backend_session_id().as_str())
             .arg("-c")
             .arg(process.spec().working_directory());
-        for (key, value) in std::env::vars_os() {
+        for (key, value) in std::env::vars_os().filter(|(key, _)| safe_environment_name(key)) {
             command.arg("-e").arg(environment_assignment(key, &value));
+        }
+        if let Some(handoff) = &environment_handoff {
+            command.arg("-e").arg(handoff.environment_assignment());
         }
         command
             .arg("-e")
@@ -242,6 +283,9 @@ impl ProcessBackend for TmuxBackend {
             .arg(manifest);
         let output = Self::execute("start session", &mut command)?;
         if output.status.success() {
+            if let Some(handoff) = environment_handoff {
+                handoff.deliver()?;
+            }
             return Ok(());
         }
         if self.inspect_session(process)? == BackendSessionState::Owned {
@@ -360,10 +404,89 @@ impl ProcessBackend for TmuxBackend {
         }
         let target = Self::exact_target(process.backend_session_id());
         self.require_success(
+            process.backend_session_id(),
             "cleanup session",
             &[OsStr::new("kill-session"), OsStr::new("-t"), &target],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+struct EnvironmentHandoff {
+    listener: UnixListener,
+    path: PathBuf,
+    encoded: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl EnvironmentHandoff {
+    fn prepare() -> Result<Option<Self>, ProcessError> {
+        let Some(encoded) = encode_forwarded_environment()? else {
+            return Ok(None);
+        };
+        let path = std::env::temp_dir().join(format!("polycode-env-{}.sock", ulid::Ulid::new()));
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(Some(Self {
+            listener,
+            path,
+            encoded,
+        }))
+    }
+
+    fn environment_assignment(&self) -> OsString {
+        environment_assignment(OsString::from(HANDOFF_SOCKET_ENV), self.path.as_os_str())
+    }
+
+    fn deliver(self) -> Result<(), ProcessError> {
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_write_timeout(Some(TIMEOUT))?;
+                    stream.write_all(&self.encoded)?;
+                    stream.shutdown(Shutdown::Write)?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(ProcessError::Runner(
+                            "environment handoff timed out".to_owned(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvironmentHandoff {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(not(unix))]
+struct EnvironmentHandoff;
+
+#[cfg(not(unix))]
+impl EnvironmentHandoff {
+    fn prepare() -> Result<Option<Self>, ProcessError> {
+        Err(ProcessError::UnsupportedPlatform)
+    }
+
+    fn environment_assignment(&self) -> OsString {
+        OsString::new()
+    }
+
+    fn deliver(self) -> Result<(), ProcessError> {
+        Err(ProcessError::UnsupportedPlatform)
     }
 }
 

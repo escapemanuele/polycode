@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    AttentionKind, ModelId, ProviderId, ProviderSessionId, Role, RunId, StageId, StageKind,
-    StageStatus,
+    AttentionKind, AttentionRequestId, ModelId, ProviderId, ProviderSessionId, Role, RunId,
+    StageId, StageKind, StageStatus,
 };
+use crate::providers::ProviderCommit;
+use crate::store::SqliteStore;
 
 /// Provider-neutral usage added by one provider signal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,10 +25,12 @@ pub enum ProviderSignal {
     NeedsUser {
         kind: AttentionKind,
         summary: String,
+        request_id: Option<AttentionRequestId>,
     },
     Usage(UsageDelta),
     Paused,
     Interrupted,
+    Resumed,
     Completed,
     Failed(String),
 }
@@ -36,6 +40,11 @@ pub enum ProviderSignal {
 pub enum ProviderPoll {
     Pending,
     Signal(ProviderSignal),
+    Checkpoint(ProviderCommit),
+    Emission {
+        signal: ProviderSignal,
+        commit: ProviderCommit,
+    },
 }
 
 /// Complete context needed to produce one provider signal.
@@ -51,6 +60,7 @@ pub struct ProviderRequest {
     attempt: u32,
     signal_index: usize,
     session_id: Option<ProviderSessionId>,
+    dependency_stage_ids: Vec<StageId>,
 }
 
 impl ProviderRequest {
@@ -66,6 +76,7 @@ impl ProviderRequest {
         attempt: u32,
         signal_index: usize,
         session_id: Option<ProviderSessionId>,
+        dependency_stage_ids: Vec<StageId>,
     ) -> Self {
         Self {
             run_id,
@@ -78,6 +89,7 @@ impl ProviderRequest {
             attempt,
             signal_index,
             session_id,
+            dependency_stage_ids,
         }
     }
 
@@ -130,6 +142,11 @@ impl ProviderRequest {
     pub const fn session_id(&self) -> Option<&ProviderSessionId> {
         self.session_id.as_ref()
     }
+
+    #[must_use]
+    pub fn dependency_stage_ids(&self) -> &[StageId] {
+        &self.dependency_stage_ids
+    }
 }
 
 /// Synchronous provider boundary. Implementations return at most one signal
@@ -139,12 +156,36 @@ pub trait Provider {
 
     fn supports_role(&self, role: Role) -> bool;
 
+    /// Whether synchronous CLI should keep polling while process remains live.
+    fn keep_attached(&self) -> bool {
+        false
+    }
+
+    /// Stages optional human response before domain attention resolution commits.
+    /// Default providers need no out-of-band response material.
+    ///
+    /// # Errors
+    /// Returns provider-specific validation or durable input failures.
+    fn stage_attention_response(
+        &mut self,
+        _store: &mut SqliteStore,
+        _run_id: RunId,
+        _request_id: AttentionRequestId,
+        _response: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Polls provider without blocking scheduler indefinitely.
     ///
     /// # Errors
     /// Returns a typed adapter/protocol failure. A scripted work failure should
     /// instead be returned as [`ProviderSignal::Failed`].
-    fn poll(&mut self, request: &ProviderRequest) -> Result<ProviderPoll, ProviderError>;
+    fn poll(
+        &mut self,
+        store: &mut SqliteStore,
+        request: &ProviderRequest,
+    ) -> Result<ProviderPoll, ProviderError>;
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

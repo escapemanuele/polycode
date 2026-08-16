@@ -8,6 +8,7 @@ use crate::domain::{
 };
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
+use crate::process::{ManagedProcessStatus, ProcessManager};
 use crate::store::{RunInput, SqliteStore, database_file, worktree_root};
 use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 
@@ -123,12 +124,25 @@ where
         run_id: RunId,
         request_id: AttentionRequestId,
     ) -> Result<ExecutionReport, AppError> {
+        self.resolve_attention_with_response(run_id, request_id, None)
+    }
+
+    /// Resolves one attention request with optional provider-native response text.
+    ///
+    /// # Errors
+    /// Returns identity, guard, lifecycle, persistence, or provider errors.
+    pub fn resolve_attention_with_response(
+        &self,
+        run_id: RunId,
+        request_id: AttentionRequestId,
+        response: Option<&str>,
+    ) -> Result<ExecutionReport, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
         self.reconcile(&mut store, run_id)?;
         let mut engine = self.engine(&mut store, run_id)?;
-        engine.resolve_attention(&mut store, run_id, request_id)?;
-        let status = engine.drive(&mut store, run_id)?;
+        engine.resolve_attention_with_response(&mut store, run_id, request_id, response)?;
+        let status = drive_attached(&mut engine, &mut store, run_id)?;
         Self::report(&mut store, run_id, before, Some(&status))
     }
 
@@ -146,7 +160,7 @@ where
         self.reconcile(&mut store, run_id)?;
         let mut engine = self.engine(&mut store, run_id)?;
         engine.retry_stage(&mut store, run_id, stage_id)?;
-        let status = engine.drive(&mut store, run_id)?;
+        let status = drive_attached(&mut engine, &mut store, run_id)?;
         Self::report(&mut store, run_id, before, Some(&status))
     }
 
@@ -174,6 +188,24 @@ where
     pub fn discard_run(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
+        let process_manager = ProcessManager::from_environment()?;
+        for process in store.list_managed_processes(run_id)? {
+            let inspection = process_manager.inspect(&mut store, process.id())?;
+            let inspection = if inspection.process.status().is_active() {
+                process_manager.interrupt(&mut store, process.id())?
+            } else {
+                inspection
+            };
+            if matches!(
+                inspection.process.status(),
+                ManagedProcessStatus::Exited
+                    | ManagedProcessStatus::Interrupted
+                    | ManagedProcessStatus::Missing
+                    | ManagedProcessStatus::Broken
+            ) {
+                process_manager.cleanup(&mut store, process.id())?;
+            }
+        }
         WorkspaceManager::new(&self.worktrees).discard(&mut store, run_id)?;
         Self::report(&mut store, run_id, before, None)
     }
@@ -258,7 +290,7 @@ where
                 _ => {}
             }
         }
-        Ok(Some(engine.drive(store, run_id)?))
+        Ok(Some(drive_attached(&mut engine, store, run_id)?))
     }
 
     fn report(
@@ -284,6 +316,23 @@ where
             committed_events,
             outcome,
         })
+    }
+}
+
+fn drive_attached<P: crate::engine::Provider>(
+    engine: &mut WorkflowEngine<P>,
+    store: &mut SqliteStore,
+    run_id: RunId,
+) -> Result<EngineStatus, AppError> {
+    loop {
+        let status = engine.drive(store, run_id)?;
+        if matches!(status, EngineStatus::WaitingForProvider { .. })
+            && engine.provider().keep_attached()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            continue;
+        }
+        return Ok(status);
     }
 }
 
@@ -394,9 +443,13 @@ mod tests {
             self.inner.supports_role(role)
         }
 
-        fn poll(&mut self, request: &ProviderRequest) -> Result<ProviderPoll, ProviderError> {
+        fn poll(
+            &mut self,
+            store: &mut SqliteStore,
+            request: &ProviderRequest,
+        ) -> Result<ProviderPoll, ProviderError> {
             self.tasks.lock().unwrap().push(request.task().to_owned());
-            self.inner.poll(request)
+            self.inner.poll(store, request)
         }
     }
 

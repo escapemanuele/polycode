@@ -60,7 +60,7 @@ fn fake_provider_must_be_selected_explicitly() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("use --provider fake")
+            .contains("use --provider claude or --provider fake")
     );
     assert!(!fixture.data.join("polycode.db").exists());
 }
@@ -92,7 +92,8 @@ fn doctor_reports_real_tmux_availability_without_creating_database() {
     let output = fixture.polycode(&["doctor"]);
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Milestone 6 managed process infrastructure"));
+    assert!(stdout.contains("Milestone 7 native Claude Code provider"));
+    assert!(stdout.contains("Claude Code:"));
     assert!(stdout.contains("tmux: available (tmux "));
     assert!(!fixture.data.join("polycode.db").exists());
 }
