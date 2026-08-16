@@ -54,6 +54,7 @@ pub struct RunDetails {
     pub provider: Option<String>,
     pub profile: Option<String>,
     pub provider_model: Option<String>,
+    pub provider_session_record: Option<String>,
     pub provider_session: Option<String>,
     pub provider_session_status: Option<String>,
     pub process_status: Option<String>,
@@ -129,6 +130,9 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .as_ref()
             .and_then(|session| session.model_id())
             .map(ToString::to_string),
+        provider_session_record: provider_session
+            .as_ref()
+            .map(|session| session.id().to_string()),
         provider_session: provider_session
             .as_ref()
             .and_then(|session| session.native_session_id())

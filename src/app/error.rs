@@ -5,6 +5,7 @@ use crate::engine::{EngineError, FakeScenarioError};
 use crate::git::GitError;
 use crate::process::ProcessError;
 use crate::providers::claude::ClaudeProviderError;
+use crate::providers::codex::CodexProviderError;
 use crate::store::{RunInputError, StoreError};
 use crate::workspace::WorkspaceError;
 
@@ -27,10 +28,12 @@ pub enum AppError {
     #[error(transparent)]
     Claude(#[from] ClaudeProviderError),
     #[error(transparent)]
+    Codex(#[from] CodexProviderError),
+    #[error(transparent)]
     Process(#[from] ProcessError),
-    #[error("provider is required; use --provider claude or --provider fake")]
+    #[error("provider is required; use --provider claude, --provider codex, or --provider fake")]
     NoProductionProvider,
-    #[error("unsupported provider {0:?}; supported providers: claude, fake")]
+    #[error("unsupported provider {0:?}; supported providers: claude, codex, fake")]
     UnsupportedProvider(String),
     #[error("run {0} cannot be resumed because its input predates the executable schema")]
     LegacyRunInput(RunId),

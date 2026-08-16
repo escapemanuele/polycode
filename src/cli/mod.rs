@@ -61,7 +61,7 @@ pub struct RunArgs {
     /// Git repository; defaults to current directory.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
-    /// Native provider (`claude`) or deterministic development provider (`fake`).
+    /// Native provider (`claude` or `codex`) or deterministic development provider (`fake`).
     #[arg(long)]
     pub provider: Option<String>,
 }

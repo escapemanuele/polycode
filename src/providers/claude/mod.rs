@@ -326,7 +326,10 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             }
             ClaudeRecord::Ignored => return Ok(ProviderPoll::Checkpoint(commit)),
         };
-        Ok(ProviderPoll::Emission { signal, commit })
+        Ok(ProviderPoll::Emission {
+            signals: vec![signal],
+            commit,
+        })
     }
 
     fn map_terminal_without_result(
@@ -363,7 +366,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             ))
         };
         Ok(ProviderPoll::Emission {
-            signal,
+            signals: vec![signal],
             commit: ProviderCommit::new(chunk, end)
                 .with_session(ProviderSessionMutation::new(session, expected)),
         })

@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 7 adds first real provider adapter: native Claude Code CLI. Adapter discovers installed `claude`, verifies supported read-only auth status, launches structured non-interactive execution in isolated worktree, parses JSONL, persists native session separately from managed processes, maps provider-neutral signals, resumes same native session after explicit attention resolution, and writes verified artifacts. Existing native Claude authentication/configuration remains authoritative; no direct Anthropic API is used. Codex/Gemini providers, async runtime, native process backend, and TUI remain deliberately absent.
+Milestone 8 adds native Codex CLI beside native Claude Code. Both adapters discover installed CLI/auth through read-only native commands, execute structured non-interactive JSONL inside isolated worktree through shared managed-process substrate, persist opaque native session separately from process invocation, and write verified provider-neutral artifacts. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, multi-provider routing, async runtime, native process backend, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -142,7 +142,7 @@ WHERE id = ? AND revision = ?
 
 Zero changed rows means `ConcurrentModification`. Snapshot update precedes event inserts inside one `BEGIN IMMEDIATE` transaction; any event constraint failure rolls back snapshot, revision, and event changes together. Store allocates contiguous event sequence values from the prior per-run maximum. Event timestamps must be non-decreasing, may be equal, and final event time must equal persisted `run.updated_at`.
 
-Current aggregate snapshot excludes task input, artifact metadata, and provider-session state because `Run` does not own them. Provider-neutral session/checkpoint events remain durable history. `FakeProvider` reconstructs deterministic cursor from those events; Claude reconstructs separately owned provider-session/process/output state without weakening `Run::rehydrate`.
+Current aggregate snapshot excludes task input, artifact metadata, and provider-session state because `Run` does not own them. Provider-neutral session/checkpoint events remain durable history. `FakeProvider` reconstructs deterministic cursor from those events; Claude and Codex reconstruct separately owned provider-session/process/output state without weakening `Run::rehydrate`.
 
 ## Run lifecycle
 
@@ -202,7 +202,7 @@ load validated Run + Ready workspace
     -> evaluate every Pending stage dependency set
     -> atomically mark all newly Ready or blocked stages
     -> resolve stage role against provider capability
-    -> consume at most one provider signal
+    -> consume one provider record (one signal or atomic signal batch)
     -> atomically commit Run state + complete event batch
     -> evaluate graph again
 ```
@@ -215,7 +215,7 @@ Execution commits recheck `WorkspaceStatus::Ready` inside same `BEGIN IMMEDIATE`
 
 Attention resolution, stage resume, interruption recovery, and retry are scheduler-boundary commands. They use same workspace/apply guards and atomic run commit as automatic advancement.
 
-## Milestone 7 application, provider, and CLI
+## Milestones 7–8 application, providers, and CLI
 
 `RunService` is application boundary. CLI parses and prints only; service owns use-case ordering:
 
@@ -230,13 +230,27 @@ validate RunInput + discover repository
     -> print
 ```
 
-Provider construction sits behind `ProviderFactory`. Runtime factory accepts explicit `claude` or `fake`, persists choice in immutable run configuration, and reconstructs same provider on restart without fallback. Fake keeps `development_fake/default_success_v1`. Claude configuration persists safe selection/options only; native credentials and environment are never snapshotted. Installed Claude version and provider-confirmed model/session are stored as runtime metadata.
+Provider construction sits behind `ProviderFactory`. Runtime factory accepts explicit `claude`, `codex`, or `fake`, persists choice in immutable run configuration, and reconstructs same provider on restart without fallback. Fake keeps `development_fake/default_success_v1`. Claude and Codex configurations persist safe selection/options only; native credentials and environment are never snapshotted. Installed CLI version and provider-confirmed model/session, when exposed, are runtime metadata.
 
 `ClaudeProvider` uses native CLI structured print mode with `dontAsk`, never broad permission bypass. Initial prompt and continuations enter through immutable stdin. JSONL decoder accepts one complete record per poll; partial record waits, unknown valid records become non-semantic checkpoints, and invalid JSON fails without cursor advancement. System init binds opaque native session, assistant/result records map to provider-neutral usage/progress/attention/failure/completion.
 
 Denied native tool calls become typed permission attention. SQLite stores only attention identity and exact raw-record range; human resolution reconstructs structured denial from retained output, converts only safely representable exact rule to native `--allowedTools`, and starts new `--resume <same-session>` invocation. Ambiguous/wildcard rules fail closed. Native questions require explicit `resolve --response`; answer is immutable run-private stdin, not argv or SQLite event payload.
 
 On success, Claude result becomes human-readable stage artifact. Downstream prompt includes only direct dependency artifacts. Provider session CAS, raw-output cursor CAS, run snapshot/revision, complete semantic event batch, and artifact metadata share one `BEGIN IMMEDIATE` transaction. Fault before commit replays record; no accepted signal can exist without matching session/cursor checkpoint.
+
+### Native Codex CLI
+
+`CodexProvider` uses `codex exec --json`, prompt `-` on immutable stdin, and `--output-last-message` under run-private provider output. Native user/project configuration, authentication, `AGENTS.md`, rules, skills, MCP, and hook trust remain active. Codex immutable config is `native_codex` schema 1 with `exec_json_v1`, `stage_kind_v1`, and approval `never`; model `null` omits `--model` and preserves native default.
+
+Execution controls are explicit and separate. `Implementation` and `Fix` select `workspace-write`; all other stage kinds select `read-only`. Approval is `never` for deterministic non-interactive execution but sandbox remains enabled. Dangerous sandbox/approval bypass, `danger-full-access`, ephemeral sessions, Git-check bypass, and native config/rules bypass are prohibited.
+
+`thread.started` binds provider-issued `thread_id` to generic native session identity. Duplicate identical identity checkpoints; conflict fails closed. Recovery consumes retained output first, then resumes exact persisted thread through `codex exec ... resume <thread-id> -` in new invocation. Failed-stage retry creates new provider session and thread. If process disappears before any thread identity exists, retained output is still parsed; only absence of recoverable identity permits later initial invocation for same attempt.
+
+Decoder handles one complete JSON line per poll. Partial line waits; unknown valid event checkpoints cursor without semantic event; invalid complete JSON fails without cursor advance. Agent messages may become progress. Reasoning content is never exposed. Command/file/MCP/web/plan items produce only bounded generic progress or checkpoints, never raw payloads. `turn.failed` and `error` fail stage. Current stable exec JSON offers no typed safely resumable approval/question request, so Codex does not fabricate `NeedsUser` from prose; this differs intentionally from Claude typed permission continuation.
+
+One `turn.completed` contains both stable input/output token usage and successful boundary. Generic `ProviderPoll::Emission` therefore carries ordered signal batch. Scheduler applies `[Usage, Completed]` to in-memory run, then existing semantic provider transaction commits run/events, provider session Completed, artifact metadata, and one output-cursor acknowledgement. Crash before commit replays raw line; after commit both effects exist once. Fake and Claude use singleton batches, preserving behavior.
+
+Provider waits for protocol completion plus successful managed-process exit. Final assistant file is copied into canonical immutable artifact with write-once fsync/hash semantics before transaction. Crash before metadata commit leaves replayable final file and possibly identical canonical orphan; replay verifies/reuses bytes without duplicate artifact row. Downstream prompts remain limited to direct dependency artifacts.
 
 Before continuation, application reconciles workspace. Engine/store guards still require `WorkspaceStatus::Ready` and reject active apply intent at mutation transaction. Resume policy continues Ready/Running, resumes deliberate suspension, recovers interruption, preserves `NeedsUser`, refuses implicit retry from Failed, reports Completed/Applied, and rejects Discarded. `resolve` and `retry` perform exact explicit action then drive again.
 
@@ -277,9 +291,9 @@ mismatched/corrupt evidence           -> Broken
 terminal + owned cleanup              -> Cleaned, files retained
 ```
 
-Absence never implies success. Tmux sessions survive client detachment/process exit, but not reboot or tmux server loss. Without valid exit evidence, lost supervisor state becomes `Missing`; Claude maps loss to semantic interruption and may recover through same native session only after explicit run recovery.
+Absence never implies success. Tmux sessions survive client detachment/process exit, but not reboot or tmux server loss. Without valid exit evidence, lost supervisor state becomes `Missing`; Claude and Codex map loss to semantic interruption after native identity exists and recover through same native session only after explicit run recovery.
 
-Output files live under `runs/<run>/processes/<process>/`. Reads return raw byte chunks with start/end offsets and do not mutate SQLite. Consumer explicitly acknowledges consumed prefix through per-stream cursor CAS. Claude semantic records combine run/events, provider session, artifact metadata, and acknowledgement in one transaction. Crash before commit replays bytes; reads remain available after exit.
+Output files live under `runs/<run>/processes/<process>/`. Reads return raw byte chunks with start/end offsets and do not mutate SQLite. Consumer explicitly acknowledges consumed prefix through per-stream cursor CAS. Native-provider semantic records combine run/events, provider session, artifact metadata, and acknowledgement in one transaction. Crash before commit replays bytes; reads remain available after exit.
 
 ## Git safety
 
@@ -358,7 +372,8 @@ src/
 │   ├── session.rs   provider-neutral conversation identity and lifecycle
 │   ├── checkpoint.rs atomic provider commit payload
 │   ├── artifact.rs  immutable artifact record
-│   └── claude/      native discovery, argv, prompts, JSONL decoder, adapter
+│   ├── claude/      native discovery, argv, prompts, JSONL decoder, adapter
+│   └── codex/       native discovery, exec argv, prompts, JSONL decoder, adapter
 ├── store/
 │   ├── sqlite.rs    transactional store and indexed projections
 │   ├── snapshot.rs  RunSnapshotV1/V2 migration and codec
@@ -402,11 +417,11 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Apply uses patch transfer instead of merge/cherry-pick and never stages or commits source changes.
 - Discard is a logical disposition; cleanup is an independent physical-resource operation.
 - Built-in workflows are validated DAG data; scheduler contains no workflow-specific execution branches.
-- One consumed provider signal produces one durable checkpoint event in same atomic run commit as any lifecycle mutation it causes.
+- One consumed provider record produces one durable checkpoint; an ordered signal batch shares same atomic run commit and one raw cursor acknowledgement.
 - Scheduler is synchronous and single-stage deterministic in Milestone 4; async/process concurrency remains a backend concern.
 - User task is immutable `RunInput`, not aggregate lifecycle state or provider configuration.
 - Workflow workspace mutability derives from stage kinds (`Implementation`/`Fix`), not workflow-name branches.
-- CLI provider choice is explicit; native Claude and development Fake profiles are restart-stable immutable run configuration.
+- CLI provider choice is explicit; native Claude, native Codex, and development Fake profiles are restart-stable immutable run configuration.
 - Application commands run scheduler to durable quiescence and render only reloaded committed state/events.
 - Managed processes are separate infrastructure attempts; process exit does not directly mutate semantic run/stage state.
 - Exact external argv is preserved end to end; tmux launches multiple command arguments directly rather than a shell command string.
@@ -415,3 +430,5 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Provider session, managed process, and backend session are distinct identities; continuation advances invocation without changing attempt/native conversation.
 - Native Claude default model is used unless immutable configuration supplies one; model shown to user comes from provider confirmation.
 - Permission continuation uses same Claude UUID and exact safely representable native allow rule; broad/ambiguous approval fails closed.
+- Native Codex default model is used unless immutable configuration supplies one; no model is marked confirmed without protocol evidence.
+- Codex sandbox derives from stage kind and remains enabled with approval `never`; no prose heuristic creates human attention.

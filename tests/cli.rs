@@ -60,7 +60,7 @@ fn fake_provider_must_be_selected_explicitly() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("use --provider claude or --provider fake")
+            .contains("use --provider claude, --provider codex, or --provider fake")
     );
     assert!(!fixture.data.join("polycode.db").exists());
 }
@@ -89,17 +89,18 @@ fn current_directory_is_default_repository_and_empty_runs_is_side_effect_free() 
 #[test]
 fn doctor_reports_real_tmux_availability_without_creating_database() {
     let fixture = Fixture::new();
-    let output = fixture.polycode(&["doctor"]);
+    let output = fixture.doctor_without_native_providers();
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Milestone 7 native Claude Code provider"));
+    assert!(stdout.contains("Milestone 8 native Claude Code + Codex CLI providers"));
     assert!(stdout.contains("Claude Code:"));
+    assert!(stdout.contains("Codex CLI: not found on PATH"));
     assert!(stdout.contains("tmux: available (tmux "));
     assert!(!fixture.data.join("polycode.db").exists());
 }
 
 struct Fixture {
-    _temp: TempDir,
+    temp: TempDir,
     repo: std::path::PathBuf,
     data: std::path::PathBuf,
 }
@@ -116,11 +117,7 @@ impl Fixture {
         fs::write(repo.join("README.md"), "baseline\n").unwrap();
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "-qm", "initial"]);
-        Self {
-            _temp: temp,
-            repo,
-            data,
-        }
+        Self { temp, repo, data }
     }
 
     fn polycode(&self, args: &[&str]) -> Output {
@@ -130,6 +127,28 @@ impl Fixture {
             .output()
             .unwrap()
     }
+
+    fn doctor_without_native_providers(&self) -> Output {
+        let bin = self.temp.path().join("doctor-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let tmux = find_on_path("tmux").expect("tmux is required for CLI integration tests");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmux, bin.join("tmux")).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_polycode"))
+            .arg("doctor")
+            .env("PATH", &bin)
+            .env("POLYCODE_DATA_DIR", &self.data)
+            .output()
+            .unwrap()
+    }
+}
+
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 fn assert_success(output: &Output) {

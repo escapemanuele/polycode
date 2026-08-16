@@ -3,6 +3,7 @@
 mod artifact;
 mod checkpoint;
 pub mod claude;
+pub mod codex;
 mod session;
 
 pub use artifact::{ArtifactRecord, ArtifactRecordError};

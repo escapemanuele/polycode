@@ -42,7 +42,7 @@ pub enum ProviderPoll {
     Signal(ProviderSignal),
     Checkpoint(ProviderCommit),
     Emission {
-        signal: ProviderSignal,
+        signals: Vec<ProviderSignal>,
         commit: ProviderCommit,
     },
 }
@@ -149,8 +149,8 @@ impl ProviderRequest {
     }
 }
 
-/// Synchronous provider boundary. Implementations return at most one signal
-/// per poll so scheduler tests and persistence checkpoints remain deterministic.
+/// Synchronous provider boundary. Each poll accepts at most one native record;
+/// one record may yield an ordered atomic signal batch.
 pub trait Provider {
     fn id(&self) -> &ProviderId;
 

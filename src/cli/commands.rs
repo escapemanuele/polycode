@@ -90,7 +90,7 @@ fn doctor() -> Result<()> {
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
-    println!("  status: Milestone 7 native Claude Code provider");
+    println!("  status: Milestone 8 native Claude Code + Codex CLI providers");
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {
@@ -129,6 +129,36 @@ fn doctor() -> Result<()> {
         println!(
             "  secret environment: set variables: {}",
             suspicious.join(", ")
+        );
+    }
+    match crate::providers::codex::CodexInstallation::discover() {
+        Ok(installation) => {
+            println!("  Codex CLI: available ({})", installation.version());
+            println!(
+                "  Codex auth: {}{}",
+                if installation.authenticated() {
+                    "ready"
+                } else {
+                    "not authenticated"
+                },
+                installation
+                    .auth_method()
+                    .map_or(String::new(), |method| format!(" ({method})"))
+            );
+        }
+        Err(crate::providers::codex::CodexProviderError::NotFound) => {
+            println!("  Codex CLI: not found on PATH");
+            println!(
+                "  guidance: install/configure Codex CLI, authenticate with native `codex login`, then rerun `polycode doctor`"
+            );
+        }
+        Err(error) => println!("  Codex CLI: error ({error})"),
+    }
+    let codex_environment = crate::providers::codex::suspicious_codex_environment();
+    if !codex_environment.is_empty() {
+        println!(
+            "  Codex environment overrides: {}",
+            codex_environment.join(", ")
         );
     }
     println!("  fake provider: available (deterministic development/testing)");
@@ -232,6 +262,13 @@ fn print_details(details: &RunDetails) {
     );
     println!(
         "Session    {}",
+        details
+            .provider_session_record
+            .as_deref()
+            .unwrap_or("unavailable")
+    );
+    println!(
+        "Native     {}",
         details.provider_session.as_deref().unwrap_or("unavailable")
     );
     println!(

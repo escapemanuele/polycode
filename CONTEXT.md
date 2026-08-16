@@ -140,9 +140,13 @@ _Avoid_: Pipeline runner, stage script
 One provider-neutral report accepted from a provider while a stage executes, such as progress, usage, human attention, suspension, interruption, failure, or completion.
 _Avoid_: Log line, provider callback
 
+**Provider signal batch**:
+An ordered group of provider signals that arise from one indivisible native record and must become durable together.
+_Avoid_: In-memory follow-up, repeated raw-record acknowledgement
+
 **Provider checkpoint**:
-A durable semantic record proving one provider signal was consumed, from which provider progress can continue without silently repeating accepted work.
-_Avoid_: In-memory cursor, artifact presence
+A durable acceptance marker proving one raw provider record was consumed, with or without semantic events, from which processing continues without silent replay.
+_Avoid_: Semantic event required, in-memory cursor, artifact presence
 
 **Provider session**:
 One logical provider conversation for one stage attempt, with opaque native identity independent from any individual process invocation.
@@ -171,6 +175,10 @@ _Avoid_: Completion sentinel, raw provider log, canonical run state
 **Permission continuation**:
 Explicit human resolution that continues same provider session with only safely representable native permission scope. Broad or ambiguous approval fails closed.
 _Avoid_: Global bypass, new attempt, generic resume
+
+**Native execution policy**:
+Provider-run sandbox and approval constraints selected from stage semantics while preserving native authentication, configuration, and repository instructions.
+_Avoid_: Workspace mode, provider fallback, disabled sandbox
 
 **Managed process**:
 A separately persisted infrastructure attempt that supervises one exact external command for one run stage without becoming run or stage state.

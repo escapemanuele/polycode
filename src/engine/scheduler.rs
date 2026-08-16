@@ -421,14 +421,23 @@ where
                     run_status: loaded.run.status(),
                 })
             }
-            ProviderPoll::Emission { signal, commit } => {
-                let emitted = self.consume_signal(
-                    &mut loaded.run,
-                    stage_id,
-                    &provider_id,
-                    checkpoint.session_id,
-                    signal,
-                )?;
+            ProviderPoll::Emission { signals, commit } => {
+                if signals.is_empty() {
+                    return Err(EngineError::ProviderProtocol {
+                        stage_id: stage_id.clone(),
+                        message: "provider emitted an empty semantic batch".to_owned(),
+                    });
+                }
+                let mut emitted = Vec::new();
+                for signal in signals {
+                    emitted.extend(self.consume_signal(
+                        &mut loaded.run,
+                        stage_id,
+                        &provider_id,
+                        checkpoint.session_id.clone(),
+                        signal,
+                    )?);
+                }
                 store.commit_provider_execution_update(
                     &loaded.run,
                     loaded.revision,
