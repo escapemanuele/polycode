@@ -15,6 +15,10 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             crate::process::run_managed_process(manifest)?;
             Ok(())
         }
+        Some(Command::ExecProcess { manifest }) => {
+            crate::process::exec_managed_process(manifest)?;
+            Ok(())
+        }
         Some(Command::Doctor) => doctor(),
         Some(Command::Runs) => runs(),
         Some(Command::Fast(args)) => start(WorkflowKind::Fast, args),

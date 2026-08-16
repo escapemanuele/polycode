@@ -17,5 +17,5 @@ pub use model::{
     ExitEvidence, ExitResult, ManagedProcess, ManagedProcessStatus, OutputChunk, OutputCursor,
     OutputStream, ProcessInspection, ProcessRevision, ProcessSpec,
 };
-pub use runner::run_managed_process;
+pub use runner::{exec_managed_process, run_managed_process};
 pub use tmux::TmuxBackend;

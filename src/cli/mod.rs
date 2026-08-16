@@ -19,6 +19,9 @@ pub enum Command {
     /// Internal managed-process runner.
     #[command(name = "__run-process", hide = true)]
     RunProcess { manifest: PathBuf },
+    /// Internal signal-normalizing exec bridge.
+    #[command(name = "__exec-process", hide = true)]
+    ExecProcess { manifest: PathBuf },
     /// Run implementation-only workflow.
     Fast(RunArgs),
     /// Run architecture, implementation, review, and decision workflow.
@@ -92,6 +95,14 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::RunProcess {
+                manifest: PathBuf::from("/tmp/spec.json")
+            })
+        );
+
+        let cli = Cli::try_parse_from(["polycode", "__exec-process", "/tmp/spec.json"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::ExecProcess {
                 manifest: PathBuf::from("/tmp/spec.json")
             })
         );

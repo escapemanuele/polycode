@@ -64,7 +64,7 @@ pub(crate) fn encode_forwarded_environment() -> Result<Option<Vec<u8>>, ProcessE
     Err(ProcessError::UnsupportedPlatform)
 }
 
-fn internal_environment_name(name: &OsStr) -> bool {
+pub(crate) fn internal_environment_name(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
         Some(

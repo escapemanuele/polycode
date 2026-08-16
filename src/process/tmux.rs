@@ -387,6 +387,7 @@ impl ProcessBackend for TmuxBackend {
         let process_group = format!("-{}", runtime.process_group_id());
         let output = Command::new("/bin/kill")
             .arg("-INT")
+            .arg("--")
             .arg(process_group)
             .output()
             .map_err(|error| ProcessError::SignalCommand(error.kind().to_string()))?;

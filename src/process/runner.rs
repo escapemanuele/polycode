@@ -7,7 +7,8 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use super::environment::{
-    HANDOFF_SOCKET_ENV, MAX_HANDOFF_BYTES, decode_forwarded_environment, safe_environment_name,
+    HANDOFF_SOCKET_ENV, MAX_HANDOFF_BYTES, decode_forwarded_environment, internal_environment_name,
+    safe_environment_name,
 };
 use super::model::{LaunchManifestV1, RuntimeEvidence};
 use super::tmux::{OWNER_FINGERPRINT_ENV, OWNER_PROCESS_ENV};
@@ -30,14 +31,19 @@ pub fn run_managed_process(manifest_path: &Path) -> Result<(), ProcessError> {
     let stdout = append_file(spec.stdout_path())?;
     let stderr = append_file(spec.stderr_path())?;
     let forwarded_environment = receive_forwarded_environment()?;
-    let mut command = Command::new(spec.executable());
+    let executable = std::env::current_exe()?;
+    let absolute_manifest = std::fs::canonicalize(manifest_path)?;
+    let mut command = Command::new(executable);
     command
-        .args(spec.argv())
+        .arg("__exec-process")
+        .arg(absolute_manifest)
         .current_dir(spec.working_directory())
         .env_clear()
         .envs(safe_child_environment())
         .envs(forwarded_environment)
         .envs(spec.environment())
+        .env(OWNER_PROCESS_ENV, manifest.process_id().to_string())
+        .env(OWNER_FINGERPRINT_ENV, manifest.command_fingerprint())
         .stdin(verified_stdin(&spec)?)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -87,6 +93,41 @@ pub fn run_managed_process(manifest_path: &Path) -> Result<(), ProcessError> {
         now(),
     );
     write_atomic_json(manifest_path, "exit.json", &evidence)
+}
+
+/// Replaces signal-normalized launch helper with exact managed command.
+///
+/// # Errors
+/// Rejects malformed/foreign manifests or failed Unix `exec`.
+pub fn exec_managed_process(manifest_path: &Path) -> Result<(), ProcessError> {
+    if !cfg!(unix) {
+        return Err(ProcessError::UnsupportedPlatform);
+    }
+    let manifest_json = std::fs::read_to_string(manifest_path)?;
+    let manifest = LaunchManifestV1::decode(&manifest_json)?;
+    let spec = manifest.validated_spec()?;
+    validate_tmux_ownership(&manifest)?;
+    let environment = std::env::vars_os()
+        .filter(|(key, _)| !internal_environment_name(key))
+        .collect::<Vec<_>>();
+    let mut command = Command::new(spec.executable());
+    command
+        .args(spec.argv())
+        .current_dir(spec.working_directory())
+        .env_clear()
+        .envs(environment);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        let error = command.exec();
+        return Err(ProcessError::Runner(format!(
+            "child exec failed: {}",
+            error.kind()
+        )));
+    }
+    #[allow(unreachable_code)]
+    Err(ProcessError::UnsupportedPlatform)
 }
 
 fn safe_child_environment() -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
