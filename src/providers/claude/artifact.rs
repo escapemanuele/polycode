@@ -102,6 +102,8 @@ const fn kind(stage: StageKind) -> ArtifactKind {
         StageKind::Research => ArtifactKind::Research,
         StageKind::Architecture => ArtifactKind::Architecture,
         StageKind::Implementation => ArtifactKind::Implementation,
+        StageKind::CodeQualityReview => ArtifactKind::CodeQualityReview,
+        StageKind::SpecReview => ArtifactKind::SpecReview,
         StageKind::Review | StageKind::IndependentReview | StageKind::DeepAnalysis => {
             ArtifactKind::Review
         }

@@ -5,6 +5,7 @@ mod checkpoint;
 pub mod claude;
 pub mod codex;
 mod session;
+mod stage_prompt;
 
 pub use artifact::{ArtifactRecord, ArtifactRecordError};
 pub use checkpoint::{ProviderCommit, ProviderSessionMutation};

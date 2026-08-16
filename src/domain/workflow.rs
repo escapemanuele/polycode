@@ -22,6 +22,9 @@ pub enum StageKind {
     Research,
     Architecture,
     Implementation,
+    CodeQualityReview,
+    SpecReview,
+    /// Legacy/general review stage retained for persisted runs.
     Review,
     IndependentReview,
     DeepAnalysis,
@@ -148,92 +151,10 @@ impl WorkflowDefinition {
     #[must_use]
     pub fn built_in(kind: WorkflowKind) -> Self {
         let stages = match kind {
-            WorkflowKind::Fast => vec![stage(
-                "implementation",
-                StageKind::Implementation,
-                Role::Implementer,
-                vec![],
-            )],
-            WorkflowKind::Standard => vec![
-                stage(
-                    "architecture",
-                    StageKind::Architecture,
-                    Role::Architect,
-                    vec![],
-                ),
-                stage(
-                    "implementation",
-                    StageKind::Implementation,
-                    Role::Implementer,
-                    vec![required("architecture")],
-                ),
-                stage(
-                    "review",
-                    StageKind::Review,
-                    Role::Reviewer,
-                    vec![required("implementation")],
-                ),
-                stage(
-                    "decision",
-                    StageKind::Decision,
-                    Role::EngineeringLead,
-                    vec![required("review")],
-                ),
-            ],
-            WorkflowKind::Deep => vec![
-                stage("research", StageKind::Research, Role::Researcher, vec![]),
-                stage(
-                    "architecture",
-                    StageKind::Architecture,
-                    Role::Architect,
-                    vec![required("research")],
-                ),
-                stage(
-                    "implementation",
-                    StageKind::Implementation,
-                    Role::Implementer,
-                    vec![required("architecture")],
-                ),
-                stage(
-                    "review",
-                    StageKind::Review,
-                    Role::Reviewer,
-                    vec![required("implementation")],
-                ),
-                stage(
-                    "decision",
-                    StageKind::Decision,
-                    Role::EngineeringLead,
-                    vec![required("review")],
-                ),
-            ],
-            WorkflowKind::Review => vec![
-                stage("research", StageKind::Research, Role::Researcher, vec![]),
-                stage(
-                    "deep_analysis",
-                    StageKind::DeepAnalysis,
-                    Role::Reviewer,
-                    vec![required("research")],
-                ),
-                stage(
-                    "independent_review",
-                    StageKind::IndependentReview,
-                    Role::Reviewer,
-                    vec![required("research")],
-                ),
-                stage(
-                    "synthesis",
-                    StageKind::Synthesis,
-                    Role::EngineeringLead,
-                    vec![optional("deep_analysis"), optional("independent_review")],
-                ),
-                stage(
-                    "decision",
-                    StageKind::Decision,
-                    Role::EngineeringLead,
-                    vec![required("synthesis")],
-                ),
-            ],
+            WorkflowKind::Fast => fast_stages(),
+            WorkflowKind::Standard => standard_stages(),
+            WorkflowKind::Deep => deep_stages(),
+            WorkflowKind::Review => review_stages(),
         };
         Self::new(kind, stages).expect("built-in workflow must remain a valid DAG")
     }
@@ -260,6 +181,116 @@ impl WorkflowDefinition {
             .iter()
             .any(|stage| matches!(stage.kind(), StageKind::Implementation | StageKind::Fix))
     }
+}
+
+fn fast_stages() -> Vec<StageDefinition> {
+    vec![stage(
+        "implementation",
+        StageKind::Implementation,
+        Role::Implementer,
+        vec![],
+    )]
+}
+
+fn standard_stages() -> Vec<StageDefinition> {
+    vec![
+        stage(
+            "architecture",
+            StageKind::Architecture,
+            Role::Architect,
+            vec![],
+        ),
+        stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            vec![required("architecture")],
+        ),
+        stage(
+            "quality_review",
+            StageKind::CodeQualityReview,
+            Role::CodeQualityReviewer,
+            vec![required("implementation")],
+        ),
+        stage(
+            "spec_review",
+            StageKind::SpecReview,
+            Role::SpecReviewer,
+            vec![required("implementation"), required("architecture")],
+        ),
+        stage(
+            "decision",
+            StageKind::Decision,
+            Role::EngineeringLead,
+            vec![required("quality_review"), required("spec_review")],
+        ),
+    ]
+}
+
+fn deep_stages() -> Vec<StageDefinition> {
+    vec![
+        stage("research", StageKind::Research, Role::Researcher, vec![]),
+        stage(
+            "architecture",
+            StageKind::Architecture,
+            Role::Architect,
+            vec![required("research")],
+        ),
+        stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            vec![required("architecture")],
+        ),
+        stage(
+            "quality_review",
+            StageKind::CodeQualityReview,
+            Role::CodeQualityReviewer,
+            vec![required("implementation")],
+        ),
+        stage(
+            "spec_review",
+            StageKind::SpecReview,
+            Role::SpecReviewer,
+            vec![required("implementation"), required("architecture")],
+        ),
+        stage(
+            "decision",
+            StageKind::Decision,
+            Role::EngineeringLead,
+            vec![required("quality_review"), required("spec_review")],
+        ),
+    ]
+}
+
+fn review_stages() -> Vec<StageDefinition> {
+    vec![
+        stage("research", StageKind::Research, Role::Researcher, vec![]),
+        stage(
+            "quality_review",
+            StageKind::CodeQualityReview,
+            Role::CodeQualityReviewer,
+            vec![required("research")],
+        ),
+        stage(
+            "spec_review",
+            StageKind::SpecReview,
+            Role::SpecReviewer,
+            vec![required("research")],
+        ),
+        stage(
+            "synthesis",
+            StageKind::Synthesis,
+            Role::EngineeringLead,
+            vec![optional("quality_review"), optional("spec_review")],
+        ),
+        stage(
+            "decision",
+            StageKind::Decision,
+            Role::EngineeringLead,
+            vec![required("synthesis")],
+        ),
+    ]
 }
 
 fn stage(id: &str, kind: StageKind, role: Role, dependencies: Vec<Dependency>) -> StageDefinition {
@@ -492,21 +523,98 @@ mod tests {
     #[test]
     fn built_in_review_is_a_data_driven_fan_out_and_join() {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
-        let deep = workflow.stage(&id("deep_analysis")).unwrap();
-        let independent = workflow.stage(&id("independent_review")).unwrap();
+        let quality = workflow.stage(&id("quality_review")).unwrap();
+        let spec = workflow.stage(&id("spec_review")).unwrap();
         let synthesis = workflow.stage(&id("synthesis")).unwrap();
 
-        assert_eq!(deep.dependencies(), &[Dependency::required(id("research"))]);
+        assert_eq!(quality.kind(), StageKind::CodeQualityReview);
+        assert_eq!(quality.role(), Role::CodeQualityReviewer);
         assert_eq!(
-            independent.dependencies(),
+            quality.dependencies(),
             &[Dependency::required(id("research"))]
         );
+        assert_eq!(spec.kind(), StageKind::SpecReview);
+        assert_eq!(spec.role(), Role::SpecReviewer);
+        assert_eq!(spec.dependencies(), &[Dependency::required(id("research"))]);
         assert_eq!(
             synthesis.dependencies(),
             &[
-                Dependency::optional(id("deep_analysis")),
-                Dependency::optional(id("independent_review")),
+                Dependency::optional(id("quality_review")),
+                Dependency::optional(id("spec_review")),
             ]
+        );
+    }
+
+    #[test]
+    fn new_built_ins_specialize_reviewers_and_direct_artifact_dependencies() {
+        let fast = WorkflowDefinition::built_in(WorkflowKind::Fast);
+        assert_eq!(fast.stages().len(), 1);
+        assert_eq!(fast.stages()[0].id(), &id("implementation"));
+
+        let standard = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        assert!(
+            standard
+                .stage(&id("architecture"))
+                .unwrap()
+                .dependencies()
+                .is_empty()
+        );
+        let deep = WorkflowDefinition::built_in(WorkflowKind::Deep);
+        assert!(
+            deep.stage(&id("research"))
+                .unwrap()
+                .dependencies()
+                .is_empty()
+        );
+        assert_eq!(
+            deep.stage(&id("architecture")).unwrap().dependencies(),
+            &[Dependency::required(id("research"))]
+        );
+
+        for kind in [WorkflowKind::Standard, WorkflowKind::Deep] {
+            let workflow = WorkflowDefinition::built_in(kind);
+            assert!(workflow.stage(&id("review")).is_none());
+            let quality = workflow.stage(&id("quality_review")).unwrap();
+            let spec = workflow.stage(&id("spec_review")).unwrap();
+            let decision = workflow.stage(&id("decision")).unwrap();
+            assert_eq!(quality.kind(), StageKind::CodeQualityReview);
+            assert_eq!(quality.role(), Role::CodeQualityReviewer);
+            assert_eq!(
+                quality.dependencies(),
+                &[Dependency::required(id("implementation"))]
+            );
+            assert_eq!(spec.kind(), StageKind::SpecReview);
+            assert_eq!(spec.role(), Role::SpecReviewer);
+            assert_eq!(
+                spec.dependencies(),
+                &[
+                    Dependency::required(id("implementation")),
+                    Dependency::required(id("architecture")),
+                ]
+            );
+            assert_eq!(
+                decision.dependencies(),
+                &[
+                    Dependency::required(id("quality_review")),
+                    Dependency::required(id("spec_review")),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn stage_kind_serialization_preserves_legacy_and_specialized_values() {
+        assert_eq!(
+            serde_json::from_str::<StageKind>("\"review\"").unwrap(),
+            StageKind::Review
+        );
+        assert_eq!(
+            serde_json::to_string(&StageKind::CodeQualityReview).unwrap(),
+            "\"code_quality_review\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StageKind::SpecReview).unwrap(),
+            "\"spec_review\""
         );
     }
 

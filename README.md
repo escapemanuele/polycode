@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository currently contains **Milestone 8: native Claude Code + Codex CLI providers**. Polycode uses locally installed `claude` and `codex` executables with their existing authentication and native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, deterministic `FakeProvider`, and crash-reconcilable tmux supervision remain intact. Gemini, multi-provider routing, async runtime, native process backend, and UI remain future work.
+Polycode is early-stage software. This repository contains **Milestone 8 native Claude Code + Codex CLI providers**, plus post-M8 reviewer specialization. Polycode uses locally installed `claude` and `codex` executables with their existing authentication and native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, deterministic `FakeProvider`, and crash-reconcilable tmux supervision remain intact. Gemini, multi-provider routing, async runtime, native process backend, and UI remain future work.
 
 ## Principles
 
@@ -14,6 +14,27 @@ Polycode is early-stage software. This repository currently contains **Milestone
 - Machine state is canonical in local SQLite; artifacts remain human-readable.
 - Every implementation run uses an isolated Git worktree and requires explicit apply.
 - Defaults should be useful without turning Polycode into a generic agent framework.
+
+## Built-in workflows
+
+New runs use these graph definitions:
+
+```text
+Fast:      Implementation
+
+Standard:  Architecture ---> Implementation ---> Code Quality Review --+
+                 |                |                                  |
+                 +----------------+--> Specification Review ---------+-> Decision
+
+Deep:      Research -> Architecture ---> Implementation ---> Code Quality Review --+
+                                |                |                                  |
+                                +----------------+--> Specification Review ---------+-> Decision
+
+Review:    Research -> Code Quality Review --+
+                   `-> Specification Review -+-> Synthesis -> Decision
+```
+
+Code Quality Review inspects actual repository state and judges how implementation is engineered. Specification Review independently compares delivered behavior with immutable task intent and available design evidence, classifying gaps as Missing, Wrong, or Unrequested. Both are read-only and create separate stage-ID-based Markdown artifacts. Existing persisted runs retain their original stored graph, including legacy generic review stages.
 
 ## Current CLI
 

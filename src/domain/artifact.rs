@@ -9,6 +9,9 @@ pub enum ArtifactKind {
     Research,
     Architecture,
     Implementation,
+    CodeQualityReview,
+    SpecReview,
+    /// Legacy/general review artifact retained for persisted records.
     Review,
     Decision,
     Fix,
@@ -149,5 +152,21 @@ mod tests {
         assert_eq!(decoded, metadata);
         assert_eq!(decoded.provider_id(), None);
         assert_eq!(decoded.model_id(), None);
+    }
+
+    #[test]
+    fn specialized_and_legacy_review_artifact_kinds_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&ArtifactKind::CodeQualityReview).unwrap(),
+            "\"code_quality_review\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ArtifactKind::SpecReview).unwrap(),
+            "\"spec_review\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ArtifactKind>("\"review\"").unwrap(),
+            ArtifactKind::Review
+        );
     }
 }

@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 8 adds native Codex CLI beside native Claude Code. Both adapters discover installed CLI/auth through read-only native commands, execute structured non-interactive JSONL inside isolated worktree through shared managed-process substrate, persist opaque native session separately from process invocation, and write verified provider-neutral artifacts. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, multi-provider routing, async runtime, native process backend, and TUI remain deliberately absent.
+Milestone 8 adds native Codex CLI beside native Claude Code. Post-M8 reviewer specialization splits new built-in review work into independent code-quality and specification responsibilities. Both adapters discover installed CLI/auth through read-only native commands, execute structured non-interactive JSONL inside isolated worktree through shared managed-process substrate, persist opaque native session separately from process invocation, and write verified provider-neutral artifacts. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, multi-provider routing, async runtime, native process backend, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -192,6 +192,33 @@ workflow stage -> engineering role -> provider -> model
 
 Workflow definitions are validated DAGs with unique stage IDs and known, non-self, non-duplicate required or optional dependencies. Built-in Fast, Standard, Deep, and Review workflows are ordinary Rust graph data.
 
+New built-in graphs are:
+
+```text
+Fast
+Implementation
+
+Standard
+Architecture ---> Implementation ---> Code Quality Review --+
+      |                |                                  |
+      +----------------+--> Specification Review ---------+-> Decision
+
+Deep
+Research -> Architecture ---> Implementation ---> Code Quality Review --+
+                   |                |                                  |
+                   +----------------+--> Specification Review ---------+-> Decision
+
+Review
+Research -> Code Quality Review --+
+        `-> Specification Review -+-> Synthesis -> Decision
+```
+
+Standard and Deep require both review branches before Decision. Specification Review directly depends on Architecture and Implementation so its prompt receives both artifacts; Code Quality Review depends only on Implementation. Decision directly receives both review artifacts. Review keeps both reviewer-to-Synthesis edges optional, preserving degraded-evidence progress if one branch fails or skips.
+
+`CodeQualityReviewer` owns HOW implementation is engineered: simplicity, readability, maintainability, boundaries, error handling, tests, and avoidable complexity. `SpecReviewer` owns WHAT behavior was delivered against immutable `RunInput` and design evidence, separating Missing, Wrong, and Unrequested behavior. Both inspect actual worktree state independently and emit distinct Markdown artifacts. Shared provider-neutral semantic instructions keep these contracts aligned; native adapters add provider-specific framing.
+
+Legacy `Reviewer`, `Review`, `IndependentReview`, and `DeepAnalysis` values remain valid. `RunSnapshotV2` already persists complete `StageDefinition` data, and resume passes `loaded.run.workflow()` to provider reconstruction. Existing runs therefore rehydrate and execute their original graph; only new run creation calls current built-in definitions. Adding enum values changes no snapshot shape or database table, so snapshot and database schema versions remain unchanged.
+
 ## Milestone 4 workflow execution
 
 Scheduler loop is graph-driven:
@@ -207,7 +234,7 @@ load validated Run + Ready workspace
     -> evaluate graph again
 ```
 
-No branch checks `WorkflowKind` during scheduling. Review fan-out makes `deep_analysis` and `independent_review` Ready in one dependency pass after research; synthesis joins their terminal outcomes through optional edges. Initial scheduler executes one eligible stage at a time even when several are Ready, preserving deterministic tests while retaining DAG parallelism for a later process backend.
+No branch checks `WorkflowKind` during scheduling. Specialized reviewer branches become Ready in one dependency pass when their declared prerequisites complete. Standard and Deep join successful review outcomes through required edges; Review synthesis joins terminal outcomes through optional edges. Initial scheduler executes one eligible stage at a time even when several are Ready, preserving deterministic tests while retaining DAG parallelism for a later process backend.
 
 `FakeProvider` is first provider. Scenarios script start, progress, usage, human attention, pause, interruption, completion, failure, and explicit delay gates. Every consumed signal has one identifying semantic event (`ProviderStarted`, `ProviderProgress`, `ProviderNeedsUser`, `ProviderUsageUpdated`, `ProviderPaused`, `ProviderInterrupted`, `ProviderCompleted`, or `ProviderFailed`). Signal index and attempt derive from per-stage event history, resetting only after explicit `StageRetryScheduled`; restart therefore cannot silently replay an already committed fake signal. `ProviderNeedsUser` links provider/session to the independently persisted `NeedsUser` lifecycle event and attention request.
 
@@ -234,6 +261,8 @@ Provider construction sits behind `ProviderFactory`. Runtime factory accepts exp
 
 `ClaudeProvider` uses native CLI structured print mode with `dontAsk`, never broad permission bypass. Initial prompt and continuations enter through immutable stdin. JSONL decoder accepts one complete record per poll; partial record waits, unknown valid records become non-semantic checkpoints, and invalid JSON fails without cursor advancement. System init binds opaque native session, assistant/result records map to provider-neutral usage/progress/attention/failure/completion.
 
+Specialized Claude reviewer prompts explicitly prohibit edits. Current Claude adapter retains native `dontAsk` policy and user configuration; it has no additional provider-independent hard read-only sandbox equivalent to Codex. Polycode documents this limitation instead of overriding native permissions with a custom mechanism.
+
 Denied native tool calls become typed permission attention. SQLite stores only attention identity and exact raw-record range; human resolution reconstructs structured denial from retained output, converts only safely representable exact rule to native `--allowedTools`, and starts new `--resume <same-session>` invocation. Ambiguous/wildcard rules fail closed. Native questions require explicit `resolve --response`; answer is immutable run-private stdin, not argv or SQLite event payload.
 
 On success, Claude result becomes human-readable stage artifact. Downstream prompt includes only direct dependency artifacts. Provider session CAS, raw-output cursor CAS, run snapshot/revision, complete semantic event batch, and artifact metadata share one `BEGIN IMMEDIATE` transaction. Fault before commit replays record; no accepted signal can exist without matching session/cursor checkpoint.
@@ -241,6 +270,8 @@ On success, Claude result becomes human-readable stage artifact. Downstream prom
 ### Native Codex CLI
 
 `CodexProvider` uses `codex exec --json`, prompt `-` on immutable stdin, and `--output-last-message` under run-private provider output. Native user/project configuration, authentication, `AGENTS.md`, rules, skills, MCP, and hook trust remain active. Codex immutable config is `native_codex` schema 1 with `exec_json_v1`, `stage_kind_v1`, and approval `never`; model `null` omits `--model` and preserves native default.
+
+Codex maps both specialized reviewer stage kinds to native `read-only` sandbox with approval `never`. Implementation and Fix alone receive `workspace-write`; adding reviewer roles never weakens this stage-derived policy.
 
 Execution controls are explicit and separate. `Implementation` and `Fix` select `workspace-write`; all other stage kinds select `read-only`. Approval is `never` for deterministic non-interactive execution but sandbox remains enabled. Dangerous sandbox/approval bypass, `danger-full-access`, ephemeral sessions, Git-check bypass, and native config/rules bypass are prohibited.
 
@@ -372,6 +403,7 @@ src/
 │   ├── session.rs   provider-neutral conversation identity and lifecycle
 │   ├── checkpoint.rs atomic provider commit payload
 │   ├── artifact.rs  immutable artifact record
+│   ├── stage_prompt.rs shared provider-neutral stage semantics
 │   ├── claude/      native discovery, argv, prompts, JSONL decoder, adapter
 │   └── codex/       native discovery, exec argv, prompts, JSONL decoder, adapter
 ├── store/
@@ -417,6 +449,8 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Apply uses patch transfer instead of merge/cherry-pick and never stages or commits source changes.
 - Discard is a logical disposition; cleanup is an independent physical-resource operation.
 - Built-in workflows are validated DAG data; scheduler contains no workflow-specific execution branches.
+- New built-ins use independent Code Quality Review and Specification Review branches; legacy persisted generic review graphs remain unchanged.
+- Reviewer semantic contracts are provider-neutral, while native adapters retain provider-specific transport and safety policy.
 - One consumed provider record produces one durable checkpoint; an ordered signal batch shares same atomic run commit and one raw cursor acknowledgement.
 - Scheduler is synchronous and single-stage deterministic in Milestone 4; async/process concurrency remains a backend concern.
 - User task is immutable `RunInput`, not aggregate lifecycle state or provider configuration.

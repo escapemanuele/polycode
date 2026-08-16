@@ -34,7 +34,9 @@ fn deep_command_survives_process_restart_and_status_is_read_only() {
     let status_before = fixture.polycode(&["status", run_id]);
     assert_success(&status_before);
     let status_before = String::from_utf8(status_before.stdout).unwrap();
-    assert!(status_before.contains("Usage      50 input units · 25 output units"));
+    assert!(status_before.contains("Usage      60 input units · 30 output units"));
+    assert!(status_before.contains("quality_review"));
+    assert!(status_before.contains("spec_review"));
 
     let resumed = fixture.polycode(&["resume", run_id]);
     assert_success(&resumed);

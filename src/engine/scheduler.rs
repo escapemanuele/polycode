@@ -896,7 +896,9 @@ mod tests {
                 }),
                 FakeEvent::Completed,
             ])
-            .stage("review")
+            .stage("quality_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("spec_review")
             .events([FakeEvent::Started, FakeEvent::Completed])
             .stage("decision")
             .events([FakeEvent::Started, FakeEvent::Completed]);
@@ -1005,9 +1007,9 @@ mod tests {
         let scenario = FakeScenario::new()
             .stage("research")
             .events([FakeEvent::Started, FakeEvent::Completed])
-            .stage("deep_analysis")
+            .stage("quality_review")
             .events([FakeEvent::Started, FakeEvent::Completed])
-            .stage("independent_review")
+            .stage("spec_review")
             .events([FakeEvent::Started, FakeEvent::Completed])
             .stage("synthesis")
             .events([FakeEvent::Started, FakeEvent::Completed])
@@ -1027,13 +1029,13 @@ mod tests {
         }
         let run = fixture.store.load_run(fixture.run_id).unwrap().run;
         assert_eq!(
-            run.stage(&StageId::new("deep_analysis").unwrap())
+            run.stage(&StageId::new("quality_review").unwrap())
                 .unwrap()
                 .status(),
             StageStatus::Ready
         );
         assert_eq!(
-            run.stage(&StageId::new("independent_review").unwrap())
+            run.stage(&StageId::new("spec_review").unwrap())
                 .unwrap()
                 .status(),
             StageStatus::Ready
@@ -1041,45 +1043,139 @@ mod tests {
     }
 
     #[test]
-    fn optional_failure_degrades_join_but_review_run_completes() {
-        let mut fixture = Fixture::new(WorkflowKind::Review, 800_000);
-        let scenario = FakeScenario::new()
-            .stage("research")
-            .events([FakeEvent::Started, FakeEvent::Completed])
-            .stage("deep_analysis")
-            .events([
-                FakeEvent::Started,
-                FakeEvent::failed("analysis unavailable"),
-            ])
-            .stage("independent_review")
-            .events([FakeEvent::Started, FakeEvent::Completed])
-            .stage("synthesis")
-            .events([FakeEvent::Started, FakeEvent::Completed])
-            .stage("decision")
-            .events([FakeEvent::Started, FakeEvent::Completed]);
-        let mut engine = WorkflowEngine::with_context(
-            FakeProvider::new(scenario).unwrap(),
-            "exercise deterministic workflow".to_owned(),
-            TestContext::new(900_000),
-        );
+    fn standard_and_deep_reviewers_fan_out_independently_and_decision_joins_both() {
+        for (kind, run_value, context_value) in [
+            (WorkflowKind::Standard, 710_000, 720_000),
+            (WorkflowKind::Deep, 730_000, 740_000),
+        ] {
+            let mut fixture = Fixture::new(kind, run_value);
+            let workflow = WorkflowDefinition::built_in(kind);
+            let mut engine = WorkflowEngine::with_context(
+                FakeProvider::new(FakeScenario::successful(&workflow)).unwrap(),
+                "review fan-out".to_owned(),
+                TestContext::new(context_value),
+            );
+            let quality = StageId::new("quality_review").unwrap();
+            let spec = StageId::new("spec_review").unwrap();
+            let decision = StageId::new("decision").unwrap();
 
-        assert_eq!(
-            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
-            EngineStatus::Finished {
-                run_status: RunStatus::Completed
+            loop {
+                assert!(matches!(
+                    engine.tick(&mut fixture.store, fixture.run_id).unwrap(),
+                    EngineStatus::Advanced { .. }
+                ));
+                let run = fixture.store.load_run(fixture.run_id).unwrap().run;
+                if run.stage(&quality).unwrap().status() == StageStatus::Ready
+                    && run.stage(&spec).unwrap().status() == StageStatus::Ready
+                {
+                    assert_eq!(run.stage(&decision).unwrap().status(), StageStatus::Pending);
+                    break;
+                }
             }
-        );
-        assert!(
-            fixture
-                .store
-                .load_events(fixture.run_id)
-                .unwrap()
-                .iter()
-                .any(|event| matches!(
-                    event.event.kind(),
-                    DomainEventKind::StageReady { degraded: true }
-                ))
-        );
+
+            for _ in 0..4 {
+                engine.tick(&mut fixture.store, fixture.run_id).unwrap();
+            }
+            let run = fixture.store.load_run(fixture.run_id).unwrap().run;
+            assert_eq!(
+                run.stage(&quality).unwrap().status(),
+                StageStatus::Completed
+            );
+            assert_eq!(run.stage(&spec).unwrap().status(), StageStatus::Ready);
+            assert_eq!(run.stage(&decision).unwrap().status(), StageStatus::Pending);
+
+            for _ in 0..4 {
+                engine.tick(&mut fixture.store, fixture.run_id).unwrap();
+            }
+            let run = fixture.store.load_run(fixture.run_id).unwrap().run;
+            assert_eq!(run.stage(&spec).unwrap().status(), StageStatus::Completed);
+            assert_eq!(run.stage(&decision).unwrap().status(), StageStatus::Pending);
+
+            engine.tick(&mut fixture.store, fixture.run_id).unwrap();
+            let run = fixture.store.load_run(fixture.run_id).unwrap().run;
+            assert_eq!(run.stage(&decision).unwrap().status(), StageStatus::Ready);
+
+            assert_eq!(
+                engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed
+                }
+            );
+            let events = fixture.store.load_events(fixture.run_id).unwrap();
+            let completion_sequence = |stage_id: &StageId| {
+                events
+                    .iter()
+                    .find(|event| {
+                        event.event.stage_id() == Some(stage_id)
+                            && matches!(
+                                event.event.kind(),
+                                DomainEventKind::ProviderCompleted { .. }
+                            )
+                    })
+                    .unwrap()
+                    .sequence
+            };
+            let implementation = StageId::new("implementation").unwrap();
+            let implementation_sequence = completion_sequence(&implementation);
+            let quality_sequence = completion_sequence(&quality);
+            let spec_sequence = completion_sequence(&spec);
+            let decision_sequence = completion_sequence(&decision);
+            assert!(implementation_sequence < quality_sequence);
+            assert!(implementation_sequence < spec_sequence);
+            assert!(decision_sequence > quality_sequence);
+            assert!(decision_sequence > spec_sequence);
+        }
+    }
+
+    #[test]
+    fn optional_failure_degrades_join_but_review_run_completes() {
+        for (failed_stage, run_value, context_value) in [
+            ("quality_review", 800_000, 900_000),
+            ("spec_review", 810_000, 910_000),
+        ] {
+            let mut fixture = Fixture::new(WorkflowKind::Review, run_value);
+            let review_events = |stage: &str| {
+                if stage == failed_stage {
+                    vec![FakeEvent::Started, FakeEvent::failed("review unavailable")]
+                } else {
+                    vec![FakeEvent::Started, FakeEvent::Completed]
+                }
+            };
+            let scenario = FakeScenario::new()
+                .stage("research")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("quality_review")
+                .events(review_events("quality_review"))
+                .stage("spec_review")
+                .events(review_events("spec_review"))
+                .stage("synthesis")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("decision")
+                .events([FakeEvent::Started, FakeEvent::Completed]);
+            let mut engine = WorkflowEngine::with_context(
+                FakeProvider::new(scenario).unwrap(),
+                "exercise deterministic workflow".to_owned(),
+                TestContext::new(context_value),
+            );
+
+            assert_eq!(
+                engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed
+                }
+            );
+            assert!(
+                fixture
+                    .store
+                    .load_events(fixture.run_id)
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(
+                        event.event.kind(),
+                        DomainEventKind::StageReady { degraded: true }
+                    ))
+            );
+        }
     }
 
     #[test]

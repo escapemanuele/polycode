@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-use polycode::domain::{RunId, RunStatus};
+use polycode::domain::{ArtifactKind, Role, RunId, RunStatus};
 use polycode::store::SqliteStore;
 
 #[test]
@@ -161,34 +161,76 @@ fn standard_run_uses_separate_threads_direct_artifacts_and_stage_sandboxes() {
         RunStatus::Completed
     );
     let sessions = store.list_provider_sessions(run_id).unwrap();
-    assert_eq!(sessions.len(), 4);
+    assert_eq!(sessions.len(), 5);
     let native = sessions
         .iter()
         .map(|session| session.native_session_id().unwrap().as_str().to_owned())
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(native.len(), 4);
+    assert_eq!(native.len(), 5);
     assert!(native.contains("codex-thread-architecture"));
     assert!(native.contains("codex-thread-implementation"));
-    assert!(native.contains("codex-thread-review"));
+    assert!(native.contains("codex-thread-quality_review"));
+    assert!(native.contains("codex-thread-spec_review"));
     assert!(native.contains("codex-thread-decision"));
 
     let implementation = fs::read_to_string(fixture.capture.join("implementation.stdin")).unwrap();
     assert!(implementation.contains("# architecture result"));
+    let quality = fs::read_to_string(fixture.capture.join("quality_review.stdin")).unwrap();
+    assert!(quality.contains("# implementation result"));
+    assert!(!quality.contains("# architecture result"));
+    assert!(quality.contains("Judge HOW the implementation is engineered"));
+    assert!(quality.contains("Do not repeat a complete requirement"));
+
+    let spec = fs::read_to_string(fixture.capture.join("spec_review.stdin")).unwrap();
+    assert!(spec.contains("# architecture result"));
+    assert!(spec.contains("# implementation result"));
+    assert!(spec.contains("Judge WHAT behavior was delivered"));
+    assert!(spec.contains("Missing, Wrong, or Unrequested"));
+
     let decision = fs::read_to_string(fixture.capture.join("decision.stdin")).unwrap();
-    assert!(decision.contains("# review result"));
+    assert!(decision.contains("# quality_review result"));
+    assert!(decision.contains("# spec_review result"));
     assert!(!decision.contains("# architecture result"));
+    assert!(!decision.contains("# implementation result"));
+    assert!(decision.contains("implementation quality and specification compliance"));
     assert!(
         fs::read_to_string(fixture.capture.join("implementation.argv"))
             .unwrap()
             .contains("--sandbox\nworkspace-write")
     );
-    for stage in ["architecture", "review", "decision"] {
+    for stage in ["architecture", "quality_review", "spec_review", "decision"] {
         assert!(
             fs::read_to_string(fixture.capture.join(format!("{stage}.argv")))
                 .unwrap()
                 .contains("--sandbox\nread-only")
         );
     }
+    let artifact_root = fixture
+        .data
+        .join("runs")
+        .join(run_id.to_string())
+        .join("artifacts");
+    assert!(artifact_root.join("quality_review.md").is_file());
+    assert!(artifact_root.join("spec_review.md").is_file());
+    let artifacts = store.list_artifacts(run_id).unwrap();
+    let quality_artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.metadata().stage_id().as_str() == "quality_review")
+        .unwrap();
+    assert_eq!(
+        quality_artifact.metadata().kind(),
+        ArtifactKind::CodeQualityReview
+    );
+    assert_eq!(
+        quality_artifact.metadata().role(),
+        Role::CodeQualityReviewer
+    );
+    let spec_artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.metadata().stage_id().as_str() == "spec_review")
+        .unwrap();
+    assert_eq!(spec_artifact.metadata().kind(), ArtifactKind::SpecReview);
+    assert_eq!(spec_artifact.metadata().role(), Role::SpecReviewer);
     assert_eq!(git_output(&fixture.repo, &["status", "--porcelain"]), "");
 }
 

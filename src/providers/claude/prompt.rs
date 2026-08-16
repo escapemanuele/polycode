@@ -1,8 +1,7 @@
 use std::fmt::Write as _;
 
-use crate::domain::{Role, StageKind};
 use crate::engine::ProviderRequest;
-use crate::providers::ArtifactRecord;
+use crate::providers::{ArtifactRecord, stage_prompt};
 
 use super::ClaudeProviderError;
 
@@ -26,7 +25,7 @@ pub(crate) fn compose(
     writeln!(
         prompt,
         "\n{}",
-        role_instruction(request.role(), request.stage_kind())
+        stage_prompt::instruction(request.role(), request.stage_kind())
     )
     .expect("String writes cannot fail");
     writeln!(
@@ -35,15 +34,7 @@ pub(crate) fn compose(
     )
     .expect("String writes cannot fail");
 
-    let dependencies = artifacts
-        .iter()
-        .filter(|artifact| {
-            request
-                .dependency_stage_ids()
-                .iter()
-                .any(|id| id == artifact.metadata().stage_id())
-        })
-        .collect::<Vec<_>>();
+    let dependencies = stage_prompt::direct_dependency_artifacts(request, artifacts);
     if !dependencies.is_empty() {
         prompt.push_str("\n# Direct dependency artifacts\n");
     }
@@ -67,19 +58,43 @@ pub(crate) fn compose(
     Ok(prompt)
 }
 
-const fn role_instruction(role: Role, kind: StageKind) -> &'static str {
-    match (role, kind) {
-        (Role::Researcher, _) => "Inspect repository and gather evidence. Do not invent facts.",
-        (Role::Architect, _) => "Design smallest coherent change. Name constraints and tradeoffs.",
-        (Role::Implementer, _) => "Implement requested change and run proportionate verification.",
-        (Role::Reviewer, _) => {
-            "Review independently. Prioritize correctness, regressions, and missing tests."
-        }
-        (Role::EngineeringLead, StageKind::Decision) => {
-            "Synthesize evidence and make explicit engineering decision."
-        }
-        (Role::EngineeringLead, _) => {
-            "Integrate prior work into one actionable engineering result."
-        }
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::domain::{ProviderSessionId, Role, RunId, StageId, StageKind, StageStatus};
+
+    use super::*;
+
+    fn request(role: Role, kind: StageKind) -> ProviderRequest {
+        ProviderRequest::new(
+            RunId::from_u128(1),
+            StageId::new("review").unwrap(),
+            kind,
+            StageStatus::Ready,
+            role,
+            "immutable task".to_owned(),
+            PathBuf::from("/managed/worktree"),
+            1,
+            0,
+            Option::<ProviderSessionId>::None,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn claude_uses_shared_specialized_reviewer_contracts() {
+        let quality = compose(
+            &request(Role::CodeQualityReviewer, StageKind::CodeQualityReview),
+            &[],
+        )
+        .unwrap();
+        let spec = compose(&request(Role::SpecReviewer, StageKind::SpecReview), &[]).unwrap();
+
+        assert!(quality.contains("Judge HOW the implementation is engineered"));
+        assert!(quality.contains("Do not edit files"));
+        assert!(spec.contains("Judge WHAT behavior was delivered"));
+        assert!(spec.contains("Missing, Wrong, or Unrequested"));
+        assert!(spec.contains("Do not edit files"));
     }
 }

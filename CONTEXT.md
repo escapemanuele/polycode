@@ -216,6 +216,18 @@ _Avoid_: Blind relaunch, session-name inference
 An engineering responsibility assigned to a stage, independent from provider and model selection.
 _Avoid_: Agent, model
 
+**Code Quality Review**:
+Independent read-only assessment of HOW an implementation is engineered: simplicity, readability, maintainability, tests, errors, unnecessary abstraction, and implementation-level regressions.
+_Avoid_: Specification review, generic review
+
+**Specification Review**:
+Independent read-only assessment of WHAT behavior an implementation delivers against immutable user intent and available design evidence, focusing on Missing, Wrong, and Unrequested behavior.
+_Avoid_: Code quality review, test-passing check, generic review
+
+**Legacy review**:
+General review responsibility retained as historical meaning for runs created before reviewer specialization.
+_Avoid_: Code quality review, specification review
+
 **Stage kind**:
 The semantic work performed by a stage, independent from the role responsible for it.
 _Avoid_: Role, provider

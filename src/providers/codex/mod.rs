@@ -1075,6 +1075,13 @@ mod tests {
         (temp, database, run_id, store, provider)
     }
 
+    #[test]
+    fn provider_accepts_specialized_reviewer_roles() {
+        let (_temp, _database, _run_id, _store, provider) = fixture("");
+        assert!(provider.supports_role(Role::CodeQualityReviewer));
+        assert!(provider.supports_role(Role::SpecReviewer));
+    }
+
     fn codex_config(
         config_id: ConfigSnapshotId,
         created_at: DateTime<Utc>,

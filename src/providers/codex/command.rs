@@ -21,6 +21,8 @@ impl CodexSandbox {
             StageKind::Implementation | StageKind::Fix => Self::WorkspaceWrite,
             StageKind::Research
             | StageKind::Architecture
+            | StageKind::CodeQualityReview
+            | StageKind::SpecReview
             | StageKind::Review
             | StageKind::IndependentReview
             | StageKind::DeepAnalysis
@@ -142,6 +144,19 @@ mod tests {
                 .any(|pair| pair == ["--model", "configured-model"])
         );
         assert_safe(&args);
+    }
+
+    #[test]
+    fn specialized_review_stages_are_read_only() {
+        for kind in [StageKind::CodeQualityReview, StageKind::SpecReview] {
+            let command = initial("review", kind, None, Path::new("/private/final.md"));
+            let args = strings(&command.argv);
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--sandbox", "read-only"])
+            );
+            assert_safe(&args);
+        }
     }
 
     #[test]

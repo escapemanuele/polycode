@@ -407,7 +407,10 @@ mod tests {
 
     use super::*;
     use crate::app::{DevelopmentFakeProviderFactory, ProviderFactory};
-    use crate::domain::{AttentionKind, ConfigSnapshotId, DomainEventKind, ProviderId, Role};
+    use crate::domain::{
+        AttentionKind, ConfigSnapshotId, Dependency, DomainEventKind, ProviderId, Role,
+        StageDefinition, StageKind,
+    };
     use crate::engine::{
         FakeEvent, FakeProvider, FakeScenario, Provider, ProviderError, ProviderPoll,
         ProviderRequest,
@@ -636,6 +639,161 @@ mod tests {
         let resumed = restarted.resume_run(run_id).unwrap();
         assert!(resumed.committed_events.is_empty());
         assert_eq!(resumed.details, inspected);
+    }
+
+    #[test]
+    fn legacy_reviewer_snapshot_resumes_its_stored_graph_without_conversion() {
+        let fixture = Fixture::new();
+        let created_at = now();
+        let run_id = RunId::from_u128(9_100_001);
+        let config_id = ConfigSnapshotId::new("legacy-reviewer-config").unwrap();
+        let id = |value: &str| StageId::new(value).unwrap();
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Standard,
+            vec![
+                StageDefinition::new(
+                    id("architecture"),
+                    StageKind::Architecture,
+                    Role::Architect,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    id("implementation"),
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    vec![Dependency::required(id("architecture"))],
+                ),
+                StageDefinition::new(
+                    id("review"),
+                    StageKind::Review,
+                    Role::Reviewer,
+                    vec![Dependency::required(id("implementation"))],
+                ),
+                StageDefinition::new(
+                    id("decision"),
+                    StageKind::Decision,
+                    Role::EngineeringLead,
+                    vec![Dependency::required(id("review"))],
+                ),
+            ],
+        )
+        .unwrap();
+        let run = Run::new(run_id, workflow.clone(), config_id.clone(), created_at);
+        let input = RunInput::new(run_id, "legacy standard task", created_at).unwrap();
+        let config = DevelopmentFakeProviderFactory
+            .config_for_new_run(Some("fake"), config_id, created_at)
+            .unwrap();
+        let event = run.created_event(EventMetadata::new(EventId::new(), created_at));
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        store
+            .create_run_with_input(&run, &input, &config, &[event])
+            .unwrap();
+        WorkspaceManager::new(&fixture.worktrees)
+            .prepare_run_workspace(&mut store, run_id, &fixture.repo)
+            .unwrap();
+        drop(store);
+
+        let reloaded = fixture.default_service().inspect_run(run_id).unwrap();
+        assert_eq!(reloaded.stages.len(), 4);
+        let completed = fixture.default_service().resume_run(run_id).unwrap();
+        assert_eq!(completed.details.status, RunStatus::Completed);
+        let loaded = SqliteStore::open(&fixture.database)
+            .unwrap()
+            .load_run(run_id)
+            .unwrap()
+            .run;
+        assert_eq!(loaded.workflow(), &workflow);
+        assert_eq!(
+            loaded.workflow().stage(&id("review")).unwrap().role(),
+            Role::Reviewer
+        );
+        assert!(loaded.workflow().stage(&id("quality_review")).is_none());
+        assert!(loaded.workflow().stage(&id("spec_review")).is_none());
+    }
+
+    #[test]
+    fn restart_after_one_specialized_review_does_not_replay_completed_branch() {
+        let fixture = Fixture::new();
+        let scenario = || {
+            FakeScenario::new()
+                .stage("architecture")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("implementation")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("quality_review")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("spec_review")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::Interrupted,
+                    FakeEvent::Completed,
+                ])
+                .stage("decision")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+        };
+        let interrupted = fixture
+            .scripted_service(scenario())
+            .start_run(
+                WorkflowKind::Standard,
+                "restart specialized reviews",
+                &fixture.repo,
+                Some("fake"),
+            )
+            .unwrap();
+        let run_id = interrupted.details.id;
+        let quality = StageId::new("quality_review").unwrap();
+        let spec = StageId::new("spec_review").unwrap();
+        let decision = StageId::new("decision").unwrap();
+        assert_eq!(
+            interrupted
+                .details
+                .stages
+                .iter()
+                .find(|stage| stage.id == quality)
+                .unwrap()
+                .status,
+            StageStatus::Completed
+        );
+        assert_eq!(
+            interrupted
+                .details
+                .stages
+                .iter()
+                .find(|stage| stage.id == spec)
+                .unwrap()
+                .status,
+            StageStatus::Interrupted
+        );
+        assert_eq!(
+            interrupted
+                .details
+                .stages
+                .iter()
+                .find(|stage| stage.id == decision)
+                .unwrap()
+                .status,
+            StageStatus::Pending
+        );
+
+        let completed = fixture
+            .scripted_service(scenario())
+            .resume_run(run_id)
+            .unwrap();
+        assert_eq!(completed.details.status, RunStatus::Completed);
+        let events = SqliteStore::open(&fixture.database)
+            .unwrap()
+            .load_events(run_id)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event.stage_id() == Some(&quality)
+                        && matches!(event.event.kind(), DomainEventKind::ProviderStarted { .. })
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]

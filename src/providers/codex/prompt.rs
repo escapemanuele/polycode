@@ -1,8 +1,8 @@
 use std::fmt::Write as _;
 
-use crate::domain::{Role, StageKind};
+use crate::domain::StageKind;
 use crate::engine::ProviderRequest;
-use crate::providers::ArtifactRecord;
+use crate::providers::{ArtifactRecord, stage_prompt};
 
 use super::CodexProviderError;
 
@@ -26,7 +26,7 @@ pub(crate) fn compose(
     writeln!(
         prompt,
         "\n{}",
-        role_instruction(request.role(), request.stage_kind())
+        stage_prompt::instruction(request.role(), request.stage_kind())
     )
     .expect("String writes cannot fail");
     writeln!(
@@ -46,15 +46,7 @@ pub(crate) fn compose(
     }
     .expect("String writes cannot fail");
 
-    let dependencies = artifacts
-        .iter()
-        .filter(|artifact| {
-            request
-                .dependency_stage_ids()
-                .iter()
-                .any(|id| id == artifact.metadata().stage_id())
-        })
-        .collect::<Vec<_>>();
+    let dependencies = stage_prompt::direct_dependency_artifacts(request, artifacts);
     if !dependencies.is_empty() {
         prompt.push_str("\n# Direct dependency artifacts\n");
     }
@@ -80,25 +72,9 @@ pub(crate) fn compose(
 
 pub(crate) fn continuation(request: &ProviderRequest) -> String {
     format!(
-        "Continue exact interrupted Polycode stage {} in same native Codex thread. Finish assigned {:?} work in current managed worktree. Do not commit, push, or apply changes to another checkout. Return final Markdown result.",
+        "Continue exact interrupted Polycode stage {} in same native Codex thread. Finish assigned {:?} work in current managed worktree. {} Do not commit, push, or apply changes to another checkout. Return final Markdown result.",
         request.stage_id(),
-        request.stage_kind()
+        request.stage_kind(),
+        stage_prompt::instruction(request.role(), request.stage_kind())
     )
-}
-
-const fn role_instruction(role: Role, kind: StageKind) -> &'static str {
-    match (role, kind) {
-        (Role::Researcher, _) => "Inspect repository and gather evidence. Do not invent facts.",
-        (Role::Architect, _) => "Design smallest coherent change. Name constraints and tradeoffs.",
-        (Role::Implementer, _) => "Implement requested change and run proportionate verification.",
-        (Role::Reviewer, _) => {
-            "Review independently. Prioritize correctness, regressions, and missing tests."
-        }
-        (Role::EngineeringLead, StageKind::Decision) => {
-            "Synthesize evidence and make explicit engineering decision."
-        }
-        (Role::EngineeringLead, _) => {
-            "Integrate direct dependency evidence into one actionable engineering result."
-        }
-    }
 }
