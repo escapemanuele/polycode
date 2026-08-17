@@ -12,8 +12,9 @@ pub use provider_factory::{
     RuntimeProviderFactory,
 };
 pub use query::{
-    AttentionSummary, CommittedEvent, RouteSummary, RunDetails, RunListItem, StageSummary,
-    UsageSummary,
+    ArtifactSummary, ArtifactView, AttentionSummary, ChangedFileSummary, CommittedEvent,
+    ProcessLogStream, ProcessLogView, RouteSummary, RunDetails, RunDiffPreview, RunListItem,
+    StageSummary, UsageSummary,
 };
 pub use routing::{
     ExecutionSelection, ExecutionTarget, RECOMMENDED_PROFILE_VERSION, RecommendedAvailability,

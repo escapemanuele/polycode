@@ -20,6 +20,7 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             crate::process::exec_managed_process(manifest)?;
             Ok(())
         }
+        Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
         Some(Command::Doctor) => doctor(),
         Some(Command::Runs) => runs(),
         Some(Command::Fast(args)) => start(WorkflowKind::Fast, args),
@@ -97,7 +98,7 @@ fn doctor() -> Result<()> {
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
-    println!("  status: Milestone 9 role routing + recommended_v1");
+    println!("  status: Milestone 10 Ratatui local control room");
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {

@@ -96,6 +96,14 @@ _Avoid_: Live recommendation, runtime fallback, benchmark claim
 The use-case boundary coordinating repository discovery, atomic creation, workspace lifecycle, provider reconstruction, scheduler commands, and committed query results.
 _Avoid_: CLI command handler, domain aggregate
 
+**Control room**:
+An ephemeral local projection and command surface over durable run state and application use cases. It never owns orchestration state, execution, provider output consumption, or workspace mutation.
+_Avoid_: Execution engine, canonical dashboard, database client
+
+**Frontend detach**:
+Ending one local client connection to a run without interrupting its managed provider, changing lifecycle state, or disposing workspace changes.
+_Avoid_: Stop, cancel, discard
+
 **Quiescence**:
 A durable condition where synchronous execution has no immediate legal work: completed, awaiting attention, paused, interrupted, failed, applied, discarded, or provider-delayed.
 _Avoid_: Every stop is an error, busy polling

@@ -3,7 +3,8 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -96,7 +97,7 @@ fn doctor_reports_codex_health_without_leaking_auth_output_or_creating_db() {
     let healthy = fixture.polycode(&["doctor"], false, false);
     assert_success(&healthy);
     let stdout = String::from_utf8(healthy.stdout).unwrap();
-    assert!(stdout.contains("Milestone 9 role routing + recommended_v1"));
+    assert!(stdout.contains("Milestone 10 Ratatui local control room"));
     assert!(stdout.contains("Codex CLI: available (codex-cli fixture-1)"));
     assert!(stdout.contains("Codex auth: ready (ChatGPT)"));
     assert!(!stdout.contains("fixture-secret"));
@@ -286,6 +287,87 @@ fn retry_creates_new_provider_session_and_new_native_thread() {
     );
 }
 
+#[test]
+fn detached_frontend_leaves_tmux_provider_alive_and_resume_consumes_retained_output() {
+    let fixture = Fixture::new();
+    let mut frontend = fixture.spawn_waiting_codex(&[
+        "fast",
+        "detach fixture task",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--provider",
+        "codex",
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (run_id, process_id, session_name) = loop {
+        if fixture.data.join("polycode.db").exists()
+            && let Ok(store) = SqliteStore::open(fixture.data.join("polycode.db"))
+            && let Ok(runs) = store.list_runs()
+            && let Some(run) = runs.first()
+            && let Ok(processes) = store.list_managed_processes(run.id)
+            && let Some(process) = processes.first()
+            && process.status().is_active()
+        {
+            let session = process.backend_session_id().as_str().to_owned();
+            let live = Command::new(fixture.fake_bin.join("tmux"))
+                .args(["-L", &session, "has-session", "-t", &session])
+                .output()
+                .unwrap();
+            if live.status.success()
+                && fixture.data.join("release-provider.waiting").exists()
+                && !fs::read_to_string(process.spec().stdout_path())
+                    .unwrap()
+                    .contains("turn.completed")
+            {
+                break (run.id, process.id(), session);
+            }
+        }
+        assert!(Instant::now() < deadline, "managed provider did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    frontend.kill().unwrap();
+    let _ = frontend.wait().unwrap();
+    let tmux = Command::new(fixture.fake_bin.join("tmux"))
+        .args(["-L", &session_name, "has-session", "-t", &session_name])
+        .output()
+        .unwrap();
+    assert!(
+        tmux.status.success(),
+        "frontend exit killed managed provider: {}",
+        String::from_utf8_lossy(&tmux.stderr)
+    );
+    fs::write(fixture.data.join("release-provider"), b"continue").unwrap();
+
+    let finished = Instant::now() + Duration::from_secs(8);
+    loop {
+        let store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
+        let process = store.load_managed_process(process_id).unwrap();
+        if fs::read_to_string(process.spec().stdout_path())
+            .unwrap()
+            .contains("turn.completed")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < finished,
+            "detached provider output did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let resumed = fixture.polycode(&["resume", &run_id.to_string()], false, false);
+    assert_success(&resumed);
+    assert!(
+        String::from_utf8(resumed.stdout)
+            .unwrap()
+            .contains("Status     completed")
+    );
+    let store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
+    assert_eq!(store.list_provider_sessions(run_id).unwrap().len(), 1);
+    assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 1);
+}
+
 struct Fixture {
     _temp: TempDir,
     repo: PathBuf,
@@ -361,6 +443,23 @@ impl Fixture {
                 self.capture.join("fail-once"),
             )
             .output()
+            .unwrap()
+    }
+
+    fn spawn_waiting_codex(&self, args: &[&str]) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_polycode"))
+            .args(args)
+            .env("PATH", &self.fake_bin)
+            .env("POLYCODE_DATA_DIR", &self.data)
+            .env("POLYCODE_FAKE_CODEX_CAPTURE_DIR", &self.capture)
+            .env(
+                "POLYCODE_FAKE_CODEX_WAIT_FILE",
+                self.data.join("release-provider"),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap()
     }
 }

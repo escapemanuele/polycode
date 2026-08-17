@@ -1,12 +1,15 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::domain::{
-    AttentionKind, AttentionRequestId, AttentionStatus, DomainEventKind, Role, RunId, RunStatus,
-    StageId, StageKind, StageStatus, WorkflowKind,
+    ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
+    DomainEventKind, Role, RunId, RunStatus, StageId, StageKind, StageStatus, WorkflowKind,
 };
-use crate::store::{RunRevision, SequencedEvent, SqliteStore};
+use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
+use crate::store::{RunRevision, SequencedEvent, SqliteStore, StoreError};
 use crate::workspace::WorkspaceStatus;
 
 use super::AppError;
@@ -85,6 +88,53 @@ pub struct CommittedEvent {
     pub sequence: u64,
     pub stage_id: Option<StageId>,
     pub kind: DomainEventKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactSummary {
+    pub stage_id: StageId,
+    pub kind: ArtifactKind,
+    pub status: ArtifactStatus,
+    pub attempt: u32,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub content_size: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactView {
+    pub summary: ArtifactSummary,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFileSummary {
+    pub path: String,
+    pub binary: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunDiffPreview {
+    pub text: String,
+    pub changed_files: Vec<ChangedFileSummary>,
+    pub total_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessLogStream {
+    pub text: String,
+    pub total_bytes: u64,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessLogView {
+    pub process_id: ManagedProcessId,
+    pub process_status: String,
+    pub stdout: ProcessLogStream,
+    pub stderr: ProcessLogStream,
 }
 
 pub(crate) fn list(store: &SqliteStore) -> Result<Vec<RunListItem>, AppError> {
@@ -233,6 +283,131 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .collect(),
         usage,
     })
+}
+
+pub(crate) fn list_artifacts(
+    store: &SqliteStore,
+    run_id: RunId,
+) -> Result<Vec<ArtifactSummary>, AppError> {
+    Ok(store
+        .list_artifacts(run_id)?
+        .into_iter()
+        .map(|artifact| artifact_summary(&artifact))
+        .collect())
+}
+
+pub(crate) fn read_artifact(
+    store: &SqliteStore,
+    run_id: RunId,
+    stage_id: &StageId,
+) -> Result<ArtifactView, AppError> {
+    let artifact = store
+        .list_artifacts(run_id)?
+        .into_iter()
+        .filter(|artifact| artifact.metadata().stage_id() == stage_id)
+        .max_by_key(crate::providers::ArtifactRecord::attempt)
+        .ok_or_else(|| AppError::ArtifactNotFound {
+            run_id,
+            stage_id: stage_id.clone(),
+        })?;
+    let bytes = std::fs::read(artifact.path()).map_err(StoreError::Io)?;
+    let size_matches = u64::try_from(bytes.len()) == Ok(artifact.content_size());
+    let mut hash = String::with_capacity(64);
+    for byte in Sha256::digest(&bytes) {
+        write!(hash, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    if !size_matches || hash != artifact.content_hash() {
+        return Err(StoreError::ArtifactIntegrity(artifact.path().to_path_buf()).into());
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| StoreError::ArtifactIntegrity(artifact.path().to_path_buf()))?;
+    Ok(ArtifactView {
+        summary: artifact_summary(&artifact),
+        text,
+    })
+}
+
+pub(crate) fn process_log_tail(
+    store: &SqliteStore,
+    manager: &ProcessManager<TmuxBackend>,
+    run_id: RunId,
+    stage_id: &StageId,
+    max_bytes: usize,
+) -> Result<ProcessLogView, AppError> {
+    let process = store
+        .list_managed_processes(run_id)?
+        .into_iter()
+        .filter(|process| process.stage_id() == stage_id)
+        .max_by_key(|process| {
+            (
+                process.attempt(),
+                process.invocation(),
+                *process.created_at(),
+            )
+        })
+        .ok_or_else(|| AppError::ProcessLogNotFound {
+            run_id,
+            stage_id: stage_id.clone(),
+        })?;
+    let (stdout, stdout_total, stdout_truncated) =
+        manager.read_output_tail(store, process.id(), OutputStream::Stdout, max_bytes)?;
+    let (stderr, stderr_total, stderr_truncated) =
+        manager.read_output_tail(store, process.id(), OutputStream::Stderr, max_bytes)?;
+    Ok(ProcessLogView {
+        process_id: process.id(),
+        process_status: process.status().as_str().to_owned(),
+        stdout: ProcessLogStream {
+            text: String::from_utf8_lossy(stdout.bytes()).into_owned(),
+            total_bytes: stdout_total,
+            truncated: stdout_truncated,
+        },
+        stderr: ProcessLogStream {
+            text: String::from_utf8_lossy(stderr.bytes()).into_owned(),
+            total_bytes: stderr_total,
+            truncated: stderr_truncated,
+        },
+    })
+}
+
+fn artifact_summary(artifact: &crate::providers::ArtifactRecord) -> ArtifactSummary {
+    ArtifactSummary {
+        stage_id: artifact.metadata().stage_id().clone(),
+        kind: artifact.metadata().kind(),
+        status: artifact.metadata().status(),
+        attempt: artifact.attempt(),
+        provider: artifact.metadata().provider_id().map(ToString::to_string),
+        model: artifact.metadata().model_id().map(ToString::to_string),
+        content_size: artifact.content_size(),
+        created_at: *artifact.metadata().created_at(),
+    }
+}
+
+pub(crate) fn summarize_diff(text: String, total_bytes: u64, truncated: bool) -> RunDiffPreview {
+    let mut changed_files = Vec::<ChangedFileSummary>::new();
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("diff --git a/") {
+            let path = path
+                .split_once(" b/")
+                .map_or(path, |(_, destination)| destination)
+                .to_owned();
+            if !changed_files.iter().any(|file| file.path == path) {
+                changed_files.push(ChangedFileSummary {
+                    path,
+                    binary: false,
+                });
+            }
+        } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            if let Some(file) = changed_files.last_mut() {
+                file.binary = true;
+            }
+        }
+    }
+    RunDiffPreview {
+        text,
+        changed_files,
+        total_bytes,
+        truncated,
+    }
 }
 
 const fn role_order(role: Role) -> u8 {

@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 9 adds immutable role routing and versioned `recommended_v1` above native Claude Code, Codex CLI, and deterministic FakeProvider adapters. Post-M8 reviewer specialization remains unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, custom routing DSL, async runtime, native process backend, and TUI remain deliberately absent.
+Milestone 10 adds Ratatui local control room as detachable projection and control surface over existing application boundary. Immutable M9 routing, reviewer specialization, native provider semantics, durable recovery, and explicit apply/discard remain unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, custom routing DSL, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -56,6 +56,39 @@ native coding-agent CLI inside isolated Git worktree
 ```
 
 Human-readable artifacts, JSONL logs, and conversations complement SQLite. They never replace canonical machine state.
+
+## Milestone 10 TUI boundary
+
+```text
+                         Polycode TUI
+                             |
+           +-----------------+-----------------+
+           |                                   |
+      read-only refresh                    user action
+           |                                   |
+           v                                   v
+       Query DTOs                       command worker
+           |                                   |
+           +-----------------+-----------------+
+                             v
+                      Application layer
+                             |
+            +----------------+----------------+
+            v                v                v
+          Store          Workspace         Engine
+                                               |
+                                           Provider
+                                               |
+                                       Managed Process
+```
+
+TUI owns ephemeral presentation only: selection, screen, scroll, modal/input state, latest read model, busy marker, and transient errors. Database/application state wins on every refresh. Rendering has no edge to SQLite, Git, tmux, provider adapters, or mutable domain aggregates.
+
+`RunService::list_runs` and `inspect_run` remain primary projections. M10 adds narrow UI-agnostic reads: integrity-verified artifact list/read, bounded process log tail, and bounded workspace diff preview. Artifact bytes are size/SHA-256 checked again before return. Log tail uses explicit file length and offset without cursor acknowledgement. Diff preview uses same temporary index and binary/full-index Git delta as apply, writes Git output to a temporary file, reads at most 2 MiB, and creates no apply intent or source/index mutation.
+
+One standard-thread command worker serializes start, resume/recover, retry, attention resolution, apply, and discard through `RunService`. Frontend thread continues terminal input, rendering, and periodic read-only refresh. No async runtime or scheduler change exists. External CLI writes remain possible; optimistic concurrency and reload stay authoritative.
+
+Quitting or Ctrl-C detaches frontend without joining active worker. Raw mode, alternate screen, bracketed paste, and cursor state are restored by RAII; panic hook performs best-effort restoration before original panic reporting. Local worker disappears when process exits, but tmux-owned provider continues and retained output remains durable. Reopening TUI is observational; explicit resume/recovery performs existing reconciliation. TUI-mode tracing uses a sink so stderr cannot corrupt alternate screen; actionable application failures stay visible in UI.
 
 ## State and events
 
@@ -444,10 +477,18 @@ src/
 │   ├── worktree.rs   create/inspect/remove and branch ownership
 │   ├── patch.rs      temporary-index patch generation and apply
 │   └── error.rs      typed Git failures
-└── workspace/
+├── workspace/
     ├── manager.rs    intent/effect/finalize orchestration
     ├── model.rs      workspace and apply-operation records
     └── error.rs      typed lifecycle/reconciliation failures
+└── tui/
+    ├── app.rs        refresh/event loop and application-action dispatch
+    ├── state.rs      ephemeral presentation state and composer editing
+    ├── render.rs     Ratatui rendering and TestBackend coverage
+    ├── input.rs      terminal key-to-intent mapping
+    ├── worker.rs     one serialized standard-thread action worker
+    ├── terminal.rs   raw-mode/alternate-screen RAII and panic restoration
+    └── mod.rs        public TUI entry point
 ```
 
 Domain operations are deterministic: callers supply UTC timestamps. Invalid transitions and persistence failures return typed `thiserror` errors; `anyhow` remains at the application boundary. Serde uses inspectable snake-case values. Aggregate deserialization is prohibited; versioned DTO decoding always ends at validated rehydration.
@@ -457,7 +498,7 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Single Cargo package and binary; no workspace.
 - Rust 2024 edition with Rust 1.85 minimum, matching stable edition support.
 - Configuration lookup uses standard environment variables and no platform-directory crate because required location is explicitly `~/.config/polycode`.
-- Missing subcommand prints help until the runs TUI exists.
+- Missing subcommand opens TUI only when stdin and stdout are interactive; non-interactive use prints help without terminal control sequences.
 - No configuration file is created during bootstrap.
 - Internal domain/database schema must not depend on provisional branding beyond filesystem and package identity where unavoidable.
 - Explicit `Ready` is persisted because preparation and dependency validation need atomic recovery boundaries.
@@ -487,3 +528,6 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Permission continuation uses same Claude UUID and exact safely representable native allow rule; broad/ambiguous approval fails closed.
 - Native Codex default model is used unless immutable configuration supplies one; no model is marked confirmed without protocol evidence.
 - Codex sandbox derives from stage kind and remains enabled with approval `never`; no prose heuristic creates human attention.
+- TUI is an ephemeral projection/control surface; canonical state and all execution remain below application boundary.
+- TUI read APIs are side-effect free: no reconciliation, output acknowledgement, apply intent, real-index mutation, or semantic event.
+- Blocking application actions are serialized on one standard thread; frontend detach never implies provider interruption or run disposition.
