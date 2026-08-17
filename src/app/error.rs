@@ -53,4 +53,6 @@ pub enum AppError {
     ArtifactNotFound { run_id: RunId, stage_id: StageId },
     #[error("run {run_id} stage {stage_id} has no managed process log")]
     ProcessLogNotFound { run_id: RunId, stage_id: StageId },
+    #[error("run {run_id} has no stage {stage_id}")]
+    StageNotFound { run_id: RunId, stage_id: StageId },
 }

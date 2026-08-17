@@ -9,13 +9,13 @@ use crate::domain::{
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
 use crate::process::{ManagedProcessStatus, ProcessManager};
-use crate::store::{RunInput, SqliteStore, database_file, worktree_root};
+use crate::store::{ResolvedConfigSnapshot, RunInput, SqliteStore, database_file, worktree_root};
 use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 
-use super::provider_factory::ProviderFactory;
+use super::provider_factory::{ProviderFactory, ProviderResolver};
 use super::{
     AppError, ArtifactSummary, ArtifactView, CommittedEvent, ExecutionSelection, ProcessLogView,
-    RunDetails, RunDiffPreview, RunListItem, query,
+    RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, query,
 };
 
 const DIFF_PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
@@ -55,7 +55,7 @@ pub struct RunService<F> {
 
 impl<F> RunService<F>
 where
-    F: ProviderFactory,
+    F: ProviderResolver,
 {
     #[must_use]
     pub const fn new(database: PathBuf, worktrees: PathBuf, provider_factory: F) -> Self {
@@ -88,12 +88,13 @@ where
         task: impl Into<String>,
         repository_path: impl AsRef<Path>,
         selection: Option<ExecutionSelection>,
-    ) -> Result<ExecutionReport, AppError> {
-        let repository = GitRepository::discover(repository_path)?;
+    ) -> Result<ExecutionReport, AppError>
+    where
+        F: ProviderFactory,
+    {
         let created_at = now();
-        let run_id = RunId::new();
-        let input = RunInput::new(run_id, task, created_at)?;
         let workflow = WorkflowDefinition::built_in(workflow_kind);
+        let run_id = RunId::new();
         let config_id = ConfigSnapshotId::new(format!("config-{run_id}"))?;
         let selection = selection.ok_or(AppError::NoProductionProvider)?;
         let config = self.provider_factory.config_for_new_run(
@@ -102,10 +103,49 @@ where
             config_id.clone(),
             created_at,
         )?;
+        self.start_run_with_config_at(
+            workflow,
+            task.into(),
+            repository_path.as_ref(),
+            &config,
+            run_id,
+            created_at,
+        )
+    }
+
+    pub(crate) fn start_run_with_config(
+        &self,
+        workflow_kind: WorkflowKind,
+        task: impl Into<String>,
+        repository_path: impl AsRef<Path>,
+        config: &ResolvedConfigSnapshot,
+    ) -> Result<ExecutionReport, AppError> {
+        self.start_run_with_config_at(
+            WorkflowDefinition::built_in(workflow_kind),
+            task.into(),
+            repository_path.as_ref(),
+            config,
+            RunId::new(),
+            now(),
+        )
+    }
+
+    fn start_run_with_config_at(
+        &self,
+        workflow: WorkflowDefinition,
+        task: String,
+        repository_path: &Path,
+        config: &ResolvedConfigSnapshot,
+        run_id: RunId,
+        created_at: DateTime<Utc>,
+    ) -> Result<ExecutionReport, AppError> {
+        let repository = GitRepository::discover(repository_path)?;
+        let input = RunInput::new(run_id, task, created_at)?;
+        let config_id = config.id().clone();
         let run = Run::new(run_id, workflow, config_id, created_at);
         let created = run.created_event(EventMetadata::new(EventId::new(), created_at));
         let mut store = SqliteStore::open(&self.database)?;
-        store.create_run_with_input(&run, &input, &config, &[created])?;
+        store.create_run_with_input(&run, &input, config, &[created])?;
 
         let manager = WorkspaceManager::new(&self.worktrees);
         manager.prepare_run_workspace(&mut store, run_id, repository.source_path())?;
@@ -291,6 +331,20 @@ where
         query::process_log_tail(&store, &manager, run_id, stage_id, PROCESS_LOG_TAIL_LIMIT)
     }
 
+    /// Returns provider-neutral evidence for exactly one stage.
+    ///
+    /// Usage excludes every other routed stage and reading does not mutate cursors or run state.
+    ///
+    /// # Errors
+    /// Returns missing/corrupt run, stage, routing, event, or provider-session data.
+    pub fn stage_execution_evidence(
+        &self,
+        run_id: RunId,
+        stage_id: &StageId,
+    ) -> Result<StageExecutionEvidence, AppError> {
+        query::stage_execution_evidence(&mut SqliteStore::open(&self.database)?, run_id, stage_id)
+    }
+
     fn reconcile(&self, store: &mut SqliteStore, run_id: RunId) -> Result<(), AppError> {
         let outcome = WorkspaceManager::new(&self.worktrees).reconcile(store, run_id)?;
         match outcome {
@@ -311,7 +365,7 @@ where
             .load_run_input(run_id)?
             .ok_or(AppError::LegacyRunInput(run_id))?;
         let events = store.load_events(run_id)?;
-        let provider = self.provider_factory.for_run(
+        let provider = self.provider_factory.resolve_for_run(
             run_id,
             &loaded.config_snapshot,
             loaded.run.workflow(),

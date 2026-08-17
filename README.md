@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository contains **Milestone 10 Ratatui local control room** above role-routed native Claude Code, Codex CLI, and deterministic FakeProvider adapters. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, crash-reconcilable tmux supervision, and immutable `recommended_v1` routing remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain future work.
+Polycode is early-stage software. This repository contains **Milestone 11 role evaluation harness and routing evidence** above role-routed native Claude Code, Codex CLI, deterministic FakeProvider adapters, and Ratatui local control room. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, crash-reconcilable tmux supervision, and immutable `recommended_v1` routing remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, direct provider chat, and `recommended_v2` remain future work.
 
 ## Principles
 
@@ -67,12 +67,65 @@ Key bindings:
 
 New-run composer defaults to Standard workflow and Recommended routing. Choices are Recommended, Claude only, Codex only, and Fake. Selection maps directly to M9 `ExecutionSelection`; UI never recomputes routes.
 
+## Evaluations
+
+Experimental evaluation tooling compares one provider/model candidate by engineering role, not general intelligence:
+
+```console
+polycode eval list
+polycode eval run --suite role_core_v1 --provider fake
+polycode eval run --suite role_core_v1 --provider codex --model <model> --repeat 3 --allow-native-usage
+polycode eval report ~/.polycode/evals/<evaluation-directory>
+polycode eval report <codex-results> <claude-results>
+```
+
+Native Claude/Codex evaluation can consume subscription or provider usage. Every invocation must explicitly pass `--allow-native-usage`; consent is never stored. Fake needs no acknowledgement, produces `synthetic = true`, and is useful only for harness/CI plumbing—not routing evidence. Omitted `--model` is recorded as `configured_model = null`, meaning native configured/default model. Confirmed model remains separate and may also be null; Polycode never guesses.
+
+`role_core_v1` contains seven high-signal cases:
+
+- Implementer: basic correctness, narrow scope discipline, and stopping on plan/repository contradiction.
+- Code Quality Reviewer: planted unnecessary abstraction/duplicate representation/nesting, plus clean-code false positives.
+- Specification Reviewer: independently planted Missing/Wrong/Unrequested behavior, plus clean-spec false positives.
+
+Architect, Researcher, and EngineeringLead remain intentionally unevaluated until deterministic high-signal oracles exist. M11 uses no LLM judge. Reviewer findings match source-controlled ground truth one-to-one using category/severity, file, nearby line range, and concept rules. Implementer cases score pre-apply diff scope, real apply into disposable source, and fixed offline validation argv. Read-only reviewer mutation is infrastructure/safety failure.
+
+Each repetition materializes a fresh fixture Git repository and uses its own SQLite/worktree/process roots. Ordinary `~/.polycode/polycode.db` is never opened, so eval runs never appear in `polycode runs`. Default evidence lives under:
+
+```text
+~/.polycode/evals/<evaluation-id>/<case-id>/rep-NNN/
+├── result.json
+├── artifact.md
+├── diff.patch
+├── validation.txt
+├── source/
+└── runtime/     isolated Polycode database, worktrees, and process evidence
+```
+
+`result.json` is schema-versioned and records suite/case fingerprints, repetition, role, configured/confirmed model, provider CLI version, benchmark vs infrastructure status, target-stage-only usage, latency, and evidence hashes. Reports aggregate role-specific metrics and expose individual failures; they never calculate monetary cost, choose a winner, generate routing, or feed runtime policy.
+
+Interpret results narrowly. Small suites do not prove general superiority; models/providers change; three repetitions remain a small sample; fixture representativeness matters; false positives matter; results apply only to measured roles; user-global native configuration intentionally influences actual runtime behavior. Record CLI/model/suite identity, but never snapshot credentials, auth files, or full environment.
+
+Future evidence workflow, not implemented:
+
+```text
+collect candidate result sets
+  -> inspect cases and evidence manually
+  -> decide role policy
+  -> author recommended_v2 in source
+  -> preserve recommended_v1 for existing runs
+```
+
+M11 does not change `recommended_v1`. Normal routing never reads `~/.polycode/evals`; deleting evaluation data has zero production effect. No evaluation controls exist in TUI.
+
 ## Current CLI
 
 ```console
 polycode --help
 polycode --version
 polycode tui
+polycode eval list
+polycode eval run --provider fake
+polycode eval report <path> [<path> ...]
 polycode doctor
 polycode fast "Fix the parser" --provider claude
 polycode standard "Add export support" --repo /path/to/repo --provider claude
@@ -220,7 +273,7 @@ Direct dependency artifacts are included in downstream prompts. Artifact metadat
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, `recommended_v1`, and local TUI are implemented; Gemini, adaptive routing/failover, Advisor, and direct provider chat remain future constraints.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, `recommended_v1`, local TUI, and separate role evaluation evidence are implemented; Gemini, adaptive routing/failover, `recommended_v2`, Advisor, and direct provider chat remain future constraints.
 
 ## License
 

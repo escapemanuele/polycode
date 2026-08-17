@@ -10,6 +10,7 @@ use crate::store::ResolvedConfigSnapshot;
 
 pub const RECOMMENDED_PROFILE_VERSION: &str = "recommended_v1";
 const UNIFORM_PROFILE_VERSION: &str = "uniform_v1";
+pub(crate) const EVAL_PROFILE_VERSION: &str = "eval_v1";
 
 /// One immutable provider/model destination selected for a role.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -273,6 +274,64 @@ pub fn resolve_config(
     Ok(snapshot)
 }
 
+/// Encodes one isolated evaluation route while keeping support roles synthetic.
+///
+/// This profile is not exposed by normal run creation or Recommended routing.
+pub(crate) fn resolve_eval_config(
+    target_role: Role,
+    target: &ExecutionTarget,
+    workflow: &WorkflowDefinition,
+    id: ConfigSnapshotId,
+    created_at: DateTime<Utc>,
+) -> Result<ResolvedConfigSnapshot, RoutingError> {
+    let roles = required_roles(workflow);
+    if !roles.contains(&target_role) {
+        return Err(RoutingError::EvaluationRoleAbsent(target_role));
+    }
+    let routes = roles
+        .into_iter()
+        .map(|role| {
+            let (target, reason) = if role == target_role {
+                (target.clone(), "eval_candidate")
+            } else {
+                (
+                    ExecutionTarget::new(
+                        ProviderId::new("fake").expect("static provider ID is valid"),
+                        None,
+                    ),
+                    "eval_support",
+                )
+            };
+            (
+                role,
+                RouteDto {
+                    provider: target.provider_id().to_string(),
+                    model: target.model_id().map(ToString::to_string),
+                    reason: reason.to_owned(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let providers = routes
+        .values()
+        .map(|route| route.provider.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|provider| Ok((provider.to_owned(), provider_config_dto(provider)?)))
+        .collect::<Result<HashMap<_, _>, RoutingError>>()?;
+    let payload = RoutingPayloadV2 {
+        schema_version: 2,
+        profile: "eval".to_owned(),
+        profile_version: EVAL_PROFILE_VERSION.to_owned(),
+        routes,
+        providers,
+    };
+    let snapshot = ResolvedConfigSnapshot::new(id, 2, serde_json::to_value(payload)?, created_at)
+        .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
+    RoutingPlan::from_snapshot(&snapshot, workflow)?;
+    Ok(snapshot)
+}
+
 fn recommended_routes(
     roles: HashSet<Role>,
     availability: RecommendedAvailability,
@@ -373,7 +432,9 @@ fn decode_v2(
         ));
     }
     match (payload.profile.as_str(), payload.profile_version.as_str()) {
-        ("uniform", UNIFORM_PROFILE_VERSION) | ("recommended", RECOMMENDED_PROFILE_VERSION) => {}
+        ("uniform", UNIFORM_PROFILE_VERSION)
+        | ("recommended", RECOMMENDED_PROFILE_VERSION)
+        | ("eval", EVAL_PROFILE_VERSION) => {}
         _ => return Err(RoutingError::InvalidProfileMetadata),
     }
     let mut provider_configs = HashMap::new();
@@ -432,6 +493,26 @@ fn decode_v2(
         return Err(RoutingError::InvalidConfig(
             "uniform profile must use one execution target".to_owned(),
         ));
+    }
+    if payload.profile == "eval" {
+        let candidate_count = role_routes
+            .values()
+            .filter(|route| route.reason() == "eval_candidate")
+            .count();
+        let support_routes_valid = role_routes.values().all(|route| {
+            route.reason() == "eval_candidate"
+                || (route.reason() == "eval_support"
+                    && route.target().provider_id().as_str() == "fake"
+                    && route.target().model_id().is_none())
+        });
+        if candidate_count != 1
+            || !support_routes_valid
+            || role_routes.len() != required_roles(workflow).len()
+        {
+            return Err(RoutingError::InvalidConfig(
+                "eval profile requires one candidate route and Fake support routes".to_owned(),
+            ));
+        }
     }
     Ok(RoutingPlan {
         profile: payload.profile,
@@ -613,6 +694,8 @@ pub enum RoutingError {
     FakeInRecommended,
     #[error("recommended profile requires authenticated Claude Code or Codex CLI")]
     RecommendedUnavailable,
+    #[error("evaluation target role {0:?} is absent from workflow")]
+    EvaluationRoleAbsent(Role),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -863,5 +946,39 @@ mod tests {
                 "{name} unexpectedly passed"
             );
         }
+    }
+
+    #[test]
+    fn eval_profile_routes_exactly_one_role_to_modeled_candidate_and_support_to_fake() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        let target = ExecutionTarget::new(
+            ProviderId::new("codex").unwrap(),
+            Some(ModelId::new("candidate-model").unwrap()),
+        );
+        let snapshot = resolve_eval_config(
+            Role::SpecReviewer,
+            &target,
+            &workflow,
+            ConfigSnapshotId::new("eval-routing").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        let plan = RoutingPlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(plan.profile(), "eval");
+        assert_eq!(plan.profile_version(), EVAL_PROFILE_VERSION);
+        assert_eq!(plan.route(Role::SpecReviewer).unwrap().target(), &target);
+        assert_eq!(
+            plan.routes()
+                .filter(|(_, route)| route.reason() == "eval_candidate")
+                .count(),
+            1
+        );
+        assert!(plan.routes().all(|(role, route)| {
+            role == Role::SpecReviewer
+                || (route.target().provider_id().as_str() == "fake"
+                    && route.target().model_id().is_none()
+                    && route.reason() == "eval_support")
+        }));
+        assert_eq!(RECOMMENDED_PROFILE_VERSION, "recommended_v1");
     }
 }

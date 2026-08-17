@@ -4,6 +4,7 @@ mod config;
 pub mod app;
 pub mod domain;
 pub mod engine;
+pub mod eval;
 pub mod git;
 pub mod process;
 pub mod providers;

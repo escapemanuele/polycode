@@ -104,6 +104,30 @@ _Avoid_: Execution engine, canonical dashboard, database client
 Ending one local client connection to a run without interrupting its managed provider, changing lifecycle state, or disposing workspace changes.
 _Avoid_: Stop, cancel, discard
 
+**Evaluation suite**:
+A human-versioned, source-controlled collection of role-specific cases whose meaning remains stable across result sets.
+_Avoid_: Generic benchmark, live leaderboard
+
+**Evaluation case**:
+One stable scenario pairing an engineering role with disposable repository evidence and an independent deterministic oracle.
+_Avoid_: Production run, prompt sample
+
+**Evaluation target**:
+One candidate provider plus optional configured model measured for exactly one role while support roles remain synthetic.
+_Avoid_: Role route, Recommended profile, winner
+
+**Evaluation result**:
+Versioned evidence from one case repetition, preserving candidate identity, fixture identity, role metrics, usage, latency, and failure classification outside production run history.
+_Avoid_: Routing policy, benchmark row in Run
+
+**Benchmark failure**:
+A measured candidate outcome that violates a case criterion, such as failed behavior, scope drift, missed finding, or false positive.
+_Avoid_: Provider outage, harness failure
+
+**Evaluation infrastructure failure**:
+Failure of fixture, provider availability, supervision, protocol, artifact integrity, apply, or safety boundary that prevents trustworthy candidate scoring.
+_Avoid_: Model failure, zero score
+
 **Quiescence**:
 A durable condition where synchronous execution has no immediate legal work: completed, awaiting attention, paused, interrupted, failed, applied, discarded, or provider-delayed.
 _Avoid_: Every stop is an error, busy polling

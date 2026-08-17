@@ -137,6 +137,19 @@ pub struct ProcessLogView {
     pub stderr: ProcessLogStream,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageExecutionEvidence {
+    pub stage_id: StageId,
+    pub configured_provider: String,
+    pub configured_model: Option<String>,
+    pub actual_provider: Option<String>,
+    pub confirmed_model: Option<String>,
+    pub provider_cli_version: Option<String>,
+    pub usage: UsageSummary,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
 pub(crate) fn list(store: &SqliteStore) -> Result<Vec<RunListItem>, AppError> {
     Ok(store
         .list_runs()?
@@ -366,6 +379,90 @@ pub(crate) fn process_log_tail(
             total_bytes: stderr_total,
             truncated: stderr_truncated,
         },
+    })
+}
+
+pub(crate) fn stage_execution_evidence(
+    store: &mut SqliteStore,
+    run_id: RunId,
+    stage_id: &StageId,
+) -> Result<StageExecutionEvidence, AppError> {
+    let loaded = store.load_run(run_id)?;
+    let stage = loaded
+        .run
+        .stage(stage_id)
+        .ok_or_else(|| AppError::StageNotFound {
+            run_id,
+            stage_id: stage_id.clone(),
+        })?;
+    let plan = RoutingPlan::from_snapshot(&loaded.config_snapshot, loaded.run.workflow())?;
+    let route = plan
+        .route(stage.role())
+        .ok_or(super::RoutingError::MissingRoleRoute(stage.role()))?;
+    let events = store.load_events(run_id)?;
+    let mut usage = UsageSummary::default();
+    let mut started_at = None;
+    let mut finished_at = None;
+    let mut started_target = None;
+    for event in events
+        .iter()
+        .filter(|event| event.event.stage_id() == Some(stage_id))
+    {
+        match event.event.kind() {
+            DomainEventKind::ProviderStarted {
+                provider_id,
+                model_id,
+                ..
+            } => {
+                started_at.get_or_insert(*event.event.occurred_at());
+                started_target = Some((
+                    provider_id.to_string(),
+                    model_id.as_ref().map(ToString::to_string),
+                ));
+            }
+            DomainEventKind::ProviderUsageUpdated {
+                input_units,
+                output_units,
+                ..
+            } => {
+                usage.input_units = usage.input_units.saturating_add(*input_units);
+                usage.output_units = usage.output_units.saturating_add(*output_units);
+            }
+            DomainEventKind::ProviderCompleted { .. } | DomainEventKind::ProviderFailed { .. } => {
+                finished_at = Some(*event.event.occurred_at());
+            }
+            _ => {}
+        }
+    }
+    let session = store
+        .list_provider_sessions(run_id)?
+        .into_iter()
+        .filter(|session| session.stage_id() == stage_id)
+        .max_by_key(crate::providers::ProviderSessionRecord::attempt);
+    Ok(StageExecutionEvidence {
+        stage_id: stage_id.clone(),
+        configured_provider: route.target().provider_id().to_string(),
+        configured_model: route.target().model_id().map(ToString::to_string),
+        actual_provider: session
+            .as_ref()
+            .map(|session| session.provider_id().to_string())
+            .or_else(|| {
+                started_target
+                    .as_ref()
+                    .map(|(provider, _)| provider.clone())
+            }),
+        confirmed_model: session
+            .as_ref()
+            .and_then(crate::providers::ProviderSessionRecord::model_id)
+            .map(ToString::to_string)
+            .or_else(|| started_target.and_then(|(_, model)| model)),
+        provider_cli_version: session
+            .as_ref()
+            .and_then(crate::providers::ProviderSessionRecord::cli_version)
+            .map(ToOwned::to_owned),
+        usage,
+        started_at,
+        finished_at,
     })
 }
 

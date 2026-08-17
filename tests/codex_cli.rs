@@ -97,7 +97,7 @@ fn doctor_reports_codex_health_without_leaking_auth_output_or_creating_db() {
     let healthy = fixture.polycode(&["doctor"], false, false);
     assert_success(&healthy);
     let stdout = String::from_utf8(healthy.stdout).unwrap();
-    assert!(stdout.contains("Milestone 10 Ratatui local control room"));
+    assert!(stdout.contains("Milestone 11 role evaluation harness"));
     assert!(stdout.contains("Codex CLI: available (codex-cli fixture-1)"));
     assert!(stdout.contains("Codex auth: ready (ChatGPT)"));
     assert!(!stdout.contains("fixture-secret"));

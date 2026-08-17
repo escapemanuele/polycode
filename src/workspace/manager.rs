@@ -247,8 +247,9 @@ impl WorkspaceManager {
     /// Builds a bounded read-only preview from same temporary-index delta used by apply.
     ///
     /// # Errors
-    /// Rejects missing/non-ready/non-branch workspaces, ownership failures, invalid limits,
-    /// or Git failures. No apply intent or canonical state is changed.
+    /// Rejects missing/non-ready workspaces, ownership failures, invalid limits, or Git failures.
+    /// Branch and detached workspaces are both inspectable; only branch workspaces remain
+    /// applicable. No apply intent or canonical state is changed.
     pub(crate) fn preview_patch(
         &self,
         store: &mut SqliteStore,
@@ -262,9 +263,6 @@ impl WorkspaceManager {
             .into());
         }
         let workspace = Self::ready_workspace(store, run_id)?;
-        if workspace.mode() != WorkspaceMode::Branch {
-            return Err(WorkspaceError::ReviewWorkspaceNotApplicable);
-        }
         self.validate_workspace(&workspace, false)?;
         Ok(generate_patch_preview(
             &self.git,

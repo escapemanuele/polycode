@@ -64,6 +64,23 @@ impl ClaudeProvider<TmuxBackend> {
             artifact_root: root,
         })
     }
+
+    pub(crate) fn from_runtime(
+        model: Option<ModelId>,
+        root: PathBuf,
+        runner_executable: PathBuf,
+    ) -> Result<Self, ClaudeProviderError> {
+        let installation = ClaudeInstallation::discover()?;
+        installation.require_authenticated()?;
+        Ok(Self {
+            id: ProviderId::new("claude")
+                .map_err(|error| ClaudeProviderError::Protocol(error.to_string()))?,
+            installation,
+            model,
+            manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
+            artifact_root: root,
+        })
+    }
 }
 
 impl<B: ProcessBackend> ClaudeProvider<B> {

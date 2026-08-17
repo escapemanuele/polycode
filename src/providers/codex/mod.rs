@@ -57,6 +57,23 @@ impl CodexProvider<TmuxBackend> {
             artifact_root: root,
         })
     }
+
+    pub(crate) fn from_runtime(
+        model: Option<ModelId>,
+        root: PathBuf,
+        runner_executable: PathBuf,
+    ) -> Result<Self, CodexProviderError> {
+        let installation = CodexInstallation::discover()?;
+        installation.require_authenticated()?;
+        Ok(Self {
+            id: ProviderId::new("codex")
+                .map_err(|error| CodexProviderError::Protocol(error.to_string()))?,
+            installation,
+            model,
+            manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
+            artifact_root: root,
+        })
+    }
 }
 
 impl<B: ProcessBackend> CodexProvider<B> {

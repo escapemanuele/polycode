@@ -45,6 +45,36 @@ pub trait ProviderFactory {
     ) -> Result<Self::Provider, AppError>;
 }
 
+pub trait ProviderResolver {
+    type Provider: Provider;
+
+    /// Reconstructs provider behavior from one validated immutable configuration.
+    ///
+    /// # Errors
+    /// Rejects invalid configuration or unavailable routed provider infrastructure.
+    fn resolve_for_run(
+        &self,
+        run_id: RunId,
+        config: &ResolvedConfigSnapshot,
+        workflow: &WorkflowDefinition,
+        events: &[SequencedEvent],
+    ) -> Result<Self::Provider, AppError>;
+}
+
+impl<T: ProviderFactory> ProviderResolver for T {
+    type Provider = T::Provider;
+
+    fn resolve_for_run(
+        &self,
+        run_id: RunId,
+        config: &ResolvedConfigSnapshot,
+        workflow: &WorkflowDefinition,
+        events: &[SequencedEvent],
+    ) -> Result<Self::Provider, AppError> {
+        ProviderFactory::for_run(self, run_id, config, workflow, events)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DevelopmentFakeProviderFactory;
 
@@ -158,6 +188,7 @@ pub struct RoutedProvider {
     plan: RoutingPlan,
     workflow: WorkflowDefinition,
     runtimes: HashMap<ExecutionTarget, RuntimeProvider>,
+    isolated_runtime: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl RoutedProvider {
@@ -167,6 +198,22 @@ impl RoutedProvider {
             plan,
             workflow,
             runtimes: HashMap::new(),
+            isolated_runtime: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn isolated(
+        plan: RoutingPlan,
+        workflow: WorkflowDefinition,
+        process_root: std::path::PathBuf,
+        runner_executable: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            plan,
+            workflow,
+            runtimes: HashMap::new(),
+            isolated_runtime: Some((process_root, runner_executable)),
         }
     }
 
@@ -193,22 +240,20 @@ impl RoutedProvider {
                         .map_err(|error| ProviderError::new(error.to_string()))?,
                 ),
                 "claude" => RuntimeProvider::Claude(
-                    ClaudeProvider::from_environment(target.model_id().cloned()).map_err(
-                        |error| {
+                    self.claude_provider(target.model_id().cloned())
+                        .map_err(|error| {
                             ProviderError::new(format!(
                                 "configured provider unavailable for claude target: {error}"
                             ))
-                        },
-                    )?,
+                        })?,
                 ),
                 "codex" => RuntimeProvider::Codex(
-                    CodexProvider::from_environment(target.model_id().cloned()).map_err(
-                        |error| {
+                    self.codex_provider(target.model_id().cloned())
+                        .map_err(|error| {
                             ProviderError::new(format!(
                                 "configured provider unavailable for codex target: {error}"
                             ))
-                        },
-                    )?,
+                        })?,
                 ),
                 other => {
                     return Err(ProviderError::new(format!(
@@ -221,6 +266,30 @@ impl RoutedProvider {
         self.runtimes
             .get_mut(target)
             .ok_or_else(|| ProviderError::new("lazy provider cache insertion failed"))
+    }
+
+    fn claude_provider(
+        &self,
+        model: Option<crate::domain::ModelId>,
+    ) -> Result<ClaudeProvider, ClaudeProviderError> {
+        match &self.isolated_runtime {
+            Some((root, runner)) => {
+                ClaudeProvider::from_runtime(model, root.clone(), runner.clone())
+            }
+            None => ClaudeProvider::from_environment(model),
+        }
+    }
+
+    fn codex_provider(
+        &self,
+        model: Option<crate::domain::ModelId>,
+    ) -> Result<CodexProvider, CodexProviderError> {
+        match &self.isolated_runtime {
+            Some((root, runner)) => {
+                CodexProvider::from_runtime(model, root.clone(), runner.clone())
+            }
+            None => CodexProvider::from_environment(model),
+        }
     }
 }
 

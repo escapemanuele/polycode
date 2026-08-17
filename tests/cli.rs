@@ -94,7 +94,7 @@ fn doctor_reports_real_tmux_availability_without_creating_database() {
     let output = fixture.doctor_without_native_providers();
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Milestone 10 Ratatui local control room"));
+    assert!(stdout.contains("Milestone 11 role evaluation harness"));
     assert!(stdout.contains("Claude Code:"));
     assert!(stdout.contains("Codex CLI: not found on PATH"));
     assert!(stdout.contains("tmux: available (tmux "));
