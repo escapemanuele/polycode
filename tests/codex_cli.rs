@@ -29,8 +29,8 @@ fn native_codex_fixture_runs_through_tmux_preserves_source_then_applies() {
     assert_success(&started);
     let stdout = String::from_utf8(started.stdout).unwrap();
     assert!(stdout.contains("Status     completed"));
-    assert!(stdout.contains("Provider   codex"));
-    assert!(stdout.contains("Native     codex-thread-implementation"));
+    assert!(stdout.contains("implementer  codex"));
+    assert!(stdout.contains("native=codex-thread-implementation"));
     assert!(stdout.contains("Usage      11 input units · 7 output units"));
     let run_id = stdout
         .lines()
@@ -74,8 +74,8 @@ fn native_codex_fixture_runs_through_tmux_preserves_source_then_applies() {
     let status = fixture.polycode(&["status", run_id], false, false);
     assert_success(&status);
     let status = String::from_utf8(status.stdout).unwrap();
-    assert!(status.contains("Provider   codex"));
-    assert!(status.contains("Conversation completed"));
+    assert!(status.contains("configured=codex/native default"));
+    assert!(status.contains("conversation=completed"));
     assert!(!status.contains("fixture-secret"));
 
     let applied = fixture.polycode(&["apply", run_id], false, false);
@@ -96,7 +96,7 @@ fn doctor_reports_codex_health_without_leaking_auth_output_or_creating_db() {
     let healthy = fixture.polycode(&["doctor"], false, false);
     assert_success(&healthy);
     let stdout = String::from_utf8(healthy.stdout).unwrap();
-    assert!(stdout.contains("Milestone 8 native Claude Code + Codex CLI providers"));
+    assert!(stdout.contains("Milestone 9 role routing + recommended_v1"));
     assert!(stdout.contains("Codex CLI: available (codex-cli fixture-1)"));
     assert!(stdout.contains("Codex auth: ready (ChatGPT)"));
     assert!(!stdout.contains("fixture-secret"));

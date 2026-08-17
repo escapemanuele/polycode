@@ -32,7 +32,7 @@ fn native_codex_completes_disposable_fast_run() {
         &data,
         &[
             "fast",
-            "Create hello.txt containing exactly `M8 native Codex smoke test` and a newline. Make no other change.",
+            "Create hello.txt containing exactly `M9 native Codex smoke test` and a newline. Make no other change.",
             "--repo",
             repository.to_str().unwrap(),
             "--provider",
@@ -42,7 +42,7 @@ fn native_codex_completes_disposable_fast_run() {
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Status     completed"));
-    assert!(stdout.contains("Provider   codex"));
+    assert!(stdout.contains("implementer  codex"));
     assert!(!repository.join("hello.txt").exists());
     assert_eq!(git_output(&repository, &["status", "--porcelain"]), "");
 }

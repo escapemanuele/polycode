@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 8 adds native Codex CLI beside native Claude Code. Post-M8 reviewer specialization splits new built-in review work into independent code-quality and specification responsibilities. Both adapters discover installed CLI/auth through read-only native commands, execute structured non-interactive JSONL inside isolated worktree through shared managed-process substrate, persist opaque native session separately from process invocation, and write verified provider-neutral artifacts. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, multi-provider routing, async runtime, native process backend, and TUI remain deliberately absent.
+Milestone 9 adds immutable role routing and versioned `recommended_v1` above native Claude Code, Codex CLI, and deterministic FakeProvider adapters. Post-M8 reviewer specialization remains unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, custom routing DSL, async runtime, native process backend, and TUI remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -16,7 +16,28 @@ These concepts remain independent:
 workflow stage -> engineering role -> provider -> model
 ```
 
-Workflow definitions depend on roles. A profile resolver will later select a provider/model and role-specific fallbacks without embedding model names in workflow semantics.
+Workflow definitions depend only on roles. Immutable execution configuration maps each used role to an `ExecutionTarget { provider_id, model_id }` without embedding provider/model names in domain or DAG semantics.
+
+## Milestone 9 routing boundary
+
+```text
+Stage
+  -> Role
+  -> immutable RoutingPlan
+  -> ExecutionTarget(provider + optional configured model)
+  -> native Provider adapter
+  -> native CLI
+```
+
+New config payload schema v2 stores profile provenance, explicit role routes, safe display reasons, and provider-native versioned options. SQLite schema and `RunSnapshot` do not change: routing belongs to existing insert-only `ConfigSnapshot` authority.
+
+`--provider claude|codex|fake` is uniform-routing shorthand, not a scheduler bypass. `--profile recommended` resolves source-controlled `recommended_v1` once at run creation. With both native providers ready, Implementer routes to Codex while Researcher, Architect, CodeQualityReviewer, SpecReviewer, legacy Reviewer, and EngineeringLead route to Claude. With only one authenticated native provider, every required role routes to that provider and fallback reason is persisted. Fake is never a Recommended fallback. Policy is provisional, not benchmark-backed.
+
+Persisted routes are authoritative. Resume, retry, recovery, and attention never re-run Recommended. Provider loss/auth expiry after creation produces configured-provider-unavailable error; no runtime rerouting occurs. Schema-v1 M5-M8 configuration normalizes in memory to uniform routes for roles in persisted workflow without rewriting immutable payload.
+
+`WorkflowEngine` builds request, asks provider boundary for actual provider ID, compares it with same-stage checkpoint, then polls. Domain events, sessions, checkpoints, and artifacts therefore record `claude`, `codex`, or `fake`; no router pseudo-provider exists. `WaitingForProvider` carries current stage's attachment policy. Attention continuation reconstructs stage/role context and verifies route matches provider session that created request.
+
+`RoutedProvider` loads routing structure without probing installations. Leaf adapters instantiate only when target is needed and cache by full provider+configured-model target. Completed historical provider may disappear without blocking unrelated remaining target. Status separates configured target from actual provider/model/session/process for each stage.
 
 ## System boundaries
 
@@ -228,7 +249,7 @@ load validated Run + Ready workspace
     -> reject active apply intent
     -> evaluate every Pending stage dependency set
     -> atomically mark all newly Ready or blocked stages
-    -> resolve stage role against provider capability
+    -> resolve stage role through immutable RoutingPlan to actual provider/model target
     -> consume one provider record (one signal or atomic signal batch)
     -> atomically commit Run state + complete event batch
     -> evaluate graph again
@@ -242,7 +263,7 @@ Execution commits recheck `WorkspaceStatus::Ready` inside same `BEGIN IMMEDIATE`
 
 Attention resolution, stage resume, interruption recovery, and retry are scheduler-boundary commands. They use same workspace/apply guards and atomic run commit as automatic advancement.
 
-## Milestones 7–8 application, providers, and CLI
+## Milestones 7–9 application, providers, routing, and CLI
 
 `RunService` is application boundary. CLI parses and prints only; service owns use-case ordering:
 
@@ -455,7 +476,7 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Scheduler is synchronous and single-stage deterministic in Milestone 4; async/process concurrency remains a backend concern.
 - User task is immutable `RunInput`, not aggregate lifecycle state or provider configuration.
 - Workflow workspace mutability derives from stage kinds (`Implementation`/`Fix`), not workflow-name branches.
-- CLI provider choice is explicit; native Claude, native Codex, and development Fake profiles are restart-stable immutable run configuration.
+- CLI execution choice is explicit: `--provider` produces uniform routes and `--profile recommended` produces versioned creation-time routes; both are restart-stable immutable run configuration.
 - Application commands run scheduler to durable quiescence and render only reloaded committed state/events.
 - Managed processes are separate infrastructure attempts; process exit does not directly mutate semantic run/stage state.
 - Exact external argv is preserved end to end; tmux launches multiple command arguments directly rather than a shell command string.

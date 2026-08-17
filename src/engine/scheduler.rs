@@ -8,7 +8,9 @@ use crate::domain::{
 use crate::store::{LoadedRun, RunRevision, SequencedEvent, SqliteStore};
 use crate::workspace::{ApplyStatus, RunWorkspace, WorkspaceStatus};
 
-use super::{EngineError, Provider, ProviderPoll, ProviderRequest, ProviderSignal};
+use super::{
+    EngineError, Provider, ProviderAttentionContext, ProviderPoll, ProviderRequest, ProviderSignal,
+};
 
 const DEFAULT_DRIVE_LIMIT: usize = 10_000;
 
@@ -35,12 +37,25 @@ impl ExecutionContext for SystemExecutionContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineStatus {
-    Advanced { run_status: RunStatus },
-    WaitingForProvider { stage_id: StageId },
-    NeedsUser { requests: Vec<AttentionRequestId> },
-    Paused { stages: Vec<StageId> },
-    Interrupted { stages: Vec<StageId> },
-    Finished { run_status: RunStatus },
+    Advanced {
+        run_status: RunStatus,
+    },
+    WaitingForProvider {
+        stage_id: StageId,
+        keep_attached: bool,
+    },
+    NeedsUser {
+        requests: Vec<AttentionRequestId>,
+    },
+    Paused {
+        stages: Vec<StageId>,
+    },
+    Interrupted {
+        stages: Vec<StageId>,
+    },
+    Finished {
+        run_status: RunStatus,
+    },
 }
 
 /// Deterministic synchronous DAG scheduler for one resolved provider.
@@ -154,8 +169,27 @@ where
         response: Option<&str>,
     ) -> Result<EngineStatus, EngineError> {
         let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let attention = loaded
+            .run
+            .attention_requests()
+            .iter()
+            .find(|request| request.id() == request_id)
+            .ok_or(crate::domain::RunAttentionError::UnknownRequest(request_id))?;
+        let stage = loaded.run.stage(attention.stage_id()).ok_or_else(|| {
+            EngineError::ProviderProtocol {
+                stage_id: attention.stage_id().clone(),
+                message: "attention references unknown stage".to_owned(),
+            }
+        })?;
+        let context = ProviderAttentionContext::new(
+            run_id,
+            stage.id().clone(),
+            stage.kind(),
+            stage.role(),
+            request_id,
+        );
         self.provider
-            .stage_attention_response(store, run_id, request_id, response)?;
+            .stage_attention_response(store, &context, response)?;
         let metadata = self.metadata_for(&loaded.run);
         let event = loaded.run.resolve_attention(request_id, metadata)?;
         commit_execution(store, &loaded.run, loaded.revision, &[event])?;
@@ -362,25 +396,10 @@ where
     ) -> Result<EngineStatus, EngineError> {
         let events = store.load_events(loaded.run.id())?;
         let checkpoint = reduce_checkpoint(&events, stage_id)?;
-        let provider_id = self.provider.id().clone();
-        if let Some(previous) = checkpoint
-            .provider_id
-            .as_ref()
-            .filter(|previous| *previous != &provider_id)
-        {
-            return Err(EngineError::ProviderChanged {
-                stage_id: stage_id.clone(),
-                previous: previous.to_string(),
-                current: provider_id.to_string(),
-            });
-        }
         let stage = loaded
             .run
             .stage(stage_id)
             .expect("selected stage must remain in loaded run");
-        if !self.provider.supports_role(stage.role()) {
-            return Err(EngineError::UnsupportedRole(stage.role()));
-        }
         let request = ProviderRequest::new(
             loaded.run.id(),
             stage.id().clone(),
@@ -398,9 +417,25 @@ where
                 .map(|dependency| dependency.stage_id().clone())
                 .collect(),
         );
+        let provider_id = self.provider.provider_id_for(&request)?;
+        if let Some(previous) = checkpoint
+            .provider_id
+            .as_ref()
+            .filter(|previous| *previous != &provider_id)
+        {
+            return Err(EngineError::ProviderChanged {
+                stage_id: stage_id.clone(),
+                previous: previous.to_string(),
+                current: provider_id.to_string(),
+            });
+        }
+        if !self.provider.supports_request(&request)? {
+            return Err(EngineError::UnsupportedRole(stage.role()));
+        }
         match self.provider.poll(store, &request)? {
             ProviderPoll::Pending => Ok(EngineStatus::WaitingForProvider {
                 stage_id: stage_id.clone(),
+                keep_attached: self.provider.keep_attached_for(&request)?,
             }),
             ProviderPoll::Checkpoint(commit) => {
                 store.commit_provider_checkpoint(&commit)?;
@@ -803,7 +838,7 @@ mod tests {
     use crate::domain::{
         AttentionKind, ConfigSnapshotId, DomainEventKind, WorkflowDefinition, WorkflowKind,
     };
-    use crate::engine::{FakeEvent, FakeProvider, FakeScenario, UsageDelta};
+    use crate::engine::{FakeEvent, FakeProvider, FakeScenario, ProviderError, UsageDelta};
     use crate::store::ResolvedConfigSnapshot;
     use crate::workspace::WorkspaceManager;
 
@@ -840,6 +875,29 @@ mod tests {
         database: PathBuf,
         store: SqliteStore,
         run_id: RunId,
+    }
+
+    struct AliasedFakeProvider {
+        id: ProviderId,
+        inner: FakeProvider,
+    }
+
+    impl Provider for AliasedFakeProvider {
+        fn provider_id_for(&self, _request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+            Ok(self.id.clone())
+        }
+
+        fn supports_role(&self, role: crate::domain::Role) -> bool {
+            self.inner.supports_role(role)
+        }
+
+        fn poll(
+            &mut self,
+            store: &mut SqliteStore,
+            request: &ProviderRequest,
+        ) -> Result<ProviderPoll, ProviderError> {
+            self.inner.poll(store, request)
+        }
     }
 
     impl Fixture {
@@ -999,6 +1057,43 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn same_stage_route_change_is_rejected_before_poll_after_restart() {
+        let mut fixture = Fixture::new(WorkflowKind::Fast, 550_000);
+        let scenario = || {
+            FakeScenario::new().stage("implementation").events([
+                FakeEvent::Started,
+                FakeEvent::delay("hold"),
+                FakeEvent::Completed,
+            ])
+        };
+        let mut original = WorkflowEngine::with_context(
+            FakeProvider::new(scenario()).unwrap(),
+            "provider continuity".to_owned(),
+            TestContext::new(560_000),
+        );
+        assert!(matches!(
+            original.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::WaitingForProvider { .. }
+        ));
+        drop(original);
+
+        let changed = AliasedFakeProvider {
+            id: ProviderId::new("claude").unwrap(),
+            inner: FakeProvider::new(scenario()).unwrap(),
+        };
+        let mut restarted = WorkflowEngine::with_context(
+            changed,
+            "provider continuity".to_owned(),
+            TestContext::new(570_000),
+        );
+        assert!(matches!(
+            restarted.drive(&mut fixture.store, fixture.run_id),
+            Err(EngineError::ProviderChanged { previous, current, .. })
+                if previous == "fake" && current == "claude"
+        ));
     }
 
     #[test]
@@ -1228,7 +1323,8 @@ mod tests {
         assert_eq!(
             engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
             EngineStatus::WaitingForProvider {
-                stage_id: stage_id.clone()
+                stage_id: stage_id.clone(),
+                keep_attached: false,
             }
         );
         engine

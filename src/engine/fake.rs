@@ -162,8 +162,8 @@ impl FakeProvider {
 }
 
 impl Provider for FakeProvider {
-    fn id(&self) -> &ProviderId {
-        &self.id
+    fn provider_id_for(&self, _request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+        Ok(self.id.clone())
     }
 
     fn supports_role(&self, _role: crate::domain::Role) -> bool {

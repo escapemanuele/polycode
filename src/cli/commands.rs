@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::CommandFactory;
 
 use crate::app::{
-    ApplyOutcome, ExecutionReport, QuiescentState, RunDetails, RunService, RuntimeProviderFactory,
+    ApplyOutcome, ExecutionReport, ExecutionSelection, QuiescentState, RunDetails, RunService,
+    RuntimeProviderFactory, UniformProvider,
 };
 use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
@@ -75,12 +76,18 @@ fn service() -> Result<RunService<RuntimeProviderFactory>> {
 }
 
 fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
-    let report = service()?.start_run(
-        workflow,
-        args.task.clone(),
-        &args.repo,
-        args.provider.as_deref(),
-    )?;
+    let selection = match (args.provider.as_deref(), args.profile.as_deref()) {
+        (Some(provider), None) => Some(ExecutionSelection::Uniform(UniformProvider::try_from(
+            provider,
+        )?)),
+        (None, Some("recommended")) => Some(ExecutionSelection::Recommended),
+        (None, Some(other)) => {
+            anyhow::bail!("unsupported profile {other:?}; supported profiles: recommended")
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting selection flags"),
+    };
+    let report = service()?.start_run(workflow, args.task.clone(), &args.repo, selection)?;
     print_report(&report);
     Ok(())
 }
@@ -90,7 +97,7 @@ fn doctor() -> Result<()> {
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
-    println!("  status: Milestone 8 native Claude Code + Codex CLI providers");
+    println!("  status: Milestone 9 role routing + recommended_v1");
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {
@@ -249,38 +256,8 @@ fn print_details(details: &RunDetails) {
     println!("Workflow   {}", enum_text(details.workflow));
     println!("Status     {}", enum_text(details.status));
     println!(
-        "Provider   {}",
-        details.provider.as_deref().unwrap_or("unavailable")
-    );
-    println!(
-        "Profile    {}",
-        details.profile.as_deref().unwrap_or("unavailable")
-    );
-    println!(
-        "Model      {}",
-        details.provider_model.as_deref().unwrap_or("unconfirmed")
-    );
-    println!(
-        "Session    {}",
-        details
-            .provider_session_record
-            .as_deref()
-            .unwrap_or("unavailable")
-    );
-    println!(
-        "Native     {}",
-        details.provider_session.as_deref().unwrap_or("unavailable")
-    );
-    println!(
-        "Conversation {}",
-        details
-            .provider_session_status
-            .as_deref()
-            .unwrap_or("unavailable")
-    );
-    println!(
-        "Process    {}",
-        details.process_status.as_deref().unwrap_or("unavailable")
+        "Profile    {} ({})",
+        details.profile, details.profile_version
     );
     println!(
         "Repository {}",
@@ -313,13 +290,45 @@ fn print_details(details: &RunDetails) {
             .unwrap_or("<legacy input unavailable>")
     );
     println!();
+    println!("Routing");
+    for route in &details.routes {
+        println!(
+            "{}  {}  {}  {}",
+            enum_text(route.role),
+            route.configured_provider,
+            route
+                .configured_model
+                .as_deref()
+                .unwrap_or("native default"),
+            route.reason
+        );
+    }
+    println!();
     println!("Stages");
     for stage in &details.stages {
         println!(
-            "{} {} ({})",
+            "{} {} ({}) · role={} · configured={}/{} · actual={}/{} · session={} · native={} · conversation={} · process={}",
             stage_mark(stage.status),
             stage.id,
-            enum_text(stage.status)
+            enum_text(stage.status),
+            enum_text(stage.role),
+            stage.configured_provider,
+            stage
+                .configured_model
+                .as_deref()
+                .unwrap_or("native default"),
+            stage.actual_provider.as_deref().unwrap_or("not started"),
+            stage.actual_model.as_deref().unwrap_or("unconfirmed"),
+            stage
+                .provider_session_record
+                .as_deref()
+                .unwrap_or("unavailable"),
+            stage.native_session.as_deref().unwrap_or("unavailable"),
+            stage
+                .provider_session_status
+                .as_deref()
+                .unwrap_or("unavailable"),
+            stage.process_status.as_deref().unwrap_or("unavailable")
         );
     }
     println!();

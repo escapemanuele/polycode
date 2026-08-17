@@ -62,8 +62,11 @@ pub struct RunArgs {
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
     /// Native provider (`claude` or `codex`) or deterministic development provider (`fake`).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "profile")]
     pub provider: Option<String>,
+    /// Versioned routing profile (`recommended`).
+    #[arg(long, conflicts_with = "provider")]
+    pub profile: Option<String>,
 }
 
 #[cfg(test)]
