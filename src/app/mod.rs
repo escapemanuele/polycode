@@ -8,14 +8,15 @@ mod run_service;
 
 pub use error::AppError;
 pub use provider_factory::{
-    DevelopmentFakeProviderFactory, ProviderFactory, RoutedProvider, RuntimeProvider,
-    RuntimeProviderFactory,
+    DevelopmentFakeProviderFactory, ProviderFactory, ProviderResolver, RoutedProvider,
+    RuntimeProvider, RuntimeProviderFactory,
 };
 pub use query::{
     ArtifactSummary, ArtifactView, AttentionSummary, ChangedFileSummary, CommittedEvent,
     ProcessLogStream, ProcessLogView, RouteSummary, RunDetails, RunDiffPreview, RunListItem,
-    StageSummary, UsageSummary,
+    StageExecutionEvidence, StageSummary, UsageSummary,
 };
+pub(crate) use routing::resolve_eval_config;
 pub use routing::{
     ExecutionSelection, ExecutionTarget, RECOMMENDED_PROFILE_VERSION, RecommendedAvailability,
     RoleRoute, RoutingError, RoutingPlan, UniformProvider,

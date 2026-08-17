@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 10 adds Ratatui local control room as detachable projection and control surface over existing application boundary. Immutable M9 routing, reviewer specialization, native provider semantics, durable recovery, and explicit apply/discard remain unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, custom routing DSL, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain deliberately absent.
+Milestone 11 adds local role-specific evaluation and versioned routing evidence without changing production routing. Ratatui control room, immutable M9 `recommended_v1`, reviewer specialization, native provider semantics, durable recovery, and explicit apply/discard remain unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, `recommended_v2`, custom routing DSL, LLM judging, cloud benchmark service, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -89,6 +89,34 @@ TUI owns ephemeral presentation only: selection, screen, scroll, modal/input sta
 One standard-thread command worker serializes start, resume/recover, retry, attention resolution, apply, and discard through `RunService`. Frontend thread continues terminal input, rendering, and periodic read-only refresh. No async runtime or scheduler change exists. External CLI writes remain possible; optimistic concurrency and reload stay authoritative.
 
 Quitting or Ctrl-C detaches frontend without joining active worker. Raw mode, alternate screen, bracketed paste, and cursor state are restored by RAII; panic hook performs best-effort restoration before original panic reporting. Local worker disappears when process exits, but tmux-owned provider continues and retained output remains durable. Reopening TUI is observational; explicit resume/recovery performs existing reconciliation. TUI-mode tracing uses a sink so stderr cannot corrupt alternate screen; actionable application failures stay visible in UI.
+
+## Milestone 11 evaluation boundary
+
+```text
+EvalCase
+   -> materialize disposable fixture Git repository
+   -> isolated Polycode database/worktree/process roots
+   -> immutable eval_v1 RoutingPlan
+        target role  -> candidate provider + optional model
+        support role -> FakeProvider
+   -> unchanged WorkflowEngine and native adapter
+   -> verified artifact + bounded pre-apply diff
+   -> existing explicit apply for implementation cases
+   -> fixed offline validation / deterministic ground-truth scorer
+   -> versioned EvalResultV1 evidence files
+```
+
+Evaluation is benchmark metadata, not production orchestration state. No `Run`, `Stage`, `RunSnapshot`, domain event, provider-session, managed-process, or production SQLite schema field changes. Every case repetition uses existing schema in separate runtime directory; ordinary run database is never opened. Final evidence remains outside `polycode.db` as `result.json`, `artifact.md`, `diff.patch`, and `validation.txt`, with isolated raw runtime data retained nearby for debugging. Normal startup and `recommended_v1` never scan evaluation files.
+
+`eval_v1` is creation-only routing provenance unavailable from normal run CLI/TUI. Routing config contains one `eval_candidate` route and Fake `eval_support` routes for every other workflow role. `RoutedProvider` remains sole request-aware router; `WorkflowEngine` contains no evaluation condition. Explicit model uses existing `ExecutionTarget.model_id`, ConfigSnapshot schema v2, routed provider cache, and native command builders. Missing configured or confirmed model remains null.
+
+`role_core_v1` embeds seven source-controlled fixtures for Implementer, CodeQualityReviewer, and SpecReviewer. Case identity and suite version are human-stable; SHA-256 fingerprints cover task, scorer ground truth, fixture files, role, and workflow. Architect, Researcher, and EngineeringLead are deferred rather than measured with weak proxies.
+
+Scoring has independent deterministic oracle. Implementer measures trusted validation, changed-file scope, deletions/unexpected files, public-surface additions, and exact empty-diff plus structured `plan_mismatch` behavior. Reviewer structured blocks remain normal Markdown artifacts; matcher pairs one reported actionable finding with at most one planted finding using exact file/category or severity, tolerant line range, and concept vocabulary. Unmatched and duplicate actionable findings are false positives. Clean quality/spec cases reward absence of invented defects. Prose outside structured block, including praise, is ignored. No LLM judge exists.
+
+Candidate usage is computed from existing `ProviderUsageUpdated` events filtered by target stage; support Fake usage is excluded. Candidate latency prefers provider start-to-completion event timestamps and falls back to local execution boundary if unavailable. Provider CLI version comes from provider session discovery; configured and confirmed models stay distinct. Native evaluation requires explicit per-command `--allow-native-usage`; Fake results are marked synthetic and cannot support Recommended policy.
+
+Results separate benchmark failure from infrastructure failure. Failed tests, scope violations, missed findings, false positives, and incorrect mismatch behavior describe candidate outcomes. Provider discovery/auth, tmux/protocol, artifact integrity, apply, fixture, and read-only safety failures remain infrastructure outcomes and are not scored as model failures. Reports show role metrics and individual failures, compare targets without automatic ranking, and omit guessed monetary cost.
 
 ## State and events
 
@@ -445,6 +473,13 @@ src/
 │   ├── provider.rs  provider-neutral synchronous signal boundary
 │   ├── fake.rs      validated scripts and restart-stable FakeProvider
 │   └── error.rs     typed execution/protocol failures
+├── eval/
+│   ├── case.rs       source-controlled role cases and ground truth
+│   ├── suite.rs      versioned suite identity and fingerprints
+│   ├── runner.rs     isolated orchestration, evidence capture, validation
+│   ├── scorer.rs     deterministic role-specific matching
+│   ├── result.rs     validated EvalResultV1 codec
+│   └── report.rs     role aggregation and target comparison
 ├── process/
 │   ├── backend.rs   provider-independent process supervisor contract
 │   ├── manager.rs   persisted intent/effect/finalize and reconciliation

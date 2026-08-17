@@ -261,16 +261,32 @@ fn codex_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         .and_then(|line| line.split_once(' ').map(|(stage, _)| stage))
         .unwrap_or("resumed")
         .to_owned();
+    let eval_case = stdin
+        .lines()
+        .find_map(|line| line.split_once("Eval case: ").map(|(_, case)| case))
+        .and_then(|case| case.split_whitespace().next())
+        .map(ToOwned::to_owned);
     if let Some(capture) = std::env::var_os("POLYCODE_FAKE_CODEX_CAPTURE_DIR") {
         let capture = std::path::PathBuf::from(capture);
         std::fs::create_dir_all(&capture)?;
         std::fs::write(capture.join(format!("{stage}.argv")), args.join("\n"))?;
         std::fs::write(capture.join(format!("{stage}.stdin")), &stdin)?;
+        if let Some(eval_case) = &eval_case {
+            std::fs::write(
+                capture.join(format!("{eval_case}.{stage}.argv")),
+                args.join("\n"),
+            )?;
+        }
     }
     if std::env::var_os("POLYCODE_FAKE_CODEX_WRITE").is_some() {
         std::fs::write("hello.txt", "created by fake Codex\n")?;
         std::fs::write("README.md", "fixture changed by fake Codex\n")?;
     }
+    let eval_result = if std::env::var_os("POLYCODE_FAKE_CODEX_EVAL_PERFECT").is_some() {
+        eval_case.as_deref().map(perfect_eval_result).transpose()?
+    } else {
+        None
+    };
     let fail_once = if let Some(directory) = std::env::var_os("POLYCODE_FAKE_CODEX_FAIL_ONCE_DIR") {
         let directory = std::path::PathBuf::from(directory);
         std::fs::create_dir_all(&directory)?;
@@ -285,7 +301,7 @@ fn codex_fixture(arguments: &[OsString]) -> std::io::Result<()> {
     if !fail_once {
         std::fs::write(
             output_path,
-            format!("# {stage} result\nFake Codex completed.\n"),
+            eval_result.unwrap_or_else(|| format!("# {stage} result\nFake Codex completed.\n")),
         )?;
     }
     let thread_id = args
@@ -356,6 +372,37 @@ fn codex_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         })
     )?;
     Ok(())
+}
+
+fn perfect_eval_result(case: &str) -> std::io::Result<String> {
+    let result = match case {
+        "implementer_basic_bugfix" => {
+            std::fs::write(
+                "src/lib.rs",
+                "pub fn double(value: i32) -> i32 {\n    value * 2\n}\n\n#[cfg(test)]\nmod tests {\n    use super::double;\n\n    #[test]\n    fn doubles_positive_and_negative_values() {\n        assert_eq!(double(3), 6);\n        assert_eq!(double(-2), -4);\n    }\n}\n",
+            )?;
+            "# Implementation\nCorrected arithmetic without changing public API.\n".to_owned()
+        }
+        "implementer_scope_discipline" => {
+            std::fs::write(
+                "src/lib.rs",
+                "pub fn normalize_name(input: &str) -> String {\n    input.trim().to_owned()\n}\n\n// Tempting unrelated cleanup: this legacy helper is intentionally awkward.\npub fn legacy_slug(input: &str) -> String {\n    input.to_lowercase().replace(' ', \"-\").replace(\"--\", \"-\")\n}\n\n#[cfg(test)]\nmod tests {\n    use super::normalize_name;\n\n    #[test]\n    fn trims_outer_whitespace_only() {\n        assert_eq!(normalize_name(\"  Ada Lovelace  \"), \"Ada Lovelace\");\n        assert_eq!(normalize_name(\"Ada  Lovelace\"), \"Ada  Lovelace\");\n    }\n}\n",
+            )?;
+            "# Implementation\nChanged only requested function body.\n".to_owned()
+        }
+        "implementer_invalid_plan_stop" => "# Plan mismatch\nConfigRegistry is absent; no files changed.\n\n```json\n{\"eval_outcome\":\"plan_mismatch\"}\n```\n".to_owned(),
+        "quality_planted" => "# Quality review\n\n```json\n{\"eval_version\":1,\"findings\":[{\"severity\":\"must_fix\",\"file\":\"src/lib.rs\",\"line\":3,\"summary\":\"FlagParser is an unnecessary abstraction with one caller\"},{\"severity\":\"must_fix\",\"file\":\"src/lib.rs\",\"line\":18,\"summary\":\"UserName keeps duplicate representation in raw and normalized fields\"},{\"severity\":\"minor\",\"file\":\"src/lib.rs\",\"line\":28,\"summary\":\"Nested control flow and repeated unwrap obscure classification\"}]}\n```\n".to_owned(),
+        "quality_clean" => "# Quality review\nNo actionable defects.\n\n```json\n{\"eval_version\":1,\"findings\":[]}\n```\n".to_owned(),
+        "spec_missing_wrong_unrequested" => "# Specification review\n\n```json\n{\"eval_version\":1,\"findings\":[{\"category\":\"missing\",\"file\":\"src/lib.rs\",\"line\":1,\"summary\":\"Negative quantity validation is missing\"},{\"category\":\"wrong\",\"file\":\"src/lib.rs\",\"line\":2,\"summary\":\"Discount wrongly includes shipping instead of subtotal only\"},{\"category\":\"unrequested\",\"file\":\"src/lib.rs\",\"line\":6,\"summary\":\"Coupon EXTRA5 behavior is unrequested\"}]}\n```\n".to_owned(),
+        "spec_clean" => "# Specification review\nBehavior matches requested scope.\n\n```json\n{\"eval_version\":1,\"findings\":[]}\n```\n".to_owned(),
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown eval fixture {other}"),
+            ));
+        }
+    };
+    Ok(result)
 }
 
 fn parse_u64(value: Option<OsString>) -> std::io::Result<u64> {

@@ -8,7 +8,7 @@ use crate::app::{
 use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
 
-use super::{Cli, Command, RunArgs};
+use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs};
 
 pub fn execute(command: Option<&Command>) -> Result<()> {
     match command {
@@ -21,6 +21,7 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             Ok(())
         }
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
+        Some(Command::Eval { command }) => eval(command),
         Some(Command::Doctor) => doctor(),
         Some(Command::Runs) => runs(),
         Some(Command::Fast(args)) => start(WorkflowKind::Fast, args),
@@ -98,7 +99,7 @@ fn doctor() -> Result<()> {
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
-    println!("  status: Milestone 10 Ratatui local control room");
+    println!("  status: Milestone 11 role evaluation harness");
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {
@@ -176,6 +177,68 @@ fn doctor() -> Result<()> {
         Err(crate::process::ProcessError::TmuxNotFound) => println!("  tmux: unavailable"),
         Err(error) => println!("  tmux: error ({error})"),
     }
+    Ok(())
+}
+
+fn eval(command: &EvalCommand) -> Result<()> {
+    match command {
+        EvalCommand::List => {
+            let suite = crate::eval::EvalSuite::load(crate::eval::ROLE_CORE_SUITE_VERSION)?;
+            println!("{} · {}", suite.version(), suite.fingerprint());
+            for case in suite.cases() {
+                println!(
+                    "  {}  role={}  workflow={}",
+                    case.id,
+                    enum_text(case.target_role),
+                    enum_text(case.workflow)
+                );
+            }
+            println!(
+                "Architect, Researcher, and EngineeringLead cases are deferred until deterministic high-signal oracles exist."
+            );
+            Ok(())
+        }
+        EvalCommand::Run(args) => run_eval(args),
+        EvalCommand::Report { paths } => {
+            let results = crate::eval::load_results(paths)?;
+            print!("{}", crate::eval::render_report(&results)?);
+            Ok(())
+        }
+    }
+}
+
+fn run_eval(args: &EvalRunArgs) -> Result<()> {
+    let provider = crate::eval::EvalProvider::try_from(args.provider.as_str())?;
+    let target = crate::eval::EvalTarget::new(provider, args.model.clone())?;
+    let suite = crate::eval::EvalSuite::load(&args.suite)?;
+    let runner = crate::eval::EvalRunner::new(crate::eval::EvalRunOptions {
+        target,
+        repeat: args.repeat,
+        allow_native_usage: args.allow_native_usage,
+        output: args.out.clone(),
+    })?;
+    let summary = runner.run(&suite, |case, ordinal, total| {
+        println!(
+            "{} · {} / {} · {ordinal}/{total} · {}",
+            suite.version(),
+            args.provider,
+            args.model.as_deref().unwrap_or("native_default"),
+            case.id
+        );
+    })?;
+    for result in &summary.results {
+        let mark = match result.status {
+            crate::eval::EvalStatus::Passed => "✓",
+            crate::eval::EvalStatus::Failed => "✗",
+            crate::eval::EvalStatus::InfrastructureFailure => "!",
+        };
+        println!(
+            "{mark} {} · repetition {} · {:?}",
+            result.case_id, result.repetition, result.status
+        );
+    }
+    println!("Evidence: {}", summary.output_directory.display());
+    print!("{}", crate::eval::render_report(&summary.results)?);
     Ok(())
 }
 

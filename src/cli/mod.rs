@@ -24,6 +24,11 @@ pub enum Command {
     ExecProcess { manifest: PathBuf },
     /// Open interactive local control room.
     Tui,
+    /// Experimental role-specific provider/model evaluation tools.
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
     /// Run implementation-only workflow.
     Fast(RunArgs),
     /// Run architecture, implementation, review, and decision workflow.
@@ -54,6 +59,41 @@ pub enum Command {
     Discard { run_id: RunId },
     /// Check Polycode's local environment.
     Doctor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum EvalCommand {
+    /// List source-controlled evaluation suites and cases.
+    List,
+    /// Execute one candidate target against an isolated suite.
+    Run(EvalRunArgs),
+    /// Aggregate one or more result files/directories without selecting a winner.
+    Report {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Args)]
+pub struct EvalRunArgs {
+    /// Source-controlled suite version.
+    #[arg(long, default_value = "role_core_v1")]
+    pub suite: String,
+    /// Candidate provider (`claude`, `codex`, or synthetic `fake`).
+    #[arg(long)]
+    pub provider: String,
+    /// Explicit provider model; omission means native configured/default model.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Fresh repetitions per case.
+    #[arg(long, default_value_t = 1)]
+    pub repeat: u32,
+    /// Explicit acknowledgement that native evaluation may consume provider usage.
+    #[arg(long)]
+    pub allow_native_usage: bool,
+    /// Evidence output directory. Defaults under ~/.polycode/evals.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Args)]
@@ -114,5 +154,25 @@ mod tests {
 
         let cli = Cli::try_parse_from(["polycode", "tui"]).unwrap();
         assert_eq!(cli.command, Some(Command::Tui));
+
+        let cli = Cli::try_parse_from([
+            "polycode",
+            "eval",
+            "run",
+            "--provider",
+            "codex",
+            "--model",
+            "fixture-model",
+            "--repeat",
+            "3",
+            "--allow-native-usage",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Eval {
+                command: EvalCommand::Run(EvalRunArgs { repeat: 3, .. })
+            })
+        ));
     }
 }

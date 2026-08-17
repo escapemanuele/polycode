@@ -583,7 +583,6 @@ fn wait_terminal<B: ProcessBackend>(
             inspection.process.status(),
             ManagedProcessStatus::Exited
                 | ManagedProcessStatus::Interrupted
-                | ManagedProcessStatus::Missing
                 | ManagedProcessStatus::Broken
         ) {
             return inspection;
