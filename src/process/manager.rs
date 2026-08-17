@@ -217,17 +217,20 @@ impl<B: ProcessBackend> ProcessManager<B> {
             }
         }
 
-        let exit = match self.backend.read_exit_evidence(&process) {
-            Ok(exit) => exit,
-            Err(error) => {
-                Self::persist_broken(store, &process, "invalid exit evidence")?;
-                return Err(error);
-            }
-        };
+        // Observe supervisor state before exit evidence. Managed runner durably writes exit.json
+        // and syncs its directory before returning; normal tmux disappearance happens afterward.
+        // Therefore evidence read after Absent cannot predate that Absent observation.
         let backend_session = match self.backend.inspect_session(&process) {
             Ok(session) => session,
             Err(error) => {
                 Self::persist_broken(store, &process, "backend ownership mismatch")?;
+                return Err(error);
+            }
+        };
+        let exit = match self.backend.read_exit_evidence(&process) {
+            Ok(exit) => exit,
+            Err(error) => {
+                Self::persist_broken(store, &process, "invalid exit evidence")?;
                 return Err(error);
             }
         };
@@ -614,4 +617,334 @@ fn can_mark_broken(status: ManagedProcessStatus) -> bool {
 
 fn now() -> DateTime<Utc> {
     std::time::SystemTime::now().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::domain::{
+        ConfigSnapshotId, EventId, EventMetadata, Run, WorkflowDefinition, WorkflowKind,
+    };
+    use crate::process::{BackendAvailability, BackendSessionId, ExitEvidence};
+    use crate::store::{ResolvedConfigSnapshot, RunInput};
+    use crate::workspace::WorkspaceManager;
+
+    #[derive(Default)]
+    struct BackendState {
+        started: bool,
+        absent: bool,
+        evidence: Option<ExitResult>,
+        complete_on_next_inspection: Option<ExitResult>,
+        calls: Vec<&'static str>,
+    }
+
+    #[derive(Clone, Default)]
+    struct InterleavingBackend {
+        state: Arc<Mutex<BackendState>>,
+    }
+
+    impl InterleavingBackend {
+        fn complete_during_next_inspection(&self, result: ExitResult) {
+            let mut state = self.state.lock().unwrap();
+            state.complete_on_next_inspection = Some(result);
+            state.calls.clear();
+        }
+
+        fn lose_session_without_evidence(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.absent = true;
+            state.evidence = None;
+            state.calls.clear();
+        }
+
+        fn finish(&self, result: ExitResult) {
+            let mut state = self.state.lock().unwrap();
+            state.absent = true;
+            state.evidence = Some(result);
+            state.calls.clear();
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.state.lock().unwrap().calls.clone()
+        }
+    }
+
+    impl ProcessBackend for InterleavingBackend {
+        fn kind(&self) -> &'static str {
+            "interleaving_fixture"
+        }
+
+        fn session_id(&self, process_id: ManagedProcessId) -> BackendSessionId {
+            BackendSessionId::for_process(process_id)
+        }
+
+        fn availability(&self) -> Result<BackendAvailability, ProcessError> {
+            Ok(BackendAvailability {
+                kind: self.kind(),
+                version: "fixture-1".to_owned(),
+            })
+        }
+
+        fn start(&self, _process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
+            let mut state = self.state.lock().unwrap();
+            state.started = true;
+            state.absent = false;
+            Ok(())
+        }
+
+        fn inspect_session(
+            &self,
+            _process: &ManagedProcess,
+        ) -> Result<BackendSessionState, ProcessError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("inspect_session");
+            if let Some(result) = state.complete_on_next_inspection.take() {
+                state.evidence = Some(result);
+                state.absent = true;
+            }
+            Ok(if state.started && !state.absent {
+                BackendSessionState::Owned
+            } else {
+                BackendSessionState::Absent
+            })
+        }
+
+        fn read_output(
+            &self,
+            process: &ManagedProcess,
+            stream: OutputStream,
+            offset: u64,
+            _max_bytes: usize,
+        ) -> Result<OutputChunk, ProcessError> {
+            OutputChunk::new(
+                process.id(),
+                stream,
+                process.cursor(stream).revision(),
+                offset,
+                Vec::new(),
+            )
+        }
+
+        fn output_length(
+            &self,
+            _process: &ManagedProcess,
+            _stream: OutputStream,
+        ) -> Result<u64, ProcessError> {
+            Ok(0)
+        }
+
+        fn read_exit_evidence(
+            &self,
+            process: &ManagedProcess,
+        ) -> Result<Option<ExitEvidence>, ProcessError> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push("read_exit_evidence");
+            Ok(state.evidence.clone().map(|result| {
+                let at = now();
+                ExitEvidence::new(
+                    process.id(),
+                    process.command_fingerprint().to_owned(),
+                    result,
+                    false,
+                    at,
+                    at,
+                )
+            }))
+        }
+
+        fn interrupt(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
+            self.finish(ExitResult::Signal { signal: 2 });
+            Ok(())
+        }
+
+        fn cleanup(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        _temp: TempDir,
+        store: SqliteStore,
+        manager: ProcessManager<InterleavingBackend>,
+        backend: InterleavingBackend,
+        process_id: ManagedProcessId,
+    }
+
+    impl Fixture {
+        fn running() -> Self {
+            let temp = TempDir::new().unwrap();
+            let source = temp.path().join("source");
+            initialize_repository(&source);
+            let run_id = RunId::new();
+            let stage_id = StageId::new("implementation").unwrap();
+            let created_at = now();
+            let config_id = ConfigSnapshotId::new(format!("race-{run_id}")).unwrap();
+            let run = Run::new(
+                run_id,
+                WorkflowDefinition::built_in(WorkflowKind::Fast),
+                config_id.clone(),
+                created_at,
+            );
+            let input = RunInput::new(run_id, "process race fixture", created_at).unwrap();
+            let config = ResolvedConfigSnapshot::new(
+                config_id,
+                1,
+                json!({"provider":"fixture"}),
+                created_at,
+            )
+            .unwrap();
+            let event = run.created_event(EventMetadata::new(EventId::new(), created_at));
+            let mut store = SqliteStore::open(temp.path().join("polycode.db")).unwrap();
+            store
+                .create_run_with_input(&run, &input, &config, &[event])
+                .unwrap();
+            WorkspaceManager::new(temp.path().join("worktrees"))
+                .prepare_run_workspace(&mut store, run_id, &source)
+                .unwrap();
+            let backend = InterleavingBackend::default();
+            let manager = ProcessManager::new(temp.path().join("runs"), backend.clone());
+            let process = manager
+                .prepare(
+                    &mut store,
+                    run_id,
+                    stage_id,
+                    0,
+                    "/bin/true",
+                    Vec::new(),
+                    BTreeMap::new(),
+                )
+                .unwrap();
+            let started = manager.start(&mut store, process.id()).unwrap();
+            assert_eq!(started.process.status(), ManagedProcessStatus::Running);
+            Self {
+                _temp: temp,
+                store,
+                manager,
+                backend,
+                process_id: process.id(),
+            }
+        }
+    }
+
+    #[test]
+    fn absent_session_uses_exit_evidence_observed_after_absence() {
+        let mut fixture = Fixture::running();
+        fixture
+            .backend
+            .complete_during_next_inspection(ExitResult::ExitCode { code: 0 });
+
+        let inspection = fixture
+            .manager
+            .reconcile(&mut fixture.store, fixture.process_id)
+            .unwrap();
+
+        assert_eq!(
+            fixture.backend.calls(),
+            vec!["inspect_session", "read_exit_evidence"]
+        );
+        assert_eq!(inspection.backend_session, BackendSessionState::Absent);
+        assert_eq!(inspection.process.status(), ManagedProcessStatus::Exited);
+        assert_eq!(
+            inspection.process.exit_result(),
+            Some(&ExitResult::ExitCode { code: 0 })
+        );
+    }
+
+    #[test]
+    fn absent_session_without_exit_evidence_remains_missing() {
+        let mut fixture = Fixture::running();
+        fixture.backend.lose_session_without_evidence();
+
+        let inspection = fixture
+            .manager
+            .reconcile(&mut fixture.store, fixture.process_id)
+            .unwrap();
+
+        assert_eq!(inspection.process.status(), ManagedProcessStatus::Missing);
+        assert!(inspection.exit_evidence.is_none());
+    }
+
+    #[test]
+    fn exit_results_preserve_failure_signal_runner_and_interrupt_semantics() {
+        let cases = [
+            (
+                ExitResult::ExitCode { code: 42 },
+                ManagedProcessStatus::Exited,
+            ),
+            (
+                ExitResult::Signal { signal: 9 },
+                ManagedProcessStatus::Exited,
+            ),
+            (
+                ExitResult::RunnerError {
+                    message: "fixture runner failed".to_owned(),
+                },
+                ManagedProcessStatus::Broken,
+            ),
+        ];
+        for (result, expected) in cases {
+            let mut fixture = Fixture::running();
+            fixture.backend.finish(result);
+            let inspection = fixture
+                .manager
+                .reconcile(&mut fixture.store, fixture.process_id)
+                .unwrap();
+            assert_eq!(inspection.process.status(), expected);
+        }
+
+        let mut interrupted = Fixture::running();
+        let inspection = interrupted
+            .manager
+            .interrupt(&mut interrupted.store, interrupted.process_id)
+            .unwrap();
+        assert_eq!(
+            inspection.process.status(),
+            ManagedProcessStatus::Interrupted
+        );
+        assert_eq!(
+            inspection.process.exit_result(),
+            Some(&ExitResult::Signal { signal: 2 })
+        );
+    }
+
+    fn initialize_repository(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "polycode@example.invalid"][..],
+            &["config", "user.name", "Polycode Test"][..],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(path.join("README.md"), "fixture\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "README.md"])
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qm", "fixture"])
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 }
