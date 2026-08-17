@@ -493,6 +493,7 @@ mod tests {
     #[derive(Clone)]
     struct FixtureBackend {
         started: Arc<Mutex<HashSet<ManagedProcessId>>>,
+        completed: Arc<Mutex<HashSet<ManagedProcessId>>>,
         output: Arc<String>,
     }
 
@@ -507,6 +508,7 @@ mod tests {
         fn new(output: &str) -> Self {
             Self {
                 started: Arc::new(Mutex::new(HashSet::new())),
+                completed: Arc::new(Mutex::new(HashSet::new())),
                 output: Arc::new(output.to_owned()),
             }
         }
@@ -545,8 +547,11 @@ mod tests {
 
         fn inspect_session(
             &self,
-            _process: &ManagedProcess,
+            process: &ManagedProcess,
         ) -> Result<BackendSessionState, ProcessError> {
+            if self.started.lock().unwrap().contains(&process.id()) {
+                self.completed.lock().unwrap().insert(process.id());
+            }
             Ok(BackendSessionState::Absent)
         }
 
@@ -591,7 +596,7 @@ mod tests {
             &self,
             process: &ManagedProcess,
         ) -> Result<Option<ExitEvidence>, ProcessError> {
-            if !self.started.lock().unwrap().contains(&process.id()) {
+            if !self.completed.lock().unwrap().contains(&process.id()) {
                 return Ok(None);
             }
             let now = CodexProvider::<Self>::now();
@@ -744,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_turn_commits_usage_completion_and_artifact_once() {
+    fn successful_turn_with_disappeared_session_and_durable_exit_completes_once() {
         let (_temp, database, run_id, mut store, provider) = fixture(SUCCESS_OUTPUT);
         let mut engine = WorkflowEngine::new(provider, "SUPER_SECRET_TASK_MARKER");
         loop {
