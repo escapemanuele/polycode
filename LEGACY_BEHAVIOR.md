@@ -133,3 +133,12 @@ Polycode preserves behavior above but does not copy these implementation choices
 - Apply generates a binary patch from persisted base commit through a temporary index, includes tracked/untracked/deleted files, runs `git apply --check`, and neither stages nor commits.
 - Apply recovery persists exact patch SHA-256 and uses forward/reverse checks to prevent duplicate application; ambiguity fails closed.
 - Discard records logical history before cleanup. Cleanup removes only validated owned resources; branch deletion requires expected-tip ownership evidence, not prefix alone.
+
+## Milestone 9 resolutions
+
+- Workflow roles remain provider-neutral; immutable configuration maps each used role to provider plus optional configured model.
+- Explicit provider selection is uniform routing. Versioned `recommended_v1` resolves provisional role routes once at creation and persists explicit targets/reasons.
+- Recommended may fall back to sole authenticated native provider only before run creation. Runtime provider loss never reroutes existing stages.
+- Schema-v1 M5-M8 configs normalize in memory to uniform routes and remain byte-for-byte immutable.
+- Provider identity, attachment policy, attention continuation, sessions, events, checkpoints, artifacts, and status are stage/request specific. No run-global router identity exists.
+- Native provider adapters load lazily and cache by provider plus configured model; SQLite schema and workflow DAGs remain unchanged.

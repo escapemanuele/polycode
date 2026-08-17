@@ -63,6 +63,56 @@ pub struct ProviderRequest {
     dependency_stage_ids: Vec<StageId>,
 }
 
+/// Persisted stage context used to route one human-attention continuation.
+#[derive(Clone, Debug)]
+pub struct ProviderAttentionContext {
+    run_id: RunId,
+    stage_id: StageId,
+    stage_kind: StageKind,
+    role: Role,
+    request_id: AttentionRequestId,
+}
+
+impl ProviderAttentionContext {
+    #[must_use]
+    pub const fn new(
+        run_id: RunId,
+        stage_id: StageId,
+        stage_kind: StageKind,
+        role: Role,
+        request_id: AttentionRequestId,
+    ) -> Self {
+        Self {
+            run_id,
+            stage_id,
+            stage_kind,
+            role,
+            request_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+    #[must_use]
+    pub const fn stage_id(&self) -> &StageId {
+        &self.stage_id
+    }
+    #[must_use]
+    pub const fn stage_kind(&self) -> StageKind {
+        self.stage_kind
+    }
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+    #[must_use]
+    pub const fn request_id(&self) -> AttentionRequestId {
+        self.request_id
+    }
+}
+
 impl ProviderRequest {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -152,13 +202,28 @@ impl ProviderRequest {
 /// Synchronous provider boundary. Each poll accepts at most one native record;
 /// one record may yield an ordered atomic signal batch.
 pub trait Provider {
-    fn id(&self) -> &ProviderId;
+    /// Returns actual provider that will serve one request.
+    ///
+    /// # Errors
+    /// Returns invalid/missing route failures.
+    fn provider_id_for(&self, request: &ProviderRequest) -> Result<ProviderId, ProviderError>;
 
     fn supports_role(&self, role: Role) -> bool;
 
+    /// Checks request support after route resolution.
+    ///
+    /// # Errors
+    /// Returns invalid/missing route failures.
+    fn supports_request(&self, request: &ProviderRequest) -> Result<bool, ProviderError> {
+        Ok(self.supports_role(request.role()))
+    }
+
     /// Whether synchronous CLI should keep polling while process remains live.
-    fn keep_attached(&self) -> bool {
-        false
+    ///
+    /// # Errors
+    /// Returns invalid/missing route failures.
+    fn keep_attached_for(&self, _request: &ProviderRequest) -> Result<bool, ProviderError> {
+        Ok(false)
     }
 
     /// Stages optional human response before domain attention resolution commits.
@@ -169,8 +234,7 @@ pub trait Provider {
     fn stage_attention_response(
         &mut self,
         _store: &mut SqliteStore,
-        _run_id: RunId,
-        _request_id: AttentionRequestId,
+        _context: &ProviderAttentionContext,
         _response: Option<&str>,
     ) -> Result<(), ProviderError> {
         Ok(())

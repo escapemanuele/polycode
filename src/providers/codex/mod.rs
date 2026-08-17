@@ -380,16 +380,16 @@ impl<B: ProcessBackend> CodexProvider<B> {
 }
 
 impl<B: ProcessBackend> Provider for CodexProvider<B> {
-    fn id(&self) -> &ProviderId {
-        &self.id
+    fn provider_id_for(&self, _request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+        Ok(self.id.clone())
     }
 
     fn supports_role(&self, _role: Role) -> bool {
         true
     }
 
-    fn keep_attached(&self) -> bool {
-        true
+    fn keep_attached_for(&self, _request: &ProviderRequest) -> Result<bool, ProviderError> {
+        Ok(true)
     }
 
     fn poll(

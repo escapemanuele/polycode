@@ -76,6 +76,22 @@ _Avoid_: Partial success
 The immutable effective configuration selected when a run is created and reused for every recovery or resume of that run.
 _Avoid_: Current configuration, config copy
 
+**Execution target**:
+One immutable provider plus optional configured model selected for an engineering role. A missing model means that provider's native configured/default model, not a model name resolved today.
+_Avoid_: Provider alone, confirmed model, current default model
+
+**Routing plan**:
+The validated immutable role-to-execution-target map inside a configuration snapshot. Routes are resolved when a run is created and loaded by pure lookup on restart.
+_Avoid_: Workflow provider choice, mutable route table, runtime resolver
+
+**Uniform routing**:
+A routing plan created from explicit `--provider`, assigning every distinct role used by one workflow to the same execution target.
+_Avoid_: Single-provider engine, routing bypass
+
+**Recommended profile**:
+A versioned source-controlled creation-time policy that probes native provider availability, resolves explicit role routes, and persists them. Provider loss after creation never re-routes existing work.
+_Avoid_: Live recommendation, runtime fallback, benchmark claim
+
 **Application service**:
 The use-case boundary coordinating repository discovery, atomic creation, workspace lifecycle, provider reconstruction, scheduler commands, and committed query results.
 _Avoid_: CLI command handler, domain aggregate
@@ -237,7 +253,7 @@ An extensible adapter identity for a native coding-agent CLI and its native sess
 _Avoid_: Model, role, vendor API
 
 **Model**:
-A provider-resolved model identity used for one provider session.
+A provider-scoped identity. Configured target may omit it to request native default; actual session model remains separately provider-confirmed.
 _Avoid_: Role, provider
 
 **Apply**:

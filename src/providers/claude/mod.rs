@@ -17,7 +17,10 @@ use chrono::{DateTime, Utc};
 use crate::domain::{
     AttentionKind, AttentionRequestId, ModelId, ProviderId, ProviderSessionId, Role,
 };
-use crate::engine::{Provider, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal};
+use crate::engine::{
+    Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest,
+    ProviderSignal,
+};
 use crate::process::{
     ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend, ProcessManager, TmuxBackend,
 };
@@ -480,33 +483,34 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
 }
 
 impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
-    fn id(&self) -> &ProviderId {
-        &self.id
+    fn provider_id_for(&self, _request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+        Ok(self.id.clone())
     }
 
     fn supports_role(&self, _role: Role) -> bool {
         true
     }
 
-    fn keep_attached(&self) -> bool {
-        true
+    fn keep_attached_for(&self, _request: &ProviderRequest) -> Result<bool, ProviderError> {
+        Ok(true)
     }
 
     fn stage_attention_response(
         &mut self,
         store: &mut SqliteStore,
-        run_id: crate::domain::RunId,
-        request_id: AttentionRequestId,
+        context: &ProviderAttentionContext,
         response: Option<&str>,
     ) -> Result<(), ProviderError> {
         let result = (|| -> Result<(), ClaudeProviderError> {
             let session = store
-                .list_provider_sessions(run_id)?
+                .list_provider_sessions(context.run_id())?
                 .into_iter()
                 .find(|session| {
-                    session
-                        .pending_attention()
-                        .is_some_and(|pending| pending.attention_id() == request_id)
+                    session.stage_id() == context.stage_id()
+                        && session.provider_id() == &self.id
+                        && session
+                            .pending_attention()
+                            .is_some_and(|pending| pending.attention_id() == context.request_id())
                 })
                 .ok_or_else(|| {
                     ClaudeProviderError::Protocol(
@@ -523,7 +527,7 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
             {
                 self.write_response_once(
                     session.id(),
-                    request_id,
+                    context.request_id(),
                     response.ok_or(ClaudeProviderError::QuestionResponseRequired)?,
                 )?;
             }

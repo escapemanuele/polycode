@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository contains **Milestone 8 native Claude Code + Codex CLI providers**, plus post-M8 reviewer specialization. Polycode uses locally installed `claude` and `codex` executables with their existing authentication and native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, deterministic `FakeProvider`, and crash-reconcilable tmux supervision remain intact. Gemini, multi-provider routing, async runtime, native process backend, and UI remain future work.
+Polycode is early-stage software. This repository contains **Milestone 9 role routing + versioned Recommended profile** above native Claude Code, Codex CLI, and deterministic FakeProvider adapters. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, and crash-reconcilable tmux supervision remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, and UI remain future work.
 
 ## Principles
 
@@ -50,6 +50,7 @@ polycode fast "Fix the parser" --provider codex
 polycode standard "Add export support" --repo /path/to/repo --provider codex
 polycode deep "Redesign authentication" --provider codex
 polycode review "Review the error boundary" --provider codex
+polycode deep "Refactor authentication" --profile recommended
 polycode fast "Fix the parser" --provider fake
 polycode runs
 polycode status <run-id>
@@ -60,7 +61,24 @@ polycode apply <run-id>
 polycode discard <run-id>
 ```
 
-Workflow commands use current directory unless `--repo` is supplied. Provider selection is explicit: use `--provider claude` or `--provider codex` for native execution, or `--provider fake` for deterministic development/testing. Provider choice is immutable for run lifetime; no fallback occurs after restart. Fake emits start, progress, usage, and completion signals without editing files. Native providers run only in managed worktree.
+Workflow commands use current directory unless `--repo` is supplied. Execution selection remains explicit and flags are mutually exclusive:
+
+- `--provider claude|codex|fake` creates uniform routing for every role used by workflow.
+- `--profile recommended` resolves versioned `recommended_v1` once, persists explicit routes, and never re-resolves them on restart.
+
+When both native providers are authenticated, provisional `recommended_v1` routes implementation to Codex and research, architecture, reviews, and decision to Claude. If only one native provider is ready at creation, every required role routes there with persisted fallback reason. Fake is never a Recommended fallback. This policy is source-controlled and provisional, not benchmark-backed.
+
+```text
+Role                   Provider (both available)
+Researcher             Claude
+Architect              Claude
+Implementer            Codex
+CodeQualityReviewer    Claude
+SpecReviewer           Claude
+EngineeringLead        Claude
+```
+
+Provider loss after run creation fails clearly; it never causes runtime fallback. Configured model may remain null, meaning provider-native default. Actual confirmed model/session/process are reported per stage. Fake emits start, progress, usage, and completion signals without editing files. Native providers run only in managed worktree.
 
 Claude uses supported non-interactive stream JSON mode. Polycode leaves model selection to native Claude default unless immutable run configuration explicitly supplies model. Existing Claude authentication, `CLAUDE.md`, settings, permissions, hooks, skills, and MCP configuration remain native inputs. Polycode never adds `--dangerously-skip-permissions`.
 
@@ -74,7 +92,7 @@ Codex `thread.started` supplies opaque native thread identity; recovery resumes 
 
 Normal blocked states (`needs_user`, paused, interrupted, failed) exit successfully because command completed and durable state remains inspectable. Operational failures exit 1; Clap argument errors exit 2. CLI progress comes only from committed semantic events.
 
-`doctor` reports paths/schema, tmux, Claude/Codex CLI versions and auth status, plus names of known credential/config override variables without printing values or creating missing database. `status` includes Polycode provider-session identity, confirmed model when available, native session, conversation status, and managed-process status. `runs` leaves missing database untouched. Public APIs are under `polycode::app`, `polycode::domain`, `polycode::engine`, `polycode::process`, `polycode::providers`, `polycode::store`, `polycode::git`, and `polycode::workspace`.
+`doctor` reports paths/schema, tmux, Claude/Codex CLI versions and auth status, plus names of known credential/config override variables without printing values or creating missing database. `status` shows immutable routing and per-stage configured/actual provider, configured/confirmed model, provider session, native session, conversation, and managed-process status. `runs` leaves missing database untouched. Public APIs are under `polycode::app`, `polycode::domain`, `polycode::engine`, `polycode::process`, `polycode::providers`, `polycode::store`, `polycode::git`, and `polycode::workspace`.
 
 ## Build
 
@@ -170,7 +188,7 @@ Direct dependency artifacts are included in downstream prompts. Artifact metadat
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude and Codex are implemented; Gemini, provider routing, and UI descriptions remain future constraints.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, and `recommended_v1` are implemented; Gemini, adaptive routing/failover, and UI remain future constraints.
 
 ## License
 

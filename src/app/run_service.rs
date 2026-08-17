@@ -13,7 +13,7 @@ use crate::store::{RunInput, SqliteStore, database_file, worktree_root};
 use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 
 use super::provider_factory::ProviderFactory;
-use super::{AppError, CommittedEvent, RunDetails, RunListItem, query};
+use super::{AppError, CommittedEvent, ExecutionSelection, RunDetails, RunListItem, query};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -81,17 +81,21 @@ where
         workflow_kind: WorkflowKind,
         task: impl Into<String>,
         repository_path: impl AsRef<Path>,
-        provider: Option<&str>,
+        selection: Option<ExecutionSelection>,
     ) -> Result<ExecutionReport, AppError> {
         let repository = GitRepository::discover(repository_path)?;
         let created_at = now();
         let run_id = RunId::new();
         let input = RunInput::new(run_id, task, created_at)?;
         let workflow = WorkflowDefinition::built_in(workflow_kind);
-        let config_id = ConfigSnapshotId::new(format!("m5-{run_id}"))?;
-        let config =
-            self.provider_factory
-                .config_for_new_run(provider, config_id.clone(), created_at)?;
+        let config_id = ConfigSnapshotId::new(format!("config-{run_id}"))?;
+        let selection = selection.ok_or(AppError::NoProductionProvider)?;
+        let config = self.provider_factory.config_for_new_run(
+            selection,
+            &workflow,
+            config_id.clone(),
+            created_at,
+        )?;
         let run = Run::new(run_id, workflow, config_id, created_at);
         let created = run.created_event(EventMetadata::new(EventId::new(), created_at));
         let mut store = SqliteStore::open(&self.database)?;
@@ -326,9 +330,13 @@ fn drive_attached<P: crate::engine::Provider>(
 ) -> Result<EngineStatus, AppError> {
     loop {
         let status = engine.drive(store, run_id)?;
-        if matches!(status, EngineStatus::WaitingForProvider { .. })
-            && engine.provider().keep_attached()
-        {
+        if matches!(
+            status,
+            EngineStatus::WaitingForProvider {
+                keep_attached: true,
+                ..
+            }
+        ) {
             std::thread::sleep(std::time::Duration::from_millis(150));
             continue;
         }
@@ -373,7 +381,7 @@ fn now() -> DateTime<Utc> {
 }
 
 fn quiescent_state(status: RunStatus, engine_status: Option<&EngineStatus>) -> QuiescentState {
-    if let Some(EngineStatus::WaitingForProvider { stage_id }) = engine_status {
+    if let Some(EngineStatus::WaitingForProvider { stage_id, .. }) = engine_status {
         return QuiescentState::WaitingForProvider {
             stage_id: stage_id.clone(),
         };
@@ -406,7 +414,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::app::{DevelopmentFakeProviderFactory, ProviderFactory};
+    use crate::app::{DevelopmentFakeProviderFactory, ProviderFactory, UniformProvider};
     use crate::domain::{
         AttentionKind, ConfigSnapshotId, Dependency, DomainEventKind, ProviderId, Role,
         StageDefinition, StageKind,
@@ -438,8 +446,12 @@ mod tests {
     }
 
     impl Provider for RecordingProvider {
-        fn id(&self) -> &ProviderId {
-            self.inner.id()
+        fn provider_id_for(&self, request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+            self.inner.provider_id_for(request)
+        }
+
+        fn supports_request(&self, request: &ProviderRequest) -> Result<bool, ProviderError> {
+            self.inner.supports_request(request)
         }
 
         fn supports_role(&self, role: Role) -> bool {
@@ -461,11 +473,12 @@ mod tests {
 
         fn config_for_new_run(
             &self,
-            provider: Option<&str>,
+            selection: ExecutionSelection,
+            workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory.config_for_new_run(provider, id, created_at)
+            DevelopmentFakeProviderFactory.config_for_new_run(selection, workflow, id, created_at)
         }
 
         fn for_run(
@@ -487,11 +500,12 @@ mod tests {
 
         fn config_for_new_run(
             &self,
-            provider: Option<&str>,
+            selection: ExecutionSelection,
+            workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory.config_for_new_run(provider, id, created_at)
+            DevelopmentFakeProviderFactory.config_for_new_run(selection, workflow, id, created_at)
         }
 
         fn for_run(
@@ -521,11 +535,12 @@ mod tests {
 
         fn config_for_new_run(
             &self,
-            provider: Option<&str>,
+            selection: ExecutionSelection,
+            workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory.config_for_new_run(provider, id, created_at)
+            DevelopmentFakeProviderFactory.config_for_new_run(selection, workflow, id, created_at)
         }
 
         fn for_run(
@@ -600,7 +615,7 @@ mod tests {
                     kind,
                     format!("task for {kind:?}"),
                     &fixture.repo,
-                    Some("fake"),
+                    Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 )
                 .unwrap();
             assert_eq!(report.details.status, RunStatus::Completed);
@@ -626,7 +641,7 @@ mod tests {
                 WorkflowKind::Deep,
                 "  Unicode α\nsecond line  ",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         let run_id = report.details.id;
@@ -681,7 +696,12 @@ mod tests {
         let run = Run::new(run_id, workflow.clone(), config_id.clone(), created_at);
         let input = RunInput::new(run_id, "legacy standard task", created_at).unwrap();
         let config = DevelopmentFakeProviderFactory
-            .config_for_new_run(Some("fake"), config_id, created_at)
+            .config_for_new_run(
+                ExecutionSelection::Uniform(UniformProvider::Fake),
+                &workflow,
+                config_id,
+                created_at,
+            )
             .unwrap();
         let event = run.created_event(EventMetadata::new(EventId::new(), created_at));
         let mut store = SqliteStore::open(&fixture.database).unwrap();
@@ -737,7 +757,7 @@ mod tests {
                 WorkflowKind::Standard,
                 "restart specialized reviews",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         let run_id = interrupted.details.id;
@@ -808,7 +828,7 @@ mod tests {
                 WorkflowKind::Standard,
                 "  α first line\nsecond line  ",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
 
@@ -834,7 +854,7 @@ mod tests {
                 WorkflowKind::Fast,
                 "attention task",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         assert_eq!(blocked.details.status, RunStatus::NeedsUser);
@@ -872,7 +892,7 @@ mod tests {
                     WorkflowKind::Fast,
                     "recover task",
                     &fixture.repo,
-                    Some("fake"),
+                    Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 )
                 .unwrap();
             assert_eq!(blocked.details.status, RunStatus::Running);
@@ -900,7 +920,7 @@ mod tests {
                 WorkflowKind::Fast,
                 "delayed task",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         assert!(matches!(
@@ -934,7 +954,7 @@ mod tests {
                 WorkflowKind::Fast,
                 "checkpoint task",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         assert!(matches!(
@@ -974,7 +994,7 @@ mod tests {
                 WorkflowKind::Fast,
                 "failing task",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         assert_eq!(failed.details.status, RunStatus::Failed);
@@ -1004,7 +1024,7 @@ mod tests {
                 WorkflowKind::Fast,
                 "empty apply",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         let (outcome, applied) = fixture
@@ -1033,7 +1053,7 @@ mod tests {
                 WorkflowKind::Fast,
                 "apply integration",
                 &fixture.repo,
-                Some("fake"),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
             )
             .unwrap();
         let run_id = complete.details.id;

@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AttentionKind, AttentionRequestId, AttentionStatus, DomainEventKind, RunId, RunStatus, StageId,
-    StageKind, StageStatus, WorkflowKind,
+    AttentionKind, AttentionRequestId, AttentionStatus, DomainEventKind, Role, RunId, RunStatus,
+    StageId, StageKind, StageStatus, WorkflowKind,
 };
 use crate::store::{RunRevision, SequencedEvent, SqliteStore};
 use crate::workspace::WorkspaceStatus;
 
 use super::AppError;
+use super::RoutingPlan;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunListItem {
@@ -25,7 +26,24 @@ pub struct RunListItem {
 pub struct StageSummary {
     pub id: StageId,
     pub kind: StageKind,
+    pub role: Role,
     pub status: StageStatus,
+    pub configured_provider: String,
+    pub configured_model: Option<String>,
+    pub actual_provider: Option<String>,
+    pub actual_model: Option<String>,
+    pub provider_session_record: Option<String>,
+    pub native_session: Option<String>,
+    pub provider_session_status: Option<String>,
+    pub process_status: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteSummary {
+    pub role: Role,
+    pub configured_provider: String,
+    pub configured_model: Option<String>,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,13 +69,9 @@ pub struct RunDetails {
     pub repository: Option<PathBuf>,
     pub workspace_status: Option<WorkspaceStatus>,
     pub base_commit: Option<String>,
-    pub provider: Option<String>,
-    pub profile: Option<String>,
-    pub provider_model: Option<String>,
-    pub provider_session_record: Option<String>,
-    pub provider_session: Option<String>,
-    pub provider_session_status: Option<String>,
-    pub process_status: Option<String>,
+    pub profile: String,
+    pub profile_version: String,
+    pub routes: Vec<RouteSummary>,
     pub revision: RunRevision,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -88,28 +102,88 @@ pub(crate) fn list(store: &SqliteStore) -> Result<Vec<RunListItem>, AppError> {
         .collect())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one query assembly keeps configured and actual stage projections aligned"
+)]
 pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetails, AppError> {
     let loaded = store.load_run(run_id)?;
     let input = store.load_run_input(run_id)?;
     let workspace = store.load_workspace(run_id)?;
     let events = store.load_events(run_id)?;
-    let payload = loaded.config_snapshot.payload();
-    let provider = payload
-        .get("provider")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    let profile = payload
-        .get("profile")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
+    let plan = match RoutingPlan::from_snapshot(&loaded.config_snapshot, loaded.run.workflow()) {
+        Ok(plan) => Some(plan),
+        Err(_) if loaded.config_snapshot.schema_version() == 1 => None,
+        Err(error) => return Err(error.into()),
+    };
     let usage = usage_summary(&events);
-    let provider_session = store.list_provider_sessions(run_id)?.pop();
-    let process_status = provider_session
-        .as_ref()
-        .and_then(crate::providers::ProviderSessionRecord::current_process_id)
-        .map(|process_id| store.load_managed_process(process_id))
-        .transpose()?
-        .map(|process| process.status().as_str().to_owned());
+    let sessions = store.list_provider_sessions(run_id)?;
+    let mut routes = plan
+        .iter()
+        .flat_map(RoutingPlan::routes)
+        .map(|(role, route)| RouteSummary {
+            role,
+            configured_provider: route.target().provider_id().to_string(),
+            configured_model: route.target().model_id().map(ToString::to_string),
+            reason: route.reason().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by_key(|route| role_order(route.role));
+    let mut stages = Vec::new();
+    for stage in loaded.run.stages() {
+        let route = plan.as_ref().and_then(|plan| plan.route(stage.role()));
+        let session = sessions
+            .iter()
+            .filter(|session| session.stage_id() == stage.id())
+            .max_by_key(|session| session.attempt());
+        let started = events.iter().rev().find_map(|event| {
+            if event.event.stage_id() != Some(stage.id()) {
+                return None;
+            }
+            match event.event.kind() {
+                DomainEventKind::ProviderStarted {
+                    provider_id,
+                    model_id,
+                    ..
+                } => Some((
+                    provider_id.to_string(),
+                    model_id.as_ref().map(ToString::to_string),
+                )),
+                _ => None,
+            }
+        });
+        let process_status = session
+            .and_then(crate::providers::ProviderSessionRecord::current_process_id)
+            .map(|process_id| store.load_managed_process(process_id))
+            .transpose()?
+            .map(|process| process.status().as_str().to_owned());
+        stages.push(StageSummary {
+            id: stage.id().clone(),
+            kind: stage.kind(),
+            role: stage.role(),
+            status: stage.status(),
+            configured_provider: route.map_or_else(
+                || "unavailable".to_owned(),
+                |route| route.target().provider_id().to_string(),
+            ),
+            configured_model: route
+                .and_then(|route| route.target().model_id())
+                .map(ToString::to_string),
+            actual_provider: session
+                .map(|session| session.provider_id().to_string())
+                .or_else(|| started.as_ref().map(|(provider, _)| provider.clone())),
+            actual_model: session
+                .and_then(crate::providers::ProviderSessionRecord::model_id)
+                .map(ToString::to_string)
+                .or_else(|| started.and_then(|(_, model)| model)),
+            provider_session_record: session.map(|session| session.id().to_string()),
+            native_session: session
+                .and_then(crate::providers::ProviderSessionRecord::native_session_id)
+                .map(ToString::to_string),
+            provider_session_status: session.map(|session| session.status().as_str().to_owned()),
+            process_status,
+        });
+    }
     Ok(RunDetails {
         id: loaded.run.id(),
         task: input.map(|input| input.task().to_owned()),
@@ -124,36 +198,27 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         base_commit: workspace
             .as_ref()
             .map(|workspace| workspace.base_commit().to_owned()),
-        provider,
-        profile,
-        provider_model: provider_session
-            .as_ref()
-            .and_then(|session| session.model_id())
-            .map(ToString::to_string),
-        provider_session_record: provider_session
-            .as_ref()
-            .map(|session| session.id().to_string()),
-        provider_session: provider_session
-            .as_ref()
-            .and_then(|session| session.native_session_id())
-            .map(ToString::to_string),
-        provider_session_status: provider_session
-            .as_ref()
-            .map(|session| session.status().as_str().to_owned()),
-        process_status,
+        profile: plan.as_ref().map_or_else(
+            || {
+                loaded
+                    .config_snapshot
+                    .payload()
+                    .get("profile")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unavailable")
+                    .to_owned()
+            },
+            |plan| plan.profile().to_owned(),
+        ),
+        profile_version: plan.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |plan| plan.profile_version().to_owned(),
+        ),
+        routes,
         revision: loaded.revision,
         created_at: *loaded.run.created_at(),
         updated_at: *loaded.run.updated_at(),
-        stages: loaded
-            .run
-            .stages()
-            .iter()
-            .map(|stage| StageSummary {
-                id: stage.id().clone(),
-                kind: stage.kind(),
-                status: stage.status(),
-            })
-            .collect(),
+        stages,
         attention: loaded
             .run
             .attention_requests()
@@ -168,6 +233,18 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .collect(),
         usage,
     })
+}
+
+const fn role_order(role: Role) -> u8 {
+    match role {
+        Role::Researcher => 0,
+        Role::Architect => 1,
+        Role::Implementer => 2,
+        Role::CodeQualityReviewer => 3,
+        Role::SpecReviewer => 4,
+        Role::Reviewer => 5,
+        Role::EngineeringLead => 6,
+    }
 }
 
 fn task_summary(task: Option<&str>) -> String {

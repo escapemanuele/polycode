@@ -9,6 +9,8 @@ use crate::providers::codex::CodexProviderError;
 use crate::store::{RunInputError, StoreError};
 use crate::workspace::WorkspaceError;
 
+use super::RoutingError;
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error(transparent)]
@@ -31,7 +33,11 @@ pub enum AppError {
     Codex(#[from] CodexProviderError),
     #[error(transparent)]
     Process(#[from] ProcessError),
-    #[error("provider is required; use --provider claude, --provider codex, or --provider fake")]
+    #[error(transparent)]
+    Routing(#[from] RoutingError),
+    #[error(
+        "execution selection is required; use --provider claude|codex|fake or --profile recommended"
+    )]
     NoProductionProvider,
     #[error("unsupported provider {0:?}; supported providers: claude, codex, fake")]
     UnsupportedProvider(String),

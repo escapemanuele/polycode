@@ -62,7 +62,7 @@ fn fake_provider_must_be_selected_explicitly() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("use --provider claude, --provider codex, or --provider fake")
+            .contains("use --provider claude|codex|fake or --profile recommended")
     );
     assert!(!fixture.data.join("polycode.db").exists());
 }
@@ -94,7 +94,7 @@ fn doctor_reports_real_tmux_availability_without_creating_database() {
     let output = fixture.doctor_without_native_providers();
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Milestone 8 native Claude Code + Codex CLI providers"));
+    assert!(stdout.contains("Milestone 9 role routing + recommended_v1"));
     assert!(stdout.contains("Claude Code:"));
     assert!(stdout.contains("Codex CLI: not found on PATH"));
     assert!(stdout.contains("tmux: available (tmux "));

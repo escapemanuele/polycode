@@ -73,10 +73,128 @@ fn main() -> std::io::Result<()> {
             std::io::stdout().write_all(&bytes)?;
         }
         "codex" => codex_fixture(&arguments.collect::<Vec<_>>())?,
+        "claude" => claude_fixture(&arguments.collect::<Vec<_>>())?,
         _ => {
             std::io::stderr().write_all(b"unknown fixture mode\n")?;
             std::process::exit(64);
         }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "single native fixture keeps emitted Claude protocol sequence inspectable"
+)]
+fn claude_fixture(arguments: &[OsString]) -> std::io::Result<()> {
+    let args = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    match args.as_slice() {
+        [version] if version == "--version" => {
+            writeln!(std::io::stdout(), "claude-code fixture-1")?;
+            return Ok(());
+        }
+        [auth, status, json] if auth == "auth" && status == "status" && json == "--json" => {
+            if std::env::var_os("POLYCODE_FAKE_CLAUDE_PROBE_FAILURE").is_some() {
+                writeln!(std::io::stdout(), "not-json")?;
+                return Ok(());
+            }
+            writeln!(
+                std::io::stdout(),
+                "{}",
+                serde_json::json!({"loggedIn":true,"authMethod":"fixture"})
+            )?;
+            return Ok(());
+        }
+        _ => {}
+    }
+    let resumed_session = args
+        .iter()
+        .position(|argument| argument == "--resume")
+        .and_then(|index| args.get(index + 1))
+        .cloned();
+    let mut stdin = String::new();
+    std::io::stdin().read_to_string(&mut stdin)?;
+    let stage = resumed_session
+        .as_deref()
+        .and_then(|session| session.strip_prefix("claude-session-"))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            stdin
+                .lines()
+                .find_map(|line| line.strip_prefix("Stage: "))
+                .and_then(|line| line.split_once(' ').map(|(stage, _)| stage.to_owned()))
+        })
+        .unwrap_or_else(|| "resumed".to_owned());
+    if let Some(capture) = std::env::var_os("POLYCODE_FAKE_CLAUDE_CAPTURE_DIR") {
+        let capture = std::path::PathBuf::from(capture);
+        std::fs::create_dir_all(&capture)?;
+        std::fs::write(
+            capture.join(format!("{stage}.claude.argv")),
+            args.join("\n"),
+        )?;
+        std::fs::write(capture.join(format!("{stage}.claude.stdin")), &stdin)?;
+    }
+    let session = resumed_session.unwrap_or_else(|| format!("claude-session-{stage}"));
+    writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::json!({
+            "type":"system",
+            "subtype":"init",
+            "session_id":session,
+            "model":"claude-fixture"
+        })
+    )?;
+    let question_stage = std::env::var("POLYCODE_FAKE_CLAUDE_QUESTION_STAGE").ok();
+    if (std::env::var_os("POLYCODE_FAKE_CLAUDE_QUESTION").is_some()
+        || question_stage.as_deref() == Some(stage.as_str()))
+        && !args.iter().any(|argument| argument == "--resume")
+    {
+        writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "type":"assistant",
+                "message":{"content":[{
+                    "type":"tool_use",
+                    "name":"AskUserQuestion",
+                    "input":{"questions":[{"question":"Choose fixture option"}]}
+                }]}
+            })
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"text","text":"Fake Claude progress"}]}
+        })
+    )?;
+    writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::json!({
+            "type":"result",
+            "subtype":"success",
+            "is_error":false,
+            "session_id":session,
+            "result":format!("# {stage} result\nFake Claude completed.\n")
+        })
+    )?;
+    if stage == "architecture"
+        && let Some(path) = std::env::var_os("POLYCODE_FAKE_CLAUDE_REMOVE_CODEX")
+    {
+        std::fs::remove_file(path)?;
+    }
+    if stage == "quality_review"
+        && let Some(path) = std::env::var_os("POLYCODE_FAKE_CLAUDE_REMOVE_COMPLETED_CODEX")
+    {
+        std::fs::remove_file(path)?;
     }
     Ok(())
 }
