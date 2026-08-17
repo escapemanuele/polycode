@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository contains **Milestone 9 role routing + versioned Recommended profile** above native Claude Code, Codex CLI, and deterministic FakeProvider adapters. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, and crash-reconcilable tmux supervision remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, and UI remain future work.
+Polycode is early-stage software. This repository contains **Milestone 10 Ratatui local control room** above role-routed native Claude Code, Codex CLI, and deterministic FakeProvider adapters. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, crash-reconcilable tmux supervision, and immutable `recommended_v1` routing remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain future work.
 
 ## Principles
 
@@ -36,11 +36,43 @@ Review:    Research -> Code Quality Review --+
 
 Code Quality Review inspects actual repository state and judges how implementation is engineered. Specification Review independently compares delivered behavior with immutable task intent and available design evidence, classifying gaps as Missing, Wrong, or Unrequested. Both are read-only and create separate stage-ID-based Markdown artifacts. Existing persisted runs retain their original stored graph, including legacy generic review stages.
 
+## Local control room
+
+Run Polycode without arguments in an interactive terminal:
+
+```console
+polycode
+polycode tui
+```
+
+Both open local Ratatui control room. With no command and non-interactive stdin/stdout, Polycode prints normal CLI help and emits no terminal control sequences. Explicit `polycode tui` requires interactive stdin and stdout.
+
+Control room is projection and control surface over application layer. It lists runs, shows stage timeline and persisted routes, keeps configured and actual provider/model distinct, highlights attention, displays verified artifacts, reads bounded raw log tails without acknowledging provider output, previews same managed-worktree delta used by apply, and delegates all mutations to `RunService`.
+
+Blocking start/resume/retry/attention/apply/discard actions run on one serialized background worker. Navigation and read-only refresh remain responsive. Pressing `q` or `Ctrl-C` detaches frontend and restores terminal; it does not interrupt, discard, clean, or apply a run. A tmux-owned provider continues independently. Reopen Polycode and explicitly resume/recover to reconcile durable state and consume retained output.
+
+Key bindings:
+
+| Context | Keys | Action |
+|---|---|---|
+| Global | `↑`/`↓`, `j`/`k` | Navigate |
+| Global | `Enter`, `Esc` | Open/confirm, back/close |
+| Global | `n`, `R`, `?` | New run, runs screen, help |
+| Global | `q`, `Ctrl-C` | Quit/detach frontend |
+| Run | `r`, `t`, `u` | Resume/recover, retry selected failed stage, attention |
+| Run | `o`, `l`, `d` | Verified artifact, raw logs, diff |
+| Run | `a`, `X` | Apply or discard with confirmation |
+| Viewer | `↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End` | Scroll |
+| Composer | `Tab`/`Shift-Tab`, arrows, typing/paste | Move fields, choose values, edit |
+
+New-run composer defaults to Standard workflow and Recommended routing. Choices are Recommended, Claude only, Codex only, and Fake. Selection maps directly to M9 `ExecutionSelection`; UI never recomputes routes.
+
 ## Current CLI
 
 ```console
 polycode --help
 polycode --version
+polycode tui
 polycode doctor
 polycode fast "Fix the parser" --provider claude
 polycode standard "Add export support" --repo /path/to/repo --provider claude
@@ -188,7 +220,7 @@ Direct dependency artifacts are included in downstream prompts. Artifact metadat
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, and `recommended_v1` are implemented; Gemini, adaptive routing/failover, and UI remain future constraints.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, `recommended_v1`, and local TUI are implemented; Gemini, adaptive routing/failover, Advisor, and direct provider chat remain future constraints.
 
 ## License
 

@@ -22,6 +22,8 @@ pub enum Command {
     /// Internal signal-normalizing exec bridge.
     #[command(name = "__exec-process", hide = true)]
     ExecProcess { manifest: PathBuf },
+    /// Open interactive local control room.
+    Tui,
     /// Run implementation-only workflow.
     Fast(RunArgs),
     /// Run architecture, implementation, review, and decision workflow.
@@ -109,5 +111,8 @@ mod tests {
                 manifest: PathBuf::from("/tmp/spec.json")
             })
         );
+
+        let cli = Cli::try_parse_from(["polycode", "tui"]).unwrap();
+        assert_eq!(cli.command, Some(Command::Tui));
     }
 }

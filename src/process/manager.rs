@@ -325,6 +325,42 @@ impl<B: ProcessBackend> ProcessManager<B> {
             .read_output(&process, stream, cursor.offset(), max_bytes)
     }
 
+    /// Reads a bounded tail without advancing durable provider-consumption cursor.
+    ///
+    /// # Errors
+    /// Returns process lookup, size, truncation, or backend I/O failures.
+    pub fn read_output_tail(
+        &self,
+        store: &SqliteStore,
+        process_id: ManagedProcessId,
+        stream: OutputStream,
+        max_bytes: usize,
+    ) -> Result<(OutputChunk, u64, bool), ProcessError> {
+        if max_bytes == 0 {
+            return Err(ProcessError::InvalidReadSize(0));
+        }
+        let process = store.load_managed_process(process_id)?;
+        let total_bytes = self.backend.output_length(&process, stream)?;
+        let max_bytes_u64 =
+            u64::try_from(max_bytes).map_err(|_| ProcessError::InvalidReadSize(max_bytes))?;
+        let offset = total_bytes.saturating_sub(max_bytes_u64);
+        let requested = usize::try_from(total_bytes.saturating_sub(offset))
+            .map_err(|_| ProcessError::InvalidReadSize(max_bytes))?;
+        let chunk = if requested == 0 {
+            OutputChunk::new(
+                process.id(),
+                stream,
+                process.cursor(stream).revision(),
+                offset,
+                Vec::new(),
+            )?
+        } else {
+            self.backend
+                .read_output(&process, stream, offset, requested)?
+        };
+        Ok((chunk, total_bytes, offset > 0))
+    }
+
     /// Advances one stream cursor after consumer durably accepts bytes.
     ///
     /// # Errors

@@ -312,6 +312,25 @@ fn codex_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         "{}",
         serde_json::json!({"type":"turn.started"})
     )?;
+    if let Some(milliseconds) = std::env::var_os("POLYCODE_FAKE_CODEX_DELAY_MS") {
+        std::io::stdout().flush()?;
+        std::thread::sleep(Duration::from_millis(parse_u64(Some(milliseconds))?));
+    }
+    if let Some(release_path) = std::env::var_os("POLYCODE_FAKE_CODEX_WAIT_FILE") {
+        std::io::stdout().flush()?;
+        let release_path = std::path::PathBuf::from(release_path);
+        std::fs::write(release_path.with_extension("waiting"), b"ready")?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !release_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for fixture release file",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     if fail_once {
         writeln!(
             std::io::stdout(),

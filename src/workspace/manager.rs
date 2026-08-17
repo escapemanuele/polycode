@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::domain::{EventId, EventMetadata, Run, RunId, RunStatus, RunTransition};
 use crate::git::{
     GitRepository, apply_patch, branch_exists, branch_tip, check_patch, create_worktree,
-    delete_owned_branch, generate_patch, inspect_worktree, remove_worktree, source_is_clean,
+    delete_owned_branch, generate_patch, generate_patch_preview, inspect_worktree, remove_worktree,
+    source_is_clean,
 };
 use crate::store::{RunRevision, SqliteStore, worktree_root};
 
@@ -241,6 +242,36 @@ impl WorkspaceManager {
         let operation =
             store.update_apply_operation(&operation, ApplyStatus::AppliedToSource, None, now())?;
         Self::finalize_apply(store, loaded.run, loaded.revision, &operation)
+    }
+
+    /// Builds a bounded read-only preview from same temporary-index delta used by apply.
+    ///
+    /// # Errors
+    /// Rejects missing/non-ready/non-branch workspaces, ownership failures, invalid limits,
+    /// or Git failures. No apply intent or canonical state is changed.
+    pub(crate) fn preview_patch(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        max_bytes: usize,
+    ) -> Result<crate::git::PatchPreview, WorkspaceError> {
+        if max_bytes == 0 {
+            return Err(crate::git::GitError::InvalidOutput(
+                "diff preview byte limit must be positive".to_owned(),
+            )
+            .into());
+        }
+        let workspace = Self::ready_workspace(store, run_id)?;
+        if workspace.mode() != WorkspaceMode::Branch {
+            return Err(WorkspaceError::ReviewWorkspaceNotApplicable);
+        }
+        self.validate_workspace(&workspace, false)?;
+        Ok(generate_patch_preview(
+            &self.git,
+            workspace.worktree_path(),
+            workspace.base_commit(),
+            max_bytes,
+        )?)
     }
 
     /// Records logical discard first, then removes owned workspace resources.

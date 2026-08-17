@@ -94,11 +94,27 @@ fn doctor_reports_real_tmux_availability_without_creating_database() {
     let output = fixture.doctor_without_native_providers();
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Milestone 9 role routing + recommended_v1"));
+    assert!(stdout.contains("Milestone 10 Ratatui local control room"));
     assert!(stdout.contains("Claude Code:"));
     assert!(stdout.contains("Codex CLI: not found on PATH"));
     assert!(stdout.contains("tmux: available (tmux "));
     assert!(!fixture.data.join("polycode.db").exists());
+}
+
+#[test]
+fn no_args_non_tty_prints_help_and_explicit_tui_fails_without_control_sequences() {
+    let fixture = Fixture::new();
+    let no_args = fixture.polycode(&[]);
+    assert_success(&no_args);
+    let stdout = String::from_utf8(no_args.stdout).unwrap();
+    assert!(stdout.contains("Usage: polycode"));
+    assert!(!stdout.contains('\u{1b}'));
+
+    let explicit = fixture.polycode(&["tui"]);
+    assert!(!explicit.status.success());
+    let stderr = String::from_utf8(explicit.stderr).unwrap();
+    assert!(stderr.contains("requires interactive stdin and stdout"));
+    assert!(!stderr.contains('\u{1b}'));
 }
 
 struct Fixture {

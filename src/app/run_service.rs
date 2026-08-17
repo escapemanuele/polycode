@@ -13,7 +13,13 @@ use crate::store::{RunInput, SqliteStore, database_file, worktree_root};
 use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 
 use super::provider_factory::ProviderFactory;
-use super::{AppError, CommittedEvent, ExecutionSelection, RunDetails, RunListItem, query};
+use super::{
+    AppError, ArtifactSummary, ArtifactView, CommittedEvent, ExecutionSelection, ProcessLogView,
+    RunDetails, RunDiffPreview, RunListItem, query,
+};
+
+const DIFF_PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
+const PROCESS_LOG_TAIL_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -233,6 +239,58 @@ where
         query::inspect(&mut SqliteStore::open(&self.database)?, run_id)
     }
 
+    /// Lists integrity-verified artifact metadata for one run.
+    ///
+    /// # Errors
+    /// Returns persistence or artifact integrity failures.
+    pub fn list_artifacts(&self, run_id: RunId) -> Result<Vec<ArtifactSummary>, AppError> {
+        query::list_artifacts(&SqliteStore::open(&self.database)?, run_id)
+    }
+
+    /// Reads latest integrity-verified artifact for one stage.
+    ///
+    /// # Errors
+    /// Returns not-found, non-UTF-8, persistence, or integrity failures.
+    pub fn read_artifact(
+        &self,
+        run_id: RunId,
+        stage_id: &StageId,
+    ) -> Result<ArtifactView, AppError> {
+        query::read_artifact(&SqliteStore::open(&self.database)?, run_id, stage_id)
+    }
+
+    /// Generates bounded read-only workspace diff from same delta semantics as apply.
+    ///
+    /// # Errors
+    /// Returns workspace ownership/readiness or Git failures.
+    pub fn preview_run_diff(&self, run_id: RunId) -> Result<RunDiffPreview, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let preview = WorkspaceManager::new(&self.worktrees).preview_patch(
+            &mut store,
+            run_id,
+            DIFF_PREVIEW_LIMIT,
+        )?;
+        Ok(query::summarize_diff(
+            String::from_utf8_lossy(&preview.bytes).into_owned(),
+            preview.total_bytes,
+            preview.truncated,
+        ))
+    }
+
+    /// Reads bounded stdout/stderr tails without acknowledging provider output.
+    ///
+    /// # Errors
+    /// Returns process lookup, path, or retained-output failures.
+    pub fn read_process_log_tail(
+        &self,
+        run_id: RunId,
+        stage_id: &StageId,
+    ) -> Result<ProcessLogView, AppError> {
+        let store = SqliteStore::open(&self.database)?;
+        let manager = ProcessManager::from_environment()?;
+        query::process_log_tail(&store, &manager, run_id, stage_id, PROCESS_LOG_TAIL_LIMIT)
+    }
+
     fn reconcile(&self, store: &mut SqliteStore, run_id: RunId) -> Result<(), AppError> {
         let outcome = WorkspaceManager::new(&self.worktrees).reconcile(store, run_id)?;
         match outcome {
@@ -406,6 +464,7 @@ fn quiescent_state(status: RunStatus, engine_status: Option<&EngineStatus>) -> Q
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -416,14 +475,17 @@ mod tests {
     use super::*;
     use crate::app::{DevelopmentFakeProviderFactory, ProviderFactory, UniformProvider};
     use crate::domain::{
-        AttentionKind, ConfigSnapshotId, Dependency, DomainEventKind, ProviderId, Role,
-        StageDefinition, StageKind,
+        ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactStatus, AttentionKind,
+        ConfigSnapshotId, Dependency, DomainEventKind, ProviderId, Role, StageDefinition,
+        StageKind,
     };
     use crate::engine::{
         FakeEvent, FakeProvider, FakeScenario, Provider, ProviderError, ProviderPoll,
         ProviderRequest,
     };
-    use crate::store::{ResolvedConfigSnapshot, SequencedEvent};
+    use crate::process::{OutputStream, ProcessManager, TmuxBackend};
+    use crate::providers::ArtifactRecord;
+    use crate::store::{ResolvedConfigSnapshot, SequencedEvent, StoreError};
 
     #[derive(Clone)]
     struct ScriptedFactory {
@@ -555,7 +617,7 @@ mod tests {
     }
 
     struct Fixture {
-        _temp: TempDir,
+        temp: TempDir,
         repo: PathBuf,
         database: PathBuf,
         worktrees: PathBuf,
@@ -575,7 +637,7 @@ mod tests {
             let database = temp.path().join("data/polycode.db");
             let worktrees = temp.path().join("data/worktrees");
             Self {
-                _temp: temp,
+                temp,
                 repo,
                 database,
                 worktrees,
@@ -1080,6 +1142,236 @@ mod tests {
     }
 
     #[test]
+    fn diff_preview_is_bounded_read_only_and_apply_uses_same_delta() {
+        let fixture = Fixture::new();
+        fs::write(fixture.repo.join("delete-me.txt"), "remove me\n").unwrap();
+        git(&fixture.repo, &["add", "delete-me.txt"]);
+        git(&fixture.repo, &["commit", "-qm", "add deletion fixture"]);
+        let service = fixture.default_service();
+        let complete = service
+            .start_run(
+                WorkflowKind::Fast,
+                "preview integration",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+            )
+            .unwrap();
+        let run_id = complete.details.id;
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        let workspace = store.load_workspace(run_id).unwrap().unwrap();
+        fs::write(
+            workspace.worktree_path().join("README.md"),
+            "preview change\n",
+        )
+        .unwrap();
+        fs::remove_file(workspace.worktree_path().join("delete-me.txt")).unwrap();
+        fs::write(workspace.worktree_path().join("new file.txt"), "new\n").unwrap();
+        let source_before = git_output(&fixture.repo, &["status", "--porcelain"]);
+        let index_before = git_output(workspace.worktree_path(), &["diff", "--cached"]);
+        let worktree_before = git_output(workspace.worktree_path(), &["status", "--porcelain"]);
+        let loaded_before = store.load_run(run_id).unwrap();
+        let events_before = store.load_events(run_id).unwrap().len();
+        let workspace_before = store.load_workspace(run_id).unwrap().unwrap();
+        assert!(store.load_apply_operation(run_id).unwrap().is_none());
+        drop(store);
+
+        let preview = service.preview_run_diff(run_id).unwrap();
+        assert!(!preview.truncated);
+        assert!(preview.text.contains("preview change"));
+        assert!(
+            preview
+                .changed_files
+                .iter()
+                .any(|file| file.path == "README.md")
+        );
+        assert!(
+            preview
+                .changed_files
+                .iter()
+                .any(|file| file.path == "delete-me.txt")
+        );
+        assert!(
+            preview
+                .changed_files
+                .iter()
+                .any(|file| file.path == "new file.txt")
+        );
+
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        let loaded_after = store.load_run(run_id).unwrap();
+        let workspace_after = store.load_workspace(run_id).unwrap().unwrap();
+        assert_eq!(loaded_after.revision, loaded_before.revision);
+        assert_eq!(store.load_events(run_id).unwrap().len(), events_before);
+        assert_eq!(workspace_after.status(), workspace_before.status());
+        assert_eq!(workspace_after.revision(), workspace_before.revision());
+        assert!(store.load_apply_operation(run_id).unwrap().is_none());
+        assert_eq!(
+            git_output(&fixture.repo, &["status", "--porcelain"]),
+            source_before
+        );
+        assert_eq!(
+            git_output(workspace.worktree_path(), &["diff", "--cached"]),
+            index_before
+        );
+        assert_eq!(
+            git_output(workspace.worktree_path(), &["status", "--porcelain"]),
+            worktree_before
+        );
+        drop(store);
+
+        let (outcome, report) = service.apply_run(run_id).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(report.details.status, RunStatus::Applied);
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
+            "preview change\n"
+        );
+        assert!(!fixture.repo.join("delete-me.txt").exists());
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("new file.txt")).unwrap(),
+            "new\n"
+        );
+        assert!(git_output(&fixture.repo, &["diff", "--cached"]).is_empty());
+    }
+
+    #[test]
+    fn diff_preview_truncates_large_workspace_output_before_returning_it() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let complete = service
+            .start_run(
+                WorkflowKind::Fast,
+                "large preview",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+            )
+            .unwrap();
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        let workspace = store.load_workspace(complete.details.id).unwrap().unwrap();
+        fs::write(
+            workspace.worktree_path().join("generated.txt"),
+            "unique preview line 0123456789\n".repeat(100_000),
+        )
+        .unwrap();
+        drop(store);
+
+        let preview = service.preview_run_diff(complete.details.id).unwrap();
+        assert!(preview.truncated);
+        assert_eq!(preview.text.len(), DIFF_PREVIEW_LIMIT);
+        assert!(preview.total_bytes > u64::try_from(DIFF_PREVIEW_LIMIT).unwrap());
+    }
+
+    #[test]
+    fn artifact_read_revalidates_hash_and_does_not_mutate_run() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let complete = service
+            .start_run(
+                WorkflowKind::Fast,
+                "artifact integration",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+            )
+            .unwrap();
+        let run_id = complete.details.id;
+        let stage_id = StageId::new("implementation").unwrap();
+        let artifact_path = fixture.temp.path().join("implementation.md");
+        let bytes = b"# Verified output\n";
+        fs::write(&artifact_path, bytes).unwrap();
+        let created_at = now();
+        let metadata = ArtifactMetadata::new(
+            ArtifactId::new(),
+            run_id,
+            stage_id.clone(),
+            ArtifactKind::Implementation,
+            Role::Implementer,
+            ArtifactStatus::Complete,
+            created_at,
+        )
+        .with_provider(ProviderId::new("fake").unwrap(), None);
+        let artifact = ArtifactRecord::new(
+            metadata,
+            1,
+            artifact_path.clone(),
+            sha256(bytes),
+            u64::try_from(bytes.len()).unwrap(),
+            created_at,
+        )
+        .unwrap();
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        store.insert_artifact(&artifact).unwrap();
+        let revision = store.load_run(run_id).unwrap().revision;
+        let event_count = store.load_events(run_id).unwrap().len();
+        drop(store);
+
+        assert_eq!(service.list_artifacts(run_id).unwrap().len(), 1);
+        let view = service.read_artifact(run_id, &stage_id).unwrap();
+        assert_eq!(view.text, "# Verified output\n");
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        assert_eq!(store.load_run(run_id).unwrap().revision, revision);
+        assert_eq!(store.load_events(run_id).unwrap().len(), event_count);
+        drop(store);
+
+        fs::write(&artifact_path, "tampered\n").unwrap();
+        assert!(matches!(
+            service.read_artifact(run_id, &stage_id),
+            Err(AppError::Store(StoreError::ArtifactIntegrity(path))) if path == artifact_path
+        ));
+    }
+
+    #[test]
+    fn raw_log_tail_does_not_advance_provider_cursor() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let complete = service
+            .start_run(
+                WorkflowKind::Fast,
+                "log integration",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+            )
+            .unwrap();
+        let run_id = complete.details.id;
+        let stage_id = StageId::new("implementation").unwrap();
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        let manager = ProcessManager::new(
+            fixture.temp.path().join("processes"),
+            TmuxBackend::new("/bin/true"),
+        );
+        let process = manager
+            .prepare(
+                &mut store,
+                run_id,
+                stage_id.clone(),
+                1,
+                "/bin/true",
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let stdout = vec![b'x'; PROCESS_LOG_TAIL_LIMIT + 1_024];
+        fs::write(process.spec().stdout_path(), &stdout).unwrap();
+        fs::write(process.spec().stderr_path(), b"diagnostic\n").unwrap();
+        let stdout_cursor = process.cursor(OutputStream::Stdout);
+        let stderr_cursor = process.cursor(OutputStream::Stderr);
+        let run_revision = store.load_run(run_id).unwrap().revision;
+        let event_count = store.load_events(run_id).unwrap().len();
+        drop(store);
+
+        let logs = service.read_process_log_tail(run_id, &stage_id).unwrap();
+        assert!(logs.stdout.truncated);
+        assert_eq!(logs.stdout.text.len(), PROCESS_LOG_TAIL_LIMIT);
+        assert_eq!(logs.stderr.text, "diagnostic\n");
+
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        let after = store.load_managed_process(process.id()).unwrap();
+        assert_eq!(after.cursor(OutputStream::Stdout), stdout_cursor);
+        assert_eq!(after.cursor(OutputStream::Stderr), stderr_cursor);
+        assert_eq!(store.load_run(run_id).unwrap().revision, run_revision);
+        assert_eq!(store.load_events(run_id).unwrap().len(), event_count);
+    }
+
+    #[test]
     fn missing_provider_is_rejected_before_database_creation() {
         let fixture = Fixture::new();
         let error = fixture
@@ -1182,5 +1474,16 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        let mut hash = String::with_capacity(64);
+        for byte in Sha256::digest(bytes) {
+            write!(hash, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        hash
     }
 }

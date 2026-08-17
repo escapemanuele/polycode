@@ -1,4 +1,5 @@
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -111,6 +112,55 @@ impl Git {
         environment: &[(OsString, OsString)],
     ) -> Result<GitOutput, GitError> {
         self.output(cwd, args, environment)?.ensure_success()
+    }
+
+    pub fn checked_to_file(
+        &self,
+        cwd: &Path,
+        args: &[OsString],
+        environment: &[(OsString, OsString)],
+        stdout: File,
+    ) -> Result<(), GitError> {
+        let description = describe_command(&self.executable, cwd, args);
+        let mut command = Command::new(&self.executable);
+        command
+            .current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::piped());
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        let output = command.output().map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => GitError::GitNotFound,
+            _ => GitError::CommandIo {
+                command: description.clone(),
+                source,
+            },
+        })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(GitError::CommandFailed {
+                command: description,
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            })
+        }
     }
 }
 

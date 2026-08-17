@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::domain::{IdError, RunId};
+use crate::domain::{IdError, RunId, StageId};
 use crate::engine::{EngineError, FakeScenarioError};
 use crate::git::GitError;
 use crate::process::ProcessError;
@@ -49,4 +49,8 @@ pub enum AppError {
     LegacyExecutionConfig(RunId),
     #[error("run {0} was discarded and cannot continue")]
     DiscardedRun(RunId),
+    #[error("run {run_id} stage {stage_id} has no verified artifact")]
+    ArtifactNotFound { run_id: RunId, stage_id: StageId },
+    #[error("run {run_id} stage {stage_id} has no managed process log")]
+    ProcessLogNotFound { run_id: RunId, stage_id: StageId },
 }

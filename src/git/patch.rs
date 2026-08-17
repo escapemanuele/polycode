@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use tempfile::{NamedTempFile, tempdir};
@@ -57,6 +57,90 @@ pub(crate) fn generate_patch(
         &environment,
     )?;
     Ok(output.stdout)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PatchPreview {
+    pub bytes: Vec<u8>,
+    pub total_bytes: u64,
+    pub truncated: bool,
+}
+
+pub(crate) fn generate_patch_preview(
+    git: &Git,
+    worktree_path: &Path,
+    base_commit: &str,
+    max_bytes: usize,
+) -> Result<PatchPreview, GitError> {
+    let temporary = tempdir().map_err(|source| GitError::CommandIo {
+        command: "create temporary Git index directory".to_owned(),
+        source,
+    })?;
+    let index_path = temporary.path().join("index");
+    let environment = vec![(
+        OsString::from("GIT_INDEX_FILE"),
+        index_path.as_os_str().to_os_string(),
+    )];
+    git.checked_with(
+        worktree_path,
+        &[os("read-tree"), os(base_commit)],
+        &environment,
+    )?;
+    git.checked_with(
+        worktree_path,
+        &[os("add"), os("-A"), os("--"), os(".")],
+        &environment,
+    )?;
+    let mut output = NamedTempFile::new().map_err(|source| GitError::CommandIo {
+        command: "create temporary Git preview file".to_owned(),
+        source,
+    })?;
+    git.checked_to_file(
+        worktree_path,
+        &[
+            os("diff"),
+            os("--cached"),
+            os("--binary"),
+            os("--full-index"),
+            os(base_commit),
+            os("--"),
+        ],
+        &environment,
+        output.reopen().map_err(|source| GitError::CommandIo {
+            command: "open temporary Git preview file".to_owned(),
+            source,
+        })?,
+    )?;
+    let total_bytes = output
+        .as_file()
+        .metadata()
+        .map_err(|source| GitError::CommandIo {
+            command: "inspect temporary Git preview file".to_owned(),
+            source,
+        })?
+        .len();
+    output
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| GitError::CommandIo {
+            command: "seek temporary Git preview file".to_owned(),
+            source,
+        })?;
+    let limit = u64::try_from(max_bytes).map_err(|_| {
+        GitError::InvalidOutput("diff preview byte limit is outside supported range".to_owned())
+    })?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    output
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| GitError::CommandIo {
+            command: "read temporary Git preview file".to_owned(),
+            source,
+        })?;
+    Ok(PatchPreview {
+        bytes,
+        total_bytes,
+        truncated: total_bytes > limit,
+    })
 }
 
 pub(crate) fn check_patch(
