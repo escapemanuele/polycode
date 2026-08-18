@@ -104,7 +104,7 @@ fn fake_codex_v2_smoke_scores_calibrated_reviewers_without_native_usage() {
     }));
     let report = render_report(&results).unwrap();
     assert!(report.contains("SUITE role_core_v2"));
-    assert!(report.contains("severity                     3/3"));
+    assert!(report.contains("severity agreement           3/3 detected"));
     assert!(report.contains("duplicate findings           0"));
 }
 

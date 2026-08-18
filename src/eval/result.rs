@@ -293,7 +293,7 @@ impl EvalResultV1 {
                     && metrics.defects_found <= metrics.defects_total
                     && metrics.must_fix_false_positives <= metrics.false_positives
                     && metrics.severity_matches <= metrics.severity_total
-                    && metrics.severity_total == metrics.defects_total
+                    && metrics.severity_total == metrics.defects_found
                     && metrics.underclassified <= metrics.severity_total
                     && metrics.overclassified <= metrics.severity_total
                     && metrics
@@ -344,8 +344,11 @@ pub enum EvalResultError {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone as _;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::eval::case::ROLE_CORE_CASES_V2;
+    use crate::eval::scorer::{ScoreInput, score};
 
     fn result() -> EvalResultV1 {
         let at = Utc
@@ -432,8 +435,8 @@ mod tests {
             recall: 2.0 / 3.0,
             false_positives: 0,
             must_fix_false_positives: 0,
-            severity_matches: 2,
-            severity_total: 3,
+            severity_matches: 1,
+            severity_total: 2,
             underclassified: 1,
             overclassified: 0,
             duplicate_findings: 1,
@@ -442,5 +445,50 @@ mod tests {
         let restored = EvalResultV1::from_json(&bytes).unwrap();
         assert_eq!(restored, original);
         assert_eq!(restored.schema_version, EVAL_RESULT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn partial_v2_quality_score_writes_and_reloads_as_failed_benchmark() {
+        let artifact = "```json\n{\"eval_version\":1,\"findings\":[\n\
+            {\"severity\":\"must_fix\",\"file\":\"src/lib.rs\",\"line\":3,\"summary\":\"Unnecessary abstraction with one caller\"},\n\
+            {\"severity\":\"minor\",\"file\":\"src/lib.rs\",\"line\":28,\"summary\":\"Nested control flow obscures classification\"}\n]}\n```";
+        let scored = score(
+            &ROLE_CORE_CASES_V2[3],
+            ScoreInput {
+                artifact: Some(artifact),
+                diff: "",
+                validation_pass: None,
+            },
+        )
+        .unwrap();
+        assert!(!scored.passed);
+        let EvalMetrics::CodeQualityReviewerV2(metrics) = &scored.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert_eq!(metrics.defects_found, 2);
+        assert_eq!(metrics.defects_total, 3);
+        assert_eq!(metrics.severity_total, 2);
+        assert_eq!(
+            metrics.severity_matches + metrics.underclassified + metrics.overclassified,
+            2
+        );
+
+        let mut result = result();
+        result.suite_version = "role_core_v2".to_owned();
+        result.case_id = "quality_planted".to_owned();
+        result.status = EvalStatus::Failed;
+        result.metrics = Some(scored.metrics);
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("result.json");
+        result.write(&path).unwrap();
+        let restored = EvalResultV1::from_json(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(restored.status, EvalStatus::Failed);
+        let Some(EvalMetrics::CodeQualityReviewerV2(restored_metrics)) = restored.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert_eq!(restored_metrics.defects_found, 2);
+        assert_eq!(restored_metrics.defects_total, 3);
+        assert!((restored_metrics.recall - (2.0 / 3.0)).abs() < f64::EPSILON);
+        assert_eq!(restored_metrics.severity_total, 2);
     }
 }

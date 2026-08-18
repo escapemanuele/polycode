@@ -102,7 +102,7 @@ pub fn render_report(results: &[EvalResultV1]) -> Result<String, EvalReportError
         if summary.has_quality_v2 {
             writeln!(
                 output,
-                "  severity                     {}/{} (underclassified {} overclassified {})",
+                "  severity agreement           {}/{} detected (underclassified {} overclassified {})",
                 summary.quality_severity_matches,
                 summary.quality_severity_total,
                 summary.quality_underclassified,
@@ -503,7 +503,7 @@ mod tests {
         );
         let report = render_report(&[v1, v2]).unwrap();
         assert_eq!(report.matches("SUITE role_core_").count(), 2);
-        assert!(report.contains("severity                     2/3"));
+        assert!(report.contains("severity agreement           2/3 detected"));
         assert!(report.contains("duplicate findings           1"));
         assert!(report.contains("role_core_v1 | fake / native_default"));
         assert!(report.contains("role_core_v2 | fake / native_default"));

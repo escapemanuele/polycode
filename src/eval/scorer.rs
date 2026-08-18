@@ -293,7 +293,7 @@ fn score_quality_v2(
             false_positives,
             must_fix_false_positives,
             severity_matches,
-            severity_total: defects_total,
+            severity_total: defects_found,
             underclassified,
             overclassified,
             duplicate_findings,
@@ -693,5 +693,76 @@ mod tests {
         assert_eq!(metrics.unrequested_found, 1);
         assert_eq!(metrics.false_positives, 0);
         assert_eq!(metrics.duplicate_findings, 1);
+    }
+
+    #[test]
+    fn quality_v2_severity_total_counts_only_detected_defects() {
+        let planted = &ROLE_CORE_CASES_V2[3];
+        let partial = input(
+            "```json\n{\"eval_version\":1,\"findings\":[\n\
+             {\"severity\":\"must_fix\",\"file\":\"src/lib.rs\",\"line\":3,\"summary\":\"Unnecessary abstraction with one caller\"},\n\
+             {\"severity\":\"minor\",\"file\":\"src/lib.rs\",\"line\":28,\"summary\":\"Nested control flow obscures classification\"}\n]}\n```",
+        );
+        let scored = score(planted, partial).unwrap();
+        assert!(!scored.passed);
+        let EvalMetrics::CodeQualityReviewerV2(metrics) = scored.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert_eq!(metrics.defects_found, 2);
+        assert_eq!(metrics.defects_total, 3);
+        assert!((metrics.recall - (2.0 / 3.0)).abs() < f64::EPSILON);
+        assert_eq!(metrics.severity_total, 2);
+        assert_eq!(
+            metrics.severity_matches + metrics.underclassified + metrics.overclassified,
+            2
+        );
+
+        let zero = score(
+            planted,
+            input("```json\n{\"eval_version\":1,\"findings\":[]}\n```"),
+        )
+        .unwrap();
+        let EvalMetrics::CodeQualityReviewerV2(zero_metrics) = zero.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert_eq!(
+            (
+                zero_metrics.defects_found,
+                zero_metrics.defects_total,
+                zero_metrics.severity_total
+            ),
+            (0, 3, 0)
+        );
+
+        let clean = score(
+            &ROLE_CORE_CASES_V2[4],
+            input("```json\n{\"eval_version\":1,\"findings\":[]}\n```"),
+        )
+        .unwrap();
+        let EvalMetrics::CodeQualityReviewerV2(clean_metrics) = clean.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert_eq!(
+            (
+                clean_metrics.defects_found,
+                clean_metrics.defects_total,
+                clean_metrics.severity_total
+            ),
+            (0, 0, 0)
+        );
+
+        let invented = score(
+            &ROLE_CORE_CASES_V2[4],
+            input(
+                "```json\n{\"eval_version\":1,\"findings\":[{\"severity\":\"minor\",\"file\":\"src/lib.rs\",\"line\":1,\"summary\":\"Invented issue\"}]}\n```",
+            ),
+        )
+        .unwrap();
+        let EvalMetrics::CodeQualityReviewerV2(invented_metrics) = invented.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert!(!invented.passed);
+        assert_eq!(invented_metrics.false_positives, 1);
+        assert_eq!(invented_metrics.severity_total, 0);
     }
 }
