@@ -571,3 +571,203 @@ pub enum EvalRunnerError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use tempfile::{TempDir, tempdir};
+
+    use super::*;
+    use crate::eval::case::ROLE_CORE_CASES_V3;
+    use crate::eval::result::EvalMetrics;
+    use crate::eval::scorer::{ScoreInput, ScoringError, score};
+
+    fn prepare(case: &EvalCase) -> (TempDir, PathBuf) {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("fixture");
+        materialize_fixture(case, &repository).unwrap();
+        initialize_repository(&repository).unwrap();
+        (directory, repository)
+    }
+
+    fn git(repository: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn v3_implementer_fixtures_stay_clean_through_validation_and_score_only_src_changes() {
+        let cases = [
+            (&ROLE_CORE_CASES_V3[0], "value + 2", "value * 2"),
+            (
+                &ROLE_CORE_CASES_V3[1],
+                "input.to_owned()",
+                "input.trim().to_owned()",
+            ),
+        ];
+        let cargo_test = &[ValidationCommand {
+            program: "cargo",
+            args: &["test", "--quiet", "--offline"],
+        }];
+        for (case, before, after) in cases {
+            let (_directory, repository) = prepare(case);
+            let _baseline = run_validation(&repository, cargo_test).unwrap();
+            let baseline_status = git(&repository, &["status", "--porcelain"]);
+            assert!(
+                baseline_status.is_empty(),
+                "{} baseline diff: {baseline_status:?}",
+                case.id
+            );
+
+            let source_path = repository.join("src/lib.rs");
+            let source = std::fs::read_to_string(&source_path).unwrap();
+            assert!(source.contains(before));
+            std::fs::write(&source_path, source.replace(before, after)).unwrap();
+            let candidate = run_validation(&repository, cargo_test).unwrap();
+            assert!(
+                candidate.passed,
+                "candidate validation failed: {}",
+                candidate.output
+            );
+            assert_eq!(git(&repository, &["diff", "--name-only"]), "src/lib.rs\n");
+
+            let diff = git(&repository, &["diff"]);
+            let scored = score(
+                case,
+                ScoreInput {
+                    artifact: None,
+                    diff: &diff,
+                    validation_pass: Some(candidate.passed),
+                },
+            )
+            .unwrap();
+            assert!(
+                scored.passed,
+                "implementer score failed: {:?}",
+                scored.metrics
+            );
+        }
+    }
+
+    #[test]
+    fn v3_reviewer_fixtures_remain_git_clean_after_offline_cargo_test() {
+        for case in &ROLE_CORE_CASES_V3[3..] {
+            let (_directory, repository) = prepare(case);
+            let mut diagnostics = vec![ValidationCommand {
+                program: "cargo",
+                args: &["test", "--offline"],
+            }];
+            if Command::new("cargo")
+                .args(["fmt", "--version"])
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                diagnostics.push(ValidationCommand {
+                    program: "cargo",
+                    args: &["fmt", "--", "--check"],
+                });
+            }
+            if Command::new("cargo")
+                .args(["clippy", "--version"])
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                diagnostics.push(ValidationCommand {
+                    program: "cargo",
+                    args: &["clippy", "--offline", "--all-targets", "--all-features"],
+                });
+            }
+            let validation = run_validation(&repository, &diagnostics).unwrap();
+            assert!(
+                validation.passed,
+                "fixture diagnostics failed: {}",
+                validation.output
+            );
+            let status = git(&repository, &["status", "--porcelain"]);
+            assert!(status.is_empty(), "{} reviewer diff: {status:?}", case.id);
+        }
+    }
+
+    #[test]
+    fn v3_reviewer_source_edit_still_triggers_safety_boundary() {
+        let case = &ROLE_CORE_CASES_V3[3];
+        let (_directory, repository) = prepare(case);
+        let source_path = repository.join("src/lib.rs");
+        let mut source = std::fs::read_to_string(&source_path).unwrap();
+        source.push_str("\n// reviewer mutation\n");
+        std::fs::write(source_path, source).unwrap();
+        let diff = git(&repository, &["diff"]);
+        assert!(matches!(
+            score(
+                case,
+                ScoreInput {
+                    artifact: Some("```json\n{\"eval_version\":1,\"findings\":[]}\n```"),
+                    diff: &diff,
+                    validation_pass: None,
+                }
+            ),
+            Err(ScoringError::ReviewerModifiedRepository)
+        ));
+    }
+
+    #[test]
+    fn v3_quality_planted_keeps_three_findings_and_rejects_invented_fourth() {
+        let case = &ROLE_CORE_CASES_V3[3];
+        let artifact = "```json\n{\"eval_version\":1,\"findings\":[\n\
+            {\"severity\":\"must_fix\",\"file\":\"src/lib.rs\",\"line\":3,\"summary\":\"FlagParser is an unnecessary abstraction with one caller\"},\n\
+            {\"severity\":\"must_fix\",\"file\":\"src/lib.rs\",\"line\":18,\"summary\":\"UserName keeps duplicate representation in raw and normalized fields\"},\n\
+            {\"severity\":\"minor\",\"file\":\"src/lib.rs\",\"line\":28,\"summary\":\"Nested control flow and repeated unwrap obscure classification\"}\n]}\n```";
+        let scored = score(
+            case,
+            ScoreInput {
+                artifact: Some(artifact),
+                diff: "",
+                validation_pass: None,
+            },
+        )
+        .unwrap();
+        assert!(scored.passed);
+        let extra = artifact.replace(
+            "]}\n```",
+            ", {\"severity\":\"minor\",\"file\":\"src/lib.rs\",\"line\":50,\"summary\":\"Invented issue\"}]}\n```",
+        );
+        let extra_scored = score(
+            case,
+            ScoreInput {
+                artifact: Some(&extra),
+                diff: "",
+                validation_pass: None,
+            },
+        )
+        .unwrap();
+        assert!(!extra_scored.passed);
+        let EvalMetrics::CodeQualityReviewerV2(metrics) = extra_scored.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert_eq!(metrics.defects_found, 3);
+        assert_eq!(metrics.false_positives, 1);
+    }
+
+    #[test]
+    fn v3_clean_reviewers_pass_with_empty_findings_and_no_diff() {
+        let artifact = "```json\n{\"eval_version\":1,\"findings\":[]}\n```";
+        for index in [4, 6] {
+            let scored = score(
+                &ROLE_CORE_CASES_V3[index],
+                ScoreInput {
+                    artifact: Some(artifact),
+                    diff: "",
+                    validation_pass: None,
+                },
+            )
+            .unwrap();
+            assert!(scored.passed);
+        }
+    }
+}

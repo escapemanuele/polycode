@@ -186,6 +186,7 @@ fn eval(command: &EvalCommand) -> Result<()> {
             for version in [
                 crate::eval::ROLE_CORE_SUITE_VERSION,
                 crate::eval::ROLE_CORE_SUITE_VERSION_V2,
+                crate::eval::ROLE_CORE_SUITE_VERSION_V3,
             ] {
                 let suite = crate::eval::EvalSuite::load(version)?;
                 println!("{} · {}", suite.version(), suite.fingerprint());

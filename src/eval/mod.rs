@@ -10,7 +10,9 @@ mod runner;
 mod scorer;
 mod suite;
 
-pub use case::{EvalCase, ROLE_CORE_SUITE_VERSION, ROLE_CORE_SUITE_VERSION_V2};
+pub use case::{
+    EvalCase, ROLE_CORE_SUITE_VERSION, ROLE_CORE_SUITE_VERSION_V2, ROLE_CORE_SUITE_VERSION_V3,
+};
 pub use report::{EvalReportError, load_results, render_report};
 pub use result::{
     EVAL_RESULT_SCHEMA_VERSION, EvalMetrics, EvalProvider, EvalResultError, EvalResultV1,

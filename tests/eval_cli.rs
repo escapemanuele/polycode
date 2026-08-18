@@ -12,7 +12,7 @@ use polycode::store::SqliteStore;
 use tempfile::{TempDir, tempdir};
 
 #[test]
-fn eval_list_exposes_immutable_v1_and_calibrated_v2() {
+fn eval_list_exposes_immutable_v1_v2_and_calibrated_v3() {
     let fixture = Fixture::new();
     let listed = fixture.polycode(&["eval", "list"]);
     assert_success(&listed);
@@ -21,6 +21,9 @@ fn eval_list_exposes_immutable_v1_and_calibrated_v2() {
         "role_core_v1 · 40d035a14aa5c5e8adaa41bcc3dbe7cb927fd0d47e122808f5a1a4b9ff6f843d"
     ));
     assert!(output.contains("role_core_v2 · "));
+    assert!(output.contains(
+        "role_core_v3 · cb9856d2c8edbc4cb0a59520aa140ef4567dce3b650b14f0436d42c4b11c375b"
+    ));
 }
 
 #[test]

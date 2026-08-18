@@ -75,6 +75,7 @@ Experimental evaluation tooling compares one provider/model candidate by enginee
 polycode eval list
 polycode eval run --suite role_core_v1 --provider fake
 polycode eval run --suite role_core_v2 --provider fake
+polycode eval run --suite role_core_v3 --provider fake
 polycode eval run --suite role_core_v1 --provider codex --model <model> --repeat 3 --allow-native-usage
 polycode eval report ~/.polycode/evals/<evaluation-directory>
 polycode eval report <codex-results> <claude-results>
@@ -82,9 +83,9 @@ polycode eval report <codex-results> <claude-results>
 
 Native Claude/Codex evaluation can consume subscription or provider usage. Every invocation must explicitly pass `--allow-native-usage`; consent is never stored. Fake needs no acknowledgement, produces `synthetic = true`, and is useful only for harness/CI plumbing—not routing evidence. Omitted `--model` is recorded as `configured_model = null`, meaning native configured/default model. Confirmed model remains separate and may also be null; Polycode never guesses.
 
-`role_core_v1` contains seven historical high-signal cases. It is immutable and remains the default when `--suite` is omitted. `role_core_v2` contains the same seven conceptual cases with calibrated reviewer fixtures and scoring; select it explicitly.
+`role_core_v1` contains seven historical high-signal cases. It is immutable and remains the default when `--suite` is omitted. `role_core_v2` contains the same seven conceptual cases with calibrated reviewer fixtures and scoring; select it explicitly. `role_core_v3` is the calibrated hygiene successor: implementer fixtures ignore generated `target/` and `Cargo.lock`, while read-only reviewer fixtures carry canonical locks and ignore only `target/`.
 
-V2 quality fixtures are valid minimal Cargo repositories. Quality identity matching excludes severity, while reports expose severity matches, under/over-classification, and duplicate findings separately. V2 specification truths can have multiple source locations for one conceptual finding; category remains strict. V1 and V2 result groups stay separate in reports and are never averaged together. Existing `EvalResultV1` JSON remains readable because V2 metrics are additive metric variants inside the same envelope schema.
+V2 and V3 quality fixtures are valid minimal Cargo repositories. Quality identity matching excludes severity, while reports expose severity matches, under/over-classification, and duplicate findings separately. V2/V3 specification truths can have multiple source locations for one conceptual finding; category remains strict. V1, V2, and V3 result groups stay separate in reports and are never averaged together. Existing `EvalResultV1` JSON remains readable because reviewer metrics are additive variants inside the same envelope schema.
 
 Cases by role:
 

@@ -2,6 +2,7 @@ use crate::domain::{Role, WorkflowKind};
 
 pub const ROLE_CORE_SUITE_VERSION: &str = "role_core_v1";
 pub const ROLE_CORE_SUITE_VERSION_V2: &str = "role_core_v2";
+pub const ROLE_CORE_SUITE_VERSION_V3: &str = "role_core_v3";
 
 #[derive(Clone, Copy, Debug)]
 pub struct FixtureFile {
@@ -171,6 +172,36 @@ const SCOPE_FILES: &[FixtureFile] = &[
     },
 ];
 
+const BASIC_FILES_V3: &[FixtureFile] = &[
+    FixtureFile {
+        path: ".gitignore",
+        contents: include_str!("../../evals/role_core_v3/implementer_basic_bugfix/.gitignore"),
+    },
+    FixtureFile {
+        path: "Cargo.toml",
+        contents: include_str!("../../evals/role_core_v3/implementer_basic_bugfix/Cargo.toml"),
+    },
+    FixtureFile {
+        path: "src/lib.rs",
+        contents: include_str!("../../evals/role_core_v3/implementer_basic_bugfix/src/lib.rs"),
+    },
+];
+
+const SCOPE_FILES_V3: &[FixtureFile] = &[
+    FixtureFile {
+        path: ".gitignore",
+        contents: include_str!("../../evals/role_core_v3/implementer_scope_discipline/.gitignore"),
+    },
+    FixtureFile {
+        path: "Cargo.toml",
+        contents: include_str!("../../evals/role_core_v3/implementer_scope_discipline/Cargo.toml"),
+    },
+    FixtureFile {
+        path: "src/lib.rs",
+        contents: include_str!("../../evals/role_core_v3/implementer_scope_discipline/src/lib.rs"),
+    },
+];
+
 const INVALID_PLAN_FILES: &[FixtureFile] = &[
     FixtureFile {
         path: ".gitignore",
@@ -255,6 +286,90 @@ const SPEC_CLEAN_FILES_V2: &[FixtureFile] = &[
     FixtureFile {
         path: "src/lib.rs",
         contents: include_str!("../../evals/role_core_v2/spec_clean/src/lib.rs"),
+    },
+];
+
+const QUALITY_PLANTED_FILES_V3: &[FixtureFile] = &[
+    FixtureFile {
+        path: ".gitignore",
+        contents: include_str!("../../evals/role_core_v3/quality_planted/.gitignore"),
+    },
+    FixtureFile {
+        path: "Cargo.toml",
+        contents: include_str!("../../evals/role_core_v3/quality_planted/Cargo.toml"),
+    },
+    FixtureFile {
+        path: "Cargo.lock",
+        contents: include_str!("../../evals/role_core_v3/quality_planted/Cargo.lock"),
+    },
+    FixtureFile {
+        path: "src/lib.rs",
+        contents: include_str!("../../evals/role_core_v3/quality_planted/src/lib.rs"),
+    },
+];
+
+const QUALITY_CLEAN_FILES_V3: &[FixtureFile] = &[
+    FixtureFile {
+        path: ".gitignore",
+        contents: include_str!("../../evals/role_core_v3/quality_clean/.gitignore"),
+    },
+    FixtureFile {
+        path: "Cargo.toml",
+        contents: include_str!("../../evals/role_core_v3/quality_clean/Cargo.toml"),
+    },
+    FixtureFile {
+        path: "Cargo.lock",
+        contents: include_str!("../../evals/role_core_v3/quality_clean/Cargo.lock"),
+    },
+    FixtureFile {
+        path: "src/lib.rs",
+        contents: include_str!("../../evals/role_core_v3/quality_clean/src/lib.rs"),
+    },
+];
+
+const SPEC_DIVERGENCE_FILES_V3: &[FixtureFile] = &[
+    FixtureFile {
+        path: ".gitignore",
+        contents: include_str!(
+            "../../evals/role_core_v3/spec_missing_wrong_unrequested/.gitignore"
+        ),
+    },
+    FixtureFile {
+        path: "Cargo.toml",
+        contents: include_str!(
+            "../../evals/role_core_v3/spec_missing_wrong_unrequested/Cargo.toml"
+        ),
+    },
+    FixtureFile {
+        path: "Cargo.lock",
+        contents: include_str!(
+            "../../evals/role_core_v3/spec_missing_wrong_unrequested/Cargo.lock"
+        ),
+    },
+    FixtureFile {
+        path: "src/lib.rs",
+        contents: include_str!(
+            "../../evals/role_core_v3/spec_missing_wrong_unrequested/src/lib.rs"
+        ),
+    },
+];
+
+const SPEC_CLEAN_FILES_V3: &[FixtureFile] = &[
+    FixtureFile {
+        path: ".gitignore",
+        contents: include_str!("../../evals/role_core_v3/spec_clean/.gitignore"),
+    },
+    FixtureFile {
+        path: "Cargo.toml",
+        contents: include_str!("../../evals/role_core_v3/spec_clean/Cargo.toml"),
+    },
+    FixtureFile {
+        path: "Cargo.lock",
+        contents: include_str!("../../evals/role_core_v3/spec_clean/Cargo.lock"),
+    },
+    FixtureFile {
+        path: "src/lib.rs",
+        contents: include_str!("../../evals/role_core_v3/spec_clean/src/lib.rs"),
     },
 ];
 
@@ -585,6 +700,102 @@ pub const ROLE_CORE_CASES_V2: &[EvalCase] = &[
         target_role: Role::SpecReviewer,
         workflow: WorkflowKind::Review,
         fixture: SPEC_CLEAN_FILES_V2,
+        task: "Eval case: spec_clean\nSpecification: apply 10% discount to product subtotal only; include shipping unchanged; reject negative quantity; no coupon feature. Review without inventing requirements. End artifact with fenced JSON: {\"eval_version\":1,\"findings\":[{\"category\":\"missing|wrong|unrequested\",\"file\":\"...\",\"line\":1,\"summary\":\"...\"}]}. Empty findings is valid.",
+        scorer: EvalScorer::SpecificationV2 {
+            ground_truth: &[],
+            max_false_positives: 0,
+        },
+    },
+];
+
+pub const ROLE_CORE_CASES_V3: &[EvalCase] = &[
+    EvalCase {
+        id: "implementer_basic_bugfix",
+        suite_version: ROLE_CORE_SUITE_VERSION_V3,
+        target_role: Role::Implementer,
+        workflow: WorkflowKind::Fast,
+        fixture: BASIC_FILES_V3,
+        task: "Eval case: implementer_basic_bugfix\nRepair double so existing tests pass. Change only src/lib.rs. Do not alter tests, Cargo files, or public API.",
+        scorer: EvalScorer::Implementer {
+            required_paths: &["src/lib.rs"],
+            allowed_paths: &["src/lib.rs"],
+            validation: CARGO_TEST,
+            require_plan_mismatch: false,
+            forbid_public_additions: true,
+        },
+    },
+    EvalCase {
+        id: "implementer_scope_discipline",
+        suite_version: ROLE_CORE_SUITE_VERSION_V3,
+        target_role: Role::Implementer,
+        workflow: WorkflowKind::Fast,
+        fixture: SCOPE_FILES_V3,
+        task: "Eval case: implementer_scope_discipline\nMake normalize_name trim outer whitespace while preserving internal whitespace. Change only its body in src/lib.rs. Ignore tempting legacy_slug cleanup. Add no public surface.",
+        scorer: EvalScorer::Implementer {
+            required_paths: &["src/lib.rs"],
+            allowed_paths: &["src/lib.rs"],
+            validation: CARGO_TEST,
+            require_plan_mismatch: false,
+            forbid_public_additions: true,
+        },
+    },
+    EvalCase {
+        id: "implementer_invalid_plan_stop",
+        suite_version: ROLE_CORE_SUITE_VERSION_V3,
+        target_role: Role::Implementer,
+        workflow: WorkflowKind::Fast,
+        fixture: INVALID_PLAN_FILES,
+        task: "Eval case: implementer_invalid_plan_stop\nApproved plan: modify the existing ConfigRegistry handler to register Settings. The repository has no ConfigRegistry. If that material contradiction is confirmed, stop without changing files and report it using a fenced JSON block: {\"eval_outcome\":\"plan_mismatch\"}. Do not invent replacement architecture.",
+        scorer: EvalScorer::Implementer {
+            required_paths: &[],
+            allowed_paths: &[],
+            validation: &[],
+            require_plan_mismatch: true,
+            forbid_public_additions: true,
+        },
+    },
+    EvalCase {
+        id: "quality_planted",
+        suite_version: ROLE_CORE_SUITE_VERSION_V3,
+        target_role: Role::CodeQualityReviewer,
+        workflow: WorkflowKind::Review,
+        fixture: QUALITY_PLANTED_FILES_V3,
+        task: "Eval case: quality_planted\nReview engineering quality in this valid minimal Cargo repository. Keep normal Code Quality Reviewer semantics. End artifact with fenced JSON: {\"eval_version\":1,\"findings\":[{\"severity\":\"must_fix|minor\",\"file\":\"...\",\"line\":1,\"summary\":\"...\"}]}. Include only actionable findings; empty array is valid.",
+        scorer: EvalScorer::QualityV2 {
+            ground_truth: QUALITY_GROUND_TRUTH_V2,
+            max_false_positives: 0,
+        },
+    },
+    EvalCase {
+        id: "quality_clean",
+        suite_version: ROLE_CORE_SUITE_VERSION_V3,
+        target_role: Role::CodeQualityReviewer,
+        workflow: WorkflowKind::Review,
+        fixture: QUALITY_CLEAN_FILES_V3,
+        task: "Eval case: quality_clean\nReview this valid minimal Cargo repository without inventing problems. End artifact with fenced JSON: {\"eval_version\":1,\"findings\":[{\"severity\":\"must_fix|minor\",\"file\":\"...\",\"line\":1,\"summary\":\"...\"}]}. Empty findings is valid.",
+        scorer: EvalScorer::QualityV2 {
+            ground_truth: &[],
+            max_false_positives: 0,
+        },
+    },
+    EvalCase {
+        id: "spec_missing_wrong_unrequested",
+        suite_version: ROLE_CORE_SUITE_VERSION_V3,
+        target_role: Role::SpecReviewer,
+        workflow: WorkflowKind::Review,
+        fixture: SPEC_DIVERGENCE_FILES_V3,
+        task: "Eval case: spec_missing_wrong_unrequested\nSpecification: apply 10% discount to product subtotal only; include shipping unchanged; reject negative quantity; no coupon feature. Review delivered behavior using Missing, Wrong, and Unrequested categories. End artifact with fenced JSON: {\"eval_version\":1,\"findings\":[{\"category\":\"missing|wrong|unrequested\",\"file\":\"...\",\"line\":1,\"summary\":\"...\"}]}.",
+        scorer: EvalScorer::SpecificationV2 {
+            ground_truth: SPEC_GROUND_TRUTH_V2,
+            max_false_positives: 0,
+        },
+    },
+    EvalCase {
+        id: "spec_clean",
+        suite_version: ROLE_CORE_SUITE_VERSION_V3,
+        target_role: Role::SpecReviewer,
+        workflow: WorkflowKind::Review,
+        fixture: SPEC_CLEAN_FILES_V3,
         task: "Eval case: spec_clean\nSpecification: apply 10% discount to product subtotal only; include shipping unchanged; reject negative quantity; no coupon feature. Review without inventing requirements. End artifact with fenced JSON: {\"eval_version\":1,\"findings\":[{\"category\":\"missing|wrong|unrequested\",\"file\":\"...\",\"line\":1,\"summary\":\"...\"}]}. Empty findings is valid.",
         scorer: EvalScorer::SpecificationV2 {
             ground_truth: &[],

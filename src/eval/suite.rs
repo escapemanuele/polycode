@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::case::{
-    EvalCase, ROLE_CORE_CASES, ROLE_CORE_CASES_V2, ROLE_CORE_SUITE_VERSION,
-    ROLE_CORE_SUITE_VERSION_V2,
+    EvalCase, ROLE_CORE_CASES, ROLE_CORE_CASES_V2, ROLE_CORE_CASES_V3, ROLE_CORE_SUITE_VERSION,
+    ROLE_CORE_SUITE_VERSION_V2, ROLE_CORE_SUITE_VERSION_V3,
 };
 
 pub const ROLE_CORE_SUITE_NAME: &str = "role_core";
@@ -83,6 +83,11 @@ impl EvalSuite {
                 ROLE_CORE_SUITE_NAME,
                 ROLE_CORE_SUITE_VERSION_V2,
                 ROLE_CORE_CASES_V2.to_vec(),
+            ),
+            ROLE_CORE_SUITE_VERSION_V3 => Self::new(
+                ROLE_CORE_SUITE_NAME,
+                ROLE_CORE_SUITE_VERSION_V3,
+                ROLE_CORE_CASES_V3.to_vec(),
             ),
             other => Err(EvalSuiteError::UnknownSuite(other.to_owned())),
         }
@@ -220,6 +225,43 @@ mod tests {
                 .fixture
                 .iter()
                 .any(|file| file.path == "Cargo.toml")
+        );
+        assert_eq!(
+            v2.fingerprint(),
+            "0215fc2979fbd8c09947ffb8c43f703cd7132b595b3516a10f37eacc51c6710b"
+        );
+    }
+
+    #[test]
+    fn role_core_v3_loads_with_same_case_ids_and_distinct_hygienic_fixtures() {
+        let v2 = EvalSuite::load(ROLE_CORE_SUITE_VERSION_V2).unwrap();
+        let v3 = EvalSuite::load(ROLE_CORE_SUITE_VERSION_V3).unwrap();
+        assert_eq!(v3.cases().len(), 7);
+        assert_ne!(v3.fingerprint(), v2.fingerprint());
+        assert_eq!(
+            v3.fingerprint(),
+            "cb9856d2c8edbc4cb0a59520aa140ef4567dce3b650b14f0436d42c4b11c375b"
+        );
+        assert_eq!(
+            v2.cases().iter().map(|case| case.id).collect::<Vec<_>>(),
+            v3.cases().iter().map(|case| case.id).collect::<Vec<_>>()
+        );
+        assert!(
+            v3.cases()
+                .iter()
+                .all(|case| case.suite_version == ROLE_CORE_SUITE_VERSION_V3)
+        );
+        assert!(
+            v3.cases()[0]
+                .fixture
+                .iter()
+                .all(|file| file.path != "Cargo.lock")
+        );
+        assert!(
+            v3.cases()[3]
+                .fixture
+                .iter()
+                .any(|file| file.path == "Cargo.lock")
         );
     }
 
