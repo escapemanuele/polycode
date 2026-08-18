@@ -79,20 +79,22 @@ impl PermissionDenial {
         }
     }
 
-    /// Terminal attention rule for a disposable eval Implementer session that
-    /// already received an exact safe Edit/Write continuation.
+    /// Terminal attention rule for explicit disposable native eval execution.
     ///
-    /// The mutation channel was granted and the harness validates the
-    /// repository deterministically afterwards, so Claude's optional Bash
-    /// validation (`cargo test`, or a re-attempted `sed -i` alternative that
-    /// stayed denied and never executed) is history. Only a new mutation
-    /// request, a question, or an unknown tool still needs a human.
-    pub(crate) fn requires_attention_after_eval_continuation(&self) -> bool {
+    /// Separates "safe to GRANT this Bash" (never, in eval) from "should a
+    /// DENIED Bash strand a completed eval stage" (no). A denied tool never
+    /// executed, so a successful eval terminal with only denied Bash/read/
+    /// search history completes and the harness — diff, scope, trusted
+    /// validation, structured artifact — decides pass or normal FAIL. Only a
+    /// mutation request, a question, or an unknown tool still needs a human;
+    /// exact safe Edit/Write then flows through eval auto-resolution.
+    pub(crate) fn requires_eval_terminal_attention(&self) -> bool {
         !matches!(
             self.tool_name.as_str(),
             "Bash" | "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "WebFetch" | "WebSearch"
         )
     }
+
     /// Exact Edit/Write continuation allowed only by disposable native eval.
     pub(crate) fn is_safe_eval_edit(&self, workspace_path: &std::path::Path) -> bool {
         if !matches!(self.tool_name.as_str(), "Edit" | "Write") {
