@@ -10,11 +10,12 @@ mod runner;
 mod scorer;
 mod suite;
 
-pub use case::{EvalCase, ROLE_CORE_SUITE_VERSION};
+pub use case::{EvalCase, ROLE_CORE_SUITE_VERSION, ROLE_CORE_SUITE_VERSION_V2};
 pub use report::{EvalReportError, load_results, render_report};
 pub use result::{
     EVAL_RESULT_SCHEMA_VERSION, EvalMetrics, EvalProvider, EvalResultError, EvalResultV1,
-    EvalStatus, EvalTarget, EvalUsage, ImplementerMetrics, QualityMetrics, SpecMetrics,
+    EvalStatus, EvalTarget, EvalUsage, ImplementerMetrics, QualityMetrics, QualityMetricsV2,
+    SpecMetrics, SpecMetricsV2,
 };
 pub use runner::{EvalRunOptions, EvalRunSummary, EvalRunner, EvalRunnerError};
 pub use suite::{EvalSuite, EvalSuiteError};

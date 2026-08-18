@@ -129,6 +129,21 @@ pub struct QualityMetrics {
     pub must_fix_false_positives: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityMetricsV2 {
+    pub defects_found: u32,
+    pub defects_total: u32,
+    pub recall: f64,
+    pub false_positives: u32,
+    pub must_fix_false_positives: u32,
+    pub severity_matches: u32,
+    pub severity_total: u32,
+    pub underclassified: u32,
+    pub overclassified: u32,
+    pub duplicate_findings: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpecMetrics {
@@ -141,12 +156,27 @@ pub struct SpecMetrics {
     pub false_positives: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecMetricsV2 {
+    pub missing_found: u32,
+    pub missing_total: u32,
+    pub wrong_found: u32,
+    pub wrong_total: u32,
+    pub unrequested_found: u32,
+    pub unrequested_total: u32,
+    pub false_positives: u32,
+    pub duplicate_findings: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
 pub enum EvalMetrics {
     Implementer(ImplementerMetrics),
     CodeQualityReviewer(QualityMetrics),
     SpecReviewer(SpecMetrics),
+    CodeQualityReviewerV2(QualityMetricsV2),
+    SpecReviewerV2(SpecMetricsV2),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -254,6 +284,30 @@ impl EvalResultV1 {
                     && metrics.recall.is_finite()
                     && (0.0..=1.0).contains(&metrics.recall) => {}
             Some(EvalMetrics::SpecReviewer(metrics))
+                if self.role == Role::SpecReviewer
+                    && metrics.missing_found <= metrics.missing_total
+                    && metrics.wrong_found <= metrics.wrong_total
+                    && metrics.unrequested_found <= metrics.unrequested_total => {}
+            Some(EvalMetrics::CodeQualityReviewerV2(metrics))
+                if self.role == Role::CodeQualityReviewer
+                    && metrics.defects_found <= metrics.defects_total
+                    && metrics.must_fix_false_positives <= metrics.false_positives
+                    && metrics.severity_matches <= metrics.severity_total
+                    && metrics.severity_total == metrics.defects_total
+                    && metrics.underclassified <= metrics.severity_total
+                    && metrics.overclassified <= metrics.severity_total
+                    && metrics
+                        .severity_matches
+                        .saturating_add(metrics.underclassified)
+                        .saturating_add(metrics.overclassified)
+                        == metrics.severity_total
+                    && metrics
+                        .underclassified
+                        .saturating_add(metrics.overclassified)
+                        <= metrics.severity_total
+                    && metrics.recall.is_finite()
+                    && (0.0..=1.0).contains(&metrics.recall) => {}
+            Some(EvalMetrics::SpecReviewerV2(metrics))
                 if self.role == Role::SpecReviewer
                     && metrics.missing_found <= metrics.missing_total
                     && metrics.wrong_found <= metrics.wrong_total
@@ -366,5 +420,27 @@ mod tests {
             EvalResultV1::from_json(&serde_json::to_vec(&wrong_role).unwrap()),
             Err(EvalResultError::InvalidResult)
         ));
+    }
+
+    #[test]
+    fn v2_metrics_round_trip_without_changing_result_envelope_schema() {
+        let mut original = result();
+        original.suite_version = "role_core_v2".to_owned();
+        original.metrics = Some(EvalMetrics::CodeQualityReviewerV2(QualityMetricsV2 {
+            defects_found: 2,
+            defects_total: 3,
+            recall: 2.0 / 3.0,
+            false_positives: 0,
+            must_fix_false_positives: 0,
+            severity_matches: 2,
+            severity_total: 3,
+            underclassified: 1,
+            overclassified: 0,
+            duplicate_findings: 1,
+        }));
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let restored = EvalResultV1::from_json(&bytes).unwrap();
+        assert_eq!(restored, original);
+        assert_eq!(restored.schema_version, EVAL_RESULT_SCHEMA_VERSION);
     }
 }

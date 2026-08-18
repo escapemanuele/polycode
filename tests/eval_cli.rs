@@ -12,6 +12,18 @@ use polycode::store::SqliteStore;
 use tempfile::{TempDir, tempdir};
 
 #[test]
+fn eval_list_exposes_immutable_v1_and_calibrated_v2() {
+    let fixture = Fixture::new();
+    let listed = fixture.polycode(&["eval", "list"]);
+    assert_success(&listed);
+    let output = String::from_utf8(listed.stdout).unwrap();
+    assert!(output.contains(
+        "role_core_v1 · 40d035a14aa5c5e8adaa41bcc3dbe7cb927fd0d47e122808f5a1a4b9ff6f843d"
+    ));
+    assert!(output.contains("role_core_v2 · "));
+}
+
+#[test]
 fn native_usage_requires_per_invocation_opt_in_before_output_creation() {
     let fixture = Fixture::new();
     let output = fixture.root().join("must-not-exist");
@@ -55,11 +67,45 @@ fn fake_repetitions_write_synthetic_results_without_polluting_normal_runs() {
             .iter()
             .all(|result| result.target.provider == EvalProvider::Fake)
     );
+    assert!(
+        results
+            .iter()
+            .all(|result| result.suite_version == "role_core_v1")
+    );
     assert!(!fixture.normal_data.join("polycode.db").exists());
 
     let listed = fixture.polycode(&["runs"]);
     assert_success(&listed);
     assert_eq!(String::from_utf8(listed.stdout).unwrap().trim(), "No runs.");
+}
+
+#[test]
+fn fake_codex_v2_smoke_scores_calibrated_reviewers_without_native_usage() {
+    let fixture = Fixture::new();
+    let output = fixture.root().join("fake-v2-results");
+    let run = fixture.polycode_with_perfect_eval(&[
+        "eval",
+        "run",
+        "--suite",
+        "role_core_v2",
+        "--provider",
+        "codex",
+        "--model",
+        "fixture-model",
+        "--allow-native-usage",
+        "--out",
+        output.to_str().unwrap(),
+    ]);
+    assert_success(&run);
+    let results = load_results(&[output]).unwrap();
+    assert_eq!(results.len(), 7);
+    assert!(results.iter().all(|result| {
+        result.suite_version == "role_core_v2" && result.status == EvalStatus::Passed
+    }));
+    let report = render_report(&results).unwrap();
+    assert!(report.contains("SUITE role_core_v2"));
+    assert!(report.contains("severity                     3/3"));
+    assert!(report.contains("duplicate findings           0"));
 }
 
 #[test]

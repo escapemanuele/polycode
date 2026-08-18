@@ -45,18 +45,19 @@ pub fn render_report(results: &[EvalResultV1]) -> Result<String, EvalReportError
     if results.is_empty() {
         return Err(EvalReportError::NoResults);
     }
-    let mut groups = BTreeMap::<String, Vec<&EvalResultV1>>::new();
+    let mut groups = BTreeMap::<(String, String), Vec<&EvalResultV1>>::new();
     for result in results {
         groups
-            .entry(result.target.label())
+            .entry((result.suite_version.clone(), result.target.label()))
             .or_default()
             .push(result);
     }
     let mut output = String::new();
     let mut summaries = Vec::new();
-    for (target, group) in &groups {
+    for ((suite_version, target), group) in &groups {
         let summary = TargetSummary::from_results(group);
-        writeln!(output, "TARGET\n{target}").expect("String write cannot fail");
+        writeln!(output, "SUITE {suite_version}\nTARGET\n{target}")
+            .expect("String write cannot fail");
         if group.iter().any(|result| result.synthetic) {
             writeln!(output, "SYNTHETIC — not routing evidence").expect("String write cannot fail");
         }
@@ -98,6 +99,23 @@ pub fn render_report(results: &[EvalResultV1]) -> Result<String, EvalReportError
             summary.quality_false_positives, summary.quality_must_fix_false_positives
         )
         .expect("String write cannot fail");
+        if summary.has_quality_v2 {
+            writeln!(
+                output,
+                "  severity                     {}/{} (underclassified {} overclassified {})",
+                summary.quality_severity_matches,
+                summary.quality_severity_total,
+                summary.quality_underclassified,
+                summary.quality_overclassified
+            )
+            .expect("String write cannot fail");
+            writeln!(
+                output,
+                "  duplicate findings           {}",
+                summary.quality_duplicate_findings
+            )
+            .expect("String write cannot fail");
+        }
         writeln!(output, "\nSpecification Reviewer").expect("String write cannot fail");
         writeln!(
             output,
@@ -123,6 +141,14 @@ pub fn render_report(results: &[EvalResultV1]) -> Result<String, EvalReportError
             summary.spec_false_positives
         )
         .expect("String write cannot fail");
+        if summary.has_spec_v2 {
+            writeln!(
+                output,
+                "  duplicate findings           {}",
+                summary.spec_duplicate_findings
+            )
+            .expect("String write cannot fail");
+        }
         writeln!(
             output,
             "\nMedian latency                 {} ms\nMedian usage                   {} input / {} output\nInfrastructure failures        {}\n",
@@ -150,19 +176,20 @@ pub fn render_report(results: &[EvalResultV1]) -> Result<String, EvalReportError
             .expect("String write cannot fail");
         }
         output.push('\n');
-        summaries.push((target.clone(), summary));
+        summaries.push((suite_version.clone(), target.clone(), summary));
     }
     if summaries.len() > 1 {
         writeln!(output, "COMPARISON").expect("String write cannot fail");
         writeln!(
             output,
-            "Target | Implementer | Quality recall | Quality FP | Spec recall | Spec FP"
+            "Suite | Target | Implementer | Quality recall | Quality FP | Spec recall | Spec FP"
         )
         .expect("String write cannot fail");
-        for (target, summary) in summaries {
+        for (suite_version, target, summary) in summaries {
             writeln!(
                 output,
-                "{} | {}/{} | {}/{} | {} | {}/{} | {}",
+                "{} | {} | {}/{} | {}/{} | {} | {}/{} | {}",
+                suite_version,
                 target,
                 summary.implementer_passed,
                 summary.implementer_total,
@@ -217,6 +244,12 @@ struct TargetSummary {
     quality_total: u32,
     quality_false_positives: u32,
     quality_must_fix_false_positives: u32,
+    has_quality_v2: bool,
+    quality_severity_matches: u32,
+    quality_severity_total: u32,
+    quality_underclassified: u32,
+    quality_overclassified: u32,
+    quality_duplicate_findings: u32,
     spec_missing_found: u32,
     spec_missing_total: u32,
     spec_wrong_found: u32,
@@ -224,6 +257,8 @@ struct TargetSummary {
     spec_unrequested_found: u32,
     spec_unrequested_total: u32,
     spec_false_positives: u32,
+    has_spec_v2: bool,
+    spec_duplicate_findings: u32,
     median_latency: u64,
     median_input: u64,
     median_output: u64,
@@ -231,6 +266,10 @@ struct TargetSummary {
 }
 
 impl TargetSummary {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one accumulator keeps V1 and additive V2 metrics in suite-scoped summaries"
+    )]
     fn from_results(results: &[&EvalResultV1]) -> Self {
         let mut summary = Self::default();
         let mut latency = Vec::new();
@@ -267,6 +306,34 @@ impl TargetSummary {
                         .quality_must_fix_false_positives
                         .saturating_add(metrics.must_fix_false_positives);
                 }
+                Some(EvalMetrics::CodeQualityReviewerV2(metrics)) => {
+                    summary.has_quality_v2 = true;
+                    summary.quality_found =
+                        summary.quality_found.saturating_add(metrics.defects_found);
+                    summary.quality_total =
+                        summary.quality_total.saturating_add(metrics.defects_total);
+                    summary.quality_false_positives = summary
+                        .quality_false_positives
+                        .saturating_add(metrics.false_positives);
+                    summary.quality_must_fix_false_positives = summary
+                        .quality_must_fix_false_positives
+                        .saturating_add(metrics.must_fix_false_positives);
+                    summary.quality_severity_matches = summary
+                        .quality_severity_matches
+                        .saturating_add(metrics.severity_matches);
+                    summary.quality_severity_total = summary
+                        .quality_severity_total
+                        .saturating_add(metrics.severity_total);
+                    summary.quality_underclassified = summary
+                        .quality_underclassified
+                        .saturating_add(metrics.underclassified);
+                    summary.quality_overclassified = summary
+                        .quality_overclassified
+                        .saturating_add(metrics.overclassified);
+                    summary.quality_duplicate_findings = summary
+                        .quality_duplicate_findings
+                        .saturating_add(metrics.duplicate_findings);
+                }
                 Some(EvalMetrics::SpecReviewer(metrics)) => {
                     summary.spec_missing_found = summary
                         .spec_missing_found
@@ -287,6 +354,31 @@ impl TargetSummary {
                     summary.spec_false_positives = summary
                         .spec_false_positives
                         .saturating_add(metrics.false_positives);
+                }
+                Some(EvalMetrics::SpecReviewerV2(metrics)) => {
+                    summary.has_spec_v2 = true;
+                    summary.spec_missing_found = summary
+                        .spec_missing_found
+                        .saturating_add(metrics.missing_found);
+                    summary.spec_missing_total = summary
+                        .spec_missing_total
+                        .saturating_add(metrics.missing_total);
+                    summary.spec_wrong_found =
+                        summary.spec_wrong_found.saturating_add(metrics.wrong_found);
+                    summary.spec_wrong_total =
+                        summary.spec_wrong_total.saturating_add(metrics.wrong_total);
+                    summary.spec_unrequested_found = summary
+                        .spec_unrequested_found
+                        .saturating_add(metrics.unrequested_found);
+                    summary.spec_unrequested_total = summary
+                        .spec_unrequested_total
+                        .saturating_add(metrics.unrequested_total);
+                    summary.spec_false_positives = summary
+                        .spec_false_positives
+                        .saturating_add(metrics.false_positives);
+                    summary.spec_duplicate_findings = summary
+                        .spec_duplicate_findings
+                        .saturating_add(metrics.duplicate_findings);
                 }
                 None => {}
             }
@@ -339,6 +431,12 @@ pub enum EvalReportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Role;
+    use crate::eval::result::{
+        EVAL_RESULT_SCHEMA_VERSION, EvalProvider, EvalTarget, EvalUsage, QualityMetrics,
+        QualityMetricsV2,
+    };
+    use chrono::{TimeZone as _, Utc};
 
     #[test]
     fn median_handles_even_odd_and_empty_inputs() {
@@ -346,5 +444,68 @@ mod tests {
         assert_eq!(median(&mut [9]), 9);
         assert_eq!(median(&mut [9, 1, 5]), 5);
         assert_eq!(median(&mut [10, 2]), 6);
+    }
+
+    #[test]
+    fn report_separates_suite_versions_and_exposes_v2_quality_metrics() {
+        let target = EvalTarget::new(EvalProvider::Fake, None).unwrap();
+        let at = Utc
+            .with_ymd_and_hms(2026, 8, 18, 12, 0, 0)
+            .single()
+            .unwrap();
+        let base = |suite_version: &str, metrics: EvalMetrics| EvalResultV1 {
+            schema_version: EVAL_RESULT_SCHEMA_VERSION,
+            suite: "role_core".to_owned(),
+            suite_version: suite_version.to_owned(),
+            suite_fingerprint: "a".repeat(64),
+            case_id: "quality_planted".to_owned(),
+            repetition: 1,
+            target: target.clone(),
+            confirmed_model: None,
+            provider_cli_version: None,
+            role: Role::CodeQualityReviewer,
+            status: EvalStatus::Passed,
+            metrics: Some(metrics),
+            usage: EvalUsage::default(),
+            latency_ms: 1,
+            artifact_hash: None,
+            diff_hash: "b".repeat(64),
+            fixture_hash: "c".repeat(64),
+            synthetic: true,
+            started_at: at,
+            finished_at: at,
+            detail: None,
+        };
+        let v1 = base(
+            "role_core_v1",
+            EvalMetrics::CodeQualityReviewer(QualityMetrics {
+                defects_found: 3,
+                defects_total: 3,
+                recall: 1.0,
+                false_positives: 0,
+                must_fix_false_positives: 0,
+            }),
+        );
+        let v2 = base(
+            "role_core_v2",
+            EvalMetrics::CodeQualityReviewerV2(QualityMetricsV2 {
+                defects_found: 3,
+                defects_total: 3,
+                recall: 1.0,
+                false_positives: 0,
+                must_fix_false_positives: 0,
+                severity_matches: 2,
+                severity_total: 3,
+                underclassified: 1,
+                overclassified: 0,
+                duplicate_findings: 1,
+            }),
+        );
+        let report = render_report(&[v1, v2]).unwrap();
+        assert_eq!(report.matches("SUITE role_core_").count(), 2);
+        assert!(report.contains("severity                     2/3"));
+        assert!(report.contains("duplicate findings           1"));
+        assert!(report.contains("role_core_v1 | fake / native_default"));
+        assert!(report.contains("role_core_v2 | fake / native_default"));
     }
 }

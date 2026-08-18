@@ -183,15 +183,20 @@ fn doctor() -> Result<()> {
 fn eval(command: &EvalCommand) -> Result<()> {
     match command {
         EvalCommand::List => {
-            let suite = crate::eval::EvalSuite::load(crate::eval::ROLE_CORE_SUITE_VERSION)?;
-            println!("{} · {}", suite.version(), suite.fingerprint());
-            for case in suite.cases() {
-                println!(
-                    "  {}  role={}  workflow={}",
-                    case.id,
-                    enum_text(case.target_role),
-                    enum_text(case.workflow)
-                );
+            for version in [
+                crate::eval::ROLE_CORE_SUITE_VERSION,
+                crate::eval::ROLE_CORE_SUITE_VERSION_V2,
+            ] {
+                let suite = crate::eval::EvalSuite::load(version)?;
+                println!("{} · {}", suite.version(), suite.fingerprint());
+                for case in suite.cases() {
+                    println!(
+                        "  {}  role={}  workflow={}",
+                        case.id,
+                        enum_text(case.target_role),
+                        enum_text(case.workflow)
+                    );
+                }
             }
             println!(
                 "Architect, Researcher, and EngineeringLead cases are deferred until deterministic high-signal oracles exist."

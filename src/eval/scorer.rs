@@ -4,9 +4,12 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::case::{
-    EvalCase, EvalScorer, QualityGroundTruth, QualitySeverity, SpecCategory, SpecGroundTruth,
+    EvalCase, EvalScorer, FindingLocation, QualityGroundTruth, QualityGroundTruthV2,
+    QualitySeverity, SpecCategory, SpecGroundTruth, SpecGroundTruthV2,
 };
-use super::result::{EvalMetrics, ImplementerMetrics, QualityMetrics, SpecMetrics};
+use super::result::{
+    EvalMetrics, ImplementerMetrics, QualityMetrics, QualityMetricsV2, SpecMetrics, SpecMetricsV2,
+};
 
 #[derive(Clone, Copy)]
 pub struct ScoreInput<'a> {
@@ -46,6 +49,14 @@ pub fn score(case: &EvalCase, input: ScoreInput<'_>) -> Result<ScoredOutcome, Sc
             ground_truth,
             max_false_positives,
         } => score_spec(ground_truth, max_false_positives, input),
+        EvalScorer::QualityV2 {
+            ground_truth,
+            max_false_positives,
+        } => score_quality_v2(ground_truth, max_false_positives, input),
+        EvalScorer::SpecificationV2 {
+            ground_truth,
+            max_false_positives,
+        } => score_spec_v2(ground_truth, max_false_positives, input),
     }
 }
 
@@ -215,6 +226,149 @@ fn score_spec(
     })
 }
 
+fn score_quality_v2(
+    expected: &[QualityGroundTruthV2],
+    max_false_positives: u32,
+    input: ScoreInput<'_>,
+) -> Result<ScoredOutcome, ScoringError> {
+    if !input.diff.trim().is_empty() {
+        return Err(ScoringError::ReviewerModifiedRepository);
+    }
+    let response: QualityResponse = parse_response(input.artifact)?;
+    if response.eval_version != 1 {
+        return Err(ScoringError::UnsupportedResponseVersion(
+            response.eval_version,
+        ));
+    }
+    let mut matched = HashSet::new();
+    let mut false_positives = 0_u32;
+    let mut must_fix_false_positives = 0_u32;
+    let mut duplicate_findings = 0_u32;
+    let mut severity_matches = 0_u32;
+    let mut underclassified = 0_u32;
+    let mut overclassified = 0_u32;
+    for finding in &response.findings {
+        let candidate = expected.iter().enumerate().find(|(index, truth)| {
+            !matched.contains(index) && quality_identity_matches_v2(finding, truth)
+        });
+        if let Some((index, truth)) = candidate {
+            matched.insert(index);
+            if finding.severity.as_str() == truth.severity.as_str() {
+                severity_matches = severity_matches.saturating_add(1);
+            } else if truth.severity == QualitySeverity::MustFix
+                && finding.severity == QualitySeverityDto::Minor
+            {
+                underclassified = underclassified.saturating_add(1);
+            } else {
+                overclassified = overclassified.saturating_add(1);
+            }
+        } else if expected.iter().enumerate().any(|(index, truth)| {
+            matched.contains(&index) && quality_identity_matches_v2(finding, truth)
+        }) {
+            duplicate_findings = duplicate_findings.saturating_add(1);
+        } else {
+            false_positives = false_positives.saturating_add(1);
+            if finding.severity == QualitySeverityDto::MustFix {
+                must_fix_false_positives = must_fix_false_positives.saturating_add(1);
+            }
+        }
+    }
+    let defects_found = u32::try_from(matched.len()).expect("finding count fits u32");
+    let defects_total = u32::try_from(expected.len()).expect("ground truth count fits u32");
+    let recall = if defects_total == 0 {
+        1.0
+    } else {
+        f64::from(defects_found) / f64::from(defects_total)
+    };
+    let all_must_fix_found = expected.iter().enumerate().all(|(index, truth)| {
+        truth.severity != QualitySeverity::MustFix || matched.contains(&index)
+    });
+    let passed = all_must_fix_found && false_positives <= max_false_positives;
+    Ok(ScoredOutcome {
+        passed,
+        metrics: EvalMetrics::CodeQualityReviewerV2(QualityMetricsV2 {
+            defects_found,
+            defects_total,
+            recall,
+            false_positives,
+            must_fix_false_positives,
+            severity_matches,
+            severity_total: defects_total,
+            underclassified,
+            overclassified,
+            duplicate_findings,
+        }),
+        detail: (!passed).then(|| "quality recall or false-positive criterion failed".to_owned()),
+    })
+}
+
+fn score_spec_v2(
+    expected: &[SpecGroundTruthV2],
+    max_false_positives: u32,
+    input: ScoreInput<'_>,
+) -> Result<ScoredOutcome, ScoringError> {
+    if !input.diff.trim().is_empty() {
+        return Err(ScoringError::ReviewerModifiedRepository);
+    }
+    let response: SpecResponse = parse_response(input.artifact)?;
+    if response.eval_version != 1 {
+        return Err(ScoringError::UnsupportedResponseVersion(
+            response.eval_version,
+        ));
+    }
+    let mut matched = HashSet::new();
+    let mut false_positives = 0_u32;
+    let mut duplicate_findings = 0_u32;
+    for finding in &response.findings {
+        let candidate = expected.iter().enumerate().find(|(index, truth)| {
+            !matched.contains(index) && spec_identity_matches_v2(finding, truth)
+        });
+        if let Some((index, _)) = candidate {
+            matched.insert(index);
+        } else if expected.iter().enumerate().any(|(index, truth)| {
+            matched.contains(&index) && spec_identity_matches_v2(finding, truth)
+        }) {
+            duplicate_findings = duplicate_findings.saturating_add(1);
+        } else {
+            false_positives = false_positives.saturating_add(1);
+        }
+    }
+    let count = |category: SpecCategory| {
+        expected
+            .iter()
+            .enumerate()
+            .filter(|(_, truth)| truth.category == category)
+            .fold((0_u32, 0_u32), |(found, total), (index, _)| {
+                (
+                    found + u32::from(matched.contains(&index)),
+                    total.saturating_add(1),
+                )
+            })
+    };
+    let (missing_found, missing_total) = count(SpecCategory::Missing);
+    let (wrong_found, wrong_total) = count(SpecCategory::Wrong);
+    let (unrequested_found, unrequested_total) = count(SpecCategory::Unrequested);
+    let passed = missing_found == missing_total
+        && wrong_found == wrong_total
+        && unrequested_found == unrequested_total
+        && false_positives <= max_false_positives;
+    Ok(ScoredOutcome {
+        passed,
+        metrics: EvalMetrics::SpecReviewerV2(SpecMetricsV2 {
+            missing_found,
+            missing_total,
+            wrong_found,
+            wrong_total,
+            unrequested_found,
+            unrequested_total,
+            false_positives,
+            duplicate_findings,
+        }),
+        detail: (!passed)
+            .then(|| "spec category recall or false-positive criterion failed".to_owned()),
+    })
+}
+
 fn quality_matches(finding: &QualityFinding, truth: &QualityGroundTruth) -> bool {
     finding.file == truth.file
         && near_line(finding.line, truth.line_start, truth.line_end)
@@ -227,6 +381,27 @@ fn spec_matches(finding: &SpecFinding, truth: &SpecGroundTruth) -> bool {
         && near_line(finding.line, truth.line_start, truth.line_end)
         && finding.category.as_str() == truth.category.as_str()
         && contains_concept(&finding.summary, truth.concepts)
+}
+
+fn quality_identity_matches_v2(finding: &QualityFinding, truth: &QualityGroundTruthV2) -> bool {
+    truth
+        .locations
+        .iter()
+        .any(|location| location_matches(finding.file.as_str(), finding.line, location))
+        && contains_concept(&finding.summary, truth.concepts)
+}
+
+fn spec_identity_matches_v2(finding: &SpecFinding, truth: &SpecGroundTruthV2) -> bool {
+    truth
+        .locations
+        .iter()
+        .any(|location| location_matches(finding.file.as_str(), finding.line, location))
+        && finding.category.as_str() == truth.category.as_str()
+        && contains_concept(&finding.summary, truth.concepts)
+}
+
+fn location_matches(file: &str, line: u32, location: &FindingLocation) -> bool {
+    file == location.file && near_line(line, location.line_start, location.line_end)
 }
 
 fn near_line(line: u32, start: u32, end: u32) -> bool {
@@ -385,7 +560,7 @@ pub enum ScoringError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::case::ROLE_CORE_CASES;
+    use crate::eval::case::{ROLE_CORE_CASES, ROLE_CORE_CASES_V2};
 
     fn input(artifact: &str) -> ScoreInput<'_> {
         ScoreInput {
@@ -471,5 +646,52 @@ mod tests {
         )
         .unwrap();
         assert!(!failed.passed);
+    }
+
+    #[test]
+    fn quality_v2_tracks_severity_without_turning_identity_match_into_false_positive() {
+        let case = &ROLE_CORE_CASES_V2[3];
+        let artifact = r#"```json
+{"eval_version":1,"findings":[
+{"severity":"minor","file":"src/lib.rs","line":12,"summary":"Unnecessary abstraction with one caller"},
+{"severity":"must_fix","file":"src/lib.rs","line":12,"summary":"Unnecessary abstraction with one caller"},
+{"severity":"must_fix","file":"src/lib.rs","line":20,"summary":"Duplicate representation stores raw and normalized"},
+{"severity":"minor","file":"src/lib.rs","line":28,"summary":"Nested control flow obscures classification"}
+]}
+```"#;
+        let scored = score(case, input(artifact)).unwrap();
+        assert!(scored.passed);
+        let EvalMetrics::CodeQualityReviewerV2(metrics) = scored.metrics else {
+            panic!("v2 quality metrics expected")
+        };
+        assert_eq!(metrics.defects_found, 3);
+        assert_eq!(metrics.false_positives, 0);
+        assert_eq!(metrics.duplicate_findings, 1);
+        assert_eq!(metrics.severity_matches, 2);
+        assert_eq!(metrics.severity_total, 3);
+        assert_eq!(metrics.underclassified, 1);
+    }
+
+    #[test]
+    fn spec_v2_uses_multi_location_identity_and_counts_duplicates_separately() {
+        let case = &ROLE_CORE_CASES_V2[5];
+        let artifact = r#"```json
+{"eval_version":1,"findings":[
+{"category":"missing","file":"src/lib.rs","line":1,"summary":"Negative quantity validation is missing; reject negative quantity"},
+{"category":"wrong","file":"src/lib.rs","line":3,"summary":"Discount incorrectly includes shipping instead of subtotal-only boundary"},
+{"category":"unrequested","file":"src/lib.rs","line":5,"summary":"Unrequested coupon feature EXTRA5"},
+{"category":"unrequested","file":"src/lib.rs","line":5,"summary":"Duplicate report of coupon EXTRA5 feature"}
+]}
+```"#;
+        let scored = score(case, input(artifact)).unwrap();
+        assert!(scored.passed);
+        let EvalMetrics::SpecReviewerV2(metrics) = scored.metrics else {
+            panic!("v2 spec metrics expected")
+        };
+        assert_eq!(metrics.missing_found, 1);
+        assert_eq!(metrics.wrong_found, 1);
+        assert_eq!(metrics.unrequested_found, 1);
+        assert_eq!(metrics.false_positives, 0);
+        assert_eq!(metrics.duplicate_findings, 1);
     }
 }

@@ -4,7 +4,10 @@ use std::path::{Component, Path};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::case::{EvalCase, ROLE_CORE_CASES, ROLE_CORE_SUITE_VERSION};
+use super::case::{
+    EvalCase, ROLE_CORE_CASES, ROLE_CORE_CASES_V2, ROLE_CORE_SUITE_VERSION,
+    ROLE_CORE_SUITE_VERSION_V2,
+};
 
 pub const ROLE_CORE_SUITE_NAME: &str = "role_core";
 
@@ -75,6 +78,11 @@ impl EvalSuite {
                 ROLE_CORE_SUITE_NAME,
                 ROLE_CORE_SUITE_VERSION,
                 ROLE_CORE_CASES.to_vec(),
+            ),
+            ROLE_CORE_SUITE_VERSION_V2 => Self::new(
+                ROLE_CORE_SUITE_NAME,
+                ROLE_CORE_SUITE_VERSION_V2,
+                ROLE_CORE_CASES_V2.to_vec(),
             ),
             other => Err(EvalSuiteError::UnknownSuite(other.to_owned())),
         }
@@ -176,8 +184,43 @@ mod tests {
         let suite = EvalSuite::load(ROLE_CORE_SUITE_VERSION).unwrap();
         assert_eq!(suite.cases().len(), 7);
         assert_eq!(suite.fingerprint().len(), 64);
+        assert_eq!(
+            suite.fingerprint(),
+            "40d035a14aa5c5e8adaa41bcc3dbe7cb927fd0d47e122808f5a1a4b9ff6f843d"
+        );
         assert_eq!(suite.cases()[0].id, "implementer_basic_bugfix");
         assert!(suite.cases().iter().all(|case| !case.fixture.is_empty()));
+    }
+
+    #[test]
+    fn role_core_v2_loads_separately_with_same_case_ids() {
+        let v1 = EvalSuite::load(ROLE_CORE_SUITE_VERSION).unwrap();
+        let v2 = EvalSuite::load(ROLE_CORE_SUITE_VERSION_V2).unwrap();
+        assert_eq!(v2.cases().len(), 7);
+        assert_ne!(v2.fingerprint(), v1.fingerprint());
+        assert_eq!(
+            v1.cases().iter().map(|case| case.id).collect::<Vec<_>>(),
+            v2.cases().iter().map(|case| case.id).collect::<Vec<_>>()
+        );
+        assert!(
+            v2.cases()
+                .iter()
+                .all(|case| case.suite_version == ROLE_CORE_SUITE_VERSION_V2)
+        );
+        assert_eq!(
+            v1.cases()[3]
+                .fixture
+                .iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            vec!["src/lib.rs"]
+        );
+        assert!(
+            v2.cases()[3]
+                .fixture
+                .iter()
+                .any(|file| file.path == "Cargo.toml")
+        );
     }
 
     #[test]
