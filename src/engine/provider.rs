@@ -240,6 +240,19 @@ pub trait Provider {
         Ok(())
     }
 
+    /// Reports whether explicit eval policy may resolve this attention request
+    /// without human input. Production providers default to false.
+    ///
+    /// # Errors
+    /// Returns provider-specific persistence or safety failures.
+    fn can_auto_resolve_attention(
+        &mut self,
+        _store: &mut SqliteStore,
+        _context: &ProviderAttentionContext,
+    ) -> Result<bool, ProviderError> {
+        Ok(false)
+    }
+
     /// Polls provider without blocking scheduler indefinitely.
     ///
     /// # Errors

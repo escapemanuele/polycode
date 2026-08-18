@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AttentionKind, AttentionRequestId, ModelId, ProviderId, ProviderSessionId, Role,
+    AttentionKind, AttentionRequestId, ModelId, ProviderId, ProviderSessionId, Role, StageKind,
 };
 use crate::engine::{
     Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest,
@@ -29,6 +29,7 @@ use crate::providers::{
     ProviderSessionRecordId, ProviderSessionStatus,
 };
 use crate::store::{SqliteStore, process_root};
+use crate::workspace::WorkspaceStatus;
 
 pub use detection::{ClaudeInstallation, suspicious_secret_environment};
 pub use error::ClaudeProviderError;
@@ -44,6 +45,7 @@ pub struct ClaudeProvider<B = TmuxBackend> {
     model: Option<ModelId>,
     manager: ProcessManager<B>,
     artifact_root: PathBuf,
+    eval_auto_approve: bool,
 }
 
 impl ClaudeProvider<TmuxBackend> {
@@ -62,6 +64,7 @@ impl ClaudeProvider<TmuxBackend> {
             model,
             manager: ProcessManager::from_environment()?,
             artifact_root: root,
+            eval_auto_approve: false,
         })
     }
 
@@ -69,6 +72,15 @@ impl ClaudeProvider<TmuxBackend> {
         model: Option<ModelId>,
         root: PathBuf,
         runner_executable: PathBuf,
+    ) -> Result<Self, ClaudeProviderError> {
+        Self::from_runtime_with_eval_policy(model, root, runner_executable, false)
+    }
+
+    pub(crate) fn from_runtime_with_eval_policy(
+        model: Option<ModelId>,
+        root: PathBuf,
+        runner_executable: PathBuf,
+        eval_auto_approve: bool,
     ) -> Result<Self, ClaudeProviderError> {
         let installation = ClaudeInstallation::discover()?;
         installation.require_authenticated()?;
@@ -79,6 +91,7 @@ impl ClaudeProvider<TmuxBackend> {
             model,
             manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
             artifact_root: root,
+            eval_auto_approve,
         })
     }
 }
@@ -139,6 +152,35 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 .map(|pending| Self::read_pending_denials(store, pending))
                 .transpose()?
                 .unwrap_or_default();
+            let denials = if self.eval_auto_approve
+                && request.role() == Role::Implementer
+                && matches!(
+                    request.stage_kind(),
+                    StageKind::Implementation | StageKind::Fix
+                ) {
+                let workspace = Self::eval_workspace_path(store, request.run_id())?;
+                let safe_edits = workspace.as_deref().map(|workspace| {
+                    denials
+                        .iter()
+                        .filter(|denial| denial.is_safe_eval_edit(workspace))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                if safe_edits.as_ref().is_some_and(|edits| !edits.is_empty())
+                    && denials.iter().all(|denial| {
+                        denial.is_recovered_diagnostic()
+                            || workspace
+                                .as_deref()
+                                .is_some_and(|workspace| denial.is_safe_eval_edit(workspace))
+                    })
+                {
+                    safe_edits.unwrap_or_default()
+                } else {
+                    denials
+                }
+            } else {
+                denials
+            };
             let response = session
                 .pending_attention()
                 .map(|pending| self.read_response(session.id(), pending.attention_id()))
@@ -286,10 +328,14 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             ClaudeRecord::Result {
                 content,
                 success,
-                error,
                 denials,
                 ..
-            } if !denials.is_empty() => {
+            } if !denials.is_empty()
+                && (!success
+                    || denials
+                        .iter()
+                        .any(PermissionDenial::requires_terminal_attention)) =>
+            {
                 let attention_id = AttentionRequestId::new();
                 let summary = permission_summary(&denials);
                 let pending = PendingProviderAttention::new(
@@ -303,7 +349,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                     .need_user(pending, Self::now())
                     .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
                 commit = commit.with_session(ProviderSessionMutation::new(session, expected));
-                let _ = (content, success, error);
+                let _ = content;
                 ProviderSignal::NeedsUser {
                     kind: AttentionKind::Permission,
                     summary,
@@ -432,6 +478,53 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         }
     }
 
+    fn safe_eval_permission(
+        store: &SqliteStore,
+        context: &ProviderAttentionContext,
+        denials: &[PermissionDenial],
+    ) -> Result<bool, ClaudeProviderError> {
+        if context.role() != Role::Implementer
+            || !matches!(
+                context.stage_kind(),
+                StageKind::Implementation | StageKind::Fix
+            )
+        {
+            return Ok(false);
+        }
+        let Some(workspace) = Self::eval_workspace_path(store, context.run_id())? else {
+            return Ok(false);
+        };
+        let has_safe_edit = denials
+            .iter()
+            .any(|denial| denial.is_safe_eval_edit(&workspace));
+        Ok(has_safe_edit
+            && denials.iter().all(|denial| {
+                denial.is_recovered_diagnostic() || denial.is_safe_eval_edit(&workspace)
+            }))
+    }
+
+    fn eval_workspace_path(
+        store: &SqliteStore,
+        run_id: crate::domain::RunId,
+    ) -> Result<Option<PathBuf>, ClaudeProviderError> {
+        let Some(workspace) = store.load_workspace(run_id)? else {
+            return Ok(None);
+        };
+        if workspace.status() != WorkspaceStatus::Ready {
+            return Ok(None);
+        }
+        let (Ok(worktree), Ok(source)) = (
+            std::fs::canonicalize(workspace.worktree_path()),
+            std::fs::canonicalize(workspace.source_repo_path()),
+        ) else {
+            return Ok(None);
+        };
+        if worktree == source || worktree.starts_with(&source) {
+            return Ok(None);
+        }
+        Ok(Some(worktree))
+    }
+
     fn response_path(
         &self,
         session_id: ProviderSessionRecordId,
@@ -538,6 +631,14 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
                 .pending_attention()
                 .expect("matched pending attention");
             let denials = Self::read_pending_denials(store, pending)?;
+            if self.eval_auto_approve
+                && response.is_none()
+                && !Self::safe_eval_permission(store, context, &denials)?
+            {
+                return Err(ClaudeProviderError::UnsafePermission(
+                    "eval permission is not an exact in-worktree Edit/Write".to_owned(),
+                ));
+            }
             if denials
                 .iter()
                 .any(|denial| denial.tool_name == "AskUserQuestion")
@@ -551,6 +652,37 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
             Ok(())
         })();
         result.map_err(|error| ProviderError::new(error.to_string()))
+    }
+
+    fn can_auto_resolve_attention(
+        &mut self,
+        store: &mut SqliteStore,
+        context: &ProviderAttentionContext,
+    ) -> Result<bool, ProviderError> {
+        if !self.eval_auto_approve {
+            return Ok(false);
+        }
+        let session = store
+            .list_provider_sessions(context.run_id())
+            .map_err(|error| ProviderError::new(error.to_string()))?
+            .into_iter()
+            .find(|session| {
+                session.stage_id() == context.stage_id()
+                    && session.provider_id() == &self.id
+                    && session
+                        .pending_attention()
+                        .is_some_and(|pending| pending.attention_id() == context.request_id())
+            });
+        let Some(session) = session else {
+            return Ok(false);
+        };
+        let pending = session.pending_attention().ok_or_else(|| {
+            ProviderError::new("matched attention has no pending provider record")
+        })?;
+        let denials = Self::read_pending_denials(store, pending)
+            .map_err(|error| ProviderError::new(error.to_string()))?;
+        Self::safe_eval_permission(store, context, &denials)
+            .map_err(|error| ProviderError::new(error.to_string()))
     }
 
     fn poll(
@@ -613,7 +745,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        ConfigSnapshotId, EventId, EventMetadata, Run, RunStatus, WorkflowDefinition, WorkflowKind,
+        AttentionKind, ConfigSnapshotId, EventId, EventMetadata, Run, RunStatus,
+        WorkflowDefinition, WorkflowKind,
     };
     use crate::engine::{EngineStatus, WorkflowEngine};
     use crate::process::{
@@ -626,6 +759,20 @@ mod tests {
     #[derive(Clone, Default)]
     struct FixtureBackend {
         started: Arc<Mutex<HashSet<ManagedProcessId>>>,
+        first_result: Arc<Mutex<Option<String>>>,
+    }
+
+    impl FixtureBackend {
+        fn with_first_result(result: impl Into<String>) -> Self {
+            Self {
+                first_result: Arc::new(Mutex::new(Some(result.into()))),
+                ..Self::default()
+            }
+        }
+
+        fn set_first_result(&self, result: impl Into<String>) {
+            *self.first_result.lock().unwrap() = Some(result.into());
+        }
     }
 
     impl ProcessBackend for FixtureBackend {
@@ -646,9 +793,16 @@ mod tests {
 
         fn start(&self, process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
             let output = if process.invocation() == 1 {
-                concat!(
-                    "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"native-session-1\",\"model\":\"fixture-model\"}\n",
-                    "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"session_id\":\"native-session-1\",\"permission_denials\":[{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"/tmp/fixture\"}}]}\n"
+                let result = self
+                    .first_result
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"session_id\":\"native-session-1\",\"permission_denials\":[{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"/tmp/fixture\"}}]}".to_owned()
+                    });
+                format!(
+                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"native-session-1\",\"model\":\"fixture-model\"}}\n{result}\n"
                 )
             } else {
                 concat!(
@@ -656,6 +810,7 @@ mod tests {
                     "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3},\"content\":[]}}\n",
                     "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"# Completed\\nFixture result\",\"session_id\":\"native-session-1\",\"permission_denials\":[]}\n"
                 )
+                .to_owned()
             };
             std::fs::write(process.spec().stdout_path(), output)?;
             self.started.lock().unwrap().insert(process.id());
@@ -782,6 +937,153 @@ mod tests {
     }
 
     #[test]
+    fn recovered_bash_denial_completes_and_persists_artifact() {
+        let backend = FixtureBackend::with_first_result(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "# Plan mismatch\n```json\n{\"eval_outcome\":\"plan_mismatch\"}\n```",
+                "session_id": "native-session-1",
+                "permission_denials": [{"tool_name":"Bash","tool_input":{"command":"cargo test && cargo clippy"}}]
+            })
+            .to_string(),
+        );
+        let (temp, _database, run_id, mut store, provider) = fixture_with_backend(backend, false);
+        let mut engine = WorkflowEngine::new(provider, "plan mismatch");
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("recovered denial stranded run: {status:?}"),
+            }
+        }
+        assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
+        drop(temp);
+    }
+
+    #[test]
+    fn blocked_edit_stays_needs_user_before_resolution() {
+        let (_temp, _database, run_id, mut store, provider) = fixture();
+        let mut engine = WorkflowEngine::new(provider, "blocked edit");
+        let request = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        let loaded = store.load_run(run_id).unwrap();
+        let attention = loaded
+            .run
+            .attention_requests()
+            .iter()
+            .find(|attention| attention.id() == request)
+            .unwrap();
+        assert_eq!(attention.kind(), AttentionKind::Permission);
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::NeedsUser
+        );
+        assert!(store.list_artifacts(run_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn eval_auto_resolution_allows_only_exact_edit_inside_worktree() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let workspace = store.load_workspace(run_id).unwrap().unwrap();
+        let target = workspace.worktree_path().join("README.md");
+        backend.set_first_result(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "blocked edit",
+                "session_id": "native-session-1",
+                "permission_denials": [{"tool_name":"Edit","tool_input":{"file_path":target}}]
+            })
+            .to_string(),
+        );
+        let mut engine = WorkflowEngine::new(provider, "safe edit");
+        let request = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        assert!(
+            engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap();
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("safe eval permission did not resume: {status:?}"),
+            }
+        }
+        let processes = store.list_managed_processes(run_id).unwrap();
+        let resumed = processes.last().unwrap();
+        let expected = format!("Edit(/{}", target.display());
+        assert!(
+            resumed
+                .spec()
+                .argv()
+                .iter()
+                .any(|arg| { arg.to_string_lossy().starts_with(&expected) })
+        );
+    }
+
+    #[test]
+    fn eval_auto_resolution_rejects_edit_outside_worktree() {
+        let backend = FixtureBackend::with_first_result(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "blocked edit",
+                "session_id": "native-session-1",
+                "permission_denials": [{"tool_name":"Edit","tool_input":{"file_path":"/tmp/other-repo/file"}}]
+            })
+            .to_string(),
+        );
+        let (_temp, _database, run_id, mut store, provider) = fixture_with_backend(backend, true);
+        let mut engine = WorkflowEngine::new(provider, "escape");
+        let request = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        assert!(
+            !engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .resolve_attention(&mut store, run_id, request)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::NeedsUser
+        );
+    }
+
+    #[test]
     fn event_failure_rolls_back_run_session_and_output_checkpoint() {
         let (_temp, _database, run_id, mut store, provider) = fixture();
         let mut engine = WorkflowEngine::new(provider, "make fixture change");
@@ -897,6 +1199,19 @@ mod tests {
         SqliteStore,
         ClaudeProvider<FixtureBackend>,
     ) {
+        fixture_with_backend(FixtureBackend::default(), false)
+    }
+
+    fn fixture_with_backend(
+        backend: FixtureBackend,
+        eval_auto_approve: bool,
+    ) -> (
+        TempDir,
+        PathBuf,
+        crate::domain::RunId,
+        SqliteStore,
+        ClaudeProvider<FixtureBackend>,
+    ) {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
         init_repository(&source);
@@ -931,8 +1246,9 @@ mod tests {
             id: ProviderId::new("claude").unwrap(),
             installation: ClaudeInstallation::fixture(PathBuf::from("/bin/true")),
             model: None,
-            manager: ProcessManager::new(&process_root, FixtureBackend::default()),
+            manager: ProcessManager::new(&process_root, backend),
             artifact_root: process_root,
+            eval_auto_approve,
         };
         (temp, database, run_id, store, provider)
     }

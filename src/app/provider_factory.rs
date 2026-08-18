@@ -170,6 +170,18 @@ impl Provider for RuntimeProvider {
         }
     }
 
+    fn can_auto_resolve_attention(
+        &mut self,
+        store: &mut SqliteStore,
+        context: &ProviderAttentionContext,
+    ) -> Result<bool, ProviderError> {
+        match self {
+            Self::Fake(provider) => provider.can_auto_resolve_attention(store, context),
+            Self::Claude(provider) => provider.can_auto_resolve_attention(store, context),
+            Self::Codex(provider) => provider.can_auto_resolve_attention(store, context),
+        }
+    }
+
     fn poll(
         &mut self,
         store: &mut SqliteStore,
@@ -189,6 +201,7 @@ pub struct RoutedProvider {
     workflow: WorkflowDefinition,
     runtimes: HashMap<ExecutionTarget, RuntimeProvider>,
     isolated_runtime: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    eval_auto_approve: bool,
 }
 
 impl RoutedProvider {
@@ -199,6 +212,7 @@ impl RoutedProvider {
             workflow,
             runtimes: HashMap::new(),
             isolated_runtime: None,
+            eval_auto_approve: false,
         }
     }
 
@@ -214,6 +228,7 @@ impl RoutedProvider {
             workflow,
             runtimes: HashMap::new(),
             isolated_runtime: Some((process_root, runner_executable)),
+            eval_auto_approve: true,
         }
     }
 
@@ -273,6 +288,14 @@ impl RoutedProvider {
         model: Option<crate::domain::ModelId>,
     ) -> Result<ClaudeProvider, ClaudeProviderError> {
         match &self.isolated_runtime {
+            Some((root, runner)) if self.eval_auto_approve => {
+                ClaudeProvider::from_runtime_with_eval_policy(
+                    model,
+                    root.clone(),
+                    runner.clone(),
+                    true,
+                )
+            }
             Some((root, runner)) => {
                 ClaudeProvider::from_runtime(model, root.clone(), runner.clone())
             }
@@ -337,6 +360,30 @@ impl Provider for RoutedProvider {
         }
         self.runtime_for(&target)?
             .stage_attention_response(store, context, response)
+    }
+
+    fn can_auto_resolve_attention(
+        &mut self,
+        store: &mut SqliteStore,
+        context: &ProviderAttentionContext,
+    ) -> Result<bool, ProviderError> {
+        let target = self.target_for_role(context.role())?;
+        let session = store
+            .list_provider_sessions(context.run_id())
+            .map_err(|error| ProviderError::new(error.to_string()))?
+            .into_iter()
+            .find(|session| {
+                session.stage_id() == context.stage_id()
+                    && session
+                        .pending_attention()
+                        .is_some_and(|pending| pending.attention_id() == context.request_id())
+            })
+            .ok_or_else(|| ProviderError::new("attention has no matching provider session"))?;
+        if session.provider_id() != target.provider_id() {
+            return Ok(false);
+        }
+        self.runtime_for(&target)?
+            .can_auto_resolve_attention(store, context)
     }
 
     fn poll(

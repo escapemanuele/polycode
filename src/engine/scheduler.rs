@@ -157,6 +157,42 @@ where
         self.resolve_attention_with_response(store, run_id, request_id, None)
     }
 
+    /// Checks whether provider-specific disposable-eval policy permits resolving
+    /// one attention request without human input.
+    ///
+    /// # Errors
+    /// Returns execution-boundary, provider, or persistence failures.
+    pub fn can_auto_resolve_attention(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        request_id: AttentionRequestId,
+    ) -> Result<bool, EngineError> {
+        let (loaded, _) = load_execution_boundary(store, run_id)?;
+        let attention = loaded
+            .run
+            .attention_requests()
+            .iter()
+            .find(|request| request.id() == request_id)
+            .ok_or(crate::domain::RunAttentionError::UnknownRequest(request_id))?;
+        let stage = loaded.run.stage(attention.stage_id()).ok_or_else(|| {
+            EngineError::ProviderProtocol {
+                stage_id: attention.stage_id().clone(),
+                message: "attention references unknown stage".to_owned(),
+            }
+        })?;
+        let context = ProviderAttentionContext::new(
+            run_id,
+            stage.id().clone(),
+            stage.kind(),
+            stage.role(),
+            request_id,
+        );
+        self.provider
+            .can_auto_resolve_attention(store, &context)
+            .map_err(EngineError::from)
+    }
+
     /// Resolves attention after provider safely stages optional response input.
     ///
     /// # Errors

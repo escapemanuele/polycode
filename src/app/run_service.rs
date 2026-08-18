@@ -196,6 +196,30 @@ where
         Self::report(&mut store, run_id, before, Some(&status))
     }
 
+    /// Resolves attention only when provider policy explicitly proves safe
+    /// disposable-eval continuation. Returns `None` for human-required input.
+    pub(crate) fn auto_resolve_attention(
+        &self,
+        run_id: RunId,
+        request_id: AttentionRequestId,
+    ) -> Result<Option<ExecutionReport>, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let before = last_sequence(&store, run_id)?;
+        self.reconcile(&mut store, run_id)?;
+        let mut engine = self.engine(&mut store, run_id)?;
+        if !engine.can_auto_resolve_attention(&mut store, run_id, request_id)? {
+            return Ok(None);
+        }
+        engine.resolve_attention(&mut store, run_id, request_id)?;
+        let status = drive_attached(&mut engine, &mut store, run_id)?;
+        Ok(Some(Self::report(
+            &mut store,
+            run_id,
+            before,
+            Some(&status),
+        )?))
+    }
+
     /// Retries one failed stage, then executes to quiescence.
     ///
     /// # Errors

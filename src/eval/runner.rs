@@ -218,10 +218,24 @@ impl EvalRunner {
             runtime.join("worktrees"),
             resolver,
         );
-        let report = service
+        let mut report = service
             .start_run_with_config(case.workflow, case.task, &source, &config)
             .map_err(|error| infrastructure(error.to_string()))?;
         let run_id = report.details.id;
+        if self.options.target.provider == EvalProvider::Claude {
+            while report.outcome == QuiescentState::NeedsUser {
+                let Some(attention) = report.details.attention.first() else {
+                    break;
+                };
+                let Some(next) = service
+                    .auto_resolve_attention(run_id, attention.id)
+                    .map_err(|error| infrastructure(error.to_string()))?
+                else {
+                    break;
+                };
+                report = next;
+            }
+        }
         if !matches!(report.outcome, QuiescentState::Completed) {
             return Err(CaseFailure::Infrastructure(format!(
                 "run reached unexpected quiescent state {:?}",
