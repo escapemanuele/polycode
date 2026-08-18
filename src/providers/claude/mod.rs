@@ -149,35 +149,27 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             })?;
             let denials = session
                 .pending_attention()
-                .map(|pending| Self::read_pending_denials(store, pending))
+                .map(|pending| Self::pending_new_denials(store, &session, pending))
                 .transpose()?
                 .unwrap_or_default();
-            let denials = if self.eval_auto_approve
-                && request.role() == Role::Implementer
-                && matches!(
+            let denials = if self.eval_auto_approve {
+                // Disposable eval never grants anything except the exact safe
+                // Edit/Write subset. Historical/denied Bash stays denied.
+                let context = ProviderAttentionContext::new(
+                    request.run_id(),
+                    request.stage_id().clone(),
                     request.stage_kind(),
-                    StageKind::Implementation | StageKind::Fix
-                ) {
-                let workspace = Self::eval_workspace_path(store, request.run_id())?;
-                let safe_edits = workspace.as_deref().map(|workspace| {
-                    denials
-                        .iter()
-                        .filter(|denial| denial.is_safe_eval_edit(workspace))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                });
-                if safe_edits.as_ref().is_some_and(|edits| !edits.is_empty())
-                    && denials.iter().all(|denial| {
-                        denial.is_recovered_diagnostic()
-                            || workspace
-                                .as_deref()
-                                .is_some_and(|workspace| denial.is_safe_eval_edit(workspace))
-                    })
-                {
-                    safe_edits.unwrap_or_default()
-                } else {
-                    denials
-                }
+                    request.role(),
+                    session
+                        .pending_attention()
+                        .map(PendingProviderAttention::attention_id)
+                        .unwrap_or_default(),
+                );
+                Self::safe_eval_grants(store, &context, &denials)?.ok_or_else(|| {
+                    ClaudeProviderError::UnsafePermission(
+                        "eval permission is not an exact in-worktree Edit/Write".to_owned(),
+                    )
+                })?
             } else {
                 denials
             };
@@ -328,67 +320,66 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             ClaudeRecord::Result {
                 content,
                 success,
+                error,
                 denials,
-                ..
-            } if !denials.is_empty()
-                && (!success
-                    || denials
-                        .iter()
-                        .any(PermissionDenial::requires_terminal_attention)) =>
-            {
-                let attention_id = AttentionRequestId::new();
-                let summary = permission_summary(&denials);
-                let pending = PendingProviderAttention::new(
-                    attention_id,
-                    commit.output().process_id(),
-                    commit.output().start_offset(),
-                    end,
-                )
-                .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
-                session
-                    .need_user(pending, Self::now())
-                    .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
-                commit = commit.with_session(ProviderSessionMutation::new(session, expected));
-                let _ = content;
-                ProviderSignal::NeedsUser {
-                    kind: AttentionKind::Permission,
-                    summary,
-                    request_id: Some(attention_id),
-                }
-            }
-            ClaudeRecord::Result {
-                content,
-                success: true,
-                ..
+                session_id: _,
             } => {
-                let workspace = store.load_workspace(request.run_id())?.ok_or_else(|| {
-                    ClaudeProviderError::Protocol("run workspace disappeared".to_owned())
-                })?;
-                let artifact = artifact::persist(
-                    &self.artifact_root,
-                    request,
-                    &self.id,
-                    session.model_id(),
-                    workspace.base_commit(),
-                    &content,
-                    Self::now(),
-                )?;
-                session
-                    .complete(Self::now())
+                // `permission_denials` is cumulative across resumed invocations;
+                // only requests not seen by an earlier invocation are unresolved.
+                let unresolved = Self::new_denials(store, &session, denials)?;
+                let needs_user = !unresolved.is_empty()
+                    && (!success
+                        || unresolved.iter().any(|denial| {
+                            denial.requires_terminal_attention(request.stage_kind())
+                        }));
+                if needs_user {
+                    let attention_id = AttentionRequestId::new();
+                    let summary = permission_summary(&unresolved);
+                    let pending = PendingProviderAttention::new(
+                        attention_id,
+                        commit.output().process_id(),
+                        commit.output().start_offset(),
+                        end,
+                    )
                     .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
-                commit = commit
-                    .with_session(ProviderSessionMutation::new(session, expected))
-                    .with_artifact(artifact);
-                ProviderSignal::Completed
-            }
-            ClaudeRecord::Result { error, .. } => {
-                session
-                    .fail(Self::now())
-                    .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
-                commit = commit.with_session(ProviderSessionMutation::new(session, expected));
-                ProviderSignal::Failed(
-                    error.unwrap_or_else(|| "Claude Code execution failed".to_owned()),
-                )
+                    session
+                        .need_user(pending, Self::now())
+                        .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
+                    commit = commit.with_session(ProviderSessionMutation::new(session, expected));
+                    ProviderSignal::NeedsUser {
+                        kind: AttentionKind::Permission,
+                        summary,
+                        request_id: Some(attention_id),
+                    }
+                } else if success {
+                    let workspace = store.load_workspace(request.run_id())?.ok_or_else(|| {
+                        ClaudeProviderError::Protocol("run workspace disappeared".to_owned())
+                    })?;
+                    let artifact = artifact::persist(
+                        &self.artifact_root,
+                        request,
+                        &self.id,
+                        session.model_id(),
+                        workspace.base_commit(),
+                        &content,
+                        Self::now(),
+                    )?;
+                    session
+                        .complete(Self::now())
+                        .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
+                    commit = commit
+                        .with_session(ProviderSessionMutation::new(session, expected))
+                        .with_artifact(artifact);
+                    ProviderSignal::Completed
+                } else {
+                    session
+                        .fail(Self::now())
+                        .map_err(|error| ClaudeProviderError::Protocol(error.to_owned()))?;
+                    commit = commit.with_session(ProviderSessionMutation::new(session, expected));
+                    ProviderSignal::Failed(
+                        error.unwrap_or_else(|| "Claude Code execution failed".to_owned()),
+                    )
+                }
             }
             ClaudeRecord::Ignored => return Ok(ProviderPoll::Checkpoint(commit)),
         };
@@ -478,29 +469,112 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         }
     }
 
-    fn safe_eval_permission(
+    /// Denials already surfaced by earlier invocations of the same native
+    /// session. Derived from durable process output, so no extra state is
+    /// needed and a crash between resume and next terminal cannot lose it.
+    fn historical_denials(
+        store: &SqliteStore,
+        session: &ProviderSessionRecord,
+    ) -> Result<Vec<PermissionDenial>, ClaudeProviderError> {
+        if session.invocation() <= 1 {
+            return Ok(Vec::new());
+        }
+        let mut historical = Vec::new();
+        for process in store.list_managed_processes(session.run_id())? {
+            if process.stage_id() != session.stage_id()
+                || process.attempt() != session.attempt()
+                || process.invocation() >= session.invocation()
+            {
+                continue;
+            }
+            let bytes = match std::fs::read(process.spec().stdout_path()) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let mut rest = bytes.as_slice();
+            // Output past the terminal record was never validated; stop at the
+            // first undecodable line instead of failing the current invocation.
+            while let Ok(Some((record, consumed))) = first_record(rest) {
+                if let ClaudeRecord::Result { denials, .. }
+                | ClaudeRecord::NeedsUser { denials, .. } = record
+                {
+                    historical.extend(denials);
+                }
+                rest = &rest[consumed..];
+            }
+        }
+        Ok(historical)
+    }
+
+    /// Splits cumulative denial history into requests not yet observed.
+    fn new_denials(
+        store: &SqliteStore,
+        session: &ProviderSessionRecord,
+        denials: Vec<PermissionDenial>,
+    ) -> Result<Vec<PermissionDenial>, ClaudeProviderError> {
+        let historical = Self::historical_denials(store, session)?;
+        Ok(denials
+            .into_iter()
+            .filter(|denial| !historical.iter().any(|seen| seen.same_request(denial)))
+            .collect())
+    }
+
+    fn pending_new_denials(
+        store: &SqliteStore,
+        session: &ProviderSessionRecord,
+        pending: &PendingProviderAttention,
+    ) -> Result<Vec<PermissionDenial>, ClaudeProviderError> {
+        let denials = Self::read_pending_denials(store, pending)?;
+        Self::new_denials(store, session, denials)
+    }
+
+    /// Exact safe Edit/Write subset a disposable eval may grant, or `None` when
+    /// this attention needs a human.
+    ///
+    /// Policy: at least one exact Edit/Write inside the eval worktree, no
+    /// mutation target outside it (a mixed request signals intent to escape,
+    /// so the safe subset does not continue either), and no question. Bash
+    /// and other denials neither veto nor get granted: they stay denied history.
+    fn safe_eval_grants(
         store: &SqliteStore,
         context: &ProviderAttentionContext,
         denials: &[PermissionDenial],
-    ) -> Result<bool, ClaudeProviderError> {
+    ) -> Result<Option<Vec<PermissionDenial>>, ClaudeProviderError> {
         if context.role() != Role::Implementer
             || !matches!(
                 context.stage_kind(),
                 StageKind::Implementation | StageKind::Fix
             )
         {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(workspace) = Self::eval_workspace_path(store, context.run_id())? else {
-            return Ok(false);
+            return Ok(None);
         };
-        let has_safe_edit = denials
+        if denials.iter().any(PermissionDenial::is_question) {
+            return Ok(None);
+        }
+        let safe_edits = denials
             .iter()
-            .any(|denial| denial.is_safe_eval_edit(&workspace));
-        Ok(has_safe_edit
-            && denials.iter().all(|denial| {
-                denial.is_recovered_diagnostic() || denial.is_safe_eval_edit(&workspace)
-            }))
+            .filter(|denial| denial.is_safe_eval_edit(&workspace))
+            .cloned()
+            .collect::<Vec<_>>();
+        let unsafe_mutation = denials
+            .iter()
+            .any(|denial| denial.is_mutating_tool() && !denial.is_safe_eval_edit(&workspace));
+        if safe_edits.is_empty() || unsafe_mutation {
+            return Ok(None);
+        }
+        Ok(Some(safe_edits))
+    }
+
+    fn safe_eval_permission(
+        store: &SqliteStore,
+        context: &ProviderAttentionContext,
+        denials: &[PermissionDenial],
+    ) -> Result<bool, ClaudeProviderError> {
+        Ok(Self::safe_eval_grants(store, context, denials)?.is_some())
     }
 
     fn eval_workspace_path(
@@ -630,7 +704,7 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
             let pending = session
                 .pending_attention()
                 .expect("matched pending attention");
-            let denials = Self::read_pending_denials(store, pending)?;
+            let denials = Self::pending_new_denials(store, &session, pending)?;
             if self.eval_auto_approve
                 && response.is_none()
                 && !Self::safe_eval_permission(store, context, &denials)?
@@ -679,7 +753,7 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
         let pending = session.pending_attention().ok_or_else(|| {
             ProviderError::new("matched attention has no pending provider record")
         })?;
-        let denials = Self::read_pending_denials(store, pending)
+        let denials = Self::pending_new_denials(store, &session, pending)
             .map_err(|error| ProviderError::new(error.to_string()))?;
         Self::safe_eval_permission(store, context, &denials)
             .map_err(|error| ProviderError::new(error.to_string()))
@@ -745,7 +819,7 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        AttentionKind, ConfigSnapshotId, EventId, EventMetadata, Run, RunStatus,
+        AttentionKind, ConfigSnapshotId, EventId, EventMetadata, Run, RunStatus, StageDefinition,
         WorkflowDefinition, WorkflowKind,
     };
     use crate::engine::{EngineStatus, WorkflowEngine};
@@ -760,6 +834,8 @@ mod tests {
     struct FixtureBackend {
         started: Arc<Mutex<HashSet<ManagedProcessId>>>,
         first_result: Arc<Mutex<Option<String>>>,
+        /// Terminal result record per invocation number; overrides defaults.
+        scripted: Arc<Mutex<BTreeMap<u32, String>>>,
     }
 
     impl FixtureBackend {
@@ -772,6 +848,13 @@ mod tests {
 
         fn set_first_result(&self, result: impl Into<String>) {
             *self.first_result.lock().unwrap() = Some(result.into());
+        }
+
+        fn set_result(&self, invocation: u32, result: impl Into<String>) {
+            self.scripted
+                .lock()
+                .unwrap()
+                .insert(invocation, result.into());
         }
     }
 
@@ -792,7 +875,17 @@ mod tests {
         }
 
         fn start(&self, process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
-            let output = if process.invocation() == 1 {
+            let scripted = self
+                .scripted
+                .lock()
+                .unwrap()
+                .get(&process.invocation())
+                .cloned();
+            let output = if let Some(result) = scripted {
+                format!(
+                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"native-session-1\",\"model\":\"fixture-model\"}}\n{result}\n"
+                )
+            } else if process.invocation() == 1 {
                 let result = self
                     .first_result
                     .lock()
@@ -1083,6 +1176,495 @@ mod tests {
         );
     }
 
+    // ---- Real-shape regression fixtures (copied structurally from native
+    // role_core_v3 Claude logs). Worktree paths are substituted at runtime.
+
+    const REAL_QUALITY_PLANTED_BASH: &str =
+        "cd \"WORKTREE\" && cargo test 2>&1 | tail -8; cargo clippy --all-targets 2>&1 | tail -30";
+    const REAL_SPEC_CLEAN_BASH: &str =
+        "cd \"WORKTREE\" && cat Cargo.toml && cargo build 2>&1 | tail -3";
+    const REAL_QUALITY_CLEAN_BASH: &str = "cd \"WORKTREE\" && git ls-files && echo --- && for f in $(git ls-files); do echo \"=== $f\"; cat \"$f\"; done";
+    const REAL_IMPLEMENTER_SED_BASH: &str = "cd \"WORKTREE\" && sed -i '' 's/    value + 2/    value * 2/' src/lib.rs && git diff && cargo test 2>&1 | tail -15";
+    const REAL_IMPLEMENTER_TEST_BASH: &str = "cargo test 2>&1 | tail -20";
+
+    fn success_result(result: &str, denials: &serde_json::Value) -> String {
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": result,
+            "session_id": "native-session-1",
+            "permission_denials": denials
+        })
+        .to_string()
+    }
+
+    fn bash_denial(id: &str, command: &str, worktree: &Path) -> serde_json::Value {
+        json!({
+            "tool_name": "Bash",
+            "tool_use_id": id,
+            "tool_input": {"command": command.replace("WORKTREE", &worktree.to_string_lossy())}
+        })
+    }
+
+    fn edit_denial(tool: &str, id: &str, path: &Path) -> serde_json::Value {
+        json!({
+            "tool_name": tool,
+            "tool_use_id": id,
+            "tool_input": {"file_path": path, "old_string": "a", "new_string": "b"}
+        })
+    }
+
+    fn drive_to_completion(
+        engine: &mut WorkflowEngine<ClaudeProvider<FixtureBackend>>,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+    ) {
+        loop {
+            match engine.drive(store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("run did not complete: {status:?}"),
+            }
+        }
+    }
+
+    fn drive_to_attention(
+        engine: &mut WorkflowEngine<ClaudeProvider<FixtureBackend>>,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+    ) -> AttentionRequestId {
+        loop {
+            match engine.drive(store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("run did not need user: {status:?}"),
+            }
+        }
+    }
+
+    fn all_argv(store: &SqliteStore, run_id: crate::domain::RunId) -> Vec<String> {
+        store
+            .list_managed_processes(run_id)
+            .unwrap()
+            .iter()
+            .flat_map(|process| {
+                process
+                    .spec()
+                    .argv()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn assert_no_bash_or_broad_grants(argv: &[String]) {
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("Bash(")),
+            "Bash must never be granted: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "Edit" || arg == "Write" || arg.contains('*')),
+            "broad/wildcard grants are forbidden: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains("dangerously") || arg.contains("bypassPermissions")),
+            "no bypass flags: {argv:?}"
+        );
+    }
+
+    fn reviewer_completes_with_denied_bash_history(
+        kind: StageKind,
+        role: Role,
+        command: &str,
+        result: &str,
+        eval_auto_approve: bool,
+    ) {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) = fixture_with_workflow(
+            backend.clone(),
+            eval_auto_approve,
+            review_workflow(kind, role),
+        );
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        backend.set_first_result(success_result(
+            result,
+            &json!([bash_denial(
+                "toolu_01DXupP8fj8XEo2X61Wz722z",
+                command,
+                &worktree
+            )]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "review");
+        drive_to_completion(&mut engine, &mut store, run_id);
+        assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 1);
+        let artifacts = store.list_artifacts(run_id).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert!(
+            std::fs::read_to_string(artifacts[0].path())
+                .unwrap()
+                .contains(result.lines().next().unwrap())
+        );
+        assert_no_bash_or_broad_grants(&all_argv(&store, run_id));
+    }
+
+    #[test]
+    fn real_quality_reviewer_recovered_cargo_diagnostic_completes_without_bash_grant() {
+        for eval in [false, true] {
+            reviewer_completes_with_denied_bash_history(
+                StageKind::CodeQualityReview,
+                Role::CodeQualityReviewer,
+                REAL_QUALITY_PLANTED_BASH,
+                "# Code Quality Review\n\n## Must fix\n\n- `src/lib.rs:28-42` — nested unwrap_or_default.\n",
+                eval,
+            );
+        }
+    }
+
+    #[test]
+    fn real_spec_reviewer_clean_review_completes_with_denied_build_history() {
+        for eval in [false, true] {
+            reviewer_completes_with_denied_bash_history(
+                StageKind::SpecReview,
+                Role::SpecReviewer,
+                REAL_SPEC_CLEAN_BASH,
+                "# Specification Review\n\n```json\n{\"findings\":[]}\n```\n",
+                eval,
+            );
+        }
+    }
+
+    #[test]
+    fn real_quality_clean_compound_shell_history_does_not_strand_review() {
+        for eval in [false, true] {
+            reviewer_completes_with_denied_bash_history(
+                StageKind::CodeQualityReview,
+                Role::CodeQualityReviewer,
+                REAL_QUALITY_CLEAN_BASH,
+                "# Code Quality Review\n\n```json\n{\"findings\":[]}\n```\n",
+                eval,
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_edit_denial_is_not_historical_success() {
+        for tool in ["Edit", "Write"] {
+            let backend = FixtureBackend::default();
+            let (_temp, _database, run_id, mut store, provider) = fixture_with_workflow(
+                backend.clone(),
+                true,
+                review_workflow(StageKind::CodeQualityReview, Role::CodeQualityReviewer),
+            );
+            let worktree = store
+                .load_workspace(run_id)
+                .unwrap()
+                .unwrap()
+                .worktree_path()
+                .to_path_buf();
+            backend.set_first_result(success_result(
+                "# Code Quality Review\n",
+                &json!([
+                    bash_denial("toolu_bash", REAL_QUALITY_PLANTED_BASH, &worktree),
+                    edit_denial(tool, "toolu_edit", &worktree.join("src/lib.rs")),
+                ]),
+            ));
+            let mut engine = WorkflowEngine::new(provider, "review");
+            let request = drive_to_attention(&mut engine, &mut store, run_id);
+            assert!(
+                !engine
+                    .can_auto_resolve_attention(&mut store, run_id, request)
+                    .unwrap()
+            );
+            assert_eq!(
+                store.load_run(run_id).unwrap().run.status(),
+                RunStatus::NeedsUser
+            );
+            assert!(store.list_artifacts(run_id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn real_implementer_cumulative_history_grants_only_exact_edit_and_completes() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(
+            worktree.join("src/lib.rs"),
+            "pub fn double(value: i32) -> i32 { value + 2 }\n",
+        )
+        .unwrap();
+        let target = worktree.join("src/lib.rs");
+        let first_history = json!([
+            edit_denial("Edit", "toolu_01Porm8WSKehWnTGkMPEgZTz", &target),
+            edit_denial("Write", "toolu_01YXn15DfzQyaiUK46xchHai", &target),
+            bash_denial(
+                "toolu_01XeeDkiuxT8FYX32WiuAaw1",
+                REAL_IMPLEMENTER_SED_BASH,
+                &worktree
+            ),
+            bash_denial(
+                "toolu_01VMux5SVAkuf5HqmXcTe93A",
+                REAL_IMPLEMENTER_TEST_BASH,
+                &worktree
+            ),
+        ]);
+        backend.set_first_result(success_result("Blocked. Report:\n", &first_history));
+        // Resumed invocation: cumulative history repeats every earlier denial
+        // (same tool_use_ids) plus one new diagnostic retry.
+        let mut second_history = first_history.as_array().unwrap().clone();
+        second_history.push(bash_denial(
+            "toolu_01NEWcargoTestRetry",
+            REAL_IMPLEMENTER_TEST_BASH,
+            &worktree,
+        ));
+        backend.set_result(
+            2,
+            success_result(
+                "# Completed\nApplied `value * 2`.\n",
+                &serde_json::Value::Array(second_history),
+            ),
+        );
+        let mut engine = WorkflowEngine::new(provider, "fix double");
+        let request = drive_to_attention(&mut engine, &mut store, run_id);
+        assert!(
+            engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap();
+        drive_to_completion(&mut engine, &mut store, run_id);
+
+        let processes = store.list_managed_processes(run_id).unwrap();
+        assert_eq!(processes.len(), 2);
+        let resumed = processes
+            .last()
+            .unwrap()
+            .spec()
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            resumed
+                .windows(2)
+                .any(|pair| pair == ["--resume", "native-session-1"]),
+            "{resumed:?}"
+        );
+        let expected_rule = format!("Edit(/{})", target.display());
+        let rules = resumed
+            .iter()
+            .skip_while(|arg| *arg != "--allowedTools")
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(rules, vec![expected_rule], "{resumed:?}");
+        assert_no_bash_or_broad_grants(&resumed);
+        let sessions = store.list_provider_sessions(run_id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].invocation(), 2);
+        assert_eq!(sessions[0].status(), ProviderSessionStatus::Completed);
+        assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn new_mutating_bash_after_resume_still_needs_user() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        let target = worktree.join("README.md");
+        backend.set_first_result(success_result(
+            "blocked",
+            &json!([edit_denial("Edit", "toolu_edit_1", &target)]),
+        ));
+        backend.set_result(
+            2,
+            success_result(
+                "still blocked",
+                &json!([
+                    edit_denial("Edit", "toolu_edit_1", &target),
+                    bash_denial("toolu_sed_new", REAL_IMPLEMENTER_SED_BASH, &worktree),
+                ]),
+            ),
+        );
+        let mut engine = WorkflowEngine::new(provider, "edit");
+        let request = drive_to_attention(&mut engine, &mut store, run_id);
+        engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap();
+        let second = drive_to_attention(&mut engine, &mut store, run_id);
+        assert_ne!(second, request);
+        assert!(
+            !engine
+                .can_auto_resolve_attention(&mut store, run_id, second)
+                .unwrap()
+        );
+        assert_no_bash_or_broad_grants(&all_argv(&store, run_id));
+    }
+
+    #[test]
+    fn unsafe_edit_mixed_with_safe_edit_never_auto_resolves_or_grants_outside_path() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        backend.set_first_result(success_result(
+            "blocked",
+            &json!([
+                edit_denial("Edit", "toolu_inside", &worktree.join("README.md")),
+                edit_denial("Edit", "toolu_outside", Path::new("/tmp/outside")),
+            ]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "escape");
+        let request = drive_to_attention(&mut engine, &mut store, run_id);
+        assert!(
+            !engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .resolve_attention(&mut store, run_id, request)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::NeedsUser
+        );
+        assert!(
+            !all_argv(&store, run_id)
+                .iter()
+                .any(|arg| arg.contains("/tmp/outside"))
+        );
+    }
+
+    #[test]
+    fn question_mixed_with_safe_edit_never_auto_resolves() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        backend.set_first_result(success_result(
+            "blocked",
+            &json!([
+                edit_denial("Edit", "toolu_inside", &worktree.join("README.md")),
+                {"tool_name":"AskUserQuestion","tool_use_id":"toolu_q","tool_input":{"questions":[{"question":"Which?"}]}}
+            ]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "question");
+        let request = drive_to_attention(&mut engine, &mut store, run_id);
+        assert!(
+            !engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .resolve_attention(&mut store, run_id, request)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn implementer_mutating_bash_only_stays_needs_user() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        backend.set_first_result(success_result(
+            "Blocked.",
+            &json!([bash_denial(
+                "toolu_sed",
+                REAL_IMPLEMENTER_SED_BASH,
+                &worktree
+            )]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "sed only");
+        let request = drive_to_attention(&mut engine, &mut store, run_id);
+        assert!(
+            !engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .resolve_attention(&mut store, run_id, request)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::NeedsUser
+        );
+        assert!(store.list_artifacts(run_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn real_implementer_invalid_plan_stop_diagnostic_wrapper_completes() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        backend.set_first_result(success_result(
+            "## Result: plan mismatch\n```json\n{\"eval_outcome\":\"plan_mismatch\"}\n```\n",
+            &json!([bash_denial(
+                "toolu_01BHjWDwh3nEk9rmuS32HDdM",
+                "cd \"WORKTREE\" && git ls-files | head -100 && echo \"---grep---\" && grep -rniE \"ConfigRegistry|config_registry|config-registry\" --exclude-dir=.git . ; echo \"grep exit: $?\"",
+                &worktree
+            )]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "plan mismatch");
+        drive_to_completion(&mut engine, &mut store, run_id);
+        assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 1);
+        assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
+    }
+
     #[test]
     fn event_failure_rolls_back_run_session_and_output_checkpoint() {
         let (_temp, _database, run_id, mut store, provider) = fixture();
@@ -1212,6 +1794,39 @@ mod tests {
         SqliteStore,
         ClaudeProvider<FixtureBackend>,
     ) {
+        fixture_with_workflow(
+            backend,
+            eval_auto_approve,
+            WorkflowDefinition::built_in(WorkflowKind::Fast),
+        )
+    }
+
+    /// Single read-only review stage so reviewer terminal semantics can be
+    /// exercised without fake dependency stages.
+    fn review_workflow(kind: StageKind, role: Role) -> WorkflowDefinition {
+        WorkflowDefinition::new(
+            WorkflowKind::Review,
+            vec![StageDefinition::new(
+                crate::domain::StageId::new("review").unwrap(),
+                kind,
+                role,
+                vec![],
+            )],
+        )
+        .unwrap()
+    }
+
+    fn fixture_with_workflow(
+        backend: FixtureBackend,
+        eval_auto_approve: bool,
+        workflow: WorkflowDefinition,
+    ) -> (
+        TempDir,
+        PathBuf,
+        crate::domain::RunId,
+        SqliteStore,
+        ClaudeProvider<FixtureBackend>,
+    ) {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
         init_repository(&source);
@@ -1220,12 +1835,7 @@ mod tests {
         let run_id = crate::domain::RunId::new();
         let created_at: DateTime<Utc> = std::time::SystemTime::now().into();
         let config_id = ConfigSnapshotId::new(format!("m7-{run_id}")).unwrap();
-        let run = Run::new(
-            run_id,
-            WorkflowDefinition::built_in(WorkflowKind::Fast),
-            config_id.clone(),
-            created_at,
-        );
+        let run = Run::new(run_id, workflow, config_id.clone(), created_at);
         let input = RunInput::new(run_id, "make fixture change", created_at).unwrap();
         let config = ResolvedConfigSnapshot::new(
             config_id,

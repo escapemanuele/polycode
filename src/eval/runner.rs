@@ -22,6 +22,10 @@ use super::scorer::{ScoreInput, ScoredOutcome, ScoringError, score};
 use super::suite::{EvalSuite, EvalSuiteError};
 
 const VALIDATION_OUTPUT_LIMIT: usize = 256 * 1024;
+/// Upper bound on safe eval permission continuations per case. Each resume
+/// grants at least one new exact in-worktree Edit; anything beyond this is a
+/// runaway session, not legitimate work.
+const MAX_EVAL_AUTO_CONTINUATIONS: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub struct EvalRunOptions {
@@ -223,7 +227,14 @@ impl EvalRunner {
             .map_err(|error| infrastructure(error.to_string()))?;
         let run_id = report.details.id;
         if self.options.target.provider == EvalProvider::Claude {
+            let mut continuations = 0;
             while report.outcome == QuiescentState::NeedsUser {
+                if continuations >= MAX_EVAL_AUTO_CONTINUATIONS {
+                    return Err(CaseFailure::Infrastructure(format!(
+                        "eval auto-continuation exceeded {MAX_EVAL_AUTO_CONTINUATIONS} resumes"
+                    )));
+                }
+                continuations += 1;
                 let Some(attention) = report.details.attention.first() else {
                     break;
                 };

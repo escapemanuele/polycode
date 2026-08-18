@@ -96,6 +96,7 @@ mod tests {
             &ProviderSessionId::new("session-1").unwrap(),
             &[PermissionDenial {
                 tool_name: "Write".to_owned(),
+                tool_use_id: None,
                 tool_input: json!({"file_path":"/tmp/result.txt"}),
             }],
             None,
@@ -127,6 +128,7 @@ mod tests {
     fn question_requires_response() {
         let denial = PermissionDenial {
             tool_name: "AskUserQuestion".to_owned(),
+            tool_use_id: None,
             tool_input: json!({"questions":[{"question":"Which option?"}]}),
         };
         assert!(matches!(
