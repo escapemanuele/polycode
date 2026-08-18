@@ -324,13 +324,21 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 denials,
                 session_id: _,
             } => {
-                // `permission_denials` is cumulative across resumed invocations;
+                // Claude may repeat earlier denials in a resumed terminal result;
                 // only requests not seen by an earlier invocation are unresolved.
+                // Re-attempted requests carry fresh tool_use_ids and count as new.
                 let unresolved = Self::new_denials(store, &session, denials)?;
+                let eval_continued = self.eval_auto_approve
+                    && success
+                    && Self::eval_mutation_continued(store, &session)?;
                 let needs_user = !unresolved.is_empty()
                     && (!success
                         || unresolved.iter().any(|denial| {
-                            denial.requires_terminal_attention(request.stage_kind())
+                            if eval_continued {
+                                denial.requires_attention_after_eval_continuation()
+                            } else {
+                                denial.requires_terminal_attention(request.stage_kind())
+                            }
                         }));
                 if needs_user {
                     let attention_id = AttentionRequestId::new();
@@ -505,6 +513,41 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             }
         }
         Ok(historical)
+    }
+
+    /// Whether an earlier invocation of this session was resumed by the
+    /// disposable eval policy with an exact Edit/Write grant.
+    ///
+    /// Explicit durable state: the resumed process spec argv persisted the
+    /// exact `Edit(...)` rules Polycode granted. Eval mode can only reach a
+    /// resume through `safe_eval_grants`, so any such rule proves the safe
+    /// mutation continuation happened for this native session.
+    fn eval_mutation_continued(
+        store: &SqliteStore,
+        session: &ProviderSessionRecord,
+    ) -> Result<bool, ClaudeProviderError> {
+        if session.invocation() <= 1 {
+            return Ok(false);
+        }
+        for process in store.list_managed_processes(session.run_id())? {
+            if process.stage_id() != session.stage_id()
+                || process.attempt() != session.attempt()
+                || process.invocation() <= 1
+                || process.invocation() > session.invocation()
+            {
+                continue;
+            }
+            let argv = process.spec().argv();
+            let granted_edit = argv
+                .iter()
+                .skip_while(|arg| arg.as_os_str() != "--allowedTools")
+                .skip(1)
+                .any(|arg| arg.to_string_lossy().starts_with("Edit("));
+            if granted_edit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Splits cumulative denial history into requests not yet observed.
@@ -836,6 +879,9 @@ mod tests {
         first_result: Arc<Mutex<Option<String>>>,
         /// Terminal result record per invocation number; overrides defaults.
         scripted: Arc<Mutex<BTreeMap<u32, String>>>,
+        /// Files written when an invocation starts, simulating an approved
+        /// native Edit taking effect in the worktree.
+        effects: Arc<Mutex<BTreeMap<u32, (PathBuf, String)>>>,
     }
 
     impl FixtureBackend {
@@ -856,6 +902,13 @@ mod tests {
                 .unwrap()
                 .insert(invocation, result.into());
         }
+
+        fn set_edit_effect(&self, invocation: u32, path: PathBuf, content: impl Into<String>) {
+            self.effects
+                .lock()
+                .unwrap()
+                .insert(invocation, (path, content.into()));
+        }
     }
 
     impl ProcessBackend for FixtureBackend {
@@ -875,6 +928,9 @@ mod tests {
         }
 
         fn start(&self, process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
+            if let Some((path, content)) = self.effects.lock().unwrap().get(&process.invocation()) {
+                std::fs::write(path, content)?;
+            }
             let scripted = self
                 .scripted
                 .lock()
@@ -1488,33 +1544,170 @@ mod tests {
         assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
     }
 
-    #[test]
-    fn new_mutating_bash_after_resume_still_needs_user() {
+    const REAL_BUGFIX_INV1_BASH: &str = "sed -i '' 's/    value + 2/    value * 2/' src/lib.rs && cargo test 2>&1 | tail -20 && git diff";
+    const REAL_BUGFIX_INV2_TEST_BASH: &str = "cargo test 2>&1 | tail -15";
+    const REAL_BUGFIX_INV2_SUBAGENT_BASH: &str = "cargo test 2>&1 | tail -60";
+    const BROKEN_LIB: &str = "pub fn double(value: i32) -> i32 {\n    value + 2\n}\n";
+    const FIXED_LIB: &str = "pub fn double(value: i32) -> i32 {\n    value * 2\n}\n";
+
+    /// Real `basic_bugfix` invocation-1 history (session 0614aad3…): exact Edit,
+    /// exact Write, and one compound mutating Bash alternative.
+    fn bugfix_invocation_one(worktree: &Path, target: &Path) -> serde_json::Value {
+        json!([
+            edit_denial("Edit", "toolu_01EGrNZfzW9jFYc3agZxCvYW", target),
+            edit_denial("Write", "toolu_01KF1yG8dn2fVGu88Jpfv9BX", target),
+            bash_denial(
+                "toolu_0196jwV8idmpppL66Jrszret",
+                REAL_BUGFIX_INV1_BASH,
+                worktree
+            ),
+        ])
+    }
+
+    /// Real `basic_bugfix` invocation-2 history: re-attempted sed (new id, still
+    /// denied, never executed), Claude's cargo test, subagent's cargo test.
+    fn bugfix_invocation_two(worktree: &Path) -> Vec<serde_json::Value> {
+        vec![
+            bash_denial(
+                "toolu_01SiSgSWADTsxsGnyCVJCzMZ",
+                REAL_BUGFIX_INV1_BASH,
+                worktree,
+            ),
+            bash_denial(
+                "toolu_01Tzj2TyFaCU1zYTfpXVdMJk",
+                REAL_BUGFIX_INV2_TEST_BASH,
+                worktree,
+            ),
+            bash_denial(
+                "toolu_011up88dJSQKrubWJ9Zc7RKq",
+                REAL_BUGFIX_INV2_SUBAGENT_BASH,
+                worktree,
+            ),
+        ]
+    }
+
+    fn bugfix_fixture(
+        eval_auto_approve: bool,
+    ) -> (
+        FixtureBackend,
+        TempDir,
+        crate::domain::RunId,
+        SqliteStore,
+        ClaudeProvider<FixtureBackend>,
+        PathBuf,
+        PathBuf,
+    ) {
         let backend = FixtureBackend::default();
-        let (_temp, _database, run_id, mut store, provider) =
-            fixture_with_backend(backend.clone(), true);
+        let (temp, _database, run_id, store, provider) =
+            fixture_with_backend(backend.clone(), eval_auto_approve);
         let worktree = store
             .load_workspace(run_id)
             .unwrap()
             .unwrap()
             .worktree_path()
             .to_path_buf();
-        let target = worktree.join("README.md");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let target = worktree.join("src/lib.rs");
+        std::fs::write(&target, BROKEN_LIB).unwrap();
         backend.set_first_result(success_result(
-            "blocked",
-            &json!([edit_denial("Edit", "toolu_edit_1", &target)]),
+            "Blocked. Report:\n\n## Result: not applied — write permission denied\n",
+            &bugfix_invocation_one(&worktree, &target),
         ));
+        (backend, temp, run_id, store, provider, worktree, target)
+    }
+
+    fn worktree_status(worktree: &Path) -> Vec<String> {
+        let output = Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(worktree)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn real_basic_bugfix_sequence_completes_after_safe_edit_continuation() {
+        let (backend, _temp, run_id, mut store, provider, worktree, target) = bugfix_fixture(true);
+        backend.set_edit_effect(2, target.clone(), FIXED_LIB);
         backend.set_result(
             2,
             success_result(
-                "still blocked",
-                &json!([
-                    edit_denial("Edit", "toolu_edit_1", &target),
-                    bash_denial("toolu_sed_new", REAL_IMPLEMENTER_SED_BASH, &worktree),
-                ]),
+                "## Result: fix applied; test run blocked\n",
+                &serde_json::Value::Array(bugfix_invocation_two(&worktree)),
             ),
         );
-        let mut engine = WorkflowEngine::new(provider, "edit");
+        let mut engine = WorkflowEngine::new(provider, "fix double");
+        let request = drive_to_attention(&mut engine, &mut store, run_id);
+        assert!(
+            engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap();
+        drive_to_completion(&mut engine, &mut store, run_id);
+
+        let processes = store.list_managed_processes(run_id).unwrap();
+        assert_eq!(processes.len(), 2);
+        let resumed = processes[1]
+            .spec()
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            resumed
+                .windows(2)
+                .any(|pair| pair == ["--resume", "native-session-1"]),
+            "{resumed:?}"
+        );
+        let rules = resumed
+            .iter()
+            .skip_while(|arg| *arg != "--allowedTools")
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(rules, vec![format!("Edit(/{})", target.display())]);
+        assert_no_bash_or_broad_grants(&all_argv(&store, run_id));
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+        assert_eq!(session.invocation(), 2);
+        assert_eq!(session.status(), ProviderSessionStatus::Completed);
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::Completed
+        );
+        let artifacts = store.list_artifacts(run_id).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert!(
+            std::fs::read_to_string(artifacts[0].path())
+                .unwrap()
+                .contains("fix applied")
+        );
+        // Trusted harness view: only the approved Edit reached the worktree;
+        // the denied sed/cargo alternatives never executed.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), FIXED_LIB);
+        assert_eq!(worktree_status(&worktree), vec!["?? src/lib.rs".to_owned()]);
+    }
+
+    #[test]
+    fn continued_session_with_question_still_needs_user() {
+        let (backend, _temp, run_id, mut store, provider, worktree, target) = bugfix_fixture(true);
+        backend.set_edit_effect(2, target, FIXED_LIB);
+        let mut history = bugfix_invocation_two(&worktree);
+        history.push(json!({
+            "tool_name":"AskUserQuestion","tool_use_id":"toolu_q",
+            "tool_input":{"questions":[{"question":"Add tests too?"}]}
+        }));
+        backend.set_result(
+            2,
+            success_result("blocked on question", &serde_json::Value::Array(history)),
+        );
+        let mut engine = WorkflowEngine::new(provider, "fix double");
         let request = drive_to_attention(&mut engine, &mut store, run_id);
         engine
             .resolve_attention(&mut store, run_id, request)
@@ -1526,7 +1719,79 @@ mod tests {
                 .can_auto_resolve_attention(&mut store, run_id, second)
                 .unwrap()
         );
-        assert_no_bash_or_broad_grants(&all_argv(&store, run_id));
+        assert!(store.list_artifacts(run_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn continued_session_with_new_unfulfilled_edit_still_needs_user() {
+        for outside in [false, true] {
+            let (backend, _temp, run_id, mut store, provider, worktree, target) =
+                bugfix_fixture(true);
+            backend.set_edit_effect(2, target, FIXED_LIB);
+            let new_target = if outside {
+                PathBuf::from("/tmp/outside/lib.rs")
+            } else {
+                worktree.join("src/other.rs")
+            };
+            let mut history = bugfix_invocation_two(&worktree);
+            history.push(edit_denial("Edit", "toolu_new_edit", &new_target));
+            backend.set_result(
+                2,
+                success_result("partially applied", &serde_json::Value::Array(history)),
+            );
+            let mut engine = WorkflowEngine::new(provider, "fix double");
+            let request = drive_to_attention(&mut engine, &mut store, run_id);
+            engine
+                .resolve_attention(&mut store, run_id, request)
+                .unwrap();
+            let second = drive_to_attention(&mut engine, &mut store, run_id);
+            assert_ne!(second, request);
+            assert_eq!(
+                store.load_run(run_id).unwrap().run.status(),
+                RunStatus::NeedsUser
+            );
+            assert!(store.list_artifacts(run_id).unwrap().is_empty());
+            let resolvable = engine
+                .can_auto_resolve_attention(&mut store, run_id, second)
+                .unwrap();
+            assert_eq!(resolvable, !outside);
+            assert!(
+                !all_argv(&store, run_id)
+                    .iter()
+                    .any(|arg| arg.contains("/tmp/outside"))
+            );
+        }
+    }
+
+    #[test]
+    fn production_policy_keeps_reattempted_mutating_bash_conservative() {
+        let (backend, _temp, run_id, mut store, provider, worktree, target) = bugfix_fixture(false);
+        backend.set_edit_effect(2, target, FIXED_LIB);
+        backend.set_result(
+            2,
+            success_result(
+                "## Result: fix applied; test run blocked\n",
+                &serde_json::Value::Array(bugfix_invocation_two(&worktree)),
+            ),
+        );
+        let mut engine = WorkflowEngine::new(provider, "fix double");
+        let request = drive_to_attention(&mut engine, &mut store, run_id);
+        assert!(
+            !engine
+                .can_auto_resolve_attention(&mut store, run_id, request)
+                .unwrap()
+        );
+        // Human approval in production grants exact rules and resumes.
+        engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap();
+        let second = drive_to_attention(&mut engine, &mut store, run_id);
+        assert_ne!(second, request);
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::NeedsUser
+        );
+        assert!(store.list_artifacts(run_id).unwrap().is_empty());
     }
 
     #[test]

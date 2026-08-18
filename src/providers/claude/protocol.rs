@@ -78,6 +78,21 @@ impl PermissionDenial {
             !self.is_recovered_diagnostic()
         }
     }
+
+    /// Terminal attention rule for a disposable eval Implementer session that
+    /// already received an exact safe Edit/Write continuation.
+    ///
+    /// The mutation channel was granted and the harness validates the
+    /// repository deterministically afterwards, so Claude's optional Bash
+    /// validation (`cargo test`, or a re-attempted `sed -i` alternative that
+    /// stayed denied and never executed) is history. Only a new mutation
+    /// request, a question, or an unknown tool still needs a human.
+    pub(crate) fn requires_attention_after_eval_continuation(&self) -> bool {
+        !matches!(
+            self.tool_name.as_str(),
+            "Bash" | "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "WebFetch" | "WebSearch"
+        )
+    }
     /// Exact Edit/Write continuation allowed only by disposable native eval.
     pub(crate) fn is_safe_eval_edit(&self, workspace_path: &std::path::Path) -> bool {
         if !matches!(self.tool_name.as_str(), "Edit" | "Write") {
