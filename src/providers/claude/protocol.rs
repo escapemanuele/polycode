@@ -1,18 +1,50 @@
 use serde_json::Value;
 
+use crate::domain::StageKind;
 use crate::engine::UsageDelta;
 
 use super::ClaudeProviderError;
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names mirror native Claude Code permission_denials JSON keys"
+)]
 pub(crate) struct PermissionDenial {
     pub tool_name: String,
+    /// Native Claude Code `tool_use_id`. Lets cumulative `permission_denials`
+    /// history be split into previously observed and newly raised requests.
+    pub tool_use_id: Option<String>,
     pub tool_input: Value,
+}
+
+/// Stage kinds that may never mutate repository content. Same predicate as
+/// `WorkflowDefinition::requires_writable_workspace`.
+pub(crate) const fn read_only_stage(kind: StageKind) -> bool {
+    !matches!(kind, StageKind::Implementation | StageKind::Fix)
 }
 
 impl PermissionDenial {
     pub(crate) fn is_mutating_tool(&self) -> bool {
-        matches!(self.tool_name.as_str(), "Edit" | "Write")
+        matches!(
+            self.tool_name.as_str(),
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
+        )
+    }
+
+    pub(crate) fn is_question(&self) -> bool {
+        self.tool_name == "AskUserQuestion"
+    }
+
+    /// Whether two denial entries describe the same native permission request.
+    ///
+    /// Prefers `tool_use_id`; falls back to structural equality only when the
+    /// CLI omitted identifiers on either side.
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        match (&self.tool_use_id, &other.tool_use_id) {
+            (Some(left), Some(right)) => left == right,
+            _ => self.tool_name == other.tool_name && self.tool_input == other.tool_input,
+        }
     }
 
     /// Whether denial can be treated as historical after a successful terminal result.
@@ -22,7 +54,7 @@ impl PermissionDenial {
     /// be read-only diagnostics may be ignored as recovered history.
     pub(crate) fn is_recovered_diagnostic(&self) -> bool {
         match self.tool_name.as_str() {
-            "Read" | "WebFetch" => true,
+            "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "WebFetch" | "WebSearch" => true,
             "Bash" => self
                 .tool_input
                 .get("command")
@@ -32,13 +64,23 @@ impl PermissionDenial {
         }
     }
 
-    pub(crate) fn requires_terminal_attention(&self) -> bool {
-        !self.is_recovered_diagnostic()
+    /// Whether a denial left in a *successful* terminal result still needs a human.
+    ///
+    /// A denied tool call never executed, so it cannot have mutated anything.
+    /// For read-only stages the only unfinished business is a requested
+    /// mutation or an unanswered question; any denied Bash/read history is
+    /// recovered history regardless of shell syntax. Mutating stages stay
+    /// conservative: only deterministically read-only diagnostics are history.
+    pub(crate) fn requires_terminal_attention(&self, stage_kind: StageKind) -> bool {
+        if read_only_stage(stage_kind) {
+            self.is_mutating_tool() || self.is_question()
+        } else {
+            !self.is_recovered_diagnostic()
+        }
     }
-
     /// Exact Edit/Write continuation allowed only by disposable native eval.
     pub(crate) fn is_safe_eval_edit(&self, workspace_path: &std::path::Path) -> bool {
-        if !self.is_mutating_tool() {
+        if !matches!(self.tool_name.as_str(), "Edit" | "Write") {
             return false;
         }
         let Some(path) = self.tool_input.get("file_path").and_then(Value::as_str) else {
@@ -129,53 +171,208 @@ fn compound_shell(command: &str) -> bool {
             .any(|character| matches!(character, ';' | '|' | '&' | '\n' | '\r'))
 }
 
-fn safe_diagnostic_shell(command: &str) -> bool {
-    if command.trim().is_empty()
-        || command.contains('>')
-        || command.contains('<')
-        || command.contains("$(")
-        || command.contains('`')
-    {
-        return false;
-    }
-    let mut segment = String::new();
-    let mut segments = Vec::new();
-    let bytes = command.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let separator = match bytes[index] {
-            b'&' if bytes.get(index + 1) == Some(&b'&') => Some(2),
-            b'|' if bytes.get(index + 1) == Some(&b'|') => Some(2),
-            b';' | b'|' | b'&' | b'\n' | b'\r' => Some(1),
-            _ => None,
-        };
-        if let Some(width) = separator {
-            segments.push(std::mem::take(&mut segment));
-            index += width;
-        } else {
-            segment.push(bytes[index] as char);
-            index += 1;
-        }
-    }
-    segments.push(segment);
-    segments
-        .into_iter()
-        .map(|segment| segment.trim().to_owned())
-        .filter(|segment| !segment.is_empty())
-        .all(|segment| safe_diagnostic_command(&segment))
+/// One shell word after quote removal.
+#[derive(Debug, Default)]
+struct ShellWord {
+    text: String,
+    /// Word contains an unquoted `<` or `>` and therefore is a redirection.
+    redirect: bool,
 }
 
-fn safe_diagnostic_command(command: &str) -> bool {
-    let mut words = command.split_whitespace();
-    if command.split_whitespace().any(|word| {
-        matches!(
-            word,
-            "-exec" | "-execdir" | "-delete" | "--delete" | "--in-place"
-        )
-    }) {
-        return false;
+/// Splits one Bash command line into simple commands (segments of words).
+///
+/// Understands single/double quotes, backslash escapes, and the separators
+/// `;`, `|`, `||`, `&`, `&&`, newlines. Returns `None` for anything that is
+/// not a flat sequence of simple commands: subshells, grouping, command
+/// substitution, backticks, heredocs, or process substitution.
+fn split_simple_commands(command: &str) -> Option<Vec<Vec<ShellWord>>> {
+    if command.contains("$(") || command.contains('`') {
+        return None;
     }
-    let Some(executable) = words.next() else {
+    let mut segments = Vec::new();
+    let mut segment: Vec<ShellWord> = Vec::new();
+    let mut word = ShellWord::default();
+    let mut in_word = false;
+    let mut chars = command.chars().peekable();
+    let flush_word = |segment: &mut Vec<ShellWord>, word: &mut ShellWord, in_word: &mut bool| {
+        if *in_word {
+            segment.push(std::mem::take(word));
+            *in_word = false;
+        }
+    };
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' => {
+                in_word = true;
+                read_single_quoted(&mut chars, &mut word.text)?;
+            }
+            '"' => {
+                in_word = true;
+                read_double_quoted(&mut chars, &mut word.text)?;
+            }
+            '\\' => match chars.next() {
+                Some('\n') => flush_word(&mut segment, &mut word, &mut in_word),
+                Some(escaped) => {
+                    in_word = true;
+                    word.text.push(escaped);
+                }
+                None => return None,
+            },
+            ' ' | '\t' => flush_word(&mut segment, &mut word, &mut in_word),
+            '\n' | '\r' | ';' => {
+                flush_word(&mut segment, &mut word, &mut in_word);
+                segments.push(std::mem::take(&mut segment));
+            }
+            '|' => {
+                flush_word(&mut segment, &mut word, &mut in_word);
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                }
+                segments.push(std::mem::take(&mut segment));
+            }
+            '&' => {
+                if chars.peek() == Some(&'>') {
+                    // `&>target` redirection prefix.
+                    in_word = true;
+                    word.text.push('&');
+                } else if in_word && word.redirect && word.text.ends_with('>') {
+                    // `2>&1` style descriptor duplication.
+                    word.text.push('&');
+                } else {
+                    flush_word(&mut segment, &mut word, &mut in_word);
+                    if chars.peek() == Some(&'&') {
+                        chars.next();
+                    }
+                    segments.push(std::mem::take(&mut segment));
+                }
+            }
+            '<' | '>' => {
+                // Redirection glued to a preceding descriptor digit (`2>`) or
+                // `&>` prefix stays in the same word; otherwise starts a new one.
+                let glued = in_word
+                    && (word.text.chars().all(|digit| digit.is_ascii_digit())
+                        || word.text == "&"
+                        || word.text == ">");
+                if !glued {
+                    flush_word(&mut segment, &mut word, &mut in_word);
+                }
+                in_word = true;
+                word.redirect = true;
+                word.text.push(character);
+            }
+            '(' | ')' => return None,
+            other => {
+                in_word = true;
+                word.text.push(other);
+            }
+        }
+    }
+    flush_word(&mut segment, &mut word, &mut in_word);
+    segments.push(segment);
+    Some(
+        segments
+            .into_iter()
+            .filter(|segment| !segment.is_empty())
+            .collect(),
+    )
+}
+
+fn read_single_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    text: &mut String,
+) -> Option<()> {
+    loop {
+        match chars.next() {
+            Some('\'') => return Some(()),
+            Some(inner) => text.push(inner),
+            None => return None,
+        }
+    }
+}
+
+fn read_double_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    text: &mut String,
+) -> Option<()> {
+    loop {
+        match chars.next() {
+            Some('"') => return Some(()),
+            Some('\\') => match chars.next() {
+                Some(escaped @ ('"' | '\\' | '$' | '`')) => text.push(escaped),
+                Some(other) => {
+                    text.push('\\');
+                    text.push(other);
+                }
+                None => return None,
+            },
+            Some(inner) => text.push(inner),
+            None => return None,
+        }
+    }
+}
+
+/// Whether one denied Bash command is deterministically read-only.
+///
+/// Accepts flat pipelines/sequences of known diagnostic executables with
+/// harmless redirections (`2>&1`, `1>&2`, `>/dev/null`, `2>/dev/null`,
+/// `</dev/null`). Everything else — assignments, loops, substitution,
+/// unknown executables, file redirection — is rejected, not interpreted.
+fn safe_diagnostic_shell(command: &str) -> bool {
+    let Some(segments) = split_simple_commands(command) else {
+        return false;
+    };
+    !segments.is_empty()
+        && segments
+            .into_iter()
+            .all(|segment| safe_diagnostic_command(&segment))
+}
+
+fn harmless_redirection(word: &str) -> bool {
+    matches!(
+        word,
+        "2>&1"
+            | "1>&2"
+            | ">&2"
+            | ">&1"
+            | "2>/dev/null"
+            | ">/dev/null"
+            | "1>/dev/null"
+            | "&>/dev/null"
+            | "</dev/null"
+    )
+}
+
+fn strip_redirections(segment: &[ShellWord]) -> Option<Vec<&str>> {
+    let mut words = Vec::new();
+    let mut index = 0;
+    while index < segment.len() {
+        let word = &segment[index];
+        if word.redirect {
+            if harmless_redirection(&word.text) {
+                index += 1;
+                continue;
+            }
+            let target = segment.get(index + 1)?;
+            if matches!(word.text.as_str(), ">" | "1>" | "2>" | "&>" | "<")
+                && !target.redirect
+                && target.text == "/dev/null"
+            {
+                index += 2;
+                continue;
+            }
+            return None;
+        }
+        words.push(word.text.as_str());
+        index += 1;
+    }
+    Some(words)
+}
+
+fn safe_diagnostic_command(segment: &[ShellWord]) -> bool {
+    let Some(words) = strip_redirections(segment) else {
+        return false;
+    };
+    let Some((executable, arguments)) = words.split_first() else {
         return false;
     };
     let executable = std::path::Path::new(executable)
@@ -183,16 +380,84 @@ fn safe_diagnostic_command(command: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or(executable);
     match executable {
-        "git" => matches!(
-            words.next(),
-            Some("status" | "diff" | "log" | "ls-files" | "show" | "rev-parse")
-        ),
-        "cargo" => matches!(
-            words.next(),
-            Some("test" | "check" | "build" | "clippy" | "fmt" | "metadata")
-        ),
-        "grep" | "rg" | "find" | "cat" | "head" | "tail" | "ls" | "pwd" | "wc" | "file"
-        | "sort" => true,
+        "git" => safe_git(arguments),
+        "cargo" => safe_cargo(arguments),
+        "find" => !arguments.iter().any(|word| {
+            matches!(
+                *word,
+                "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-delete"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        }),
+        "sort" => !arguments.iter().any(|word| {
+            *word == "-o"
+                || word.starts_with("--output")
+                || (word.starts_with('-') && !word.starts_with("--") && word.contains('o'))
+        }),
+        "rg" => !arguments.iter().any(|word| word.starts_with("--pre")),
+        "cd" | "echo" | "printf" | "true" | "false" | ":" | "pwd" | "test" | "[" | "type"
+        | "which" | "grep" | "egrep" | "fgrep" | "cat" | "head" | "tail" | "ls" | "wc" | "file"
+        | "stat" | "tr" | "cut" | "uniq" | "nl" | "basename" | "dirname" | "readlink"
+        | "realpath" | "du" | "df" | "tree" | "diff" | "cmp" | "shasum" | "sha256sum"
+        | "md5sum" | "od" | "xxd" | "hexdump" | "strings" | "column" | "date" => true,
+        _ => false,
+    }
+}
+
+fn safe_git(arguments: &[&str]) -> bool {
+    let mut index = 0;
+    while let Some(word) = arguments.get(index) {
+        match *word {
+            "-C" => index += 2,
+            "--no-pager" | "-P" => index += 1,
+            _ => break,
+        }
+    }
+    let Some(subcommand) = arguments.get(index) else {
+        return false;
+    };
+    matches!(
+        *subcommand,
+        "status"
+            | "diff"
+            | "log"
+            | "ls-files"
+            | "show"
+            | "rev-parse"
+            | "grep"
+            | "rev-list"
+            | "blame"
+            | "cat-file"
+            | "ls-tree"
+            | "describe"
+            | "shortlog"
+    ) && !arguments[index + 1..]
+        .iter()
+        .any(|word| word.starts_with("--output"))
+}
+
+fn safe_cargo(arguments: &[&str]) -> bool {
+    let mut index = 0;
+    while arguments
+        .get(index)
+        .is_some_and(|word| word.starts_with('+'))
+    {
+        index += 1;
+    }
+    let Some(subcommand) = arguments.get(index) else {
+        return false;
+    };
+    let rest = &arguments[index + 1..];
+    match *subcommand {
+        "test" | "check" | "build" | "clippy" | "metadata" | "tree" => !rest.contains(&"--fix"),
+        "fmt" => rest.contains(&"--check"),
         _ => false,
     }
 }
@@ -273,6 +538,10 @@ fn decode_assistant(value: &Value) -> ClaudeRecord {
             summary: question_summary(tool.get("input").unwrap_or(&Value::Null)),
             denials: vec![PermissionDenial {
                 tool_name: "AskUserQuestion".to_owned(),
+                tool_use_id: tool
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 tool_input: tool.get("input").cloned().unwrap_or(Value::Null),
             }],
             question: true,
@@ -317,12 +586,17 @@ fn decode_result(value: &Value) -> ClaudeRecord {
         .filter_map(|denial| {
             Some(PermissionDenial {
                 tool_name: denial.get("tool_name")?.as_str()?.to_owned(),
+                tool_use_id: denial
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 tool_input: denial.get("tool_input").cloned().unwrap_or(Value::Null),
             })
         })
         .collect::<Vec<_>>();
     // `permission_denials` is cumulative history, not proof of an unresolved
-    // request. Provider maps mutation/unsafe denials separately.
+    // request. Provider splits it into historical and newly raised denials and
+    // applies stage semantics separately.
     let success = !value
         .get("is_error")
         .and_then(Value::as_bool)
@@ -333,7 +607,7 @@ fn decode_result(value: &Value) -> ClaudeRecord {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let error = (!success && denials.is_empty()).then(|| {
+    let error = (!success).then(|| {
         value
             .get("error")
             .and_then(Value::as_str)
@@ -393,6 +667,22 @@ impl<T> Pipe for T {}
 mod tests {
     use super::*;
 
+    fn bash(command: &str) -> PermissionDenial {
+        PermissionDenial {
+            tool_name: "Bash".to_owned(),
+            tool_use_id: None,
+            tool_input: serde_json::json!({ "command": command }),
+        }
+    }
+
+    fn tool(name: &str, input: Value) -> PermissionDenial {
+        PermissionDenial {
+            tool_name: name.to_owned(),
+            tool_use_id: None,
+            tool_input: input,
+        }
+    }
+
     #[test]
     fn partial_record_waits_for_newline() {
         assert_eq!(first_record(br#"{"type":"system"}"#).unwrap(), None);
@@ -414,8 +704,8 @@ mod tests {
     }
 
     #[test]
-    fn structured_denial_stays_structured() {
-        let raw = b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"permission_denials\":[{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"/tmp/a\"}}]}\n";
+    fn structured_denial_stays_structured_and_keeps_tool_use_id() {
+        let raw = b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\",\"permission_denials\":[{\"tool_name\":\"Write\",\"tool_use_id\":\"toolu_01A\",\"tool_input\":{\"file_path\":\"/tmp/a\"}}]}\n";
         let Some((
             ClaudeRecord::Result {
                 success, denials, ..
@@ -426,29 +716,162 @@ mod tests {
             panic!()
         };
         assert!(success);
+        assert_eq!(denials[0].tool_use_id.as_deref(), Some("toolu_01A"));
         assert_eq!(denials[0].exact_rule().unwrap(), "Edit(//tmp/a)");
     }
 
     #[test]
-    fn recovered_diagnostic_denial_is_not_terminal_attention() {
-        let denial = PermissionDenial {
-            tool_name: "Bash".to_owned(),
-            tool_input: serde_json::json!({"command":"cargo test && cargo clippy"}),
-        };
-        assert!(denial.is_recovered_diagnostic());
-        assert!(!denial.requires_terminal_attention());
-        assert!(denial.exact_rule().is_err());
+    fn same_request_prefers_tool_use_id_then_structure() {
+        let mut first = bash("cargo test 2>&1 | tail -20");
+        first.tool_use_id = Some("toolu_1".to_owned());
+        let mut second = bash("cargo test 2>&1 | tail -20");
+        second.tool_use_id = Some("toolu_2".to_owned());
+        assert!(!first.same_request(&second));
+        assert!(first.same_request(&first.clone()));
+        let untagged = bash("cargo test 2>&1 | tail -20");
+        assert!(untagged.same_request(&first));
+        assert!(!untagged.same_request(&bash("cargo test")));
     }
 
     #[test]
-    fn mutating_or_ambiguous_bash_denial_stays_terminal_attention() {
-        let denial = PermissionDenial {
-            tool_name: "Bash".to_owned(),
-            tool_input: serde_json::json!({"command":"rm -rf /tmp/output && git status"}),
-        };
-        assert!(!denial.is_recovered_diagnostic());
-        assert!(denial.requires_terminal_attention());
+    fn simple_synthetic_diagnostic_is_still_recovered() {
+        let denial = bash("cargo test && cargo clippy");
+        assert!(denial.is_recovered_diagnostic());
+        assert!(!denial.requires_terminal_attention(StageKind::Implementation));
         assert!(denial.exact_rule().is_err());
+    }
+
+    // Real shapes below are copied structurally from native role_core_v3 logs.
+
+    #[test]
+    fn real_invalid_plan_stop_diagnostic_wrapper_is_recovered() {
+        let denial = bash(
+            "cd \"/ABS/EVAL/WORKTREE\" && git ls-files | head -100 && echo \"---grep---\" && grep -rniE \"ConfigRegistry|config_registry|config-registry\" --exclude-dir=.git . ; echo \"grep exit: $?\"",
+        );
+        assert!(denial.is_recovered_diagnostic());
+        assert!(!denial.requires_terminal_attention(StageKind::Implementation));
+    }
+
+    #[test]
+    fn real_cargo_diagnostics_with_stderr_plumbing_are_recovered() {
+        for command in [
+            "cd \"/ABS/EVAL/WORKTREE\" && cargo test 2>&1 | tail -8; cargo clippy --all-targets 2>&1 | tail -30",
+            "cd \"/ABS/EVAL/WORKTREE\" && cat Cargo.toml && cargo build 2>&1 | tail -3",
+            "cargo test 2>&1 | tail -20",
+            "cd \"/ABS/EVAL/WORKTREE\" && cat Cargo.toml .gitignore && git show --stat HEAD | head -20 && cargo build 2>&1 | tail -5",
+            "cargo check 2> /dev/null; git status 1>&2",
+        ] {
+            assert!(
+                bash(command).is_recovered_diagnostic(),
+                "should be diagnostic: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_scripts_substitution_and_assignments_stay_unclassified() {
+        for command in [
+            "cd \"/ABS/EVAL/WORKTREE\" && git ls-files && echo --- && for f in $(git ls-files); do echo \"=== $f\"; cat \"$f\"; done",
+            "R=/ABS/EVAL/WORKTREE; grep -rniE \"registry\" \"$R\" 2>/dev/null | head -100",
+            "cd \"$(git rev-parse --show-toplevel)\" 2>/dev/null; cat -n src/lib.rs",
+            "git grep -n foo $(git rev-list --all)",
+            "(cd src && cat lib.rs)",
+            "cat `ls`",
+            "bash -c 'cargo test'",
+            "sh scripts/check.sh",
+        ] {
+            let denial = bash(command);
+            assert!(
+                !denial.is_recovered_diagnostic(),
+                "must stay unclassified: {command}"
+            );
+            assert!(denial.requires_terminal_attention(StageKind::Implementation));
+            // Read-only stages do not depend on shell classification at all.
+            assert!(!denial.requires_terminal_attention(StageKind::CodeQualityReview));
+            assert!(!denial.requires_terminal_attention(StageKind::SpecReview));
+        }
+    }
+
+    #[test]
+    fn mutating_shell_is_never_diagnostic() {
+        for command in [
+            "cd \"/ABS/EVAL/WORKTREE\" && sed -i '' 's/    value + 2/    value * 2/' src/lib.rs && git diff && cargo test 2>&1 | tail -15",
+            "sed -i '' 's/^    input\\.to_owned()$/    input.trim().to_owned()/' src/lib.rs && git diff",
+            "perl -i -pe 's/a/b/' src/lib.rs",
+            "rm -rf /tmp/output && git status",
+            "mv src/a.rs src/b.rs",
+            "cp src/a.rs src/b.rs",
+            "cargo test 2>&1 | tee out.log",
+            "cargo test > out.log 2>&1",
+            "cargo test 2>out.log",
+            "echo x >> file",
+            "cat < input.txt",
+            "cargo fmt",
+            "cargo clippy --fix",
+            "git status --output=x",
+            "git -c alias.st='!rm -rf .' st",
+            "sort -o out.txt input.txt",
+            "find . -name '*.rs' -exec rm {} \\;",
+            "find . -delete",
+            "rg --pre 'rm -rf' foo",
+            "xargs rm",
+            "printf x >> file && git diff",
+            "cargo run",
+        ] {
+            let denial = bash(command);
+            assert!(
+                !denial.is_recovered_diagnostic(),
+                "must not pass: {command}"
+            );
+            assert!(denial.requires_terminal_attention(StageKind::Implementation));
+        }
+        assert!(bash("cargo fmt --check").is_recovered_diagnostic());
+        assert!(
+            bash("git -C /ABS/EVAL/WORKTREE --no-pager log --oneline -5").is_recovered_diagnostic()
+        );
+        assert!(
+            bash("find . -type d \\( -name .git -o -name target \\) -prune -o -type f -print")
+                .is_recovered_diagnostic()
+        );
+        assert!(bash("grep -rn \"a > b\" src").is_recovered_diagnostic());
+    }
+
+    #[test]
+    fn read_only_stage_terminal_attention_only_for_mutation_or_question() {
+        let edit = tool(
+            "Edit",
+            serde_json::json!({"file_path":"/ABS/EVAL/WORKTREE/src/lib.rs"}),
+        );
+        let write = tool(
+            "Write",
+            serde_json::json!({"file_path":"/ABS/EVAL/WORKTREE/src/lib.rs"}),
+        );
+        let question = tool("AskUserQuestion", serde_json::json!({"questions":[]}));
+        for kind in [
+            StageKind::CodeQualityReview,
+            StageKind::SpecReview,
+            StageKind::Research,
+        ] {
+            assert!(read_only_stage(kind));
+            assert!(edit.requires_terminal_attention(kind));
+            assert!(write.requires_terminal_attention(kind));
+            assert!(question.requires_terminal_attention(kind));
+            assert!(!bash("sed -i '' 's/a/b/' src/lib.rs").requires_terminal_attention(kind));
+            assert!(
+                !tool("Read", serde_json::json!({"file_path":"/x"}))
+                    .requires_terminal_attention(kind)
+            );
+        }
+        for kind in [StageKind::Implementation, StageKind::Fix] {
+            assert!(!read_only_stage(kind));
+            assert!(edit.requires_terminal_attention(kind));
+            assert!(question.requires_terminal_attention(kind));
+            assert!(bash("sed -i '' 's/a/b/' src/lib.rs").requires_terminal_attention(kind));
+            assert!(
+                !tool("Read", serde_json::json!({"file_path":"/x"}))
+                    .requires_terminal_attention(kind)
+            );
+        }
     }
 
     #[test]
@@ -457,48 +880,70 @@ mod tests {
         let workspace = temp.path().join("worktree");
         std::fs::create_dir_all(workspace.join("src")).unwrap();
         std::fs::write(workspace.join("src/lib.rs"), "fn main() {}\n").unwrap();
-        let denial = PermissionDenial {
-            tool_name: "Edit".to_owned(),
-            tool_input: serde_json::json!({
+        let denial = tool(
+            "Edit",
+            serde_json::json!({
                 "file_path": workspace.join("src/lib.rs").to_string_lossy()
             }),
-        };
+        );
         assert!(denial.is_safe_eval_edit(&workspace));
-        let escape = PermissionDenial {
-            tool_name: "Edit".to_owned(),
-            tool_input: serde_json::json!({"file_path": "/tmp/other-repo/file"}),
-        };
+        let escape = tool(
+            "Edit",
+            serde_json::json!({"file_path": "/tmp/other-repo/file"}),
+        );
         assert!(!escape.is_safe_eval_edit(&workspace));
         let outside = temp.path().join("outside.txt");
         std::fs::write(&outside, "outside\n").unwrap();
         let link = workspace.join("src/link.txt");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
-        let symlink = PermissionDenial {
-            tool_name: "Write".to_owned(),
-            tool_input: serde_json::json!({"file_path": link}),
-        };
+        let symlink = tool("Write", serde_json::json!({"file_path": link}));
         assert!(!symlink.is_safe_eval_edit(&workspace));
+        let wildcard = tool(
+            "Edit",
+            serde_json::json!({"file_path": workspace.join("src/*.rs").to_string_lossy()}),
+        );
+        assert!(!wildcard.is_safe_eval_edit(&workspace));
+        let traversal = tool(
+            "Edit",
+            serde_json::json!({"file_path": workspace.join("src/../../outside.txt").to_string_lossy()}),
+        );
+        assert!(!traversal.is_safe_eval_edit(&workspace));
     }
 
     #[test]
     fn ask_user_question_always_decodes_as_question_attention() {
-        let raw = br#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"question":"Choose?"}]}}]}}
+        let raw = br#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_q","name":"AskUserQuestion","input":{"questions":[{"question":"Choose?"}]}}]}}
 "#;
-        let Some((ClaudeRecord::NeedsUser { question, .. }, _)) = first_record(raw).unwrap() else {
+        let Some((
+            ClaudeRecord::NeedsUser {
+                question, denials, ..
+            },
+            _,
+        )) = first_record(raw).unwrap()
+        else {
             panic!()
         };
         assert!(question);
+        assert_eq!(denials[0].tool_use_id.as_deref(), Some("toolu_q"));
     }
 
     #[test]
     fn compound_bash_is_not_misrepresented_as_one_exact_rule() {
-        let denial = PermissionDenial {
-            tool_name: "Bash".to_owned(),
-            tool_input: serde_json::json!({"command":"printf x >> file && git diff"}),
-        };
+        let denial = bash("printf x >> file && git diff");
         assert!(matches!(
             denial.exact_rule(),
             Err(ClaudeProviderError::UnsafePermission(_))
         ));
+    }
+
+    #[test]
+    fn failed_result_with_denials_still_carries_error() {
+        let raw = b"{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":\"\",\"permission_denials\":[{\"tool_name\":\"Bash\",\"tool_use_id\":\"t\",\"tool_input\":{\"command\":\"cargo test\"}}]}\n";
+        let Some((ClaudeRecord::Result { success, error, .. }, _)) = first_record(raw).unwrap()
+        else {
+            panic!()
+        };
+        assert!(!success);
+        assert_eq!(error.as_deref(), Some("error_max_turns"));
     }
 }
