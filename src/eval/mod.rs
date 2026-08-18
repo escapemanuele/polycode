@@ -20,4 +20,6 @@ pub use result::{
     SpecMetrics, SpecMetricsV2,
 };
 pub use runner::{EvalRunOptions, EvalRunSummary, EvalRunner, EvalRunnerError};
+#[cfg(test)]
+pub(crate) use scorer::{ScoreInput, score};
 pub use suite::{EvalSuite, EvalSuiteError};

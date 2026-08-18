@@ -328,14 +328,14 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 // only requests not seen by an earlier invocation are unresolved.
                 // Re-attempted requests carry fresh tool_use_ids and count as new.
                 let unresolved = Self::new_denials(store, &session, denials)?;
-                let eval_continued = self.eval_auto_approve
-                    && success
-                    && Self::eval_mutation_continued(store, &session)?;
+                // Disposable eval never grants Bash; a denied call never ran, so
+                // only mutation/question/unknown requests block a successful
+                // eval terminal. Production keeps stage-kind conservative rules.
                 let needs_user = !unresolved.is_empty()
                     && (!success
                         || unresolved.iter().any(|denial| {
-                            if eval_continued {
-                                denial.requires_attention_after_eval_continuation()
+                            if self.eval_auto_approve {
+                                denial.requires_eval_terminal_attention()
                             } else {
                                 denial.requires_terminal_attention(request.stage_kind())
                             }
@@ -513,41 +513,6 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             }
         }
         Ok(historical)
-    }
-
-    /// Whether an earlier invocation of this session was resumed by the
-    /// disposable eval policy with an exact Edit/Write grant.
-    ///
-    /// Explicit durable state: the resumed process spec argv persisted the
-    /// exact `Edit(...)` rules Polycode granted. Eval mode can only reach a
-    /// resume through `safe_eval_grants`, so any such rule proves the safe
-    /// mutation continuation happened for this native session.
-    fn eval_mutation_continued(
-        store: &SqliteStore,
-        session: &ProviderSessionRecord,
-    ) -> Result<bool, ClaudeProviderError> {
-        if session.invocation() <= 1 {
-            return Ok(false);
-        }
-        for process in store.list_managed_processes(session.run_id())? {
-            if process.stage_id() != session.stage_id()
-                || process.attempt() != session.attempt()
-                || process.invocation() <= 1
-                || process.invocation() > session.invocation()
-            {
-                continue;
-            }
-            let argv = process.spec().argv();
-            let granted_edit = argv
-                .iter()
-                .skip_while(|arg| arg.as_os_str() != "--allowedTools")
-                .skip(1)
-                .any(|arg| arg.to_string_lossy().starts_with("Edit("));
-            if granted_edit {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Splits cumulative denial history into requests not yet observed.
@@ -1867,17 +1832,14 @@ mod tests {
         );
     }
 
+    /// Bash-only attempted mutation: production stays conservative; disposable
+    /// eval completes with an unchanged repository and lets trusted scoring
+    /// produce a normal FAIL (not `InfrastructureFailure`).
     #[test]
-    fn implementer_mutating_bash_only_stays_needs_user() {
-        let backend = FixtureBackend::default();
-        let (_temp, _database, run_id, mut store, provider) =
-            fixture_with_backend(backend.clone(), true);
-        let worktree = store
-            .load_workspace(run_id)
-            .unwrap()
-            .unwrap()
-            .worktree_path()
-            .to_path_buf();
+    fn implementer_mutating_bash_only_is_conservative_in_production_and_scored_in_eval() {
+        // Production: NeedsUser, unresolved.
+        let (backend, _temp, run_id, mut store, provider, worktree, _target) =
+            bugfix_fixture(false);
         backend.set_first_result(success_result(
             "Blocked.",
             &json!([bash_denial(
@@ -1893,16 +1855,101 @@ mod tests {
                 .can_auto_resolve_attention(&mut store, run_id, request)
                 .unwrap()
         );
-        assert!(
-            engine
-                .resolve_attention(&mut store, run_id, request)
-                .is_err()
-        );
         assert_eq!(
             store.load_run(run_id).unwrap().run.status(),
             RunStatus::NeedsUser
         );
         assert!(store.list_artifacts(run_id).unwrap().is_empty());
+
+        // Eval: provider Completed, no Bash granted, repository untouched.
+        let (backend, _temp, run_id, mut store, provider, worktree, target) = bugfix_fixture(true);
+        backend.set_first_result(success_result(
+            "Blocked.",
+            &json!([bash_denial(
+                "toolu_sed",
+                REAL_IMPLEMENTER_SED_BASH,
+                &worktree
+            )]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "sed only");
+        drive_to_completion(&mut engine, &mut store, run_id);
+        assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 1);
+        assert_no_bash_or_broad_grants(&all_argv(&store, run_id));
+        let artifacts = store.list_artifacts(run_id).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), BROKEN_LIB);
+
+        // Trusted harness view: expected diff absent → normal benchmark FAIL.
+        let suite = crate::eval::EvalSuite::load("role_core_v3").unwrap();
+        let case = suite
+            .cases()
+            .iter()
+            .find(|case| case.id == "implementer_basic_bugfix")
+            .unwrap();
+        let artifact = std::fs::read_to_string(artifacts[0].path()).unwrap();
+        let scored = crate::eval::score(
+            case,
+            crate::eval::ScoreInput {
+                artifact: Some(&artifact),
+                diff: "",
+                validation_pass: Some(false),
+            },
+        )
+        .unwrap();
+        assert!(!scored.passed);
+    }
+
+    /// Exact real `invalid_plan_stop` sequence: denied initial diagnostic Bash,
+    /// denied Explore-subagent Bash with `for`/`$(...)`, successful terminal,
+    /// no Edit/Write/question, empty diff.
+    #[test]
+    fn real_invalid_plan_stop_sequence_completes_in_eval_and_stays_conservative_in_production() {
+        const INITIAL: &str = "cd \"WORKTREE\" && git ls-files | head -100 && echo \"--- grep ---\" && grep -rniE \"ConfigRegistry|config_registry|config-registry\" --exclude-dir=.git . ; echo \"exit=$?\"";
+        const EXPLORE: &str = "cd \"WORKTREE\" && for f in .gitignore Cargo.toml src/lib.rs; do echo \"=== $f ($(wc -l < \"$f\") lines) ===\"; cat \"$f\"; done; git status --porcelain";
+        for eval in [true, false] {
+            let backend = FixtureBackend::default();
+            let (_temp, _database, run_id, mut store, provider) =
+                fixture_with_backend(backend.clone(), eval);
+            let worktree = store
+                .load_workspace(run_id)
+                .unwrap()
+                .unwrap()
+                .worktree_path()
+                .to_path_buf();
+            backend.set_first_result(success_result(
+                "## Result: plan mismatch\n```json\n{\"eval_outcome\":\"plan_mismatch\"}\n```\n",
+                &json!([
+                    bash_denial("toolu_01BHjWDwh3nEk9rmuS32HDdM", INITIAL, &worktree),
+                    bash_denial("toolu_01ExploreForLoop", EXPLORE, &worktree),
+                ]),
+            ));
+            let mut engine = WorkflowEngine::new(provider, "plan mismatch");
+            if eval {
+                drive_to_completion(&mut engine, &mut store, run_id);
+                assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 1);
+                let artifacts = store.list_artifacts(run_id).unwrap();
+                assert_eq!(artifacts.len(), 1);
+                assert!(
+                    std::fs::read_to_string(artifacts[0].path())
+                        .unwrap()
+                        .contains("plan_mismatch")
+                );
+                assert!(worktree_status(&worktree).is_empty());
+                assert_no_bash_or_broad_grants(&all_argv(&store, run_id));
+            } else {
+                let request = drive_to_attention(&mut engine, &mut store, run_id);
+                assert!(
+                    !engine
+                        .can_auto_resolve_attention(&mut store, run_id, request)
+                        .unwrap()
+                );
+                assert_eq!(
+                    store.load_run(run_id).unwrap().run.status(),
+                    RunStatus::NeedsUser
+                );
+                assert!(store.list_artifacts(run_id).unwrap().is_empty());
+            }
+        }
     }
 
     #[test]
