@@ -4,9 +4,12 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
+use std::collections::BTreeMap;
+
 use crate::domain::{
     ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
-    DomainEventKind, Role, RunId, RunStatus, StageId, StageKind, StageStatus, WorkflowKind,
+    DomainEventKind, NativeModelUsage, Role, RunId, RunStatus, StageId, StageKind, StageStatus,
+    WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
 use crate::store::{RunRevision, SequencedEvent, SqliteStore, StoreError};
@@ -57,10 +60,42 @@ pub struct AttentionSummary {
     pub summary: String,
 }
 
+/// Aggregated provider-native usage folded from committed usage events.
+///
+/// Units are provider-native and never normalized across providers; totals
+/// from different providers must not be compared directly. Optional
+/// dimensions stay `None` while no event reported them (`None` = unavailable,
+/// `Some(0)` = explicitly reported zero).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UsageSummary {
     pub input_units: u64,
     pub output_units: u64,
+    pub cache_read_units: Option<u64>,
+    pub cache_write_units: Option<u64>,
+    pub reasoning_output_units: Option<u64>,
+}
+
+impl UsageSummary {
+    fn absorb(
+        &mut self,
+        input_units: u64,
+        output_units: u64,
+        cache_read_units: Option<u64>,
+        cache_write_units: Option<u64>,
+        reasoning_output_units: Option<u64>,
+    ) {
+        self.input_units = self.input_units.saturating_add(input_units);
+        self.output_units = self.output_units.saturating_add(output_units);
+        absorb_dimension(&mut self.cache_read_units, cache_read_units);
+        absorb_dimension(&mut self.cache_write_units, cache_write_units);
+        absorb_dimension(&mut self.reasoning_output_units, reasoning_output_units);
+    }
+}
+
+fn absorb_dimension(total: &mut Option<u64>, delta: Option<u64>) {
+    if let Some(delta) = delta {
+        *total = Some(total.unwrap_or(0).saturating_add(delta));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +172,20 @@ pub struct ProcessLogView {
     pub stderr: ProcessLogStream,
 }
 
+/// Durable per-stage execution evidence for observability.
+///
+/// `latency_ms` is provider execution latency: the span from the stage's
+/// first committed `ProviderStarted` event to its last committed
+/// `ProviderCompleted`/`ProviderFailed` event, across every attempt. It
+/// excludes scheduler/queueing delay and is unavailable while no terminal
+/// provider event exists. `invocation_count` counts persisted managed native
+/// invocations for the stage across attempts. `injected_prompt_bytes` sums
+/// the exact stdin bytes Polycode piped into those invocations (initial
+/// prompts plus continuations); it measures only Polycode-injected content,
+/// never files, project instructions, MCP context, or anything the native
+/// runtime read on its own. `native_model_usage` is the runtime-reported
+/// per-model breakdown merged by model; it overlaps `usage` and must not be
+/// summed with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageExecutionEvidence {
     pub stage_id: StageId,
@@ -146,8 +195,12 @@ pub struct StageExecutionEvidence {
     pub confirmed_model: Option<String>,
     pub provider_cli_version: Option<String>,
     pub usage: UsageSummary,
+    pub native_model_usage: Option<Vec<NativeModelUsage>>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub latency_ms: Option<u64>,
+    pub invocation_count: u64,
+    pub injected_prompt_bytes: Option<u64>,
 }
 
 pub(crate) fn list(store: &SqliteStore) -> Result<Vec<RunListItem>, AppError> {
@@ -382,6 +435,73 @@ pub(crate) fn process_log_tail(
     })
 }
 
+/// Counts persisted native invocations for one stage and sums the exact
+/// stdin bytes Polycode piped into them (initial prompt plus continuations).
+///
+/// The stdin file holds the exact immutable bytes piped into the native CLI
+/// (SHA-256 verified at spawn); its length IS the injected prompt size.
+/// Missing files or stdin-less invocations leave the sum unavailable rather
+/// than pretending zero.
+/// Merges runtime-reported per-model breakdown entries by model name.
+///
+/// The merged view stays separate from the aggregate usage fold: the two
+/// views overlap (the breakdown spans subagent models) and must never be
+/// summed together.
+fn merge_native_models<'entry>(
+    merged: &mut BTreeMap<String, NativeModelUsage>,
+    entries: impl Iterator<Item = &'entry NativeModelUsage>,
+) {
+    for entry in entries {
+        let model = merged
+            .entry(entry.model.clone())
+            .or_insert_with(|| NativeModelUsage {
+                model: entry.model.clone(),
+                input_units: 0,
+                output_units: 0,
+                cache_read_units: None,
+                cache_write_units: None,
+            });
+        model.input_units = model.input_units.saturating_add(entry.input_units);
+        model.output_units = model.output_units.saturating_add(entry.output_units);
+        absorb_dimension(&mut model.cache_read_units, entry.cache_read_units);
+        absorb_dimension(&mut model.cache_write_units, entry.cache_write_units);
+    }
+}
+
+/// Clamped span between the stage's first `ProviderStarted` and last terminal
+/// provider event. Same definition as eval `duration_ms`; committed event
+/// timestamps are monotone per stage, so the clamp is defensive only.
+fn provider_latency_ms((start, finish): (DateTime<Utc>, DateTime<Utc>)) -> u64 {
+    u64::try_from(
+        finish
+            .signed_duration_since(start)
+            .num_milliseconds()
+            .max(0),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn invocation_telemetry(
+    store: &SqliteStore,
+    run_id: RunId,
+    stage_id: &StageId,
+) -> Result<(u64, Option<u64>), AppError> {
+    let mut invocation_count = 0_u64;
+    let mut injected_prompt_bytes: Option<u64> = None;
+    for process in store.list_managed_processes(run_id)? {
+        if process.stage_id() != stage_id {
+            continue;
+        }
+        invocation_count += 1;
+        if let Some(path) = process.spec().stdin_path()
+            && let Ok(metadata) = std::fs::metadata(path)
+        {
+            absorb_dimension(&mut injected_prompt_bytes, Some(metadata.len()));
+        }
+    }
+    Ok((invocation_count, injected_prompt_bytes))
+}
+
 pub(crate) fn stage_execution_evidence(
     store: &mut SqliteStore,
     run_id: RunId,
@@ -401,6 +521,7 @@ pub(crate) fn stage_execution_evidence(
         .ok_or(super::RoutingError::MissingRoleRoute(stage.role()))?;
     let events = store.load_events(run_id)?;
     let mut usage = UsageSummary::default();
+    let mut native_models: BTreeMap<String, NativeModelUsage> = BTreeMap::new();
     let mut started_at = None;
     let mut finished_at = None;
     let mut started_target = None;
@@ -423,10 +544,20 @@ pub(crate) fn stage_execution_evidence(
             DomainEventKind::ProviderUsageUpdated {
                 input_units,
                 output_units,
+                cache_read_units,
+                cache_write_units,
+                reasoning_output_units,
+                native_models: event_models,
                 ..
             } => {
-                usage.input_units = usage.input_units.saturating_add(*input_units);
-                usage.output_units = usage.output_units.saturating_add(*output_units);
+                usage.absorb(
+                    *input_units,
+                    *output_units,
+                    *cache_read_units,
+                    *cache_write_units,
+                    *reasoning_output_units,
+                );
+                merge_native_models(&mut native_models, event_models.iter().flatten());
             }
             DomainEventKind::ProviderCompleted { .. } | DomainEventKind::ProviderFailed { .. } => {
                 finished_at = Some(*event.event.occurred_at());
@@ -434,6 +565,8 @@ pub(crate) fn stage_execution_evidence(
             _ => {}
         }
     }
+    let latency_ms = started_at.zip(finished_at).map(provider_latency_ms);
+    let (invocation_count, injected_prompt_bytes) = invocation_telemetry(store, run_id, stage_id)?;
     let session = store
         .list_provider_sessions(run_id)?
         .into_iter()
@@ -461,8 +594,13 @@ pub(crate) fn stage_execution_evidence(
             .and_then(crate::providers::ProviderSessionRecord::cli_version)
             .map(ToOwned::to_owned),
         usage,
+        native_model_usage: (!native_models.is_empty())
+            .then(|| native_models.into_values().collect()),
         started_at,
         finished_at,
+        latency_ms,
+        invocation_count,
+        injected_prompt_bytes,
     })
 }
 
@@ -543,11 +681,19 @@ fn usage_summary(events: &[SequencedEvent]) -> UsageSummary {
             if let DomainEventKind::ProviderUsageUpdated {
                 input_units,
                 output_units,
+                cache_read_units,
+                cache_write_units,
+                reasoning_output_units,
                 ..
             } = event.event.kind()
             {
-                usage.input_units = usage.input_units.saturating_add(*input_units);
-                usage.output_units = usage.output_units.saturating_add(*output_units);
+                usage.absorb(
+                    *input_units,
+                    *output_units,
+                    *cache_read_units,
+                    *cache_write_units,
+                    *reasoning_output_units,
+                );
             }
             usage
         })

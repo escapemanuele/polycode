@@ -88,10 +88,7 @@ impl FakeScenario {
             scenario = scenario.stage(stage.id().as_str()).events([
                 FakeEvent::Started,
                 FakeEvent::progress(format!("Executing {}", stage.id())),
-                FakeEvent::Usage(UsageDelta {
-                    input_units: 10,
-                    output_units: 5,
-                }),
+                FakeEvent::Usage(UsageDelta::stable(10, 5)),
                 FakeEvent::Completed,
             ]);
         }
@@ -228,7 +225,7 @@ fn to_signal(
             summary: summary.clone(),
             request_id: None,
         },
-        FakeEvent::Usage(usage) => ProviderSignal::Usage(*usage),
+        FakeEvent::Usage(usage) => ProviderSignal::Usage(usage.clone()),
         FakeEvent::Paused => ProviderSignal::Paused,
         FakeEvent::Interrupted => ProviderSignal::Interrupted,
         FakeEvent::Completed => ProviderSignal::Completed,

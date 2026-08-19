@@ -260,6 +260,10 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
     ) -> Result<ProviderPoll, ClaudeProviderError> {
         let expected = session.revision();
         let mut commit = ProviderCommit::new(chunk, end);
+        // Terminal result records carry the invocation's authoritative usage;
+        // it is emitted atomically ahead of the terminal signal so replay
+        // cannot split usage from the outcome (mirrors Codex turn.completed).
+        let mut terminal_usage = None;
         let signal = match record {
             ClaudeRecord::Initialized { session_id, model } => {
                 let native = ProviderSessionId::new(session_id)
@@ -282,7 +286,6 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 }
             }
             ClaudeRecord::Progress(message) => ProviderSignal::Progress(message),
-            ClaudeRecord::Usage(usage) => ProviderSignal::Usage(usage),
             ClaudeRecord::NeedsUser {
                 summary,
                 denials,
@@ -323,7 +326,9 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 error,
                 denials,
                 session_id: _,
+                usage,
             } => {
+                terminal_usage = usage;
                 // Claude may repeat earlier denials in a resumed terminal result;
                 // only requests not seen by an earlier invocation are unresolved.
                 // Re-attempted requests carry fresh tool_use_ids and count as new.
@@ -391,10 +396,12 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             }
             ClaudeRecord::Ignored => return Ok(ProviderPoll::Checkpoint(commit)),
         };
-        Ok(ProviderPoll::Emission {
-            signals: vec![signal],
-            commit,
-        })
+        let signals = terminal_usage
+            .map(ProviderSignal::Usage)
+            .into_iter()
+            .chain(std::iter::once(signal))
+            .collect();
+        Ok(ProviderPoll::Emission { signals, commit })
     }
 
     fn map_terminal_without_result(
@@ -1157,6 +1164,175 @@ mod tests {
                 .iter()
                 .any(|arg| { arg.to_string_lossy().starts_with(&expected) })
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one deterministic two-invocation sequence exercises usage, native breakdown, latency, and prompt-byte evidence together"
+    )]
+    fn terminal_usage_latency_and_prompt_bytes_are_observable_per_invocation() {
+        let backend = FixtureBackend::default();
+        let (_temp, database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        let workspace = store.load_workspace(run_id).unwrap().unwrap();
+        let target = workspace.worktree_path().join("README.md");
+        // Invocation 1: real-shape terminal usage plus one safe Edit denial.
+        backend.set_first_result(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "blocked edit",
+                "session_id": "native-session-1",
+                "permission_denials": [{"tool_name":"Edit","tool_input":{"file_path":target}}],
+                "usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 1221,
+                    "cache_read_input_tokens": 153_292,
+                    "cache_creation_input_tokens": 3638
+                },
+                "modelUsage": {
+                    "claude-fable-5": {
+                        "inputTokens": 8,
+                        "outputTokens": 1221,
+                        "cacheReadInputTokens": 153_292,
+                        "cacheCreationInputTokens": 3638
+                    }
+                }
+            })
+            .to_string(),
+        );
+        // Invocation 2 (continuation after auto-approval): its own usage.
+        backend.set_result(
+            2,
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "# Completed\napplied",
+                "session_id": "native-session-1",
+                "permission_denials": [{"tool_name":"Edit","tool_input":{"file_path":target}}],
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 40,
+                    "cache_read_input_tokens": 160_000
+                },
+                "modelUsage": {
+                    "claude-fable-5": {
+                        "inputTokens": 3,
+                        "outputTokens": 40,
+                        "cacheReadInputTokens": 160_000
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let mut engine = WorkflowEngine::new(provider, "safe edit");
+        let request = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap();
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("continuation did not complete: {status:?}"),
+            }
+        }
+
+        // Exactly one usage event per terminal result; replay-safe commit
+        // means no duplicates despite the intermediate NeedsUser round trip.
+        let events = store.load_events(run_id).unwrap();
+        let usage_events = events
+            .iter()
+            .filter_map(|event| match event.event.kind() {
+                crate::domain::DomainEventKind::ProviderUsageUpdated {
+                    input_units,
+                    output_units,
+                    cache_read_units,
+                    cache_write_units,
+                    native_models,
+                    ..
+                } => Some((
+                    *input_units,
+                    *output_units,
+                    *cache_read_units,
+                    *cache_write_units,
+                    native_models.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage_events.len(), 2);
+        assert_eq!(usage_events[0].0, 8);
+        assert_eq!(usage_events[0].2, Some(153_292));
+        assert_eq!(usage_events[1].1, 40);
+        // Second invocation reported no cache-write: unavailable, not zero.
+        assert_eq!(usage_events[1].3, None);
+
+        let stage_id = crate::domain::StageId::new("implementation").unwrap();
+        let evidence =
+            crate::app::query::stage_execution_evidence(&mut store, run_id, &stage_id).unwrap();
+        // Aggregate folds only the authoritative terminal usage totals; the
+        // native per-model breakdown is merged separately and never summed in.
+        assert_eq!(evidence.usage.input_units, 11);
+        assert_eq!(evidence.usage.output_units, 1261);
+        assert_eq!(evidence.usage.cache_read_units, Some(313_292));
+        assert_eq!(evidence.usage.cache_write_units, Some(3638));
+        assert_eq!(evidence.usage.reasoning_output_units, None);
+        let native = evidence.native_model_usage.clone().unwrap();
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].model, "claude-fable-5");
+        assert_eq!(native[0].input_units, 11);
+        assert_eq!(native[0].output_units, 1261);
+        assert_eq!(native[0].cache_read_units, Some(313_292));
+
+        // Invocation telemetry: two persisted invocations; injected prompt
+        // bytes equal the exact stdin bytes piped into each native process,
+        // with initial and resume invocations independently attributable.
+        let processes = store.list_managed_processes(run_id).unwrap();
+        assert_eq!(processes.len(), 2);
+        assert_eq!(evidence.invocation_count, 2);
+        let stdin_sizes = processes
+            .iter()
+            .map(|process| {
+                let path = process.spec().stdin_path().unwrap();
+                std::fs::metadata(path).unwrap().len()
+            })
+            .collect::<Vec<_>>();
+        let initial = std::fs::read_to_string(processes[0].spec().stdin_path().unwrap()).unwrap();
+        assert!(initial.starts_with("# Polycode stage"));
+        let resume = std::fs::read_to_string(processes[1].spec().stdin_path().unwrap()).unwrap();
+        assert!(resume.contains("approved the exact pending permission"));
+        assert_eq!(
+            evidence.injected_prompt_bytes,
+            Some(stdin_sizes.iter().sum::<u64>())
+        );
+
+        // Latency: provider execution span from first ProviderStarted to the
+        // final terminal provider event, deterministic from persisted events.
+        let expected = u64::try_from(
+            evidence
+                .finished_at
+                .unwrap()
+                .signed_duration_since(evidence.started_at.unwrap())
+                .num_milliseconds(),
+        )
+        .unwrap();
+        assert_eq!(evidence.latency_ms, Some(expected));
+        let mut reopened = SqliteStore::open(&database).unwrap();
+        let replayed =
+            crate::app::query::stage_execution_evidence(&mut reopened, run_id, &stage_id).unwrap();
+        assert_eq!(replayed, evidence);
     }
 
     #[test]

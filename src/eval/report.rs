@@ -151,10 +151,30 @@ pub fn render_report(results: &[EvalResultV1]) -> Result<String, EvalReportError
         }
         writeln!(
             output,
-            "\nMedian latency                 {} ms\nMedian usage                   {} input / {} output\nInfrastructure failures        {}\n",
-            summary.median_latency,
-            summary.median_input,
-            summary.median_output,
+            "\nMedian latency                 {} ms\nMedian usage (provider-native) {} input / {} output",
+            summary.median_latency, summary.median_input, summary.median_output,
+        )
+        .expect("String write cannot fail");
+        let optional_units = [
+            ("Median cache read units", summary.median_cache_read),
+            ("Median cache write units", summary.median_cache_write),
+            (
+                "Median reasoning output units",
+                summary.median_reasoning_output,
+            ),
+        ];
+        for (label, value) in optional_units {
+            if let Some(value) = value {
+                writeln!(output, "{label}  {value}").expect("String write cannot fail");
+            }
+        }
+        if let Some(bytes) = summary.median_injected_prompt_bytes {
+            writeln!(output, "Median injected prompt bytes   {bytes}")
+                .expect("String write cannot fail");
+        }
+        writeln!(
+            output,
+            "Usage units are provider-native (runtime-specific) and are not cross-provider normalized; never compare them across targets.\nInfrastructure failures        {}\n",
             summary.infrastructure_failures
         )
         .expect("String write cannot fail");
@@ -202,6 +222,11 @@ pub fn render_report(results: &[EvalResultV1]) -> Result<String, EvalReportError
             )
             .expect("String write cannot fail");
         }
+        writeln!(
+            output,
+            "\nThe comparison intentionally excludes usage units: provider-reported usage is runtime-specific and is not cross-provider normalized. Latency and injected prompt bytes are the cross-target comparable dimensions."
+        )
+        .expect("String write cannot fail");
     }
     Ok(output)
 }
@@ -262,6 +287,10 @@ struct TargetSummary {
     median_latency: u64,
     median_input: u64,
     median_output: u64,
+    median_cache_read: Option<u64>,
+    median_cache_write: Option<u64>,
+    median_reasoning_output: Option<u64>,
+    median_injected_prompt_bytes: Option<u64>,
     infrastructure_failures: u32,
 }
 
@@ -275,10 +304,18 @@ impl TargetSummary {
         let mut latency = Vec::new();
         let mut input = Vec::new();
         let mut output = Vec::new();
+        let mut cache_read = Vec::new();
+        let mut cache_write = Vec::new();
+        let mut reasoning_output = Vec::new();
+        let mut injected_prompt_bytes = Vec::new();
         for result in results {
             latency.push(result.latency_ms);
             input.push(result.usage.input_units);
             output.push(result.usage.output_units);
+            cache_read.extend(result.usage.cache_read_units);
+            cache_write.extend(result.usage.cache_write_units);
+            reasoning_output.extend(result.usage.reasoning_output_units);
+            injected_prompt_bytes.extend(result.injected_prompt_bytes);
             if result.status == EvalStatus::InfrastructureFailure {
                 summary.infrastructure_failures = summary.infrastructure_failures.saturating_add(1);
             }
@@ -386,6 +423,12 @@ impl TargetSummary {
         summary.median_latency = median(&mut latency);
         summary.median_input = median(&mut input);
         summary.median_output = median(&mut output);
+        // Medians over reporting results only; unavailable dimensions stay
+        // None rather than pretending zero.
+        summary.median_cache_read = optional_median(&mut cache_read);
+        summary.median_cache_write = optional_median(&mut cache_write);
+        summary.median_reasoning_output = optional_median(&mut reasoning_output);
+        summary.median_injected_prompt_bytes = optional_median(&mut injected_prompt_bytes);
         summary
     }
 
@@ -396,6 +439,10 @@ impl TargetSummary {
     const fn spec_total(&self) -> u32 {
         self.spec_missing_total + self.spec_wrong_total + self.spec_unrequested_total
     }
+}
+
+fn optional_median(values: &mut [u64]) -> Option<u64> {
+    (!values.is_empty()).then(|| median(values))
 }
 
 fn median(values: &mut [u64]) -> u64 {
@@ -467,6 +514,7 @@ mod tests {
             status: EvalStatus::Passed,
             metrics: Some(metrics),
             usage: EvalUsage::default(),
+            injected_prompt_bytes: None,
             latency_ms: 1,
             artifact_hash: None,
             diff_hash: "b".repeat(64),
@@ -501,11 +549,40 @@ mod tests {
                 duplicate_findings: 1,
             }),
         );
-        let report = render_report(&[v1, v2]).unwrap();
+        let mut with_resources = base(
+            "role_core_v2",
+            EvalMetrics::CodeQualityReviewer(QualityMetrics {
+                defects_found: 3,
+                defects_total: 3,
+                recall: 1.0,
+                false_positives: 0,
+                must_fix_false_positives: 0,
+            }),
+        );
+        with_resources.repetition = 2;
+        with_resources.usage.cache_read_units = Some(313_292);
+        with_resources.usage.reasoning_output_units = Some(219);
+        with_resources.injected_prompt_bytes = Some(18_432);
+        let report = render_report(&[v1, v2, with_resources]).unwrap();
         assert_eq!(report.matches("SUITE role_core_").count(), 2);
         assert!(report.contains("severity agreement           2/3 detected"));
         assert!(report.contains("duplicate findings           1"));
         assert!(report.contains("role_core_v1 | fake / native_default"));
         assert!(report.contains("role_core_v2 | fake / native_default"));
+        // Provider-native usage is labeled and explicitly marked incomparable
+        // in every per-target section and once more under the comparison.
+        assert!(report.contains("Median usage (provider-native)"));
+        assert_eq!(
+            report
+                .matches("Usage units are provider-native (runtime-specific) and are not cross-provider normalized")
+                .count(),
+            2
+        );
+        assert!(report.contains("The comparison intentionally excludes usage units"));
+        // Optional dimensions render only where a result reported them.
+        assert!(report.contains("Median cache read units  313292"));
+        assert!(report.contains("Median reasoning output units  219"));
+        assert!(report.contains("Median injected prompt bytes   18432"));
+        assert_eq!(report.matches("Median cache write units").count(), 0);
     }
 }

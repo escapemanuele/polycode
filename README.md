@@ -123,6 +123,16 @@ collect candidate result sets
 
 `recommended_v1` remains frozen. Normal routing never reads `~/.polycode/evals`; deleting evaluation data has zero production effect. No evaluation controls exist in TUI.
 
+## Resource observability
+
+M13a adds observability, not resource policy. Telemetry never influences routing, Recommended profiles, retries, permissions, or any execution decision; it only measures and reports.
+
+What Polycode measures per stage: provider-native usage units, per-invocation wall-clock provider latency (first `ProviderStarted` to the last terminal provider event, excluding scheduler delay), the number of persisted native invocations, and injected prompt bytes — the exact stdin bytes Polycode piped into each native invocation (initial prompt plus continuations), derived from the immutable per-invocation stdin file. Injected prompt bytes deliberately exclude everything the native runtime reads on its own: repository files, CLAUDE.md/AGENTS.md, MCP context, skills, cached native context, and provider system prompts. Native runtimes may independently read large repository context that Polycode neither sees nor bounds.
+
+Usage sources are provider-native and are NOT cross-provider normalized; never compare Claude and Codex units. Claude usage comes from the terminal result record's cumulative totals (input, output, cache read, cache write) — per-assistant-message usage is intentionally ignored because real streams repeat identical usage across content-block records and carry partial output snapshots. Claude's native `modelUsage` per-model breakdown (subagent models included) is captured as a separate typed view that overlaps the aggregate and is never summed into it; native per-model cost figures are intentionally not captured. Codex usage comes from `turn.completed`: input, cached input, cache write, output, and reasoning output are recorded as reported. Codex never confirms its actual model, so confirmed model stays unavailable rather than inferred. In every surface `unavailable` (absent) means the runtime did not report a dimension and is never rendered as zero.
+
+Cross-provider comparable dimensions: wall-clock latency, invocation count, injected prompt bytes, and eval pass/fail outcomes. Provider-native, never comparable: input/output/cache/reasoning units and per-model native accounting.
+
 ## Current CLI
 
 ```console

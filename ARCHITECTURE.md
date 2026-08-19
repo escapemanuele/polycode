@@ -124,6 +124,10 @@ Runs, stages, and attention requests use explicit typed state. Artifacts carry t
 
 Events are semantic history and integration signals, not an event-sourcing system. Domain state persisted in SQLite is authoritative; restoration does not replay full history.
 
+### M13a resource observability boundary
+
+Resource telemetry is observation only: no token/context/usage value influences routing, Recommended profiles, scheduling, retries, permissions, or lifecycle classification. `UsageDelta` and `ProviderUsageUpdated` carry stable `input_units`/`output_units` plus optional provider-native dimensions (`cache_read_units`, `cache_write_units`, `reasoning_output_units`) and an optional typed `native_models` per-model breakdown; `None` always means the runtime did not report a dimension and is never collapsed into zero. Old persisted event payloads decode unchanged with the additions unavailable. Claude usage is taken from the terminal result record's cumulative totals (one atomic `[Usage, terminal]` signal batch per invocation, mirroring Codex `turn.completed`); per-assistant-message usage is intentionally discarded as unreliable (repeated per content block, partial output snapshots, sidechains indistinguishable). The Claude `modelUsage` breakdown overlaps the aggregate (it spans subagent models) and is never summed into it. Codex reports no native-confirmed model; confirmed model stays unavailable. Units are provider-native and never cross-provider normalized; the comparable dimensions are wall-clock provider latency (first `ProviderStarted` to last terminal provider event, derived from committed event timestamps), persisted invocation count, and injected prompt bytes (the exact immutable stdin bytes Polycode piped per invocation, measured from the SHA-256-verified stdin file without touching prompt content). Query DTOs (`UsageSummary`, `StageExecutionEvidence`) fold committed events at read time; nothing is pre-aggregated, so replay and restart semantics are unchanged and no schema migration was needed.
+
 ### Milestone 2 persistence boundary
 
 Implemented flow:

@@ -164,7 +164,35 @@ pub enum DomainEventKind {
         provider_id: ProviderId,
         input_units: u64,
         output_units: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_units: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_units: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_output_units: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_models: Option<Vec<NativeModelUsage>>,
     },
+}
+
+/// One native-runtime-reported per-model usage entry.
+///
+/// Units are provider-native and never normalized across providers. The
+/// breakdown is a parallel provider-defined view of the same execution and
+/// MUST NOT be summed together with the aggregate `input_units`/`output_units`
+/// of the carrying event: for Claude the aggregate covers the primary agent
+/// while the breakdown spans every model the runtime used (including
+/// subagents), so the two views overlap. `None` means the runtime did not
+/// report the dimension; it is never a synonym for zero.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeModelUsage {
+    pub model: String,
+    pub input_units: u64,
+    pub output_units: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_units: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_units: Option<u64>,
 }
 
 #[cfg(test)]
@@ -188,6 +216,82 @@ mod tests {
         let decoded: DomainEvent = serde_json::from_str(&encoded).unwrap();
 
         assert!(encoded.contains("\"type\":\"stage_ready\""));
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn pre_m13a_usage_event_payload_decodes_with_unavailable_resource_dimensions() {
+        // Exact shape persisted before resource observability existed. Missing
+        // dimensions must decode as unavailable (None), never as zero.
+        // Derive the exact pre-M13a JSON from a real event by re-encoding:
+        // the new optional fields are absent when None, so this byte shape is
+        // identical to what pre-M13a code persisted.
+        let event = DomainEvent::new(
+            EventMetadata::new(
+                EventId::from_u128(1),
+                Utc.with_ymd_and_hms(2026, 8, 14, 8, 0, 0).single().unwrap(),
+            ),
+            RunId::from_u128(2),
+            Some(StageId::new("implementation").unwrap()),
+            DomainEventKind::ProviderUsageUpdated {
+                provider_id: ProviderId::new("claude").unwrap(),
+                input_units: 18,
+                output_units: 83,
+                cache_read_units: None,
+                cache_write_units: None,
+                reasoning_output_units: None,
+                native_models: None,
+            },
+        );
+        let legacy = serde_json::to_string(&event).unwrap();
+        assert!(legacy.contains("\"input_units\":18"));
+        let decoded: DomainEvent = serde_json::from_str(&legacy).unwrap();
+        let DomainEventKind::ProviderUsageUpdated {
+            input_units,
+            output_units,
+            cache_read_units,
+            cache_write_units,
+            reasoning_output_units,
+            native_models,
+            ..
+        } = decoded.kind()
+        else {
+            panic!("expected usage event");
+        };
+        assert_eq!((*input_units, *output_units), (18, 83));
+        assert_eq!(*cache_read_units, None);
+        assert_eq!(*cache_write_units, None);
+        assert_eq!(*reasoning_output_units, None);
+        assert_eq!(*native_models, None);
+        // Round-trip keeps unavailable dimensions absent rather than zero.
+        let encoded = serde_json::to_string(&decoded).unwrap();
+        assert!(!encoded.contains("cache_read_units"));
+        assert!(!encoded.contains("native_models"));
+    }
+
+    #[test]
+    fn usage_event_distinguishes_reported_zero_from_unavailable() {
+        let event = DomainEvent::new(
+            EventMetadata::new(
+                EventId::from_u128(3),
+                Utc.with_ymd_and_hms(2026, 8, 19, 8, 0, 0).single().unwrap(),
+            ),
+            RunId::from_u128(4),
+            Some(StageId::new("implementation").unwrap()),
+            DomainEventKind::ProviderUsageUpdated {
+                provider_id: ProviderId::new("codex").unwrap(),
+                input_units: 100,
+                output_units: 20,
+                cache_read_units: Some(0),
+                cache_write_units: None,
+                reasoning_output_units: Some(5),
+                native_models: None,
+            },
+        );
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains("\"cache_read_units\":0"));
+        assert!(!encoded.contains("cache_write_units"));
+        let decoded: DomainEvent = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, event);
     }
 }

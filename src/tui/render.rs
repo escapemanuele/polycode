@@ -288,10 +288,25 @@ fn render_stage_context(frame: &mut Frame<'_>, area: Rect, state: &TuiState, det
             details.profile, details.profile_version
         )),
         Line::from(format!("Run         {}", details.id)),
-        Line::from(format!(
-            "Usage       {} in / {} out",
-            details.usage.input_units, details.usage.output_units
-        )),
+        Line::from({
+            use std::fmt::Write as _;
+            // Provider-native units; optional dimensions appear only when the
+            // runtime reported them.
+            let mut usage = format!(
+                "Usage       {} in / {} out",
+                details.usage.input_units, details.usage.output_units
+            );
+            for (label, value) in [
+                ("cache read", details.usage.cache_read_units),
+                ("cache write", details.usage.cache_write_units),
+                ("reasoning out", details.usage.reasoning_output_units),
+            ] {
+                if let Some(value) = value {
+                    let _ = write!(usage, " / {value} {label}");
+                }
+            }
+            usage
+        }),
         Line::from(format!(
             "Workspace   {}",
             details
@@ -896,6 +911,7 @@ mod tests {
             usage: UsageSummary {
                 input_units: 123,
                 output_units: 14,
+                ..UsageSummary::default()
             },
         });
 
