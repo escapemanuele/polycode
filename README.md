@@ -4,7 +4,7 @@
 
 Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
 
-Polycode is early-stage software. This repository contains **Milestone 11 role evaluation harness and routing evidence** above role-routed native Claude Code, Codex CLI, deterministic FakeProvider adapters, and Ratatui local control room. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, crash-reconcilable tmux supervision, and immutable `recommended_v1` routing remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, direct provider chat, and `recommended_v2` remain future work.
+Polycode is early-stage software. This repository contains **Milestone 11 role evaluation harness and routing evidence** above role-routed native Claude Code, Codex CLI, deterministic FakeProvider adapters, and Ratatui local control room. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, crash-reconcilable tmux supervision, and immutable versioned Recommended routing (`recommended_v1` frozen, `recommended_v2` current) remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain future work.
 
 ## Principles
 
@@ -111,7 +111,7 @@ Each repetition materializes a fresh fixture Git repository and uses its own SQL
 
 Interpret results narrowly. Small suites do not prove general superiority; models/providers change; three repetitions remain a small sample; fixture representativeness matters; false positives matter; results apply only to measured roles; user-global native configuration intentionally influences actual runtime behavior. Record CLI/model/suite identity, but never snapshot credentials, auth files, or full environment.
 
-Future evidence workflow, not implemented:
+Evidence workflow, now exercised once for `recommended_v2`:
 
 ```text
 collect candidate result sets
@@ -121,7 +121,7 @@ collect candidate result sets
   -> preserve recommended_v1 for existing runs
 ```
 
-M11 does not change `recommended_v1`. Normal routing never reads `~/.polycode/evals`; deleting evaluation data has zero production effect. No evaluation controls exist in TUI.
+`recommended_v1` remains frozen. Normal routing never reads `~/.polycode/evals`; deleting evaluation data has zero production effect. No evaluation controls exist in TUI.
 
 ## Current CLI
 
@@ -155,18 +155,19 @@ polycode discard <run-id>
 Workflow commands use current directory unless `--repo` is supplied. Execution selection remains explicit and flags are mutually exclusive:
 
 - `--provider claude|codex|fake` creates uniform routing for every role used by workflow.
-- `--profile recommended` resolves versioned `recommended_v1` once, persists explicit routes, and never re-resolves them on restart.
+- `--profile recommended` resolves the current versioned profile (`recommended_v2`) once, persists explicit routes, and never re-resolves them on restart. Runs persisted under `recommended_v1` keep resolving their original routes unchanged.
 
-When both native providers are authenticated, provisional `recommended_v1` routes implementation to Codex and research, architecture, reviews, and decision to Claude. If only one native provider is ready at creation, every required role routes there with persisted fallback reason. Fake is never a Recommended fallback. This policy is source-controlled and provisional, not benchmark-backed.
+`recommended_v2` is the first profile informed by role_core_v3 native-runtime evaluations (fingerprint `cb9856d2…c375b`, 3 repetitions per case, targets `claude/native_default` and `codex/native_default`, zero infrastructure failures on both). Evidence is runtime-level: each target is a whole native agent runtime that may orchestrate multiple models/subagents internally, so results are not single-model comparisons and encode no cost/token claims. Measured decisions: Implementer stays Codex (equivalent measured correctness, lower observed runtime latency; high confidence), CodeQualityReviewer stays Claude (higher measured defect recall, accepting modest non-must-fix false-positive noise; medium confidence), SpecReviewer moves to Codex (equivalent measured correctness across every criterion, lower observed runtime latency; medium confidence — latency evidence is suite-level, not role-isolated). Researcher, Architect, EngineeringLead, and legacy Reviewer are inherited from `recommended_v1` because role_core_v3 does not evaluate them. If only one native provider is ready at creation, every required role routes there with persisted fallback reason. Fake is never a Recommended fallback.
 
 ```text
-Role                   Provider (both available)
-Researcher             Claude
-Architect              Claude
-Implementer            Codex
-CodeQualityReviewer    Claude
-SpecReviewer           Claude
-EngineeringLead        Claude
+Role                   v1 (frozen)   v2 (current)
+Researcher             Claude        Claude (inherited)
+Architect              Claude        Claude (inherited)
+Implementer            Codex         Codex  (measured)
+CodeQualityReviewer    Claude        Claude (measured)
+SpecReviewer           Claude        Codex  (measured)
+EngineeringLead        Claude        Claude (inherited)
+legacy Reviewer        Claude        Claude (inherited)
 ```
 
 Provider loss after run creation fails clearly; it never causes runtime fallback. Configured model may remain null, meaning provider-native default. Actual confirmed model/session/process are reported per stage. Fake emits start, progress, usage, and completion signals without editing files. Native providers run only in managed worktree.
@@ -279,7 +280,7 @@ Direct dependency artifacts are included in downstream prompts. Artifact metadat
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, `recommended_v1`, local TUI, and separate role evaluation evidence are implemented; Gemini, adaptive routing/failover, `recommended_v2`, Advisor, and direct provider chat remain future constraints.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, `recommended_v1`/`recommended_v2`, local TUI, and separate role evaluation evidence are implemented; Gemini, adaptive routing/failover, Advisor, and direct provider chat remain future constraints.
 
 ## License
 
