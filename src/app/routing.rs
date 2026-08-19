@@ -8,9 +8,178 @@ use thiserror::Error;
 use crate::domain::{ConfigSnapshotId, ModelId, ProviderId, Role, WorkflowDefinition};
 use crate::store::ResolvedConfigSnapshot;
 
-pub const RECOMMENDED_PROFILE_VERSION: &str = "recommended_v1";
+/// Frozen initial Recommended policy. Preserved verbatim so persisted
+/// snapshots created under it keep resolving identically; never re-emitted
+/// for new runs.
+pub const RECOMMENDED_PROFILE_VERSION_V1: &str = "recommended_v1";
+/// Current Recommended policy emitted for new `--profile recommended` runs.
+pub const RECOMMENDED_PROFILE_VERSION: &str = "recommended_v2";
 const UNIFORM_PROFILE_VERSION: &str = "uniform_v1";
 pub(crate) const EVAL_PROFILE_VERSION: &str = "eval_v1";
+
+/// Suite identity backing `recommended_v2` role decisions.
+pub const RECOMMENDED_V2_EVIDENCE_SUITE: &str = "role_core_v3";
+/// Frozen fingerprint of the evidence suite at decision time.
+pub const RECOMMENDED_V2_EVIDENCE_FINGERPRINT: &str =
+    "cb9856d2c8edbc4cb0a59520aa140ef4567dce3b650b14f0436d42c4b11c375b";
+
+/// How one role decision in a Recommended profile was justified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionBasis {
+    /// Backed by the profile's benchmark evidence at the stated confidence.
+    Measured(DecisionConfidence),
+    /// Carried over from the previous profile; no current benchmark evidence.
+    Inherited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionConfidence {
+    High,
+    Medium,
+}
+
+/// One immutable per-role routing decision inside a Recommended profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecommendedDecision {
+    pub role: Role,
+    pub provider: &'static str,
+    pub basis: DecisionBasis,
+    /// Factual machine-readable rationale; never a monetary/token-cost claim.
+    pub rationale: &'static str,
+}
+
+/// Immutable provenance for one versioned Recommended profile.
+///
+/// `benchmark_kind: "native_runtime"` means targets were whole native
+/// runtimes (`provider / native_default`) which may orchestrate multiple
+/// models/subagents internally — not single-model comparisons. Latency
+/// evidence is runtime-level (suite median), not per-role isolated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecommendedProvenance {
+    pub profile_version: &'static str,
+    pub evidence_suite: Option<&'static str>,
+    pub evidence_fingerprint: Option<&'static str>,
+    pub repetitions_per_case: Option<u32>,
+    pub targets: &'static [&'static str],
+    pub benchmark_kind: &'static str,
+    pub decisions: &'static [RecommendedDecision],
+}
+
+const RECOMMENDED_V1_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
+    profile_version: RECOMMENDED_PROFILE_VERSION_V1,
+    evidence_suite: None,
+    evidence_fingerprint: None,
+    repetitions_per_case: None,
+    targets: &[],
+    benchmark_kind: "expert_provisional",
+    decisions: &[
+        RecommendedDecision {
+            role: Role::Researcher,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "initial_provisional_policy",
+        },
+        RecommendedDecision {
+            role: Role::Architect,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "initial_provisional_policy",
+        },
+        RecommendedDecision {
+            role: Role::Implementer,
+            provider: "codex",
+            basis: DecisionBasis::Inherited,
+            rationale: "initial_provisional_policy",
+        },
+        RecommendedDecision {
+            role: Role::CodeQualityReviewer,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "initial_provisional_policy",
+        },
+        RecommendedDecision {
+            role: Role::SpecReviewer,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "initial_provisional_policy",
+        },
+        RecommendedDecision {
+            role: Role::Reviewer,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "initial_provisional_policy",
+        },
+        RecommendedDecision {
+            role: Role::EngineeringLead,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "initial_provisional_policy",
+        },
+    ],
+};
+
+const RECOMMENDED_V2_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
+    profile_version: RECOMMENDED_PROFILE_VERSION,
+    evidence_suite: Some(RECOMMENDED_V2_EVIDENCE_SUITE),
+    evidence_fingerprint: Some(RECOMMENDED_V2_EVIDENCE_FINGERPRINT),
+    repetitions_per_case: Some(3),
+    targets: &["claude/native_default", "codex/native_default"],
+    benchmark_kind: "native_runtime",
+    decisions: &[
+        RecommendedDecision {
+            role: Role::Implementer,
+            provider: "codex",
+            basis: DecisionBasis::Measured(DecisionConfidence::High),
+            rationale: "equivalent_measured_correctness_lower_observed_runtime_latency",
+        },
+        RecommendedDecision {
+            role: Role::CodeQualityReviewer,
+            provider: "claude",
+            basis: DecisionBasis::Measured(DecisionConfidence::Medium),
+            rationale: "higher_measured_defect_recall_accepting_non_must_fix_fp_noise",
+        },
+        RecommendedDecision {
+            role: Role::SpecReviewer,
+            provider: "codex",
+            basis: DecisionBasis::Measured(DecisionConfidence::Medium),
+            rationale: "equivalent_measured_correctness_lower_observed_runtime_latency",
+        },
+        RecommendedDecision {
+            role: Role::Researcher,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "no_role_core_v3_evidence_inherited_from_recommended_v1",
+        },
+        RecommendedDecision {
+            role: Role::Architect,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "no_role_core_v3_evidence_inherited_from_recommended_v1",
+        },
+        RecommendedDecision {
+            role: Role::EngineeringLead,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "no_role_core_v3_evidence_inherited_from_recommended_v1",
+        },
+        RecommendedDecision {
+            role: Role::Reviewer,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "legacy_compatibility_route_inherited_from_recommended_v1",
+        },
+    ],
+};
+
+/// Immutable provenance for a known Recommended profile version.
+#[must_use]
+pub fn recommended_provenance(profile_version: &str) -> Option<&'static RecommendedProvenance> {
+    match profile_version {
+        RECOMMENDED_PROFILE_VERSION_V1 => Some(&RECOMMENDED_V1_PROVENANCE),
+        RECOMMENDED_PROFILE_VERSION => Some(&RECOMMENDED_V2_PROVENANCE),
+        _ => None,
+    }
+}
 
 /// One immutable provider/model destination selected for a role.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -363,15 +532,12 @@ fn recommended_routes(
                     "fallback_preferred_provider_unavailable_at_run_creation",
                 )
             } else {
-                match role {
-                    Role::Implementer => ("codex", "implementation_specialist"),
-                    Role::CodeQualityReviewer | Role::SpecReviewer => {
-                        ("claude", "independent_from_implementer")
-                    }
-                    Role::Researcher | Role::Architect | Role::Reviewer | Role::EngineeringLead => {
-                        ("claude", "recommended_default")
-                    }
-                }
+                let decision = RECOMMENDED_V2_PROVENANCE
+                    .decisions
+                    .iter()
+                    .find(|decision| decision.role == role)
+                    .expect("recommended_v2 provenance covers every role");
+                (decision.provider, decision.rationale)
             };
             (
                 role,
@@ -433,7 +599,7 @@ fn decode_v2(
     }
     match (payload.profile.as_str(), payload.profile_version.as_str()) {
         ("uniform", UNIFORM_PROFILE_VERSION)
-        | ("recommended", RECOMMENDED_PROFILE_VERSION)
+        | ("recommended", RECOMMENDED_PROFILE_VERSION_V1 | RECOMMENDED_PROFILE_VERSION)
         | ("eval", EVAL_PROFILE_VERSION) => {}
         _ => return Err(RoutingError::InvalidProfileMetadata),
     }
@@ -721,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn recommended_v1_is_mixed_when_both_providers_are_available() {
+    fn recommended_v2_maps_roles_exactly_and_pins_no_models() {
         let plan = snapshot(
             ExecutionSelection::Recommended,
             RecommendedAvailability {
@@ -730,6 +896,95 @@ mod tests {
             },
         );
         assert_eq!(plan.profile_version(), RECOMMENDED_PROFILE_VERSION);
+        assert_eq!(plan.profile_version(), "recommended_v2");
+        for (role, provider) in [
+            (Role::Architect, "claude"),
+            (Role::Implementer, "codex"),
+            (Role::CodeQualityReviewer, "claude"),
+            (Role::SpecReviewer, "codex"),
+            (Role::EngineeringLead, "claude"),
+        ] {
+            let route = plan.route(role).unwrap();
+            assert_eq!(route.target().provider_id().as_str(), provider, "{role:?}");
+            assert!(
+                route.target().model_id().is_none(),
+                "{role:?} pinned a model"
+            );
+        }
+    }
+
+    #[test]
+    fn recommended_v2_full_mapping_covers_every_role_including_researcher_and_legacy_reviewer() {
+        let provenance = recommended_provenance("recommended_v2").unwrap();
+        let expected = [
+            (Role::Researcher, "claude"),
+            (Role::Architect, "claude"),
+            (Role::Implementer, "codex"),
+            (Role::CodeQualityReviewer, "claude"),
+            (Role::SpecReviewer, "codex"),
+            (Role::EngineeringLead, "claude"),
+            (Role::Reviewer, "claude"),
+        ];
+        assert_eq!(provenance.decisions.len(), expected.len());
+        for (role, provider) in expected {
+            let decision = provenance
+                .decisions
+                .iter()
+                .find(|decision| decision.role == role)
+                .unwrap();
+            assert_eq!(decision.provider, provider, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn recommended_v1_snapshot_still_resolves_v1_routes_unchanged() {
+        // Byte-level persisted v1 payload: SpecReviewer routed to Claude with
+        // the original v1 reasons. Introducing v2 must not reinterpret it.
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let mut routes = serde_json::Map::new();
+        for (role, provider, reason) in [
+            ("architect", "claude", "recommended_default"),
+            ("implementer", "codex", "implementation_specialist"),
+            (
+                "code_quality_reviewer",
+                "claude",
+                "independent_from_implementer",
+            ),
+            ("spec_reviewer", "claude", "independent_from_implementer"),
+            ("engineering_lead", "claude", "recommended_default"),
+        ] {
+            routes.insert(
+                role.to_owned(),
+                json!({"provider": provider, "model": null, "reason": reason}),
+            );
+        }
+        let payload = json!({
+            "schema_version": 2,
+            "profile": "recommended",
+            "profile_version": RECOMMENDED_PROFILE_VERSION_V1,
+            "routes": routes,
+            "providers": {
+                "claude": serde_json::to_value(provider_config_dto("claude").unwrap()).unwrap(),
+                "codex": serde_json::to_value(provider_config_dto("codex").unwrap()).unwrap(),
+            }
+        });
+        let snapshot = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("persisted-v1").unwrap(),
+            2,
+            payload.clone(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        let plan = RoutingPlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(plan.profile_version(), "recommended_v1");
+        assert_eq!(
+            plan.route(Role::SpecReviewer)
+                .unwrap()
+                .target()
+                .provider_id()
+                .as_str(),
+            "claude"
+        );
         assert_eq!(
             plan.route(Role::Implementer)
                 .unwrap()
@@ -738,17 +993,83 @@ mod tests {
                 .as_str(),
             "codex"
         );
+        assert_eq!(
+            plan.route(Role::CodeQualityReviewer)
+                .unwrap()
+                .target()
+                .provider_id()
+                .as_str(),
+            "claude"
+        );
+        assert!(
+            plan.routes()
+                .all(|(_, route)| route.target().model_id().is_none())
+        );
+        // Snapshot payload itself is never rewritten by decoding.
+        assert_eq!(snapshot.payload(), &payload);
+    }
+
+    #[test]
+    fn recommended_v2_provenance_records_measured_and_inherited_evidence() {
+        let provenance = recommended_provenance(RECOMMENDED_PROFILE_VERSION).unwrap();
+        assert_eq!(provenance.evidence_suite, Some("role_core_v3"));
+        assert_eq!(
+            provenance.evidence_fingerprint,
+            Some("cb9856d2c8edbc4cb0a59520aa140ef4567dce3b650b14f0436d42c4b11c375b")
+        );
+        assert_eq!(provenance.repetitions_per_case, Some(3));
+        assert_eq!(provenance.benchmark_kind, "native_runtime");
+        assert_eq!(
+            provenance.targets,
+            ["claude/native_default", "codex/native_default"]
+        );
+        let basis = |role: Role| {
+            provenance
+                .decisions
+                .iter()
+                .find(|decision| decision.role == role)
+                .unwrap()
+                .basis
+        };
+        assert_eq!(
+            basis(Role::Implementer),
+            DecisionBasis::Measured(DecisionConfidence::High)
+        );
+        assert_eq!(
+            basis(Role::CodeQualityReviewer),
+            DecisionBasis::Measured(DecisionConfidence::Medium)
+        );
+        assert_eq!(
+            basis(Role::SpecReviewer),
+            DecisionBasis::Measured(DecisionConfidence::Medium)
+        );
         for role in [
+            Role::Researcher,
             Role::Architect,
-            Role::CodeQualityReviewer,
-            Role::SpecReviewer,
             Role::EngineeringLead,
+            Role::Reviewer,
         ] {
-            assert_eq!(
-                plan.route(role).unwrap().target().provider_id().as_str(),
-                "claude"
-            );
+            assert_eq!(basis(role), DecisionBasis::Inherited, "{role:?}");
         }
+        // No monetary/token-cost claims encoded anywhere in rationales.
+        for decision in provenance.decisions {
+            for term in ["cost", "cheap", "token", "price", "usd", "%"] {
+                assert!(
+                    !decision.rationale.contains(term),
+                    "{:?} rationale encodes cost claim",
+                    decision.role
+                );
+            }
+        }
+        // v1 provenance exists and is explicitly non-benchmark.
+        let v1 = recommended_provenance("recommended_v1").unwrap();
+        assert_eq!(v1.evidence_suite, None);
+        assert!(
+            v1.decisions
+                .iter()
+                .all(|decision| decision.basis == DecisionBasis::Inherited)
+        );
+        assert!(recommended_provenance("recommended_v999").is_none());
     }
 
     #[test]
@@ -979,6 +1300,7 @@ mod tests {
                     && route.target().model_id().is_none()
                     && route.reason() == "eval_support")
         }));
-        assert_eq!(RECOMMENDED_PROFILE_VERSION, "recommended_v1");
+        assert_eq!(RECOMMENDED_PROFILE_VERSION_V1, "recommended_v1");
+        assert_eq!(RECOMMENDED_PROFILE_VERSION, "recommended_v2");
     }
 }

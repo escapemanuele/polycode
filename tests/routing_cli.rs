@@ -24,7 +24,7 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     assert_success(&started);
     let stdout = String::from_utf8(started.stdout).unwrap();
     assert!(stdout.contains("Status     completed"));
-    assert!(stdout.contains("Profile    recommended (recommended_v1)"));
+    assert!(stdout.contains("Profile    recommended (recommended_v2)"));
     assert!(stdout.contains("architect  claude"));
     assert!(stdout.contains("implementer  codex"));
     let run_id: RunId = stdout
@@ -47,14 +47,14 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     assert_eq!(by_stage["architecture"], "claude");
     assert_eq!(by_stage["implementation"], "codex");
     assert_eq!(by_stage["quality_review"], "claude");
-    assert_eq!(by_stage["spec_review"], "claude");
+    assert_eq!(by_stage["spec_review"], "codex");
     assert_eq!(by_stage["decision"], "claude");
 
     let implementation = fs::read_to_string(fixture.capture.join("implementation.stdin")).unwrap();
     assert!(implementation.contains("# architecture result"));
     let quality = fs::read_to_string(fixture.capture.join("quality_review.claude.stdin")).unwrap();
     assert!(quality.contains("# implementation result"));
-    let spec = fs::read_to_string(fixture.capture.join("spec_review.claude.stdin")).unwrap();
+    let spec = fs::read_to_string(fixture.capture.join("spec_review.stdin")).unwrap();
     assert!(spec.contains("# architecture result"));
     assert!(spec.contains("# implementation result"));
     let decision = fs::read_to_string(fixture.capture.join("decision.claude.stdin")).unwrap();

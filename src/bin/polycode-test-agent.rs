@@ -165,6 +165,12 @@ fn claude_fixture(arguments: &[OsString]) -> std::io::Result<()> {
                 }]}
             })
         )?;
+        // All prior stages (including any Codex-routed ones) are completed by
+        // the time this attention stage asks its question; removing Codex here
+        // simulates a historical provider disappearing before resume.
+        if let Some(path) = std::env::var_os("POLYCODE_FAKE_CLAUDE_REMOVE_COMPLETED_CODEX") {
+            std::fs::remove_file(path)?;
+        }
         return Ok(());
     }
     writeln!(
@@ -188,11 +194,6 @@ fn claude_fixture(arguments: &[OsString]) -> std::io::Result<()> {
     )?;
     if stage == "architecture"
         && let Some(path) = std::env::var_os("POLYCODE_FAKE_CLAUDE_REMOVE_CODEX")
-    {
-        std::fs::remove_file(path)?;
-    }
-    if stage == "quality_review"
-        && let Some(path) = std::env::var_os("POLYCODE_FAKE_CLAUDE_REMOVE_COMPLETED_CODEX")
     {
         std::fs::remove_file(path)?;
     }
