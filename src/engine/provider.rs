@@ -1,17 +1,43 @@
 use std::path::{Path, PathBuf};
 
 use crate::domain::{
-    AttentionKind, AttentionRequestId, ModelId, ProviderId, ProviderSessionId, Role, RunId,
-    StageId, StageKind, StageStatus,
+    AttentionKind, AttentionRequestId, ModelId, NativeModelUsage, ProviderId, ProviderSessionId,
+    Role, RunId, StageId, StageKind, StageStatus,
 };
 use crate::providers::ProviderCommit;
 use crate::store::SqliteStore;
 
 /// Provider-neutral usage added by one provider signal.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// All unit values are provider-native (each runtime's own accounting) and
+/// are never normalized across providers. `None` means the runtime did not
+/// report the dimension for this signal; `Some(0)` means it explicitly
+/// reported zero. The optional `native_models` breakdown is a parallel
+/// provider-defined view that overlaps the aggregate units and must never be
+/// summed with them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UsageDelta {
     pub input_units: u64,
     pub output_units: u64,
+    pub cache_read_units: Option<u64>,
+    pub cache_write_units: Option<u64>,
+    pub reasoning_output_units: Option<u64>,
+    pub native_models: Option<Vec<NativeModelUsage>>,
+}
+
+impl UsageDelta {
+    /// Usage carrying only the stable input/output dimensions.
+    #[must_use]
+    pub const fn stable(input_units: u64, output_units: u64) -> Self {
+        Self {
+            input_units,
+            output_units,
+            cache_read_units: None,
+            cache_write_units: None,
+            reasoning_output_units: None,
+            native_models: None,
+        }
+    }
 }
 
 /// One atomic provider output consumed by workflow execution.

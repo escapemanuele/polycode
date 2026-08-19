@@ -2,7 +2,7 @@
 
 mod error;
 mod provider_factory;
-mod query;
+pub(crate) mod query;
 mod routing;
 mod run_service;
 

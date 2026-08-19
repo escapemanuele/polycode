@@ -579,6 +579,10 @@ where
                         provider_id: provider_id.clone(),
                         input_units: usage.input_units,
                         output_units: usage.output_units,
+                        cache_read_units: usage.cache_read_units,
+                        cache_write_units: usage.cache_write_units,
+                        reasoning_output_units: usage.reasoning_output_units,
+                        native_models: usage.native_models,
                     },
                     metadata,
                 )?);
@@ -984,10 +988,7 @@ mod tests {
             .stage("implementation")
             .events([
                 FakeEvent::Started,
-                FakeEvent::Usage(UsageDelta {
-                    input_units: 120,
-                    output_units: 45,
-                }),
+                FakeEvent::Usage(UsageDelta::stable(120, 45)),
                 FakeEvent::Completed,
             ])
             .stage("quality_review")

@@ -14,7 +14,7 @@ mod workflow;
 
 pub use artifact::{ArtifactKind, ArtifactMetadata, ArtifactStatus};
 pub use attention::{AttentionError, AttentionKind, AttentionRequest, AttentionStatus};
-pub use event::{DomainEvent, DomainEventKind, EventMetadata};
+pub use event::{DomainEvent, DomainEventKind, EventMetadata, NativeModelUsage};
 pub use ids::{
     ArtifactId, AttentionRequestId, ConfigSnapshotId, EventId, IdError, ModelId, ProviderId,
     ProviderSessionId, RunId, StageId,

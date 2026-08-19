@@ -69,6 +69,11 @@ fn decode_item(item: &Value) -> CodexRecord {
 
 fn decode_usage(value: &Value) -> UsageDelta {
     let usage = value.get("usage").unwrap_or(&Value::Null);
+    // Optional dimensions stay `None` when the native record omits them;
+    // absence is "not reported", never zero. All values are Codex-native
+    // units: `cached_input_tokens` is Codex's own cached-input accounting and
+    // `reasoning_output_tokens` its private reasoning output, reported
+    // separately from `output_tokens` exactly as the runtime emits them.
     UsageDelta {
         input_units: usage
             .get("input_tokens")
@@ -78,6 +83,12 @@ fn decode_usage(value: &Value) -> UsageDelta {
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        cache_read_units: usage.get("cached_input_tokens").and_then(Value::as_u64),
+        cache_write_units: usage
+            .get("cache_write_input_tokens")
+            .and_then(Value::as_u64),
+        reasoning_output_units: usage.get("reasoning_output_tokens").and_then(Value::as_u64),
+        native_models: None,
     }
 }
 
@@ -143,14 +154,41 @@ mod tests {
     }
 
     #[test]
-    fn turn_completed_keeps_stable_usage_only() {
-        let raw = b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":50,\"output_tokens\":20,\"reasoning_output_tokens\":5}}\n";
+    fn turn_completed_captures_native_cache_and_reasoning_dimensions() {
+        // Shape copied structurally from a real role_core_v3 Codex
+        // turn.completed record (implementer_invalid_plan_stop rep-003).
+        let raw = b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":48610,\"cached_input_tokens\":40192,\"cache_write_input_tokens\":0,\"output_tokens\":720,\"reasoning_output_tokens\":219}}\n";
+        assert_eq!(
+            first_record(raw).unwrap(),
+            Some((
+                CodexRecord::TurnCompleted(UsageDelta {
+                    input_units: 48610,
+                    output_units: 720,
+                    cache_read_units: Some(40192),
+                    // Explicit native zero stays Some(0), not unavailable.
+                    cache_write_units: Some(0),
+                    reasoning_output_units: Some(219),
+                    native_models: None,
+                }),
+                raw.len()
+            ))
+        );
+    }
+
+    #[test]
+    fn turn_completed_missing_optional_dimensions_stay_unavailable() {
+        let raw =
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}\n";
         assert_eq!(
             first_record(raw).unwrap(),
             Some((
                 CodexRecord::TurnCompleted(UsageDelta {
                     input_units: 100,
-                    output_units: 20
+                    output_units: 20,
+                    cache_read_units: None,
+                    cache_write_units: None,
+                    reasoning_output_units: None,
+                    native_models: None,
                 }),
                 raw.len()
             ))

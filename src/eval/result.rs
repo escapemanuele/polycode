@@ -101,11 +101,24 @@ pub enum EvalStatus {
     InfrastructureFailure,
 }
 
+/// Provider-native usage recorded for the evaluated target stage.
+///
+/// Units are runtime-specific and never normalized across providers; results
+/// from different targets must not be compared unit-for-unit. Optional
+/// dimensions are additive schema-V1 extensions: absent in results written
+/// before resource observability existed, decoded as unavailable (`None`)
+/// rather than zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvalUsage {
     pub input_units: u64,
     pub output_units: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_units: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_units: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_units: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +208,11 @@ pub struct EvalResultV1 {
     pub status: EvalStatus,
     pub metrics: Option<EvalMetrics>,
     pub usage: EvalUsage,
+    /// Exact bytes Polycode piped into the target stage's native invocations
+    /// (initial prompt plus continuations). Cross-provider comparable, unlike
+    /// usage units. Absent in pre-observability results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected_prompt_bytes: Option<u64>,
     pub latency_ms: u64,
     pub artifact_hash: Option<String>,
     pub diff_hash: String,
@@ -375,6 +393,7 @@ mod tests {
                 must_fix_false_positives: 0,
             })),
             usage: EvalUsage::default(),
+            injected_prompt_bytes: None,
             latency_ms: 25,
             artifact_hash: Some("b".repeat(64)),
             diff_hash: "c".repeat(64),
@@ -394,6 +413,50 @@ mod tests {
         assert_eq!(restored, original);
         assert_eq!(restored.target.configured_model, None);
         assert_eq!(restored.confirmed_model, None);
+    }
+
+    #[test]
+    fn pre_observability_result_json_decodes_with_unavailable_resource_fields() {
+        // Byte-shape of a result.json written before M13a: no cache/reasoning
+        // usage dimensions and no injected_prompt_bytes. Must stay readable,
+        // with the additions decoding as unavailable rather than zero.
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "suite": "role_core",
+            "suite_version": "role_core_v3",
+            "suite_fingerprint": "a".repeat(64),
+            "case_id": "implementer_basic_bugfix",
+            "repetition": 1,
+            "target": {"provider": "claude", "configured_model": null},
+            "confirmed_model": null,
+            "provider_cli_version": "1.0.0",
+            "role": "implementer",
+            "status": "passed",
+            "metrics": {"kind": "implementer", "values": {
+                "behavioral_pass": true, "scope_pass": true,
+                "plan_mismatch_behavior": null, "validation_pass": true,
+                "unexpected_files": [], "deletions": []
+            }},
+            "usage": {"input_units": 18, "output_units": 83},
+            "latency_ms": 29113,
+            "artifact_hash": null,
+            "diff_hash": "c".repeat(64),
+            "fixture_hash": "d".repeat(64),
+            "synthetic": false,
+            "started_at": "2026-08-14T08:00:00Z",
+            "finished_at": "2026-08-14T08:01:00Z",
+            "detail": null
+        });
+        let restored = EvalResultV1::from_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(restored.usage.input_units, 18);
+        assert_eq!(restored.usage.cache_read_units, None);
+        assert_eq!(restored.usage.cache_write_units, None);
+        assert_eq!(restored.usage.reasoning_output_units, None);
+        assert_eq!(restored.injected_prompt_bytes, None);
+        // Re-encoding keeps unavailable dimensions absent.
+        let encoded = serde_json::to_string(&restored).unwrap();
+        assert!(!encoded.contains("cache_read_units"));
+        assert!(!encoded.contains("injected_prompt_bytes"));
     }
 
     #[test]

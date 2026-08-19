@@ -417,10 +417,27 @@ fn print_details(details: &RunDetails) {
         }
     }
     println!();
-    println!(
+    println!("{}", usage_line(&details.usage));
+}
+
+/// Provider-native units; optional dimensions appear only when reported.
+/// Totals are not comparable across providers.
+fn usage_line(usage: &crate::app::UsageSummary) -> String {
+    use std::fmt::Write as _;
+    let mut line = format!(
         "Usage      {} input units · {} output units",
-        details.usage.input_units, details.usage.output_units
+        usage.input_units, usage.output_units
     );
+    for (label, value) in [
+        ("cache read", usage.cache_read_units),
+        ("cache write", usage.cache_write_units),
+        ("reasoning output", usage.reasoning_output_units),
+    ] {
+        if let Some(value) = value {
+            let _ = write!(line, " · {value} {label} units");
+        }
+    }
+    line
 }
 
 fn stage_mark(status: StageStatus) -> &'static str {

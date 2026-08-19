@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::domain::StageKind;
+use crate::domain::{NativeModelUsage, StageKind};
 use crate::engine::UsageDelta;
 
 use super::ClaudeProviderError;
@@ -493,7 +493,6 @@ pub(crate) enum ClaudeRecord {
         model: Option<String>,
     },
     Progress(String),
-    Usage(UsageDelta),
     NeedsUser {
         summary: String,
         denials: Vec<PermissionDenial>,
@@ -505,6 +504,7 @@ pub(crate) enum ClaudeRecord {
         success: bool,
         error: Option<String>,
         denials: Vec<PermissionDenial>,
+        usage: Option<UsageDelta>,
     },
     Ignored,
 }
@@ -564,22 +564,12 @@ fn decode_assistant(value: &Value) -> ClaudeRecord {
             question: true,
         };
     }
-    if let Some(usage) = message.get("usage") {
-        let input_units = usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let output_units = usage
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if input_units != 0 || output_units != 0 {
-            return ClaudeRecord::Usage(UsageDelta {
-                input_units,
-                output_units,
-            });
-        }
-    }
+    // Per-assistant-message `usage` is intentionally NOT accounted: real
+    // role_core_v3 streams repeat identical usage across content-block records
+    // of one API call and carry partial output snapshots (summed 18/83 vs the
+    // authoritative terminal 8/1221 in one real session), and sidechain
+    // records are indistinguishable here. The terminal result record is the
+    // only trustworthy Claude usage source; see decode_result.
     let text = content
         .into_iter()
         .flatten()
@@ -641,7 +631,57 @@ fn decode_result(value: &Value) -> ClaudeRecord {
         success,
         error,
         denials,
+        usage: decode_result_usage(value),
     }
+}
+
+/// Extracts the terminal cumulative usage of one Claude Code invocation.
+///
+/// The result record's `usage` object is the runtime's authoritative
+/// main-agent total for the whole invocation; `modelUsage` is the runtime's
+/// own per-model breakdown across every model it used (subagents included).
+/// The breakdown overlaps the aggregate and is carried separately so it is
+/// never summed into it. Absent native fields stay `None` (unavailable),
+/// never zero. Returns `None` when the record carries no `usage` object.
+fn decode_result_usage(value: &Value) -> Option<UsageDelta> {
+    let usage = value.get("usage")?;
+    let native_models = value
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .map(|models| {
+            let mut entries = models
+                .iter()
+                .map(|(model, dims)| NativeModelUsage {
+                    model: model.clone(),
+                    input_units: dims.get("inputTokens").and_then(Value::as_u64).unwrap_or(0),
+                    output_units: dims
+                        .get("outputTokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    cache_read_units: dims.get("cacheReadInputTokens").and_then(Value::as_u64),
+                    cache_write_units: dims.get("cacheCreationInputTokens").and_then(Value::as_u64),
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.model.cmp(&right.model));
+            entries
+        })
+        .filter(|entries| !entries.is_empty());
+    Some(UsageDelta {
+        input_units: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_units: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read_units: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        cache_write_units: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64),
+        reasoning_output_units: None,
+        native_models,
+    })
 }
 
 fn required_string(value: &Value, key: &'static str) -> Result<String, ClaudeProviderError> {
@@ -718,6 +758,86 @@ mod tests {
                 raw.len()
             ))
         );
+    }
+
+    #[test]
+    fn result_captures_authoritative_usage_and_native_model_breakdown() {
+        // Shape copied structurally from a real role_core_v3 Claude result
+        // record (implementer_scope_discipline rep-003): terminal usage is the
+        // runtime's cumulative main-agent total, modelUsage the per-model
+        // breakdown across every model the runtime used (subagents included).
+        let raw = concat!(
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,",
+            "\"result\":\"done\",\"session_id\":\"abc\",\"permission_denials\":[],",
+            "\"num_turns\":4,\"total_cost_usd\":0.31,",
+            "\"usage\":{\"input_tokens\":8,\"cache_creation_input_tokens\":3638,",
+            "\"cache_read_input_tokens\":153292,\"output_tokens\":1221,",
+            "\"service_tier\":\"standard\"},",
+            "\"modelUsage\":{",
+            "\"claude-sonnet-5\":{\"inputTokens\":4,\"outputTokens\":782,",
+            "\"cacheReadInputTokens\":13118,\"cacheCreationInputTokens\":3855,",
+            "\"costUSD\":0.03,\"contextWindow\":1000000},",
+            "\"claude-fable-5\":{\"inputTokens\":8,\"outputTokens\":1221,",
+            "\"cacheReadInputTokens\":153292,\"cacheCreationInputTokens\":3638,",
+            "\"costUSD\":0.28,\"contextWindow\":1000000}}}\n"
+        )
+        .as_bytes();
+        let Some((ClaudeRecord::Result { usage, .. }, _)) = first_record(raw).unwrap() else {
+            panic!("expected result record");
+        };
+        let usage = usage.expect("result carries usage");
+        assert_eq!(usage.input_units, 8);
+        assert_eq!(usage.output_units, 1221);
+        assert_eq!(usage.cache_read_units, Some(153_292));
+        assert_eq!(usage.cache_write_units, Some(3638));
+        assert_eq!(usage.reasoning_output_units, None);
+        let models = usage.native_models.expect("modelUsage captured");
+        assert_eq!(models.len(), 2);
+        // Sorted by model for determinism regardless of native map order.
+        assert_eq!(models[0].model, "claude-fable-5");
+        assert_eq!(models[0].output_units, 1221);
+        assert_eq!(models[0].cache_read_units, Some(153_292));
+        assert_eq!(models[1].model, "claude-sonnet-5");
+        assert_eq!(models[1].input_units, 4);
+        assert_eq!(models[1].cache_write_units, Some(3855));
+        // The breakdown overlaps the aggregate (fable == main agent) and is
+        // carried separately, never summed into input/output units.
+        assert_eq!(models[0].input_units, usage.input_units);
+    }
+
+    #[test]
+    fn result_missing_usage_dimensions_stay_unavailable_not_zero() {
+        let bare = b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"permission_denials\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":9}}\n";
+        let Some((ClaudeRecord::Result { usage, .. }, _)) = first_record(bare).unwrap() else {
+            panic!("expected result record");
+        };
+        let usage = usage.unwrap();
+        assert_eq!(usage.cache_read_units, None);
+        assert_eq!(usage.cache_write_units, None);
+        assert_eq!(usage.native_models, None);
+
+        let without = b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"x\",\"permission_denials\":[]}\n";
+        let Some((ClaudeRecord::Result { usage, .. }, _)) = first_record(without).unwrap() else {
+            panic!("expected result record");
+        };
+        assert_eq!(usage, None);
+    }
+
+    #[test]
+    fn assistant_message_usage_is_not_accounted_as_usage() {
+        // Real streams repeat identical per-message usage across content-block
+        // records and carry partial output snapshots; only the terminal result
+        // usage is trustworthy, so assistant usage maps to Progress/Ignored.
+        let with_text = b"{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":7},\"content\":[{\"type\":\"text\",\"text\":\"working\"}]}}\n";
+        assert!(matches!(
+            first_record(with_text).unwrap(),
+            Some((ClaudeRecord::Progress(text), _)) if text == "working"
+        ));
+        let without_text = b"{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":7},\"content\":[]}}\n";
+        assert!(matches!(
+            first_record(without_text).unwrap(),
+            Some((ClaudeRecord::Ignored, _))
+        ));
     }
 
     #[test]

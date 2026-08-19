@@ -162,6 +162,7 @@ impl EvalRunner {
             status,
             metrics,
             usage: evidence.usage,
+            injected_prompt_bytes: evidence.injected_prompt_bytes,
             latency_ms: evidence
                 .latency_ms
                 .unwrap_or_else(|| duration_ms(started_at, finished_at)),
@@ -270,11 +271,14 @@ impl EvalRunner {
         evidence.usage = EvalUsage {
             input_units: stage_evidence.usage.input_units,
             output_units: stage_evidence.usage.output_units,
+            cache_read_units: stage_evidence.usage.cache_read_units,
+            cache_write_units: stage_evidence.usage.cache_write_units,
+            reasoning_output_units: stage_evidence.usage.reasoning_output_units,
         };
-        evidence.latency_ms = stage_evidence
-            .started_at
-            .zip(stage_evidence.finished_at)
-            .map(|(start, finish)| duration_ms(start, finish));
+        evidence.injected_prompt_bytes = stage_evidence.injected_prompt_bytes;
+        // Provider execution latency (first ProviderStarted to terminal
+        // provider event), not the whole-case wall clock fallback below.
+        evidence.latency_ms = stage_evidence.latency_ms;
         let diff = service
             .preview_run_diff(run_id)
             .map_err(|error| infrastructure(error.to_string()))?;
@@ -359,6 +363,7 @@ struct CaseEvidence {
     diff: String,
     validation: String,
     usage: EvalUsage,
+    injected_prompt_bytes: Option<u64>,
     latency_ms: Option<u64>,
     confirmed_model: Option<String>,
     provider_cli_version: Option<String>,
