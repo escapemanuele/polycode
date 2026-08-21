@@ -2,7 +2,8 @@ use std::fmt::Write as _;
 
 use crate::domain::StageKind;
 use crate::engine::ProviderRequest;
-use crate::providers::{ArtifactRecord, stage_prompt};
+use crate::providers::change_handoff::ChangeHandoff;
+use crate::providers::{ArtifactRecord, change_handoff, stage_prompt};
 
 use super::CodexProviderError;
 
@@ -11,6 +12,7 @@ const MAX_DEPENDENCY_BYTES: u64 = 1024 * 1024;
 pub(crate) fn compose(
     request: &ProviderRequest,
     artifacts: &[ArtifactRecord],
+    handoff: Option<&ChangeHandoff>,
 ) -> Result<String, CodexProviderError> {
     let mut prompt = String::new();
     writeln!(prompt, "# Polycode stage").expect("String writes cannot fail");
@@ -67,6 +69,9 @@ pub(crate) fn compose(
         )
         .expect("String writes cannot fail");
     }
+    if let Some(handoff) = handoff {
+        prompt.push_str(&change_handoff::render(handoff));
+    }
     Ok(prompt)
 }
 
@@ -77,4 +82,69 @@ pub(crate) fn continuation(request: &ProviderRequest) -> String {
         request.stage_kind(),
         stage_prompt::instruction(request.role(), request.stage_kind())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::domain::{ProviderSessionId, Role, RunId, StageId, StageKind, StageStatus};
+    use crate::git::{ChangeKind, ChangedFileRecord};
+
+    use super::*;
+
+    fn request(role: Role, kind: StageKind) -> ProviderRequest {
+        ProviderRequest::new(
+            RunId::from_u128(2),
+            StageId::new("review").unwrap(),
+            kind,
+            StageStatus::Ready,
+            role,
+            "immutable task".to_owned(),
+            PathBuf::from("/managed/worktree"),
+            1,
+            0,
+            Option::<ProviderSessionId>::None,
+            vec![],
+        )
+    }
+
+    fn handoff() -> ChangeHandoff {
+        ChangeHandoff::for_tests(
+            &"b".repeat(40),
+            vec![ChangedFileRecord {
+                kind: ChangeKind::Modified,
+                path: "src/lib.rs".to_owned(),
+                previous_path: None,
+                binary: false,
+            }],
+            "diff --git a/src/lib.rs b/src/lib.rs\n+one line\n",
+            46,
+            true,
+        )
+    }
+
+    #[test]
+    fn reviewer_prompt_embeds_shared_change_handoff_verbatim_and_grows_by_it() {
+        let handoff = handoff();
+        let request = request(Role::SpecReviewer, StageKind::SpecReview);
+        let without = compose(&request, &[], None).unwrap();
+        let with = compose(&request, &[], Some(&handoff)).unwrap();
+        let section = change_handoff::render(&handoff);
+
+        assert!(!without.contains("# Implementation change map"));
+        assert!(with.contains(&section), "section must embed verbatim");
+        assert_eq!(with.len(), without.len() + section.len());
+        // Same shared render() as the Claude adapter: semantic identity is the
+        // single provider-neutral section, byte-for-byte.
+    }
+
+    #[test]
+    fn continuation_prompt_stays_compact_without_change_handoff() {
+        let text = continuation(&request(
+            Role::CodeQualityReviewer,
+            StageKind::CodeQualityReview,
+        ));
+        assert!(!text.contains("# Implementation change map"));
+    }
 }

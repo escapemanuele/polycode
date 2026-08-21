@@ -133,6 +133,10 @@ Usage sources are provider-native and are NOT cross-provider normalized; never c
 
 Cross-provider comparable dimensions: wall-clock latency, invocation count, injected prompt bytes, and eval pass/fail outcomes. Provider-native, never comparable: input/output/cache/reasoning units and per-model native accounting.
 
+## Implementation change map for review stages
+
+Review stages (CodeQualityReviewer, SpecReviewer, and the legacy Reviewer role) receive a deterministic bounded implementation-change map in their initial prompt: the changed-file inventory (with change kind and binary markers) plus a bounded textual diff of the managed worktree relative to the immutable run base — the exact delta semantics used by apply and diff preview, including untracked files. The handoff is navigation evidence, not the source of truth: reviewers retain full access to the real worktree and must inspect code as needed. Binary contents are never injected. Oversized diffs are explicitly marked INCOMPLETE with the shown/total byte counts — never silently truncated — and the changed-file inventory is always complete even when the diff is bounded. The handoff is provider-neutral (one shared section, byte-identical across Claude and Codex) and removes redundant mechanical change discovery, especially for future runtimes launched with restricted read-only tool sets that cannot run `git diff` themselves. Researcher, Architect, Implementer, and Decision stages do not receive it; resume/continuation prompts stay compact and never re-inject it. Its prompt cost is visible through the existing injected-prompt-bytes telemetry.
+
 ## Current CLI
 
 ```console

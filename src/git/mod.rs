@@ -10,8 +10,11 @@ pub use error::GitError;
 pub use repository::GitRepository;
 
 pub(crate) use command::Git;
+#[cfg(test)]
+pub(crate) use patch::ChangeKind;
 pub(crate) use patch::{
-    PatchPreview, apply_patch, check_patch, generate_patch, generate_patch_preview, source_is_clean,
+    ChangedFileRecord, PatchPreview, apply_patch, check_patch, generate_change_evidence,
+    generate_patch, generate_patch_preview, source_is_clean,
 };
 pub(crate) use worktree::{
     WorktreeIdentity, branch_exists, branch_tip, create_worktree, delete_owned_branch,

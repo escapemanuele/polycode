@@ -26,7 +26,7 @@ use crate::process::{
 };
 use crate::providers::{
     PendingProviderAttention, ProviderCommit, ProviderSessionMutation, ProviderSessionRecord,
-    ProviderSessionRecordId, ProviderSessionStatus,
+    ProviderSessionRecordId, ProviderSessionStatus, change_handoff,
 };
 use crate::store::{SqliteStore, process_root};
 use crate::workspace::WorkspaceStatus;
@@ -142,7 +142,11 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         }
         let command = if invocation == 1 {
             let artifacts = store.list_artifacts(request.run_id())?;
-            command::initial(&prompt::compose(request, &artifacts)?, self.model.as_ref())
+            let handoff = change_handoff::for_request(store, request)?;
+            command::initial(
+                &prompt::compose(request, &artifacts, handoff.as_ref())?,
+                self.model.as_ref(),
+            )
         } else {
             let native = session.native_session_id().ok_or_else(|| {
                 ClaudeProviderError::Protocol("resume has no native session ID".to_owned())

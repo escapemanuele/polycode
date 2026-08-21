@@ -20,7 +20,7 @@ use crate::process::{
 };
 use crate::providers::{
     ProviderCommit, ProviderSessionMutation, ProviderSessionRecord, ProviderSessionRecordId,
-    ProviderSessionStatus,
+    ProviderSessionStatus, change_handoff,
 };
 use crate::store::{SqliteStore, process_root};
 
@@ -147,8 +147,9 @@ impl<B: ProcessBackend> CodexProvider<B> {
             )
         } else {
             let artifacts = store.list_artifacts(request.run_id())?;
+            let handoff = change_handoff::for_request(store, request)?;
             command::initial(
-                &prompt::compose(request, &artifacts)?,
+                &prompt::compose(request, &artifacts, handoff.as_ref())?,
                 request.stage_kind(),
                 self.model.as_ref(),
                 &final_message_path,
