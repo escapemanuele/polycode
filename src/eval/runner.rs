@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::app::{
-    AppError, ExecutionTarget, ProviderResolver, QuiescentState, RoutedProvider, RoutingPlan,
-    RunService,
+    AppError, ExecutionTarget, ProviderResolver, QuiescentState, ResourcePlan, RoutedProvider,
+    RoutingPlan, RunService,
 };
 use crate::domain::{ConfigSnapshotId, ModelId, ProviderId, RunId, StageId, WorkflowDefinition};
 use crate::store::{ResolvedConfigSnapshot, SequencedEvent};
@@ -147,6 +147,7 @@ impl EvalRunner {
         };
         write_evidence(&repetition_root, &evidence)?;
         let result = EvalResultV1 {
+            requested_effort: Some(crate::domain::EffortSetting::NativeDefault),
             schema_version: EVAL_RESULT_SCHEMA_VERSION,
             suite: suite.name().to_owned(),
             suite_version: suite.version().to_owned(),
@@ -348,8 +349,10 @@ impl ProviderResolver for EvalProviderResolver {
                 error.into()
             }
         })?;
+        let resource_plan = ResourcePlan::from_snapshot(config, workflow)?;
         Ok(RoutedProvider::isolated(
             plan,
+            resource_plan,
             workflow.clone(),
             self.process_root.clone(),
             self.runner_executable.clone(),

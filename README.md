@@ -133,6 +133,14 @@ Usage sources are provider-native and are NOT cross-provider normalized; never c
 
 Cross-provider comparable dimensions: wall-clock latency, invocation count, injected prompt bytes, and eval pass/fail outcomes. Provider-native, never comparable: input/output/cache/reasoning units and per-model native accounting.
 
+## Effort policy (resource intent)
+
+M13b separates four concepts that must never be conflated: **Role** answers what responsibility a stage carries; the **RoutingPlan** answers which coding runtime/model destination executes it; the **ResourcePlan** answers how much native-runtime effort is requested; **M13a telemetry** answers what resource usage was actually observed. Effort is resource intent, not a token budget — Polycode cannot reliably enforce a universal token ceiling inside native coding runtimes and does not try.
+
+New runs accept `--effort native|low|medium|high` (CLI) or the Effort field in the TUI composer. Omitted effort means `NativeDefault`: every native invocation stays byte-identical to pre-M13b behavior, preserving each runtime's own configuration exactly. `NativeDefault` is deliberately distinct from `medium` — a runtime's default may be anything. Explicit levels are translated by each provider adapter onto its native supported control: Claude Code maps onto the `--effort low|medium|high` session flag; Codex maps onto a `-c model_reasoning_effort="low|medium|high"` configuration override. Adapters own these mappings; domain code never encodes provider- or model-specific aliases, so a future runtime (for example a local-model harness) can translate `high` completely differently (say, a reasoning-tier model profile). An explicit level is never silently no-opped: it always changes the native invocation, and the persisted requested effort is visible in `status` and the TUI per stage.
+
+Effort persists as a per-role ResourcePlan inside the immutable config snapshot (schema v3; omitted effort keeps emitting the pre-M13b schema v2 payload). Old v1/v2 snapshots decode to `NativeDefault` for every role — no old run changes native runtime behavior — and unknown or malformed effort values fail closed instead of degrading to a default. Effort never rewrites routing: `--profile recommended` resolves the same frozen `recommended_v2` routes regardless of effort, and M13a telemetry never feeds back into effort dynamically. Review stages receive identical change-handoff evidence at every effort level so effort comparisons measure runtime reasoning, not supplied evidence.
+
 ## Implementation change map for review stages
 
 Review stages (CodeQualityReviewer, SpecReviewer, and the legacy Reviewer role) receive a deterministic bounded implementation-change map in their initial prompt: the changed-file inventory (with change kind and binary markers) plus a bounded textual diff of the managed worktree relative to the immutable run base — the exact delta semantics used by apply and diff preview, including untracked files. The handoff is navigation evidence, not the source of truth: reviewers retain full access to the real worktree and must inspect code as needed. Binary contents are never injected. Oversized diffs are explicitly marked INCOMPLETE with the shown/total byte counts — never silently truncated — and the changed-file inventory is always complete even when the diff is bounded. The handoff is provider-neutral (one shared section, byte-identical across Claude and Codex) and removes redundant mechanical change discovery, especially for future runtimes launched with restricted read-only tool sets that cannot run `git diff` themselves. Researcher, Architect, Implementer, and Decision stages do not receive it; resume/continuation prompts stay compact and never re-inject it. Its prompt cost is visible through the existing injected-prompt-bytes telemetry.
@@ -152,6 +160,7 @@ polycode standard "Add export support" --repo /path/to/repo --provider claude
 polycode deep "Redesign authentication" --provider claude
 polycode review "Review the error boundary" --provider claude
 polycode fast "Fix the parser" --provider codex
+polycode standard "Refactor parser" --profile recommended --effort high
 polycode standard "Add export support" --repo /path/to/repo --provider codex
 polycode deep "Redesign authentication" --provider codex
 polycode review "Review the error boundary" --provider codex

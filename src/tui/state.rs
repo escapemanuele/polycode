@@ -4,7 +4,7 @@ use crate::app::{
     ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails, RunDiffPreview,
     RunListItem, UniformProvider,
 };
-use crate::domain::{AttentionRequestId, RunId, StageId, WorkflowKind};
+use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
@@ -139,12 +139,44 @@ impl ExecutionChoice {
     }
 }
 
+/// Requested native-runtime effort choice for the new-run composer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EffortChoice {
+    NativeDefault,
+    Low,
+    Medium,
+    High,
+}
+
+impl EffortChoice {
+    pub(crate) const ALL: [Self; 4] = [Self::NativeDefault, Self::Low, Self::Medium, Self::High];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::NativeDefault => "Native default",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+
+    pub(crate) const fn setting(self) -> EffortSetting {
+        match self {
+            Self::NativeDefault => EffortSetting::NativeDefault,
+            Self::Low => EffortSetting::LOW,
+            Self::Medium => EffortSetting::MEDIUM,
+            Self::High => EffortSetting::HIGH,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NewRunForm {
     pub task: TextField,
     pub repository: TextField,
     pub workflow: WorkflowKind,
     pub execution: ExecutionChoice,
+    pub effort: EffortChoice,
     pub focus: usize,
 }
 
@@ -155,16 +187,17 @@ impl NewRunForm {
             repository: TextField::new(repository.display().to_string()),
             workflow: WorkflowKind::Standard,
             execution: ExecutionChoice::Recommended,
+            effort: EffortChoice::NativeDefault,
             focus: 0,
         }
     }
 
     pub(crate) fn next_field(&mut self) {
-        self.focus = (self.focus + 1) % 4;
+        self.focus = (self.focus + 1) % 5;
     }
 
     pub(crate) fn previous_field(&mut self) {
-        self.focus = self.focus.checked_sub(1).unwrap_or(3);
+        self.focus = self.focus.checked_sub(1).unwrap_or(4);
     }
 
     pub(crate) fn cycle_value(&mut self, forward: bool) {
@@ -190,6 +223,13 @@ impl NewRunForm {
                     .unwrap_or(0);
                 self.execution =
                     ExecutionChoice::ALL[cycle(index, ExecutionChoice::ALL.len(), forward)];
+            }
+            4 => {
+                let index = EffortChoice::ALL
+                    .iter()
+                    .position(|choice| *choice == self.effort)
+                    .unwrap_or(0);
+                self.effort = EffortChoice::ALL[cycle(index, EffortChoice::ALL.len(), forward)];
             }
             _ => {}
         }

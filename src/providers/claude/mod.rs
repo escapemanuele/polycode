@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AttentionKind, AttentionRequestId, ModelId, ProviderId, ProviderSessionId, Role, StageKind,
+    AttentionKind, AttentionRequestId, EffortSetting, ModelId, ProviderId, ProviderSessionId, Role,
+    StageKind,
 };
 use crate::engine::{
     Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest,
@@ -43,6 +44,7 @@ pub struct ClaudeProvider<B = TmuxBackend> {
     id: ProviderId,
     installation: ClaudeInstallation,
     model: Option<ModelId>,
+    effort: EffortSetting,
     manager: ProcessManager<B>,
     artifact_root: PathBuf,
     eval_auto_approve: bool,
@@ -62,6 +64,7 @@ impl ClaudeProvider<TmuxBackend> {
                 .map_err(|error| ClaudeProviderError::Protocol(error.to_string()))?,
             installation,
             model,
+            effort: EffortSetting::NativeDefault,
             manager: ProcessManager::from_environment()?,
             artifact_root: root,
             eval_auto_approve: false,
@@ -89,6 +92,7 @@ impl ClaudeProvider<TmuxBackend> {
                 .map_err(|error| ClaudeProviderError::Protocol(error.to_string()))?,
             installation,
             model,
+            effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
             artifact_root: root,
             eval_auto_approve,
@@ -100,6 +104,14 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
     #[must_use]
     pub const fn installation(&self) -> &ClaudeInstallation {
         &self.installation
+    }
+
+    /// Sets the requested effort translated onto native `--effort`.
+    /// `NativeDefault` keeps invocations byte-identical to pre-effort policy.
+    #[must_use]
+    pub fn with_effort(mut self, effort: EffortSetting) -> Self {
+        self.effort = effort;
+        self
     }
 
     fn now() -> DateTime<Utc> {
@@ -146,6 +158,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             command::initial(
                 &prompt::compose(request, &artifacts, handoff.as_ref())?,
                 self.model.as_ref(),
+                self.effort,
             )
         } else {
             let native = session.native_session_id().ok_or_else(|| {
@@ -182,7 +195,13 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 .map(|pending| self.read_response(session.id(), pending.attention_id()))
                 .transpose()?
                 .flatten();
-            command::resume(native, &denials, response.as_deref(), self.model.as_ref())?
+            command::resume(
+                native,
+                &denials,
+                response.as_deref(),
+                self.model.as_ref(),
+                self.effort,
+            )?
         };
         let process = self.manager.prepare_with_input(
             store,
@@ -2348,6 +2367,7 @@ mod tests {
             id: ProviderId::new("claude").unwrap(),
             installation: ClaudeInstallation::fixture(PathBuf::from("/bin/true")),
             model: None,
+            effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&process_root, backend),
             artifact_root: process_root,
             eval_auto_approve,

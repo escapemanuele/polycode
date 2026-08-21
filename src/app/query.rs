@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::domain::{
     ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
-    DomainEventKind, NativeModelUsage, Role, RunId, RunStatus, StageId, StageKind, StageStatus,
-    WorkflowKind,
+    DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus, StageId, StageKind,
+    StageStatus, WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
 use crate::store::{RunRevision, SequencedEvent, SqliteStore, StoreError};
@@ -35,6 +35,9 @@ pub struct StageSummary {
     pub role: Role,
     pub status: StageStatus,
     pub configured_provider: String,
+    /// Persisted requested effort from the immutable resource plan.
+    /// `NativeDefault` for every pre-effort-policy snapshot.
+    pub requested_effort: EffortSetting,
     pub configured_model: Option<String>,
     pub actual_provider: Option<String>,
     pub actual_model: Option<String>,
@@ -232,6 +235,9 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         Err(_) if loaded.config_snapshot.schema_version() == 1 => None,
         Err(error) => return Err(error.into()),
     };
+    let resource_plan =
+        super::routing::ResourcePlan::from_snapshot(&loaded.config_snapshot, loaded.run.workflow())
+            .ok();
     let usage = usage_summary(&events);
     let sessions = store.list_provider_sessions(run_id)?;
     let mut routes = plan
@@ -282,6 +288,10 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
                 || "unavailable".to_owned(),
                 |route| route.target().provider_id().to_string(),
             ),
+            requested_effort: resource_plan
+                .as_ref()
+                .and_then(|plan| plan.effort(stage.role()))
+                .unwrap_or_default(),
             configured_model: route
                 .and_then(|route| route.target().model_id())
                 .map(ToString::to_string),

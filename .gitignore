@@ -6,3 +6,6 @@
 /.project-meta.yaml
 /PROJECT.md
 /ZSHRC-FUNCTION.txt
+
+# Claude Code local worktrees/session data
+/.claude/

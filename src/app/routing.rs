@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::domain::{ConfigSnapshotId, ModelId, ProviderId, Role, WorkflowDefinition};
+use crate::domain::{
+    ConfigSnapshotId, EffortSetting, ModelId, ProviderId, Role, WorkflowDefinition,
+};
 use crate::store::ResolvedConfigSnapshot;
 
 /// Frozen initial Recommended policy. Preserved verbatim so persisted
@@ -309,9 +311,95 @@ impl RoutingPlan {
     ) -> Result<Self, RoutingError> {
         match snapshot.schema_version() {
             1 => decode_legacy(snapshot, workflow),
-            2 => decode_v2(snapshot, workflow),
+            2 | 3 => decode_v2(snapshot, workflow),
             version => Err(RoutingError::UnsupportedSchema(version)),
         }
+    }
+}
+
+/// Validated immutable per-role requested effort reconstructed from one
+/// configuration snapshot. Separate from `RoutingPlan`: routing answers the
+/// destination, the resource plan answers requested native-runtime effort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourcePlan {
+    role_efforts: HashMap<Role, EffortSetting>,
+}
+
+impl ResourcePlan {
+    /// Requested effort for one routed role.
+    #[must_use]
+    pub fn effort(&self, role: Role) -> Option<EffortSetting> {
+        self.role_efforts.get(&role).copied()
+    }
+
+    pub fn efforts(&self) -> impl Iterator<Item = (Role, EffortSetting)> + '_ {
+        self.role_efforts
+            .iter()
+            .map(|(role, effort)| (*role, *effort))
+    }
+
+    /// Reconstructs the immutable resource plan from a persisted snapshot.
+    ///
+    /// Schema v1 and v2 predate effort policy and always decode to
+    /// `NativeDefault` for every workflow role — never `Medium` — so no old
+    /// run changes native runtime behavior. Schema v3 requires an explicit
+    /// setting for exactly the workflow's required roles; anything malformed
+    /// fails closed.
+    ///
+    /// # Errors
+    /// Rejects malformed payloads, unknown settings, or incomplete coverage.
+    pub fn from_snapshot(
+        snapshot: &ResolvedConfigSnapshot,
+        workflow: &WorkflowDefinition,
+    ) -> Result<Self, RoutingError> {
+        let required = required_roles(workflow);
+        match snapshot.schema_version() {
+            1 | 2 => Ok(Self {
+                role_efforts: required
+                    .into_iter()
+                    .map(|role| (role, EffortSetting::NativeDefault))
+                    .collect(),
+            }),
+            3 => {
+                let payload: RoutingPayloadV2 = serde_json::from_value(snapshot.payload().clone())?;
+                validate_resource_plan_shape(&payload, workflow)?;
+                let role_efforts = payload.resource_plan.ok_or_else(|| {
+                    RoutingError::InvalidConfig("schema v3 requires a resource plan".to_owned())
+                })?;
+                Ok(Self { role_efforts })
+            }
+            version => Err(RoutingError::UnsupportedSchema(version)),
+        }
+    }
+}
+
+/// Structural effort rules shared by routing and resource decoding: v2 must
+/// not smuggle a resource plan; v3 must cover exactly the workflow roles.
+fn validate_resource_plan_shape(
+    payload: &RoutingPayloadV2,
+    workflow: &WorkflowDefinition,
+) -> Result<(), RoutingError> {
+    match (payload.schema_version, payload.resource_plan.as_ref()) {
+        (1 | 2, None) => Ok(()),
+        (2, Some(_)) => Err(RoutingError::InvalidConfig(
+            "resource plan requires config schema 3".to_owned(),
+        )),
+        (3, Some(plan)) => {
+            let required = required_roles(workflow);
+            if plan.len() != required.len() || !required.iter().all(|role| plan.contains_key(role))
+            {
+                return Err(RoutingError::InvalidConfig(
+                    "resource plan must cover exactly the workflow's required roles".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (3, None) => Err(RoutingError::InvalidConfig(
+            "schema v3 requires a resource plan".to_owned(),
+        )),
+        _ => Err(RoutingError::InvalidConfig(
+            "unsupported payload schema for resource plan".to_owned(),
+        )),
     }
 }
 
@@ -394,6 +482,7 @@ pub struct RecommendedAvailability {
 /// Rejects unavailable Recommended or invalid identifiers/configuration.
 pub fn resolve_config(
     selection: ExecutionSelection,
+    effort: EffortSetting,
     workflow: &WorkflowDefinition,
     availability: RecommendedAvailability,
     id: ConfigSnapshotId,
@@ -430,16 +519,39 @@ pub fn resolve_config(
         .into_iter()
         .map(|provider| Ok((provider.to_owned(), provider_config_dto(provider)?)))
         .collect::<Result<HashMap<_, _>, RoutingError>>()?;
+    // NativeDefault keeps the exact pre-effort schema-v2 payload; explicit
+    // effort persists a per-role resource plan under schema v3. Old payloads
+    // are never rewritten either way.
+    let (schema_version, resource_plan) = match effort {
+        EffortSetting::NativeDefault => (2, None),
+        explicit @ EffortSetting::Level(_) => (
+            3,
+            Some(
+                routes
+                    .keys()
+                    .copied()
+                    .map(|role| (role, explicit))
+                    .collect::<HashMap<_, _>>(),
+            ),
+        ),
+    };
     let payload = RoutingPayloadV2 {
-        schema_version: 2,
+        schema_version,
         profile: profile.to_owned(),
         profile_version: profile_version.to_owned(),
         routes,
         providers,
+        resource_plan,
     };
-    let snapshot = ResolvedConfigSnapshot::new(id, 2, serde_json::to_value(payload)?, created_at)
-        .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
+    let snapshot = ResolvedConfigSnapshot::new(
+        id,
+        schema_version,
+        serde_json::to_value(payload)?,
+        created_at,
+    )
+    .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
     RoutingPlan::from_snapshot(&snapshot, workflow)?;
+    ResourcePlan::from_snapshot(&snapshot, workflow)?;
     Ok(snapshot)
 }
 
@@ -494,6 +606,7 @@ pub(crate) fn resolve_eval_config(
         profile_version: EVAL_PROFILE_VERSION.to_owned(),
         routes,
         providers,
+        resource_plan: None,
     };
     let snapshot = ResolvedConfigSnapshot::new(id, 2, serde_json::to_value(payload)?, created_at)
         .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
@@ -567,6 +680,10 @@ struct RoutingPayloadV2 {
     profile_version: String,
     routes: HashMap<Role, RouteDto>,
     providers: HashMap<String, ProviderConfigDto>,
+    /// Schema v3 only: per-role requested effort. Absent on v2 payloads;
+    /// unknown values fail decoding closed instead of degrading silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_plan: Option<HashMap<Role, EffortSetting>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -592,11 +709,12 @@ fn decode_v2(
     workflow: &WorkflowDefinition,
 ) -> Result<RoutingPlan, RoutingError> {
     let payload: RoutingPayloadV2 = serde_json::from_value(snapshot.payload().clone())?;
-    if payload.schema_version != 2 {
+    if payload.schema_version != snapshot.schema_version() {
         return Err(RoutingError::InvalidConfig(
-            "payload schema_version must be 2".to_owned(),
+            "payload schema_version must match snapshot schema".to_owned(),
         ));
     }
+    validate_resource_plan_shape(&payload, workflow)?;
     match (payload.profile.as_str(), payload.profile_version.as_str()) {
         ("uniform", UNIFORM_PROFILE_VERSION)
         | ("recommended", RECOMMENDED_PROFILE_VERSION_V1 | RECOMMENDED_PROFILE_VERSION)
@@ -877,6 +995,7 @@ mod tests {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
         let snapshot = resolve_config(
             selection,
+            EffortSetting::NativeDefault,
             &workflow,
             available,
             ConfigSnapshotId::new("routing-test").unwrap(),
@@ -1086,6 +1205,7 @@ mod tests {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Fast);
         let config = resolve_config(
             ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
             &workflow,
             RecommendedAvailability {
                 claude: true,
@@ -1128,6 +1248,7 @@ mod tests {
         assert!(matches!(
             resolve_config(
                 ExecutionSelection::Recommended,
+                EffortSetting::NativeDefault,
                 &workflow,
                 RecommendedAvailability::default(),
                 ConfigSnapshotId::new("none").unwrap(),
@@ -1162,6 +1283,7 @@ mod tests {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Fast);
         let persisted = resolve_config(
             ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
             &workflow,
             RecommendedAvailability {
                 claude: true,
@@ -1181,6 +1303,184 @@ mod tests {
                 .as_str(),
             "codex"
         );
+    }
+
+    #[test]
+    fn omitted_effort_keeps_schema_v2_payload_identical_to_pre_effort_encoding() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let snapshot = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("native-default").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.schema_version(), 2);
+        assert!(snapshot.payload().get("resource_plan").is_none());
+        // Bare recommended remains recommended_v2; no recommended_v3 semantics.
+        assert_eq!(
+            snapshot.payload().get("profile_version").unwrap(),
+            RECOMMENDED_PROFILE_VERSION
+        );
+        let plan = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+        for (_, effort) in plan.efforts() {
+            assert_eq!(effort, EffortSetting::NativeDefault);
+        }
+    }
+
+    #[test]
+    fn explicit_effort_persists_per_role_resource_plan_under_schema_v3() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Deep);
+        let snapshot = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::HIGH,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("explicit-high").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.schema_version(), 3);
+        // Routing behavior is untouched by effort: same profile identity.
+        assert_eq!(
+            snapshot.payload().get("profile_version").unwrap(),
+            RECOMMENDED_PROFILE_VERSION
+        );
+        let routing = RoutingPlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(routing.profile_version(), RECOMMENDED_PROFILE_VERSION);
+        let plan = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+        let mut count = 0;
+        for (_, effort) in plan.efforts() {
+            assert_eq!(effort, EffortSetting::HIGH);
+            count += 1;
+        }
+        assert_eq!(count, routing.routes().count());
+        // Restart determinism: decoding the same immutable snapshot twice is exact.
+        assert_eq!(
+            plan,
+            ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_v1_and_v2_decode_to_native_default_never_medium() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let legacy = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("legacy-effort").unwrap(),
+            1,
+            json!({
+                "schema_version":1,
+                "profile":"native_codex",
+                "provider":"codex",
+                "model":null,
+                "provider_options":codex_options()
+            }),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        let v2 = resolve_config(
+            ExecutionSelection::Uniform(UniformProvider::Fake),
+            EffortSetting::NativeDefault,
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("v2-effort").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        for snapshot in [&legacy, &v2] {
+            let plan = ResourcePlan::from_snapshot(snapshot, &workflow).unwrap();
+            for role in workflow
+                .stages()
+                .iter()
+                .map(crate::domain::StageDefinition::role)
+            {
+                let effort = plan.effort(role).unwrap();
+                assert_eq!(effort, EffortSetting::NativeDefault);
+                assert_ne!(effort, EffortSetting::MEDIUM);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_unknown_effort_fails_closed() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let valid = resolve_config(
+            ExecutionSelection::Uniform(UniformProvider::Fake),
+            EffortSetting::MEDIUM,
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("valid-effort").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert_eq!(valid.schema_version(), 3);
+
+        let corrupt = |mutate: fn(&mut Value), id: &str| {
+            let mut payload = valid.payload().clone();
+            mutate(&mut payload);
+            ResolvedConfigSnapshot::new(
+                ConfigSnapshotId::new(id).unwrap(),
+                payload
+                    .get("schema_version")
+                    .and_then(Value::as_u64)
+                    .and_then(|version| u32::try_from(version).ok())
+                    .unwrap_or(3),
+                payload,
+                std::time::SystemTime::now().into(),
+            )
+            .unwrap()
+        };
+
+        // Unknown future setting never silently becomes Medium/default.
+        let unknown = corrupt(
+            |payload| {
+                payload["resource_plan"]["implementer"] = json!("turbo");
+            },
+            "unknown-effort",
+        );
+        assert!(ResourcePlan::from_snapshot(&unknown, &workflow).is_err());
+        assert!(RoutingPlan::from_snapshot(&unknown, &workflow).is_err());
+
+        // Missing role coverage fails closed.
+        let missing = corrupt(
+            |payload| {
+                payload["resource_plan"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("implementer");
+            },
+            "missing-role-effort",
+        );
+        assert!(ResourcePlan::from_snapshot(&missing, &workflow).is_err());
+
+        // v3 without a resource plan fails closed.
+        let absent = corrupt(
+            |payload| {
+                payload.as_object_mut().unwrap().remove("resource_plan");
+            },
+            "absent-plan",
+        );
+        assert!(ResourcePlan::from_snapshot(&absent, &workflow).is_err());
+
+        // A resource plan smuggled into schema v2 fails closed.
+        let mut smuggled_payload = valid.payload().clone();
+        smuggled_payload["schema_version"] = json!(2);
+        let smuggled = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("smuggled-plan").unwrap(),
+            2,
+            smuggled_payload,
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert!(RoutingPlan::from_snapshot(&smuggled, &workflow).is_err());
     }
 
     #[test]
@@ -1214,6 +1514,7 @@ mod tests {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
         let valid = resolve_config(
             ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
             &workflow,
             RecommendedAvailability {
                 claude: true,

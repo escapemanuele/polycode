@@ -21,7 +21,7 @@ pub use routing::{
     DecisionBasis, DecisionConfidence, ExecutionSelection, ExecutionTarget,
     RECOMMENDED_PROFILE_VERSION, RECOMMENDED_PROFILE_VERSION_V1,
     RECOMMENDED_V2_EVIDENCE_FINGERPRINT, RECOMMENDED_V2_EVIDENCE_SUITE, RecommendedAvailability,
-    RecommendedDecision, RecommendedProvenance, RoleRoute, RoutingError, RoutingPlan,
+    RecommendedDecision, RecommendedProvenance, ResourcePlan, RoleRoute, RoutingError, RoutingPlan,
     UniformProvider, recommended_provenance,
 };
 pub use run_service::{ApplyOutcome, ExecutionReport, QuiescentState, RunService};

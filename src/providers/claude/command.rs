@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 
-use crate::domain::{ModelId, ProviderSessionId};
+use crate::domain::{EffortLevel, EffortSetting, ModelId, ProviderSessionId};
 
 use super::{ClaudeProviderError, PermissionDenial};
 
@@ -10,9 +10,13 @@ pub(crate) struct ClaudeCommand {
     pub stdin: Vec<u8>,
 }
 
-pub(crate) fn initial(prompt: &str, model: Option<&ModelId>) -> ClaudeCommand {
+pub(crate) fn initial(
+    prompt: &str,
+    model: Option<&ModelId>,
+    effort: EffortSetting,
+) -> ClaudeCommand {
     ClaudeCommand {
-        argv: base(model),
+        argv: base(model, effort),
         stdin: prompt.as_bytes().to_vec(),
     }
 }
@@ -22,6 +26,7 @@ pub(crate) fn resume(
     denials: &[PermissionDenial],
     response: Option<&str>,
     model: Option<&ModelId>,
+    effort: EffortSetting,
 ) -> Result<ClaudeCommand, ClaudeProviderError> {
     if denials
         .iter()
@@ -30,7 +35,7 @@ pub(crate) fn resume(
     {
         return Err(ClaudeProviderError::QuestionResponseRequired);
     }
-    let mut argv = base(model);
+    let mut argv = base(model, effort);
     argv.push(OsString::from("--resume"));
     argv.push(OsString::from(session_id.as_str()));
     let mut rules = BTreeSet::new();
@@ -68,7 +73,7 @@ pub(crate) fn resume(
     })
 }
 
-fn base(model: Option<&ModelId>) -> Vec<OsString> {
+fn base(model: Option<&ModelId>, effort: EffortSetting) -> Vec<OsString> {
     let mut argv = vec![
         OsString::from("-p"),
         OsString::from("--verbose"),
@@ -81,7 +86,23 @@ fn base(model: Option<&ModelId>) -> Vec<OsString> {
         argv.push(OsString::from("--model"));
         argv.push(OsString::from(model.as_str()));
     }
+    // Adapter-owned mapping onto the native supported `--effort` session flag
+    // (Claude Code 2.x: low|medium|high|xhigh|max). NativeDefault omits the
+    // flag entirely so native configuration keeps deciding.
+    if let EffortSetting::Level(level) = effort {
+        argv.push(OsString::from("--effort"));
+        argv.push(OsString::from(native_effort_value(level)));
+    }
     argv
+}
+
+/// Native Claude Code value for one explicit requested level.
+pub(crate) const fn native_effort_value(level: EffortLevel) -> &'static str {
+    match level {
+        EffortLevel::Low => "low",
+        EffortLevel::Medium => "medium",
+        EffortLevel::High => "high",
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +110,80 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn native_default_argv_is_byte_identical_to_pre_effort_invocation() {
+        let command = initial("prompt", None, EffortSetting::NativeDefault);
+        let args = command
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--permission-mode",
+                "dontAsk",
+            ]
+        );
+    }
+
+    #[test]
+    fn effort_changes_only_argv_never_the_injected_prompt() {
+        let prompt = "identical stage prompt with change map";
+        let baseline = initial(prompt, None, EffortSetting::NativeDefault);
+        for setting in [
+            EffortSetting::LOW,
+            EffortSetting::MEDIUM,
+            EffortSetting::HIGH,
+        ] {
+            let command = initial(prompt, None, setting);
+            assert_eq!(command.stdin, baseline.stdin);
+            assert_ne!(command.argv, baseline.argv);
+        }
+    }
+
+    #[test]
+    fn explicit_effort_maps_onto_native_effort_flag_never_silently() {
+        for (setting, native) in [
+            (EffortSetting::LOW, "low"),
+            (EffortSetting::MEDIUM, "medium"),
+            (EffortSetting::HIGH, "high"),
+        ] {
+            let command = initial("prompt", None, setting);
+            let args = command
+                .argv
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                args.windows(2).any(|pair| pair == ["--effort", native]),
+                "{setting:?} must produce --effort {native}"
+            );
+        }
+        let resume_command = resume(
+            &ProviderSessionId::new("session-9").unwrap(),
+            &[PermissionDenial {
+                tool_name: "Write".to_owned(),
+                tool_use_id: None,
+                tool_input: json!({"file_path":"/tmp/result.txt"}),
+            }],
+            None,
+            None,
+            EffortSetting::HIGH,
+        )
+        .unwrap();
+        let args = resume_command
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--effort", "high"]));
+    }
 
     #[test]
     fn resume_uses_same_session_and_exact_write_target() {
@@ -101,6 +196,7 @@ mod tests {
             }],
             None,
             None,
+            EffortSetting::NativeDefault,
         )
         .unwrap();
         let args = command
@@ -137,6 +233,7 @@ mod tests {
                 std::slice::from_ref(&denial),
                 None,
                 None,
+                EffortSetting::NativeDefault,
             ),
             Err(ClaudeProviderError::QuestionResponseRequired)
         ));
@@ -146,6 +243,7 @@ mod tests {
                 &[denial],
                 Some("Option A"),
                 None,
+                EffortSetting::NativeDefault,
             )
             .is_ok()
         );

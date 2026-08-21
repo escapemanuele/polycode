@@ -259,6 +259,7 @@ fn render_stage_context(frame: &mut Frame<'_>, area: Rect, state: &TuiState, det
                 .as_deref()
                 .unwrap_or("native default")
         )),
+        Line::from(format!("Effort      {}", selected.requested_effort.label())),
         Line::from(format!(
             "Actual      {} / {}",
             selected.actual_provider.as_deref().unwrap_or("not started"),
@@ -471,6 +472,8 @@ fn render_new_run(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         form_line("Repository", &repository, form.focus == 2),
         Line::from(""),
         form_line("Execution", form.execution.label(), form.focus == 3),
+        Line::from(""),
+        form_line("Effort", form.effort.label(), form.focus == 4),
         Line::from(""),
         Line::from("Tab/Shift-Tab fields · ←/→ choices · Enter start · Esc cancel"),
     ];
@@ -859,6 +862,7 @@ mod tests {
         let mut state = TuiState::new(std::path::Path::new("/repo"));
         let id = RunId::from_u128(2);
         let make_summary = |id: &str, kind, role| StageSummary {
+            requested_effort: crate::domain::EffortSetting::NativeDefault,
             id: StageId::new(id).unwrap(),
             kind,
             role,

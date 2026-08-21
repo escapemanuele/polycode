@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use crate::app::{ApplyOutcome, ExecutionReport, ExecutionSelection, ProviderFactory, RunService};
-use crate::domain::{AttentionRequestId, RunId, StageId, WorkflowKind};
+use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
@@ -34,6 +34,7 @@ pub(crate) enum WorkerCommand {
         task: String,
         repository: PathBuf,
         selection: ExecutionSelection,
+        effort: EffortSetting,
     },
     ResumeRun {
         run_id: RunId,
@@ -166,8 +167,9 @@ where
             task,
             repository,
             selection,
+            effort,
         } => service
-            .start_run(workflow, task, repository, Some(selection))
+            .start_run(workflow, task, repository, Some(selection), effort)
             .map(WorkerSuccess::Execution),
         WorkerCommand::ResumeRun { run_id } => {
             service.resume_run(run_id).map(WorkerSuccess::Execution)
@@ -225,6 +227,7 @@ mod tests {
                 task: "worker integration".to_owned(),
                 repository: repo,
                 selection: ExecutionSelection::Uniform(UniformProvider::Fake),
+                effort: EffortSetting::NativeDefault,
             })
             .unwrap();
 
@@ -255,6 +258,7 @@ mod tests {
                 task: "invalid repository".to_owned(),
                 repository: fixture.path().join("missing"),
                 selection: ExecutionSelection::Uniform(UniformProvider::Fake),
+                effort: EffortSetting::NativeDefault,
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
