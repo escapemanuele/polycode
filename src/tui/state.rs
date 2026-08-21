@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::app::{
     ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails, RunDiffPreview,
@@ -25,10 +27,32 @@ pub(crate) enum Overlay {
     DiscardConfirm,
 }
 
+/// Presentation-level notification severity. TUI-only; durable state that
+/// needs user action stays in `RunDetails`/attention and is rendered from
+/// there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UiMessageKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl UiMessageKind {
+    pub(crate) const fn ttl(self) -> Duration {
+        match self {
+            Self::Info | Self::Success => Duration::from_secs(4),
+            Self::Warning => Duration::from_secs(6),
+            Self::Error => Duration::from_secs(8),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UiMessage {
     pub text: String,
-    pub persistent: bool,
+    pub kind: UiMessageKind,
+    pub expires_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -225,6 +249,8 @@ pub(crate) struct TuiState {
     pub selected_stage: Option<StageId>,
     pub selected_stage_index: usize,
     pub artifact: Option<ArtifactView>,
+    pub artifact_raw: bool,
+    pub stages_with_artifacts: HashSet<StageId>,
     pub logs: Option<ProcessLogView>,
     pub diff: Option<RunDiffPreview>,
     pub scroll: u16,
@@ -249,6 +275,8 @@ impl TuiState {
             selected_stage: None,
             selected_stage_index: 0,
             artifact: None,
+            artifact_raw: false,
+            stages_with_artifacts: HashSet::new(),
             logs: None,
             diff: None,
             scroll: 0,
@@ -336,18 +364,39 @@ impl TuiState {
             .map(|attention| attention.id)
     }
 
-    pub(crate) fn set_error(&mut self, error: impl Into<String>) {
+    pub(crate) fn notify(&mut self, kind: UiMessageKind, text: impl Into<String>) {
+        self.notify_at(kind, text, Instant::now());
+    }
+
+    pub(crate) fn notify_at(&mut self, kind: UiMessageKind, text: impl Into<String>, now: Instant) {
         self.message = Some(UiMessage {
-            text: error.into(),
-            persistent: true,
+            text: text.into(),
+            kind,
+            expires_at: now.checked_add(kind.ttl()),
         });
     }
 
+    pub(crate) fn set_error(&mut self, error: impl Into<String>) {
+        self.notify(UiMessageKind::Error, error);
+    }
+
     pub(crate) fn set_message(&mut self, message: impl Into<String>) {
-        self.message = Some(UiMessage {
-            text: message.into(),
-            persistent: false,
-        });
+        self.notify(UiMessageKind::Success, message);
+    }
+
+    pub(crate) fn clear_expired_message(&mut self, now: Instant) {
+        if self
+            .message
+            .as_ref()
+            .and_then(|message| message.expires_at)
+            .is_some_and(|expires_at| now >= expires_at)
+        {
+            self.message = None;
+        }
+    }
+
+    pub(crate) fn dismiss_message(&mut self) {
+        self.message = None;
     }
 }
 
@@ -398,6 +447,39 @@ mod tests {
         field.home();
         field.delete();
         assert_eq!(field.text(), "aféè");
+    }
+
+    #[test]
+    fn message_kinds_have_distinct_escalating_lifetimes() {
+        assert_eq!(UiMessageKind::Info.ttl(), UiMessageKind::Success.ttl());
+        assert!(UiMessageKind::Warning.ttl() > UiMessageKind::Info.ttl());
+        assert!(UiMessageKind::Error.ttl() > UiMessageKind::Warning.ttl());
+    }
+
+    #[test]
+    fn messages_expire_deterministically_without_sleeping() {
+        let mut state = TuiState::new(Path::new("/repo"));
+        let now = Instant::now();
+        state.notify_at(UiMessageKind::Info, "saved", now);
+        state.clear_expired_message(now + Duration::from_secs(3));
+        assert!(state.message.is_some(), "info survives before its TTL");
+        state.clear_expired_message(now + Duration::from_secs(4));
+        assert!(state.message.is_none(), "info expires at its TTL");
+
+        state.notify_at(UiMessageKind::Error, "boom", now);
+        state.clear_expired_message(now + Duration::from_secs(7));
+        assert!(state.message.is_some(), "errors linger longer than info");
+        state.clear_expired_message(now + Duration::from_secs(8));
+        assert!(state.message.is_none(), "errors still expire");
+    }
+
+    #[test]
+    fn manual_dismiss_clears_message_immediately() {
+        let mut state = TuiState::new(Path::new("/repo"));
+        state.set_error("failure");
+        assert_eq!(state.message.as_ref().unwrap().kind, UiMessageKind::Error);
+        state.dismiss_message();
+        assert!(state.message.is_none());
     }
 
     #[test]
