@@ -3,12 +3,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use crate::app::{RunService, RuntimeProviderFactory};
-use crate::domain::StageStatus;
+use crate::app::{AppError, RunService, RuntimeProviderFactory};
+use crate::domain::{StageId, StageStatus};
 
 use super::input::{Intent, map_key, map_text_key};
 use super::render;
-use super::state::{Overlay, Screen, TuiState};
+use super::state::{Overlay, Screen, TuiState, UiMessageKind};
 use super::terminal::TerminalSession;
 use super::worker::{Worker, WorkerCommand, WorkerResult, WorkerSuccess};
 
@@ -40,6 +40,7 @@ impl TuiApp {
         self.refresh();
         while !self.state.quit {
             self.receive_worker_results();
+            self.state.clear_expired_message(Instant::now());
             if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
                 self.refresh();
             }
@@ -101,6 +102,9 @@ impl TuiApp {
                     self.refresh_selected();
                 }
             }
+            // Enter on a stage opens its primary result; open_artifact keeps
+            // expected absence informational, so this never mutates anything.
+            Intent::Enter if self.state.screen == Screen::RunDetail => self.open_artifact(),
             Intent::Escape => self.back(),
             Intent::NewRun => {
                 self.state.screen = Screen::NewRun;
@@ -120,6 +124,10 @@ impl TuiApp {
             Intent::Diff => self.open_diff(),
             Intent::Apply => self.open_apply_confirmation(),
             Intent::Discard => self.state.overlay = Some(Overlay::DiscardConfirm),
+            Intent::DismissMessage => self.state.dismiss_message(),
+            Intent::ToggleRaw if self.state.screen == Screen::Artifact => {
+                self.state.artifact_raw = !self.state.artifact_raw;
+            }
             Intent::Help => self.state.overlay = Some(Overlay::Help),
             _ => {}
         }
@@ -324,8 +332,19 @@ impl TuiApp {
         match self.reader.read_artifact(run_id, &stage_id) {
             Ok(artifact) => {
                 self.state.artifact = Some(artifact);
+                self.state.artifact_raw = false;
                 self.state.scroll = 0;
                 self.state.screen = Screen::Artifact;
+            }
+            Err(AppError::ArtifactNotFound { .. }) => {
+                let status = self
+                    .state
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.stages.get(self.state.selected_stage_index))
+                    .map(|stage| stage.status);
+                let (kind, text) = artifact_unavailable_feedback(status, &stage_id);
+                self.state.notify(kind, text);
             }
             Err(error) => self.state.set_error(error.to_string()),
         }
@@ -458,6 +477,45 @@ impl TuiApp {
             Ok(details) => self.state.replace_details(details),
             Err(error) => self.state.set_error(error.to_string()),
         }
+        if let Ok(artifacts) = self.reader.list_artifacts(run_id) {
+            self.state.stages_with_artifacts = artifacts
+                .into_iter()
+                .filter(|artifact| artifact.status == crate::domain::ArtifactStatus::Complete)
+                .map(|artifact| artifact.stage_id)
+                .collect();
+        }
+    }
+}
+
+/// Presentation severity for "no verified artifact" keyed on typed stage
+/// state: absence is expected while a stage has not completed, and only a
+/// completed stage missing its artifact is a genuine error.
+fn artifact_unavailable_feedback(
+    status: Option<StageStatus>,
+    stage_id: &StageId,
+) -> (UiMessageKind, String) {
+    match status {
+        Some(StageStatus::Running) => (
+            UiMessageKind::Info,
+            format!("Artifact not available yet — {stage_id} is still running."),
+        ),
+        Some(StageStatus::Pending | StageStatus::Ready) => (
+            UiMessageKind::Info,
+            "Artifact not available yet — this stage has not completed.".to_owned(),
+        ),
+        Some(
+            StageStatus::Failed
+            | StageStatus::NeedsUser
+            | StageStatus::Paused
+            | StageStatus::Interrupted,
+        ) => (
+            UiMessageKind::Warning,
+            "No verified artifact is available for this stage yet.".to_owned(),
+        ),
+        Some(StageStatus::Completed | StageStatus::Skipped) | None => (
+            UiMessageKind::Error,
+            format!("Stage {stage_id} completed but has no verified artifact."),
+        ),
     }
 }
 
@@ -483,6 +541,30 @@ mod tests {
             crate::tui::worker::ActionKind::Resume.label(),
             "resuming run"
         );
+    }
+
+    #[test]
+    fn artifact_absence_severity_tracks_stage_state() {
+        let stage_id = crate::domain::StageId::new("implementation").unwrap();
+        let (kind, text) = artifact_unavailable_feedback(Some(StageStatus::Running), &stage_id);
+        assert_eq!(kind, UiMessageKind::Info);
+        assert!(text.contains("still running"));
+
+        let (kind, _) = artifact_unavailable_feedback(Some(StageStatus::Pending), &stage_id);
+        assert_eq!(kind, UiMessageKind::Info);
+
+        let (kind, _) = artifact_unavailable_feedback(Some(StageStatus::Failed), &stage_id);
+        assert_eq!(kind, UiMessageKind::Warning);
+        let (kind, _) = artifact_unavailable_feedback(Some(StageStatus::NeedsUser), &stage_id);
+        assert_eq!(kind, UiMessageKind::Warning);
+
+        let (kind, text) = artifact_unavailable_feedback(Some(StageStatus::Completed), &stage_id);
+        assert_eq!(
+            kind,
+            UiMessageKind::Error,
+            "completed without artifact is real"
+        );
+        assert!(text.contains("completed but has no verified artifact"));
     }
 
     #[test]

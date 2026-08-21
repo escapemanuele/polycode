@@ -2,6 +2,8 @@
 
 mod app;
 mod input;
+mod markdown;
+mod mascot;
 mod render;
 mod state;
 mod terminal;
