@@ -123,7 +123,14 @@ mod tests {
             tool_use_id: None,
             tool_input: serde_json::json!({"file_path": "/managed/worktree/a.rs"}),
         };
-        let command = super::super::command::resume(&session, &[denial], None, None).unwrap();
+        let command = super::super::command::resume(
+            &session,
+            &[denial],
+            None,
+            None,
+            crate::domain::EffortSetting::NativeDefault,
+        )
+        .unwrap();
         let stdin = String::from_utf8(command.stdin).unwrap();
         assert!(!stdin.contains("# Implementation change map"));
         assert!(stdin.len() < 256, "resume stdin must stay compact");

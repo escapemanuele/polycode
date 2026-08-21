@@ -213,6 +213,11 @@ pub struct EvalResultV1 {
     /// usage units. Absent in pre-observability results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_prompt_bytes: Option<u64>,
+    /// Requested native-runtime effort for the candidate stage. Absent in
+    /// pre-effort-policy results, which ran under the runtime's native
+    /// configured default (`NativeDefault` semantics, never `Medium`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_effort: Option<crate::domain::EffortSetting>,
     pub latency_ms: u64,
     pub artifact_hash: Option<String>,
     pub diff_hash: String,
@@ -374,6 +379,7 @@ mod tests {
             .single()
             .unwrap();
         EvalResultV1 {
+            requested_effort: None,
             schema_version: EVAL_RESULT_SCHEMA_VERSION,
             suite: "role_core".to_owned(),
             suite_version: "role_core_v1".to_owned(),

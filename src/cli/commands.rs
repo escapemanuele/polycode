@@ -89,9 +89,26 @@ fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
         (None, None) => None,
         (Some(_), Some(_)) => unreachable!("clap rejects conflicting selection flags"),
     };
-    let report = service()?.start_run(workflow, args.task.clone(), &args.repo, selection)?;
+    let effort = parse_effort(args.effort.as_deref())?;
+    let report =
+        service()?.start_run(workflow, args.task.clone(), &args.repo, selection, effort)?;
     print_report(&report);
     Ok(())
+}
+
+/// CLI effort words. `native` (or omission) preserves the runtime's own
+/// configured default; anything unknown fails closed.
+fn parse_effort(value: Option<&str>) -> Result<crate::domain::EffortSetting> {
+    use crate::domain::EffortSetting;
+    match value {
+        None | Some("native") => Ok(EffortSetting::NativeDefault),
+        Some("low") => Ok(EffortSetting::LOW),
+        Some("medium") => Ok(EffortSetting::MEDIUM),
+        Some("high") => Ok(EffortSetting::HIGH),
+        Some(other) => {
+            anyhow::bail!("unsupported effort {other:?}; supported: native, low, medium, high")
+        }
+    }
 }
 
 fn doctor() -> Result<()> {
@@ -377,7 +394,7 @@ fn print_details(details: &RunDetails) {
     println!("Stages");
     for stage in &details.stages {
         println!(
-            "{} {} ({}) · role={} · configured={}/{} · actual={}/{} · session={} · native={} · conversation={} · process={}",
+            "{} {} ({}) · role={} · configured={}/{} · effort={} · actual={}/{} · session={} · native={} · conversation={} · process={}",
             stage_mark(stage.status),
             stage.id,
             enum_text(stage.status),
@@ -387,6 +404,7 @@ fn print_details(details: &RunDetails) {
                 .configured_model
                 .as_deref()
                 .unwrap_or("native default"),
+            stage.requested_effort.label(),
             stage.actual_provider.as_deref().unwrap_or("not started"),
             stage.actual_model.as_deref().unwrap_or("unconfirmed"),
             stage

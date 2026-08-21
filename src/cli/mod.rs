@@ -109,6 +109,10 @@ pub struct RunArgs {
     /// Versioned routing profile (`recommended`).
     #[arg(long, conflicts_with = "provider")]
     pub profile: Option<String>,
+    /// Requested native-runtime effort (`native`, `low`, `medium`, `high`).
+    /// Omitted or `native` preserves each runtime's own configured default.
+    #[arg(long)]
+    pub effort: Option<String>,
 }
 
 #[cfg(test)]

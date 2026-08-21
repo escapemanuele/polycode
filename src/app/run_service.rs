@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AttentionRequestId, ConfigSnapshotId, EventId, EventMetadata, Run, RunId, RunStatus, StageId,
-    StageStatus, WorkflowDefinition, WorkflowKind,
+    AttentionRequestId, ConfigSnapshotId, EffortSetting, EventId, EventMetadata, Run, RunId,
+    RunStatus, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
 };
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
@@ -88,6 +88,7 @@ where
         task: impl Into<String>,
         repository_path: impl AsRef<Path>,
         selection: Option<ExecutionSelection>,
+        effort: EffortSetting,
     ) -> Result<ExecutionReport, AppError>
     where
         F: ProviderFactory,
@@ -99,6 +100,7 @@ where
         let selection = selection.ok_or(AppError::NoProductionProvider)?;
         let config = self.provider_factory.config_for_new_run(
             selection,
+            effort,
             &workflow,
             config_id.clone(),
             created_at,
@@ -614,11 +616,13 @@ mod tests {
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
+            effort: EffortSetting,
             workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory.config_for_new_run(selection, workflow, id, created_at)
+            DevelopmentFakeProviderFactory
+                .config_for_new_run(selection, effort, workflow, id, created_at)
         }
 
         fn for_run(
@@ -641,11 +645,13 @@ mod tests {
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
+            effort: EffortSetting,
             workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory.config_for_new_run(selection, workflow, id, created_at)
+            DevelopmentFakeProviderFactory
+                .config_for_new_run(selection, effort, workflow, id, created_at)
         }
 
         fn for_run(
@@ -676,11 +682,13 @@ mod tests {
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
+            effort: EffortSetting,
             workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory.config_for_new_run(selection, workflow, id, created_at)
+            DevelopmentFakeProviderFactory
+                .config_for_new_run(selection, effort, workflow, id, created_at)
         }
 
         fn for_run(
@@ -756,6 +764,7 @@ mod tests {
                     format!("task for {kind:?}"),
                     &fixture.repo,
                     Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                    EffortSetting::NativeDefault,
                 )
                 .unwrap();
             assert_eq!(report.details.status, RunStatus::Completed);
@@ -782,6 +791,7 @@ mod tests {
                 "  Unicode α\nsecond line  ",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let run_id = report.details.id;
@@ -838,6 +848,7 @@ mod tests {
         let config = DevelopmentFakeProviderFactory
             .config_for_new_run(
                 ExecutionSelection::Uniform(UniformProvider::Fake),
+                EffortSetting::NativeDefault,
                 &workflow,
                 config_id,
                 created_at,
@@ -898,6 +909,7 @@ mod tests {
                 "restart specialized reviews",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let run_id = interrupted.details.id;
@@ -969,6 +981,7 @@ mod tests {
                 "  α first line\nsecond line  ",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
 
@@ -995,6 +1008,7 @@ mod tests {
                 "attention task",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         assert_eq!(blocked.details.status, RunStatus::NeedsUser);
@@ -1033,6 +1047,7 @@ mod tests {
                     "recover task",
                     &fixture.repo,
                     Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                    EffortSetting::NativeDefault,
                 )
                 .unwrap();
             assert_eq!(blocked.details.status, RunStatus::Running);
@@ -1061,6 +1076,7 @@ mod tests {
                 "delayed task",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         assert!(matches!(
@@ -1095,6 +1111,7 @@ mod tests {
                 "checkpoint task",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         assert!(matches!(
@@ -1135,6 +1152,7 @@ mod tests {
                 "failing task",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         assert_eq!(failed.details.status, RunStatus::Failed);
@@ -1165,6 +1183,7 @@ mod tests {
                 "empty apply",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let (outcome, applied) = fixture
@@ -1194,6 +1213,7 @@ mod tests {
                 "apply integration",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -1232,6 +1252,7 @@ mod tests {
                 "preview integration",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -1322,6 +1343,7 @@ mod tests {
                 "large preview",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let store = SqliteStore::open(&fixture.database).unwrap();
@@ -1349,6 +1371,7 @@ mod tests {
                 "artifact integration",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -1407,6 +1430,7 @@ mod tests {
                 "log integration",
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -1450,11 +1474,61 @@ mod tests {
     }
 
     #[test]
+    fn explicit_effort_persists_immutably_and_survives_service_restart() {
+        let fixture = Fixture::new();
+        let report = fixture
+            .default_service()
+            .start_run(
+                WorkflowKind::Standard,
+                "effort persistence",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::HIGH,
+            )
+            .unwrap();
+        let run_id = report.details.id;
+        for stage in &report.details.stages {
+            assert_eq!(stage.requested_effort, EffortSetting::HIGH);
+        }
+        // Fresh service instance: requested effort reconstructs exactly from
+        // the persisted immutable snapshot, not from in-memory state.
+        let reloaded = fixture.default_service().inspect_run(run_id).unwrap();
+        for stage in &reloaded.stages {
+            assert_eq!(stage.requested_effort, EffortSetting::HIGH);
+        }
+    }
+
+    #[test]
+    fn omitted_effort_reports_native_default_for_every_stage() {
+        let fixture = Fixture::new();
+        let report = fixture
+            .default_service()
+            .start_run(
+                WorkflowKind::Fast,
+                "default effort",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        for stage in &report.details.stages {
+            assert_eq!(stage.requested_effort, EffortSetting::NativeDefault);
+            assert_ne!(stage.requested_effort, EffortSetting::MEDIUM);
+        }
+    }
+
+    #[test]
     fn missing_provider_is_rejected_before_database_creation() {
         let fixture = Fixture::new();
         let error = fixture
             .default_service()
-            .start_run(WorkflowKind::Fast, "task", &fixture.repo, None)
+            .start_run(
+                WorkflowKind::Fast,
+                "task",
+                &fixture.repo,
+                None,
+                EffortSetting::NativeDefault,
+            )
             .unwrap_err();
         assert!(matches!(error, AppError::NoProductionProvider));
         assert!(!fixture.database.exists());

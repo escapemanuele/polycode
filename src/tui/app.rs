@@ -249,6 +249,7 @@ impl TuiApp {
             task,
             repository: PathBuf::from(repository),
             selection: self.state.new_run.execution.selection(),
+            effort: self.state.new_run.effort.setting(),
         });
         if self.state.worker_busy.is_some() {
             self.state.screen = Screen::Runs;

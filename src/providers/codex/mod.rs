@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::domain::{ModelId, ProviderId, ProviderSessionId, Role, StageStatus};
+use crate::domain::{EffortSetting, ModelId, ProviderId, ProviderSessionId, Role, StageStatus};
 use crate::engine::{Provider, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal};
 use crate::process::{
     ExitResult, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend, ProcessManager,
@@ -35,6 +35,7 @@ pub struct CodexProvider<B = TmuxBackend> {
     id: ProviderId,
     installation: CodexInstallation,
     model: Option<ModelId>,
+    effort: EffortSetting,
     manager: ProcessManager<B>,
     artifact_root: PathBuf,
 }
@@ -53,6 +54,7 @@ impl CodexProvider<TmuxBackend> {
                 .map_err(|error| CodexProviderError::Protocol(error.to_string()))?,
             installation,
             model,
+            effort: EffortSetting::NativeDefault,
             manager: ProcessManager::from_environment()?,
             artifact_root: root,
         })
@@ -70,9 +72,21 @@ impl CodexProvider<TmuxBackend> {
                 .map_err(|error| CodexProviderError::Protocol(error.to_string()))?,
             installation,
             model,
+            effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
             artifact_root: root,
         })
+    }
+}
+
+impl<B> CodexProvider<B> {
+    /// Sets the requested effort translated onto the native
+    /// `model_reasoning_effort` override. `NativeDefault` keeps invocations
+    /// byte-identical to pre-effort policy.
+    #[must_use]
+    pub fn with_effort(mut self, effort: EffortSetting) -> Self {
+        self.effort = effort;
+        self
     }
 }
 
@@ -143,6 +157,7 @@ impl<B: ProcessBackend> CodexProvider<B> {
                 &prompt::continuation(request),
                 request.stage_kind(),
                 self.model.as_ref(),
+                self.effort,
                 &final_message_path,
             )
         } else {
@@ -152,6 +167,7 @@ impl<B: ProcessBackend> CodexProvider<B> {
                 &prompt::compose(request, &artifacts, handoff.as_ref())?,
                 request.stage_kind(),
                 self.model.as_ref(),
+                self.effort,
                 &final_message_path,
             )
         };
@@ -1005,6 +1021,7 @@ mod tests {
             id: ProviderId::new("codex").unwrap(),
             installation: CodexInstallation::fixture(PathBuf::from("/bin/true")),
             model: None,
+            effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&process_root, backend),
             artifact_root: process_root,
         };
@@ -1092,6 +1109,7 @@ mod tests {
             id: ProviderId::new("codex").unwrap(),
             installation: CodexInstallation::fixture(PathBuf::from("/bin/true")),
             model: None,
+            effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&process_root, FixtureBackend::new(output)),
             artifact_root: process_root,
         };

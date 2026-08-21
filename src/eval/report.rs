@@ -501,6 +501,7 @@ mod tests {
             .single()
             .unwrap();
         let base = |suite_version: &str, metrics: EvalMetrics| EvalResultV1 {
+            requested_effort: None,
             schema_version: EVAL_RESULT_SCHEMA_VERSION,
             suite: "role_core".to_owned(),
             suite_version: suite_version.to_owned(),

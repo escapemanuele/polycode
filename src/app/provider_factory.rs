@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::domain::{ConfigSnapshotId, ProviderId, RunId, WorkflowDefinition};
+use crate::domain::{ConfigSnapshotId, EffortSetting, ProviderId, Role, RunId, WorkflowDefinition};
 use crate::engine::{
     FakeProvider, FakeScenario, Provider, ProviderAttentionContext, ProviderError, ProviderPoll,
     ProviderRequest,
@@ -13,8 +13,8 @@ use crate::store::{ResolvedConfigSnapshot, SequencedEvent, SqliteStore};
 
 use super::AppError;
 use super::routing::{
-    ExecutionSelection, ExecutionTarget, RecommendedAvailability, RoutingPlan, UniformProvider,
-    resolve_config,
+    ExecutionSelection, ExecutionTarget, RecommendedAvailability, ResourcePlan, RoutingPlan,
+    UniformProvider, resolve_config,
 };
 
 pub trait ProviderFactory {
@@ -27,6 +27,7 @@ pub trait ProviderFactory {
     fn config_for_new_run(
         &self,
         selection: ExecutionSelection,
+        effort: EffortSetting,
         workflow: &WorkflowDefinition,
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
@@ -84,6 +85,7 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
     fn config_for_new_run(
         &self,
         selection: ExecutionSelection,
+        effort: EffortSetting,
         workflow: &WorkflowDefinition,
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
@@ -93,6 +95,7 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
         }
         Ok(resolve_config(
             selection,
+            effort,
             workflow,
             RecommendedAvailability::default(),
             id,
@@ -198,17 +201,23 @@ impl Provider for RuntimeProvider {
 /// Request-aware provider composition with lazy native adapter construction.
 pub struct RoutedProvider {
     plan: RoutingPlan,
+    resource_plan: ResourcePlan,
     workflow: WorkflowDefinition,
-    runtimes: HashMap<ExecutionTarget, RuntimeProvider>,
+    runtimes: HashMap<(ExecutionTarget, EffortSetting), RuntimeProvider>,
     isolated_runtime: Option<(std::path::PathBuf, std::path::PathBuf)>,
     eval_auto_approve: bool,
 }
 
 impl RoutedProvider {
     #[must_use]
-    pub fn new(plan: RoutingPlan, workflow: WorkflowDefinition) -> Self {
+    pub fn new(
+        plan: RoutingPlan,
+        resource_plan: ResourcePlan,
+        workflow: WorkflowDefinition,
+    ) -> Self {
         Self {
             plan,
+            resource_plan,
             workflow,
             runtimes: HashMap::new(),
             isolated_runtime: None,
@@ -219,12 +228,14 @@ impl RoutedProvider {
     #[must_use]
     pub(crate) fn isolated(
         plan: RoutingPlan,
+        resource_plan: ResourcePlan,
         workflow: WorkflowDefinition,
         process_root: std::path::PathBuf,
         runner_executable: std::path::PathBuf,
     ) -> Self {
         Self {
             plan,
+            resource_plan,
             workflow,
             runtimes: HashMap::new(),
             isolated_runtime: Some((process_root, runner_executable)),
@@ -237,18 +248,27 @@ impl RoutedProvider {
         &self.plan
     }
 
-    fn target_for_role(&self, role: crate::domain::Role) -> Result<ExecutionTarget, ProviderError> {
+    fn target_for_role(&self, role: Role) -> Result<ExecutionTarget, ProviderError> {
         self.plan
             .route(role)
             .map(|route| route.target().clone())
             .ok_or_else(|| ProviderError::new(format!("configured route missing for {role:?}")))
     }
 
+    /// Requested effort resolved once from the immutable resource plan.
+    fn effort_for_role(&self, role: Role) -> Result<EffortSetting, ProviderError> {
+        self.resource_plan
+            .effort(role)
+            .ok_or_else(|| ProviderError::new(format!("configured effort missing for {role:?}")))
+    }
+
     fn runtime_for(
         &mut self,
         target: &ExecutionTarget,
+        effort: EffortSetting,
     ) -> Result<&mut RuntimeProvider, ProviderError> {
-        if !self.runtimes.contains_key(target) {
+        let key = (target.clone(), effort);
+        if !self.runtimes.contains_key(&key) {
             let runtime = match target.provider_id().as_str() {
                 "fake" => RuntimeProvider::Fake(
                     FakeProvider::new(FakeScenario::successful(&self.workflow))
@@ -256,6 +276,7 @@ impl RoutedProvider {
                 ),
                 "claude" => RuntimeProvider::Claude(
                     self.claude_provider(target.model_id().cloned())
+                        .map(|provider| provider.with_effort(effort))
                         .map_err(|error| {
                             ProviderError::new(format!(
                                 "configured provider unavailable for claude target: {error}"
@@ -264,6 +285,7 @@ impl RoutedProvider {
                 ),
                 "codex" => RuntimeProvider::Codex(
                     self.codex_provider(target.model_id().cloned())
+                        .map(|provider| provider.with_effort(effort))
                         .map_err(|error| {
                             ProviderError::new(format!(
                                 "configured provider unavailable for codex target: {error}"
@@ -276,10 +298,10 @@ impl RoutedProvider {
                     )));
                 }
             };
-            self.runtimes.insert(target.clone(), runtime);
+            self.runtimes.insert(key.clone(), runtime);
         }
         self.runtimes
-            .get_mut(target)
+            .get_mut(&key)
             .ok_or_else(|| ProviderError::new("lazy provider cache insertion failed"))
     }
 
@@ -327,8 +349,9 @@ impl Provider for RoutedProvider {
 
     fn keep_attached_for(&self, request: &ProviderRequest) -> Result<bool, ProviderError> {
         let target = self.target_for_role(request.role())?;
+        let effort = self.effort_for_role(request.role())?;
         self.runtimes
-            .get(&target)
+            .get(&(target, effort))
             .ok_or_else(|| ProviderError::new("waiting provider was not instantiated"))?
             .keep_attached_for(request)
     }
@@ -358,7 +381,8 @@ impl Provider for RoutedProvider {
                 session.provider_id()
             )));
         }
-        self.runtime_for(&target)?
+        let effort = self.effort_for_role(context.role())?;
+        self.runtime_for(&target, effort)?
             .stage_attention_response(store, context, response)
     }
 
@@ -382,7 +406,8 @@ impl Provider for RoutedProvider {
         if session.provider_id() != target.provider_id() {
             return Ok(false);
         }
-        self.runtime_for(&target)?
+        let effort = self.effort_for_role(context.role())?;
+        self.runtime_for(&target, effort)?
             .can_auto_resolve_attention(store, context)
     }
 
@@ -392,7 +417,8 @@ impl Provider for RoutedProvider {
         request: &ProviderRequest,
     ) -> Result<ProviderPoll, ProviderError> {
         let target = self.target_for_role(request.role())?;
-        let runtime = self.runtime_for(&target)?;
+        let effort = self.effort_for_role(request.role())?;
+        let runtime = self.runtime_for(&target, effort)?;
         if runtime.provider_id_for(request)? != *target.provider_id() {
             return Err(ProviderError::new(
                 "resolved leaf provider identity mismatch",
@@ -418,6 +444,7 @@ impl ProviderFactory for RuntimeProviderFactory {
     fn config_for_new_run(
         &self,
         selection: ExecutionSelection,
+        effort: EffortSetting,
         workflow: &WorkflowDefinition,
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
@@ -431,6 +458,7 @@ impl ProviderFactory for RuntimeProviderFactory {
         };
         Ok(resolve_config(
             selection,
+            effort,
             workflow,
             availability,
             id,
@@ -452,7 +480,8 @@ impl ProviderFactory for RuntimeProviderFactory {
                 error.into()
             }
         })?;
-        Ok(RoutedProvider::new(plan, workflow.clone()))
+        let resource_plan = ResourcePlan::from_snapshot(config, workflow)?;
+        Ok(RoutedProvider::new(plan, resource_plan, workflow.clone()))
     }
 }
 
@@ -495,13 +524,27 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::domain::{Role, StageId, StageKind, StageStatus, WorkflowKind};
+    use crate::domain::{StageId, StageKind, StageStatus, WorkflowKind};
+
+    fn native_default_resource_plan(workflow: &WorkflowDefinition) -> ResourcePlan {
+        let snapshot = resolve_config(
+            ExecutionSelection::Uniform(UniformProvider::Fake),
+            EffortSetting::NativeDefault,
+            workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("effort-test").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        ResourcePlan::from_snapshot(&snapshot, workflow).unwrap()
+    }
 
     #[test]
     fn reconstructing_routed_provider_does_not_instantiate_native_adapters() {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
         let snapshot = resolve_config(
             ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
             &workflow,
             RecommendedAvailability {
                 claude: true,
@@ -536,7 +579,11 @@ mod tests {
                 )
             })
             .collect();
-        let mut provider = RoutedProvider::new(RoutingPlan::test_plan(routes), workflow.clone());
+        let mut provider = RoutedProvider::new(
+            RoutingPlan::test_plan(routes),
+            native_default_resource_plan(&workflow),
+            workflow.clone(),
+        );
         assert!(
             provider
                 .plan

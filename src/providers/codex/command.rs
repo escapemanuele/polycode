@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::domain::{ModelId, ProviderSessionId, StageKind};
+use crate::domain::{EffortLevel, EffortSetting, ModelId, ProviderSessionId, StageKind};
 
 pub(crate) struct CodexCommand {
     pub argv: Vec<OsString>,
@@ -43,9 +43,10 @@ pub(crate) fn initial(
     prompt: &str,
     stage_kind: StageKind,
     model: Option<&ModelId>,
+    effort: EffortSetting,
     final_message_path: &Path,
 ) -> CodexCommand {
-    let mut argv = base(stage_kind, model, final_message_path);
+    let mut argv = base(stage_kind, model, effort, final_message_path);
     argv.push(OsString::from("-"));
     CodexCommand {
         argv,
@@ -59,9 +60,10 @@ pub(crate) fn resume(
     prompt: &str,
     stage_kind: StageKind,
     model: Option<&ModelId>,
+    effort: EffortSetting,
     final_message_path: &Path,
 ) -> CodexCommand {
-    let mut argv = base(stage_kind, model, final_message_path);
+    let mut argv = base(stage_kind, model, effort, final_message_path);
     argv.push(OsString::from("resume"));
     argv.push(OsString::from(session_id.as_str()));
     argv.push(OsString::from("-"));
@@ -75,12 +77,23 @@ pub(crate) fn resume(
 fn base(
     stage_kind: StageKind,
     model: Option<&ModelId>,
+    effort: EffortSetting,
     final_message_path: &Path,
 ) -> Vec<OsString> {
     let mut argv = Vec::new();
     if let Some(model) = model {
         argv.push(OsString::from("--model"));
         argv.push(OsString::from(model.as_str()));
+    }
+    // Adapter-owned mapping onto the native supported `model_reasoning_effort`
+    // configuration override. NativeDefault omits the override entirely so
+    // ~/.codex/config.toml keeps deciding.
+    if let EffortSetting::Level(level) = effort {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(format!(
+            "model_reasoning_effort=\"{}\"",
+            native_effort_value(level)
+        )));
     }
     argv.extend([
         OsString::from("--sandbox"),
@@ -97,9 +110,74 @@ fn base(
     argv
 }
 
+/// Native Codex value for one explicit requested level.
+pub(crate) const fn native_effort_value(level: EffortLevel) -> &'static str {
+    match level {
+        EffortLevel::Low => "low",
+        EffortLevel::Medium => "medium",
+        EffortLevel::High => "high",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_default_omits_reasoning_override_byte_identical() {
+        let command = initial(
+            "prompt",
+            StageKind::Review,
+            None,
+            EffortSetting::NativeDefault,
+            Path::new("/private/final.md"),
+        );
+        assert!(
+            !command
+                .argv
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("model_reasoning_effort"))
+        );
+        assert!(!command.argv.iter().any(|arg| arg == "-c"));
+    }
+
+    #[test]
+    fn explicit_effort_maps_onto_model_reasoning_effort_override() {
+        for (setting, expected) in [
+            (EffortSetting::LOW, "model_reasoning_effort=\"low\""),
+            (EffortSetting::MEDIUM, "model_reasoning_effort=\"medium\""),
+            (EffortSetting::HIGH, "model_reasoning_effort=\"high\""),
+        ] {
+            for command in [
+                initial(
+                    "prompt",
+                    StageKind::Review,
+                    None,
+                    setting,
+                    Path::new("/private/final.md"),
+                ),
+                resume(
+                    &ProviderSessionId::new("thread-1").unwrap(),
+                    "continue",
+                    StageKind::Review,
+                    None,
+                    setting,
+                    Path::new("/private/final.md"),
+                ),
+            ] {
+                let args = strings(&command.argv);
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair[0] == "-c" && pair[1] == expected),
+                    "{setting:?} must produce -c {expected}"
+                );
+                // Root-level override must precede the exec subcommand.
+                let c_index = args.iter().position(|arg| arg == "-c").unwrap();
+                let exec_index = args.iter().position(|arg| arg == "exec").unwrap();
+                assert!(c_index < exec_index);
+            }
+        }
+    }
 
     #[test]
     fn initial_prompt_is_stdin_and_policy_is_explicit() {
@@ -108,6 +186,7 @@ mod tests {
             marker,
             StageKind::Review,
             None,
+            EffortSetting::NativeDefault,
             Path::new("/private/final.md"),
         );
         let args = strings(&command.argv);
@@ -132,6 +211,7 @@ mod tests {
             "task",
             StageKind::Implementation,
             Some(&ModelId::new("configured-model").unwrap()),
+            EffortSetting::NativeDefault,
             Path::new("/private/final.md"),
         );
         let args = strings(&command.argv);
@@ -149,7 +229,13 @@ mod tests {
     #[test]
     fn specialized_review_stages_are_read_only() {
         for kind in [StageKind::CodeQualityReview, StageKind::SpecReview] {
-            let command = initial("review", kind, None, Path::new("/private/final.md"));
+            let command = initial(
+                "review",
+                kind,
+                None,
+                EffortSetting::NativeDefault,
+                Path::new("/private/final.md"),
+            );
             let args = strings(&command.argv);
             assert!(
                 args.windows(2)
@@ -166,6 +252,7 @@ mod tests {
             "continue",
             StageKind::Fix,
             None,
+            EffortSetting::NativeDefault,
             Path::new("/private/final.md"),
         );
         let args = strings(&command.argv);

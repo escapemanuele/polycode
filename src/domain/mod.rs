@@ -4,6 +4,7 @@
 
 mod artifact;
 mod attention;
+mod effort;
 mod event;
 mod ids;
 mod rehydration;
@@ -14,6 +15,7 @@ mod workflow;
 
 pub use artifact::{ArtifactKind, ArtifactMetadata, ArtifactStatus};
 pub use attention::{AttentionError, AttentionKind, AttentionRequest, AttentionStatus};
+pub use effort::{EffortLevel, EffortParseError, EffortSetting};
 pub use event::{DomainEvent, DomainEventKind, EventMetadata, NativeModelUsage};
 pub use ids::{
     ArtifactId, AttentionRequestId, ConfigSnapshotId, EventId, IdError, ModelId, ProviderId,
