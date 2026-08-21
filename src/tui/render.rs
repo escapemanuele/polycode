@@ -78,7 +78,7 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         // Decoration yields to content: the mascot appears only when the
         // empty state has room for it.
         if area.width >= 60 && area.height >= 14 {
-            lines.extend(mascot::mascot_lines(None));
+            lines.extend(mascot::mascot_lines(mascot::MascotState::Idle, None));
             lines.push(Line::from(""));
         }
         lines.push(Line::from("No runs yet."));
@@ -234,7 +234,11 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         while left.len() < inner_height - mascot_rows {
             left.push(Line::from(""));
         }
-        left.extend(mascot::mascot_lines(Some(details.status)));
+        let selected = details.stages.get(state.selected_stage_index);
+        left.extend(mascot::mascot_lines(
+            mascot::mascot_state(Some(details.status), selected.map(|stage| stage.status)),
+            selected.map(|stage| mascot::mascot_activity(stage.role)),
+        ));
     }
     frame.render_widget(
         Paragraph::new(left).block(Block::default().borders(Borders::ALL).title(format!(
@@ -1159,14 +1163,50 @@ mod tests {
 
     #[test]
     fn mascot_appears_with_space_and_disappears_when_constrained() {
+        const POD_SHELL: &str = "▄██████████▄";
         let empty = TuiState::new(std::path::Path::new("/repo"));
-        assert!(render_text(&empty, 90, 24).contains(r"/_/  \_\"));
-        assert!(!render_text(&empty, 55, 12).contains(r"/_/  \_\"));
+        assert!(render_text(&empty, 90, 24).contains(POD_SHELL));
+        assert!(render_text(&empty, 90, 24).contains("READY"));
+        assert!(!render_text(&empty, 55, 12).contains(POD_SHELL));
 
         let detail = detail_state();
-        assert!(render_text(&detail, 160, 40).contains(r"/_/  \_\"));
-        assert!(render_text(&detail, 160, 40).contains("RUNNING"));
-        assert!(!render_text(&detail, 70, 24).contains(r"/_/  \_\"));
+        let text = render_text(&detail, 160, 40);
+        assert!(text.contains(POD_SHELL));
+        // Completed implementation stage: state wins, so no activity accent.
+        assert!(text.contains("DONE"));
+        assert!(!text.contains("</>"));
+        assert!(!render_text(&detail, 70, 24).contains(POD_SHELL));
+    }
+
+    #[test]
+    fn running_stage_shows_activity_accent_and_label() {
+        let mut detail = detail_state();
+        let details = detail.details.as_mut().unwrap();
+        details.status = RunStatus::Running;
+        details.stages[0].status = StageStatus::Running;
+        let text = render_text(&detail, 160, 40);
+        assert!(
+            text.contains("BUILDING"),
+            "implementer running reads as BUILDING"
+        );
+        assert!(text.contains("</>"), "coding accent while running");
+
+        detail.details.as_mut().unwrap().stages[0].role = Role::Architect;
+        let text = render_text(&detail, 160, 40);
+        assert!(text.contains("THINKING"));
+        assert!(text.contains("[#]"));
+    }
+
+    #[test]
+    fn mascot_never_displaces_stage_list_or_status() {
+        let detail = detail_state();
+        for (width, height) in [(160, 40), (100, 30), (70, 24), (50, 10)] {
+            let text = render_text(&detail, width, height);
+            assert!(
+                text.contains("Terminal too small") || text.contains("implementation"),
+                "stage list survives at {width}x{height}"
+            );
+        }
     }
 
     #[test]
