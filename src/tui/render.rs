@@ -5,9 +5,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{QuiescentState, RunDetails, StageSummary};
-use crate::domain::{RunStatus, StageStatus};
+use crate::domain::{AttentionKind, RunStatus, StageStatus};
 
-use super::state::{Overlay, Screen, TuiState};
+use super::state::{Overlay, Screen, TuiState, UiMessageKind};
+use super::{markdown, mascot};
 
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 10;
@@ -23,12 +24,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &TuiState) {
         );
         return;
     }
+    // Footer grows one row for a notification; key hints are never replaced.
+    let footer_height = if state.message.is_some() { 3 } else { 2 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(4),
-            Constraint::Length(2),
+            Constraint::Length(footer_height),
         ])
         .split(area);
     render_header(frame, rows[0], state);
@@ -71,8 +74,18 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if state.runs.is_empty() {
+        let mut lines = Vec::new();
+        // Decoration yields to content: the mascot appears only when the
+        // empty state has room for it.
+        if area.width >= 60 && area.height >= 14 {
+            lines.extend(mascot::mascot_lines(None));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from("No runs yet."));
+        lines.push(Line::from(""));
+        lines.push(Line::from("[n] Start your first run"));
         frame.render_widget(
-            Paragraph::new("No runs yet.\n\n[n] Start your first run")
+            Paragraph::new(lines)
                 .alignment(Alignment::Center)
                 .block(Block::default().borders(Borders::ALL).title(" Runs ")),
             area,
@@ -215,6 +228,14 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
         left.push(line);
     }
+    let inner_height = columns[0].height.saturating_sub(2) as usize;
+    let mascot_rows = mascot::MASCOT_HEIGHT as usize;
+    if columns[0].width >= mascot::MASCOT_WIDTH + 20 && inner_height > left.len() + mascot_rows {
+        while left.len() < inner_height - mascot_rows {
+            left.push(Line::from(""));
+        }
+        left.extend(mascot::mascot_lines(Some(details.status)));
+    }
     frame.render_widget(
         Paragraph::new(left).block(Block::default().borders(Borders::ALL).title(format!(
             " {} · {} ",
@@ -249,6 +270,22 @@ fn render_stage_context(frame: &mut Frame<'_>, area: Rect, state: &TuiState, det
         Line::from(vec![
             Span::raw("Status      "),
             Span::styled(enum_text(selected.status), stage_style(selected.status)),
+        ]),
+        Line::from(vec![
+            Span::raw("Result      "),
+            if state.stages_with_artifacts.contains(&selected.id) {
+                Span::styled(
+                    "✓ verified artifact — [Enter/o] open result",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    "no verified artifact yet",
+                    Style::default().fg(Color::DarkGray),
+                )
+            },
         ]),
         Line::from(""),
         Line::from(format!(
@@ -352,20 +389,39 @@ fn render_stage_context(frame: &mut Frame<'_>, area: Rect, state: &TuiState, det
 }
 
 fn render_artifact(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let (title, text) = state.artifact.as_ref().map_or_else(
-        || (" Artifact ".to_owned(), "Artifact unavailable".to_owned()),
+    let (title, lines) = state.artifact.as_ref().map_or_else(
+        || {
+            (
+                " Artifact ".to_owned(),
+                vec![Line::from("Artifact unavailable")],
+            )
+        },
         |artifact| {
+            let mode = if state.artifact_raw {
+                "raw · [m] rendered"
+            } else {
+                "rendered · [m] raw"
+            };
+            let lines = if state.artifact_raw {
+                artifact
+                    .text
+                    .lines()
+                    .map(|line| Line::from(line.to_owned()))
+                    .collect()
+            } else {
+                markdown::render_markdown(&artifact.text)
+            };
             (
                 format!(
-                    " {} · attempt {} ",
+                    " {} · attempt {} · {mode} ",
                     artifact.summary.stage_id, artifact.summary.attempt
                 ),
-                artifact.text.clone(),
+                lines,
             )
         },
     );
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(lines)
             .scroll((state.scroll, 0))
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(title)),
@@ -499,34 +555,66 @@ fn form_line<'a>(label: &'a str, value: &'a str, selected: bool) -> Line<'a> {
     ])
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let default = match state.screen {
-        Screen::Runs => "↑↓/jk navigate  Enter open  n new  ? help  q quit/detach",
-        Screen::RunDetail => {
-            "↑↓/jk stage  r resume  t retry  u attention  o artifact  l logs  d diff  a apply  X discard"
-        }
-        Screen::Artifact | Screen::Logs | Screen::Diff => {
-            "↑↓ PgUp/PgDn scroll  Esc back  q quit/detach"
-        }
-        Screen::NewRun => "Tab fields  ←→ choices/edit  Enter start  Esc cancel",
+/// Key hints per screen; the compact variant is chosen deterministically
+/// when the full hints do not fit, so navigation is never hidden.
+fn footer_hints(screen: Screen, width: u16) -> &'static str {
+    let (full, compact) = match screen {
+        Screen::Runs => (
+            "↑↓/jk run · Enter open · n new · ? help · q quit/detach",
+            "↑↓ · Enter open · n new · ? help · q quit",
+        ),
+        Screen::RunDetail => (
+            "↑↓ stage · Enter/o result · Esc runs · r resume · t retry · u attention · l logs · d diff · a apply · X discard · ? help",
+            "↑↓ stage · Esc runs · o result · u attn · ? help",
+        ),
+        Screen::Artifact => (
+            "↑↓/PgUp/PgDn scroll · m raw/rendered · Esc run detail · q quit/detach",
+            "↑↓ scroll · m raw · Esc run detail",
+        ),
+        Screen::Logs | Screen::Diff => (
+            "↑↓/PgUp/PgDn scroll · Esc run detail · q quit/detach",
+            "↑↓ scroll · Esc run detail",
+        ),
+        Screen::NewRun => (
+            "Tab/Shift-Tab fields · ←→ choices/edit · Enter start · Esc cancel",
+            "Tab fields · Enter start · Esc cancel",
+        ),
     };
-    let (text, style) = state.message.as_ref().map_or(
-        (default.to_owned(), Style::default().fg(Color::DarkGray)),
-        |message| {
-            (
-                message.text.clone(),
-                if message.persistent {
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Green)
-                },
-            )
-        },
-    );
+    if full.chars().count() <= width as usize {
+        full
+    } else {
+        compact
+    }
+}
+
+fn message_presentation(kind: UiMessageKind) -> (&'static str, Style) {
+    match kind {
+        UiMessageKind::Info => ("ℹ", Style::default().fg(Color::Cyan)),
+        UiMessageKind::Success => ("✓", Style::default().fg(Color::Green)),
+        UiMessageKind::Warning => ("⚠", Style::default().fg(Color::Yellow)),
+        UiMessageKind::Error => (
+            "✗",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    }
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let mut lines = Vec::new();
+    if let Some(message) = state.message.as_ref() {
+        let (glyph, style) = message_presentation(message.kind);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), style),
+            Span::styled(message.text.clone(), style),
+            Span::styled("  · x dismiss", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        footer_hints(state.screen, area.width),
+        Style::default().fg(Color::DarkGray),
+    )));
     frame.render_widget(
-        Paragraph::new(text)
-            .style(style)
-            .block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::TOP)),
         area,
     );
 }
@@ -537,7 +625,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  r resume/recover\n  t retry selected failed stage\n  u resolve selected attention\n  o verified artifact\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(Block::default().borders(Borders::ALL).title(" Help · Esc closes ")),
             popup,
@@ -579,13 +667,27 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(format!(
-        "Response: {}",
-        field_display(&state.attention_response, true)
-    )));
-    lines.push(Line::from(
-        "↑/↓ select request · type response if required · Enter resolve · Esc cancel",
-    ));
+    let selected_kind = details
+        .attention
+        .get(state.attention_index)
+        .map(|attention| attention.kind);
+    if selected_kind == Some(AttentionKind::Permission) {
+        lines.push(Line::from(Span::styled(
+            "Permission request — no text response required",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(
+            "↑/↓ select request · Enter approve/resolve · Esc cancel",
+        ));
+    } else {
+        lines.push(Line::from(format!(
+            "Response: {}",
+            field_display(&state.attention_response, true)
+        )));
+        lines.push(Line::from(
+            "↑/↓ select request · type response · Enter submit · Esc cancel",
+        ));
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -922,5 +1024,177 @@ mod tests {
         assert!(text.contains("Configured  codex / native default"));
         assert!(text.contains("Actual      codex / gpt-fixture"));
         assert!(text.contains("recommended_role_assignment"));
+    }
+
+    fn detail_state() -> TuiState {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        let id = RunId::from_u128(3);
+        state.screen = Screen::RunDetail;
+        state.selected_run = Some(id);
+        state.replace_details(RunDetails {
+            id,
+            task: Some("Dogfooding run".to_owned()),
+            workflow: WorkflowKind::Standard,
+            status: RunStatus::Running,
+            repository: Some(std::path::PathBuf::from("/repo")),
+            workspace_status: Some(crate::workspace::WorkspaceStatus::Ready),
+            base_commit: Some("abc".to_owned()),
+            profile: "recommended".to_owned(),
+            profile_version: "recommended_v1".to_owned(),
+            routes: Vec::new(),
+            revision: crate::store::RunRevision::initial(),
+            created_at: Utc
+                .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+                .single()
+                .unwrap(),
+            updated_at: Utc
+                .with_ymd_and_hms(2026, 8, 17, 12, 1, 0)
+                .single()
+                .unwrap(),
+            stages: vec![StageSummary {
+                id: StageId::new("implementation").unwrap(),
+                kind: StageKind::Implementation,
+                role: Role::Implementer,
+                status: StageStatus::Completed,
+                configured_provider: "codex".to_owned(),
+                configured_model: None,
+                actual_provider: Some("codex".to_owned()),
+                actual_model: None,
+                provider_session_record: None,
+                native_session: None,
+                provider_session_status: None,
+                process_status: None,
+            }],
+            attention: Vec::new(),
+            usage: UsageSummary::default(),
+        });
+        state
+    }
+
+    #[test]
+    fn notification_never_hides_run_detail_navigation_hints() {
+        let mut state = detail_state();
+        state.set_error("resuming run failed for run-1: boom");
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("boom"), "message is visible");
+        assert!(text.contains("Esc runs"), "leave-screen hint stays visible");
+        assert!(text.contains("u attention"), "controls stay visible");
+        assert!(text.contains("x dismiss"), "dismiss affordance advertised");
+    }
+
+    #[test]
+    fn footer_hints_abbreviate_deterministically_on_narrow_terminals() {
+        assert!(footer_hints(Screen::RunDetail, 160).contains("X discard"));
+        let compact = footer_hints(Screen::RunDetail, 55);
+        assert!(
+            compact.contains("Esc runs"),
+            "navigation survives narrowing"
+        );
+        assert!(compact.chars().count() <= 55);
+    }
+
+    #[test]
+    fn message_kinds_render_distinct_styles() {
+        let styles: Vec<_> = [
+            UiMessageKind::Info,
+            UiMessageKind::Success,
+            UiMessageKind::Warning,
+            UiMessageKind::Error,
+        ]
+        .into_iter()
+        .map(message_presentation)
+        .collect();
+        for (index, (glyph, style)) in styles.iter().enumerate() {
+            for (other_glyph, other_style) in styles.iter().skip(index + 1) {
+                assert!(glyph != other_glyph || style != other_style);
+            }
+        }
+    }
+
+    #[test]
+    fn completed_stage_advertises_result_and_viewer_advertises_back() {
+        let mut state = detail_state();
+        state
+            .stages_with_artifacts
+            .insert(StageId::new("implementation").unwrap());
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("✓ verified artifact — [Enter/o] open result"));
+
+        state.screen = Screen::Artifact;
+        state.artifact = Some(crate::app::ArtifactView {
+            summary: crate::app::ArtifactSummary {
+                stage_id: StageId::new("implementation").unwrap(),
+                kind: crate::domain::ArtifactKind::Implementation,
+                status: crate::domain::ArtifactStatus::Complete,
+                attempt: 1,
+                provider: None,
+                model: None,
+                content_size: 10,
+                created_at: Utc
+                    .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
+                    .single()
+                    .unwrap(),
+            },
+            text: "## Result\n\n**done** with `code`".to_owned(),
+        });
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("Esc run detail"), "viewer advertises back");
+        assert!(text.contains("Result"), "heading text renders");
+        assert!(!text.contains("## Result"), "no literal markdown heading");
+        assert!(!text.contains("**done**"), "no literal bold markers");
+
+        state.artifact_raw = true;
+        let raw = render_text(&state, 120, 30);
+        assert!(
+            raw.contains("## Result"),
+            "raw mode shows markdown verbatim"
+        );
+        assert!(raw.contains("**done**"));
+    }
+
+    #[test]
+    fn mascot_appears_with_space_and_disappears_when_constrained() {
+        let empty = TuiState::new(std::path::Path::new("/repo"));
+        assert!(render_text(&empty, 90, 24).contains(r"/_/  \_\"));
+        assert!(!render_text(&empty, 55, 12).contains(r"/_/  \_\"));
+
+        let detail = detail_state();
+        assert!(render_text(&detail, 160, 40).contains(r"/_/  \_\"));
+        assert!(render_text(&detail, 160, 40).contains("RUNNING"));
+        assert!(!render_text(&detail, 70, 24).contains(r"/_/  \_\"));
+    }
+
+    #[test]
+    fn attention_overlay_distinguishes_permission_from_question() {
+        let mut state = detail_state();
+        let details = state.details.as_mut().unwrap();
+        details.attention = vec![crate::app::AttentionSummary {
+            id: crate::domain::AttentionRequestId::from_u128(1),
+            stage_id: StageId::new("implementation").unwrap(),
+            kind: crate::domain::AttentionKind::Permission,
+            summary: "allow network access".to_owned(),
+        }];
+        state.overlay = Some(Overlay::Attention);
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("Permission request — no text response required"));
+        assert!(text.contains("Enter approve/resolve"));
+        assert!(!text.contains("Response:"), "no implied response field");
+
+        state.details.as_mut().unwrap().attention[0].kind = crate::domain::AttentionKind::Question;
+        let text = render_text(&state, 120, 30);
+        assert!(
+            text.contains("Response:"),
+            "question keeps editable response"
+        );
+        assert!(text.contains("Enter submit"));
+    }
+
+    #[test]
+    fn confirmation_overlays_keep_existing_semantics() {
+        let mut state = detail_state();
+        state.overlay = Some(Overlay::ApplyConfirm);
+        assert!(render_text(&state, 120, 30).contains("Enter confirms apply"));
+        state.overlay = Some(Overlay::DiscardConfirm);
+        assert!(render_text(&state, 120, 30).contains("Enter confirms discard"));
     }
 }

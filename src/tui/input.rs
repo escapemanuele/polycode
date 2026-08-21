@@ -27,6 +27,8 @@ pub(crate) enum Intent {
     Diff,
     Apply,
     Discard,
+    DismissMessage,
+    ToggleRaw,
     Help,
     Character(char),
     Ignore,
@@ -61,6 +63,8 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('d') => Intent::Diff,
         KeyCode::Char('a') => Intent::Apply,
         KeyCode::Char('X') => Intent::Discard,
+        KeyCode::Char('x') => Intent::DismissMessage,
+        KeyCode::Char('m') => Intent::ToggleRaw,
         KeyCode::Char('?') => Intent::Help,
         KeyCode::Char('q') => Intent::Quit,
         KeyCode::Char(character)
@@ -115,6 +119,22 @@ mod tests {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE)),
             Intent::Character('é')
+        );
+    }
+
+    #[test]
+    fn lowercase_x_dismisses_and_stays_distinct_from_uppercase_discard() {
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Intent::DismissMessage
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)),
+            Intent::Discard
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+            Intent::ToggleRaw
         );
     }
 }
