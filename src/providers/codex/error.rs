@@ -29,6 +29,8 @@ pub enum CodexProviderError {
     #[error("Codex artifact path conflict: {0}")]
     ArtifactConflict(PathBuf),
     #[error(transparent)]
+    ChangeHandoff(#[from] crate::providers::change_handoff::ChangeHandoffError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),

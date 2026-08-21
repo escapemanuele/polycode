@@ -1,6 +1,7 @@
 //! Native coding-agent provider adapters and provider-owned persisted state.
 
 mod artifact;
+pub(crate) mod change_handoff;
 mod checkpoint;
 pub mod claude;
 pub mod codex;
