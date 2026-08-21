@@ -45,6 +45,13 @@ pub struct StageSummary {
     pub native_session: Option<String>,
     pub provider_session_status: Option<String>,
     pub process_status: Option<String>,
+    /// Semantic wall-clock span of the stage's current attempt, folded from
+    /// committed `StageStarted` and terminal stage events. A retry restarts
+    /// the span, so a running stage reports the attempt in flight. Distinct
+    /// from provider latency, which measures native invocations only. Both
+    /// stay `None` when a run's events carry no such evidence.
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +126,10 @@ pub struct RunDetails {
     pub stages: Vec<StageSummary>,
     pub attention: Vec<AttentionSummary>,
     pub usage: UsageSummary,
+    /// Semantic wall-clock span of the run, folded from committed
+    /// `RunStarted` and terminal run events. Resuming does not restart it.
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,6 +250,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         super::routing::ResourcePlan::from_snapshot(&loaded.config_snapshot, loaded.run.workflow())
             .ok();
     let usage = usage_summary(&events);
+    let run_span = run_span(&events);
     let sessions = store.list_provider_sessions(run_id)?;
     let mut routes = plan
         .iter()
@@ -253,6 +265,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
     routes.sort_by_key(|route| role_order(route.role));
     let mut stages = Vec::new();
     for stage in loaded.run.stages() {
+        let (started_at, finished_at) = stage_span(&events, stage.id());
         let route = plan.as_ref().and_then(|plan| plan.route(stage.role()));
         let session = sessions
             .iter()
@@ -308,6 +321,8 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
                 .map(ToString::to_string),
             provider_session_status: session.map(|session| session.status().as_str().to_owned()),
             process_status,
+            started_at,
+            finished_at,
         });
     }
     Ok(RunDetails {
@@ -358,7 +373,50 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             })
             .collect(),
         usage,
+        started_at: run_span.0,
+        finished_at: run_span.1,
     })
+}
+
+/// Folds the run's semantic span from committed lifecycle events. Resuming
+/// keeps the original start; the terminal event closes the span.
+fn run_span(events: &[SequencedEvent]) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    let mut span = (None, None);
+    for event in events {
+        match event.event.kind() {
+            DomainEventKind::RunStarted => {
+                span.0.get_or_insert(*event.event.occurred_at());
+            }
+            DomainEventKind::RunCompleted | DomainEventKind::RunFailed => {
+                span.1 = Some(*event.event.occurred_at());
+            }
+            _ => {}
+        }
+    }
+    span
+}
+
+/// Folds one stage's semantic span from committed lifecycle events. Each
+/// `StageStarted` opens a fresh span, so a retried stage reports its current
+/// attempt rather than the total across attempts.
+fn stage_span(
+    events: &[SequencedEvent],
+    stage_id: &StageId,
+) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    let mut span = (None, None);
+    for event in events
+        .iter()
+        .filter(|event| event.event.stage_id() == Some(stage_id))
+    {
+        match event.event.kind() {
+            DomainEventKind::StageStarted => span = (Some(*event.event.occurred_at()), None),
+            DomainEventKind::StageCompleted
+            | DomainEventKind::StageFailed
+            | DomainEventKind::StageSkipped => span.1 = Some(*event.event.occurred_at()),
+            _ => {}
+        }
+    }
+    span
 }
 
 pub(crate) fn list_artifacts(
@@ -707,4 +765,123 @@ fn usage_summary(events: &[SequencedEvent]) -> UsageSummary {
             }
             usage
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone as _;
+
+    use super::*;
+    use crate::domain::{DomainEvent, EventId, EventMetadata};
+
+    fn at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 21, hour, minute, second)
+            .single()
+            .unwrap()
+    }
+
+    fn event(
+        sequence: u64,
+        at: DateTime<Utc>,
+        stage: Option<&str>,
+        kind: DomainEventKind,
+    ) -> SequencedEvent {
+        SequencedEvent {
+            sequence,
+            event: DomainEvent::new(
+                EventMetadata::new(EventId::from_u128(u128::from(sequence)), at),
+                RunId::from_u128(1),
+                stage.map(|id| StageId::new(id).unwrap()),
+                kind,
+            ),
+        }
+    }
+
+    #[test]
+    fn stage_span_folds_from_persisted_lifecycle_events() {
+        let events = vec![
+            event(1, at(12, 0, 0), None, DomainEventKind::RunStarted),
+            event(
+                2,
+                at(12, 0, 5),
+                Some("architecture"),
+                DomainEventKind::StageStarted,
+            ),
+            event(
+                3,
+                at(12, 2, 19),
+                Some("architecture"),
+                DomainEventKind::StageCompleted,
+            ),
+            event(
+                4,
+                at(12, 2, 19),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+        ];
+        let architecture = stage_span(&events, &StageId::new("architecture").unwrap());
+        assert_eq!(architecture, (Some(at(12, 0, 5)), Some(at(12, 2, 19))));
+
+        // A stage in flight has a start and no finish, so the caller measures
+        // against the current time rather than a persisted end.
+        let implementation = stage_span(&events, &StageId::new("implementation").unwrap());
+        assert_eq!(implementation, (Some(at(12, 2, 19)), None));
+
+        // A stage that has not started carries no span at all.
+        let pending = stage_span(&events, &StageId::new("decision").unwrap());
+        assert_eq!(pending, (None, None));
+    }
+
+    #[test]
+    fn retry_restarts_the_stage_span_on_the_current_attempt() {
+        let events = vec![
+            event(
+                1,
+                at(12, 0, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+            event(
+                2,
+                at(12, 1, 0),
+                Some("implementation"),
+                DomainEventKind::StageFailed,
+            ),
+            event(
+                3,
+                at(12, 9, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+        ];
+        assert_eq!(
+            stage_span(&events, &StageId::new("implementation").unwrap()),
+            (Some(at(12, 9, 0)), None),
+            "the retried attempt owns the span, not the failed one"
+        );
+    }
+
+    #[test]
+    fn run_span_survives_resume_and_closes_on_the_terminal_event() {
+        let events = vec![
+            event(1, at(12, 0, 0), None, DomainEventKind::RunStarted),
+            event(2, at(12, 3, 0), None, DomainEventKind::RunPaused),
+            event(3, at(12, 5, 0), None, DomainEventKind::RunResumed),
+            event(4, at(12, 12, 48), None, DomainEventKind::RunCompleted),
+        ];
+        assert_eq!(
+            run_span(&events),
+            (Some(at(12, 0, 0)), Some(at(12, 12, 48)))
+        );
+    }
+
+    #[test]
+    fn runs_without_timing_evidence_report_no_span() {
+        assert_eq!(run_span(&[]), (None, None));
+        assert_eq!(
+            stage_span(&[], &StageId::new("implementation").unwrap()),
+            (None, None)
+        );
+    }
 }

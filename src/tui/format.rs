@@ -1,0 +1,197 @@
+//! Deterministic operational formatters for the Mission Deck.
+//!
+//! Durations render as human spans (never milliseconds) and provider-native
+//! units render compactly. Unit values stay provider-native: they are never
+//! normalized across providers and never imply cost.
+
+use chrono::{DateTime, TimeDelta, Utc};
+
+/// Wall-clock span of a stage or run, resolved against `now` for spans that
+/// are still open. Returns `None` when the run carries no timing evidence,
+/// so callers render nothing rather than a fabricated `0s`.
+pub(crate) fn elapsed(
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<TimeDelta> {
+    let started = started_at?;
+    let end = finished_at.unwrap_or(now);
+    Some(end.signed_duration_since(started).max(TimeDelta::zero()))
+}
+
+/// Human span: `<1s`, `14s`, `1m 08s`, `12m 41s`, `1h 04m`.
+pub(crate) fn format_duration(span: TimeDelta) -> String {
+    let total = span.num_seconds().max(0);
+    if total == 0 {
+        return "<1s".to_owned();
+    }
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Prominent clock for the hero line: `04:32`, `1:02:48`.
+pub(crate) fn format_clock(span: TimeDelta) -> String {
+    let total = span.num_seconds().max(0);
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Compact provider-native unit count: exact below 1000, then `1.2k`, `2.3M`.
+/// Integer arithmetic throughout, so large counts never lose precision to a
+/// float conversion; the fraction truncates rather than rounds, which keeps
+/// the displayed figure from ever overstating reported usage.
+pub(crate) fn format_units(units: u64) -> String {
+    let scaled = |divisor: u64, suffix: char| {
+        format!(
+            "{}.{}{suffix}",
+            units / divisor,
+            (units % divisor) / (divisor / 10)
+        )
+    };
+    if units < 1_000 {
+        units.to_string()
+    } else if units < 1_000_000 {
+        scaled(1_000, 'k')
+    } else {
+        scaled(1_000_000, 'M')
+    }
+}
+
+/// Concise repository identity for operational rows; the full path stays in
+/// technical mode.
+pub(crate) fn repository_name(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// Safely shortens a task title to one line of at most `limit` characters.
+pub(crate) fn truncate_title(task: &str, limit: usize) -> String {
+    let first = task
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(task)
+        .trim();
+    let mut characters = first.chars();
+    let head: String = characters.by_ref().take(limit).collect();
+    if characters.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone as _;
+
+    use super::*;
+
+    fn at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 21, hour, minute, second)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn duration_formatter_covers_boundaries() {
+        assert_eq!(format_duration(TimeDelta::milliseconds(400)), "<1s");
+        assert_eq!(format_duration(TimeDelta::seconds(0)), "<1s");
+        assert_eq!(format_duration(TimeDelta::seconds(1)), "1s");
+        assert_eq!(format_duration(TimeDelta::seconds(14)), "14s");
+        assert_eq!(format_duration(TimeDelta::seconds(59)), "59s");
+        assert_eq!(format_duration(TimeDelta::seconds(60)), "1m 00s");
+        assert_eq!(format_duration(TimeDelta::seconds(68)), "1m 08s");
+        assert_eq!(format_duration(TimeDelta::seconds(761)), "12m 41s");
+        assert_eq!(format_duration(TimeDelta::seconds(3600)), "1h 00m");
+        assert_eq!(format_duration(TimeDelta::seconds(3840)), "1h 04m");
+        assert_eq!(format_duration(TimeDelta::seconds(8280)), "2h 18m");
+        assert_eq!(
+            format_duration(TimeDelta::seconds(-5)),
+            "<1s",
+            "negative spans clamp instead of panicking"
+        );
+    }
+
+    #[test]
+    fn clock_formatter_is_prominent_and_stable() {
+        assert_eq!(format_clock(TimeDelta::seconds(0)), "00:00");
+        assert_eq!(format_clock(TimeDelta::seconds(272)), "04:32");
+        assert_eq!(format_clock(TimeDelta::seconds(768)), "12:48");
+        assert_eq!(format_clock(TimeDelta::seconds(3768)), "1:02:48");
+    }
+
+    #[test]
+    fn running_span_measures_from_persisted_start_not_tui_open() {
+        let started = at(12, 0, 0);
+        let span = elapsed(Some(started), None, at(12, 4, 32)).unwrap();
+        assert_eq!(format_clock(span), "04:32");
+        // A detach and reopen much later keeps measuring from the same
+        // persisted start.
+        let span = elapsed(Some(started), None, at(13, 2, 48)).unwrap();
+        assert_eq!(format_clock(span), "1:02:48");
+    }
+
+    #[test]
+    fn completed_span_uses_persisted_finish_and_ignores_now() {
+        let span = elapsed(Some(at(12, 0, 0)), Some(at(12, 2, 14)), at(18, 0, 0)).unwrap();
+        assert_eq!(format_duration(span), "2m 14s");
+    }
+
+    #[test]
+    fn missing_timing_evidence_is_absent_not_zero() {
+        assert!(elapsed(None, None, at(12, 0, 0)).is_none());
+        assert!(
+            elapsed(None, Some(at(12, 0, 0)), at(12, 1, 0)).is_none(),
+            "a finish without a start carries no measurable span"
+        );
+    }
+
+    #[test]
+    fn unit_formatter_keeps_provider_native_scale() {
+        assert_eq!(format_units(0), "0");
+        assert_eq!(format_units(999), "999");
+        assert_eq!(format_units(1_000), "1.0k");
+        assert_eq!(format_units(1_234), "1.2k");
+        assert_eq!(
+            format_units(12_288),
+            "12.2k",
+            "the fraction truncates so the figure never overstates usage"
+        );
+        assert_eq!(format_units(38_400), "38.4k");
+        assert_eq!(format_units(999_999), "999.9k");
+        assert_eq!(format_units(2_310_442), "2.3M");
+        assert_eq!(
+            format_units(u64::MAX),
+            "18446744073709.5M",
+            "integer scaling keeps huge counts exact"
+        );
+    }
+
+    #[test]
+    fn repository_identity_prefers_basename() {
+        assert_eq!(
+            repository_name(std::path::Path::new("/Users/e/Code/wp-calypso-2")),
+            "wp-calypso-2"
+        );
+        assert_eq!(repository_name(std::path::Path::new("/")), "/");
+    }
+
+    #[test]
+    fn titles_truncate_on_character_boundaries() {
+        assert_eq!(truncate_title("  Add OAuth  \nmore", 40), "Add OAuth");
+        assert_eq!(truncate_title("caffè è più", 5), "caffè…");
+        assert_eq!(truncate_title("", 10), "");
+    }
+}

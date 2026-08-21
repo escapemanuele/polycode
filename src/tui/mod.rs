@@ -1,6 +1,7 @@
 //! Local Ratatui projection and control surface over application use cases.
 
 mod app;
+mod format;
 mod input;
 mod markdown;
 mod mascot;

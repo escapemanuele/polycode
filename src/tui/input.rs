@@ -29,6 +29,7 @@ pub(crate) enum Intent {
     Discard,
     DismissMessage,
     ToggleRaw,
+    TechnicalDetails,
     Help,
     Character(char),
     Ignore,
@@ -65,6 +66,7 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('X') => Intent::Discard,
         KeyCode::Char('x') => Intent::DismissMessage,
         KeyCode::Char('m') => Intent::ToggleRaw,
+        KeyCode::Char('i') => Intent::TechnicalDetails,
         KeyCode::Char('?') => Intent::Help,
         KeyCode::Char('q') => Intent::Quit,
         KeyCode::Char(character)
