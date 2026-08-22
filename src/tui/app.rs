@@ -128,6 +128,10 @@ impl TuiApp {
             Intent::ToggleRaw if self.state.screen == Screen::Artifact => {
                 self.state.artifact_raw = !self.state.artifact_raw;
             }
+            Intent::TechnicalDetails if self.state.screen == Screen::RunDetail => {
+                self.state.technical = !self.state.technical;
+                self.refresh_evidence();
+            }
             Intent::Help => self.state.overlay = Some(Overlay::Help),
             _ => {}
         }
@@ -382,6 +386,14 @@ impl TuiApp {
         let Some(run_id) = self.state.selected_run else {
             return;
         };
+        // The workspace layer rejects apply outside the completed branch-run
+        // state; refusing here keeps the TUI from dispatching an action the
+        // domain will decline, without weakening that guard.
+        if !self.state.run_is_applyable() {
+            self.state
+                .notify(UiMessageKind::Info, apply_unavailable_reason(&self.state));
+            return;
+        }
         match self.reader.preview_run_diff(run_id) {
             Ok(diff) => {
                 self.state.diff = Some(diff);
@@ -484,6 +496,42 @@ impl TuiApp {
                 .map(|artifact| artifact.stage_id)
                 .collect();
         }
+        self.refresh_evidence();
+    }
+
+    /// Per-stage diagnostic evidence is only needed by the technical view, so
+    /// it is fetched only while that view is open.
+    fn refresh_evidence(&mut self) {
+        if !self.state.technical || self.state.screen != Screen::RunDetail {
+            self.state.evidence = None;
+            return;
+        }
+        let Some((run_id, stage_id)) = self.selected_stage_identity() else {
+            self.state.evidence = None;
+            return;
+        };
+        self.state.evidence = self.reader.stage_execution_evidence(run_id, &stage_id).ok();
+    }
+}
+
+/// Explains, in operational language, why apply is not offered yet.
+fn apply_unavailable_reason(state: &TuiState) -> String {
+    let Some(details) = state.details.as_ref() else {
+        return "Select a run before applying.".to_owned();
+    };
+    if details.workflow == crate::domain::WorkflowKind::Review {
+        return "Review runs make no workspace changes, so there is nothing to apply.".to_owned();
+    }
+    match details.status {
+        crate::domain::RunStatus::Applied => "This run has already been applied.".to_owned(),
+        crate::domain::RunStatus::Discarded => "This run was discarded.".to_owned(),
+        crate::domain::RunStatus::NeedsUser => {
+            "Run needs you — resolve the attention request before applying.".to_owned()
+        }
+        crate::domain::RunStatus::Failed => {
+            "Run failed — retry the failed stage before applying.".to_owned()
+        }
+        _ => "Run is still working — Apply becomes available when it completes.".to_owned(),
     }
 }
 
@@ -525,7 +573,210 @@ const fn is_viewer(screen: Screen) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::app::{RunDetails, StageSummary, UsageSummary};
+    use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
+
+    /// A `TuiApp` wired to an empty temporary store: enough to drive intents
+    /// without touching the user's data directory or any provider.
+    fn app_with(details: RunDetails) -> (TuiApp, TempDir) {
+        let fixture = TempDir::new().unwrap();
+        let database = fixture.path().join("polycode.db");
+        let worktrees = fixture.path().join("worktrees");
+        let mut state = TuiState::new(fixture.path());
+        state.screen = Screen::RunDetail;
+        state.selected_run = Some(details.id);
+        state.replace_details(details);
+        let app = TuiApp {
+            state,
+            reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
+            worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            last_refresh: Instant::now(),
+        };
+        (app, fixture)
+    }
+
+    fn details(status: RunStatus, workflow: WorkflowKind) -> RunDetails {
+        RunDetails {
+            id: RunId::from_u128(7),
+            task: Some("Add OAuth provider support".to_owned()),
+            workflow,
+            status,
+            repository: Some(std::path::PathBuf::from("/repo")),
+            workspace_status: Some(crate::workspace::WorkspaceStatus::Ready),
+            base_commit: Some("abc1234".to_owned()),
+            profile: "recommended".to_owned(),
+            profile_version: "recommended_v2".to_owned(),
+            routes: Vec::new(),
+            revision: crate::store::RunRevision::initial(),
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            stages: vec![StageSummary {
+                id: StageId::new("implementation").unwrap(),
+                kind: StageKind::Implementation,
+                role: Role::Implementer,
+                status: StageStatus::Running,
+                configured_provider: "codex".to_owned(),
+                requested_effort: EffortSetting::NativeDefault,
+                configured_model: None,
+                actual_provider: None,
+                actual_model: None,
+                provider_session_record: None,
+                native_session: None,
+                provider_session_status: None,
+                process_status: None,
+                started_at: None,
+                finished_at: None,
+            }],
+            attention: Vec::new(),
+            usage: UsageSummary::default(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn apply_is_refused_for_every_non_applyable_run_state() {
+        // The workspace layer rejects apply outside a completed branch run;
+        // the TUI must not dispatch into that rejection. The confirmation
+        // overlay is the only path to ApplyRun, so an overlay that never
+        // opens is a command that never dispatches.
+        for (status, workflow) in [
+            (RunStatus::Running, WorkflowKind::Standard),
+            (RunStatus::NeedsUser, WorkflowKind::Standard),
+            (RunStatus::Paused, WorkflowKind::Standard),
+            (RunStatus::Failed, WorkflowKind::Standard),
+            (RunStatus::Applied, WorkflowKind::Standard),
+            (RunStatus::Completed, WorkflowKind::Review),
+        ] {
+            let (mut app, _fixture) = app_with(details(status, workflow));
+            app.handle_intent(Intent::Apply);
+            assert_eq!(
+                app.state.overlay, None,
+                "apply confirmation must not open for {status:?}/{workflow:?}"
+            );
+            assert!(
+                app.state.worker_busy.is_none(),
+                "no worker command dispatched for {status:?}/{workflow:?}"
+            );
+            let message = app.state.message.as_ref().expect("user is told why");
+            assert_eq!(message.kind, UiMessageKind::Info, "refusal is not an error");
+        }
+    }
+
+    #[test]
+    fn apply_opens_confirmation_for_a_real_completed_branch_run() {
+        // Driven against a real committed fake run so the whole path runs:
+        // eligibility gate, diff preview, then the confirmation overlay.
+        let fixture = TempDir::new().unwrap();
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&arguments)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        std::fs::write(repo.join("README.md"), "baseline\n").unwrap();
+        for arguments in [vec!["add", "README.md"], vec!["commit", "-qm", "initial"]] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&arguments)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let database = fixture.path().join("polycode.db");
+        let worktrees = fixture.path().join("worktrees");
+        let report = RunService::new(
+            database.clone(),
+            worktrees.clone(),
+            crate::app::DevelopmentFakeProviderFactory,
+        )
+        .start_run(
+            WorkflowKind::Standard,
+            "mission deck apply gate",
+            repo,
+            Some(crate::app::ExecutionSelection::Uniform(
+                crate::app::UniformProvider::Fake,
+            )),
+            EffortSetting::NativeDefault,
+        )
+        .unwrap();
+        assert_eq!(report.details.status, RunStatus::Completed);
+
+        let mut state = TuiState::new(fixture.path());
+        state.screen = Screen::RunDetail;
+        state.selected_run = Some(report.details.id);
+        state.replace_details(report.details);
+        let mut app = TuiApp {
+            state,
+            reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
+            worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            last_refresh: Instant::now(),
+        };
+        assert!(app.state.run_is_applyable());
+        app.handle_intent(Intent::Apply);
+        assert_eq!(app.state.overlay, Some(Overlay::ApplyConfirm));
+        assert!(
+            app.state.worker_busy.is_none(),
+            "opening the confirmation still dispatches nothing"
+        );
+    }
+
+    #[test]
+    fn refusal_wording_names_the_blocking_state() {
+        let (app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        assert!(apply_unavailable_reason(&app.state).contains("still working"));
+
+        let (app, _fixture) = app_with(details(RunStatus::NeedsUser, WorkflowKind::Standard));
+        assert!(apply_unavailable_reason(&app.state).contains("resolve the attention"));
+
+        let (app, _fixture) = app_with(details(RunStatus::Applied, WorkflowKind::Standard));
+        assert!(apply_unavailable_reason(&app.state).contains("already been applied"));
+
+        let (app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Review));
+        assert!(apply_unavailable_reason(&app.state).contains("no workspace changes"));
+    }
+
+    #[test]
+    fn technical_toggle_is_scoped_to_run_detail() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        assert!(!app.state.technical, "operational view is the default");
+        app.handle_intent(Intent::TechnicalDetails);
+        assert!(app.state.technical);
+        app.handle_intent(Intent::TechnicalDetails);
+        assert!(!app.state.technical);
+
+        app.state.screen = Screen::Logs;
+        app.handle_intent(Intent::TechnicalDetails);
+        assert!(!app.state.technical, "viewers keep their own controls");
+    }
+
+    #[test]
+    fn discard_confirmation_still_opens_for_any_run() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.handle_intent(Intent::Discard);
+        assert_eq!(
+            app.state.overlay,
+            Some(Overlay::DiscardConfirm),
+            "discard eligibility is unchanged by this milestone"
+        );
+    }
 
     #[test]
     fn viewer_identification_is_explicit() {

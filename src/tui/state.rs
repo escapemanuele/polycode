@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::{
     ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails, RunDiffPreview,
-    RunListItem, UniformProvider,
+    RunListItem, StageExecutionEvidence, UniformProvider,
 };
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
 
@@ -290,6 +290,9 @@ pub(crate) struct TuiState {
     pub selected_stage_index: usize,
     pub artifact: Option<ArtifactView>,
     pub artifact_raw: bool,
+    /// Operational view by default; `i` reveals the diagnostic rows.
+    pub technical: bool,
+    pub evidence: Option<StageExecutionEvidence>,
     pub stages_with_artifacts: HashSet<StageId>,
     pub logs: Option<ProcessLogView>,
     pub diff: Option<RunDiffPreview>,
@@ -316,6 +319,8 @@ impl TuiState {
             selected_stage_index: 0,
             artifact: None,
             artifact_raw: false,
+            technical: false,
+            evidence: None,
             stages_with_artifacts: HashSet::new(),
             logs: None,
             diff: None,
@@ -402,6 +407,19 @@ impl TuiState {
             .as_ref()
             .and_then(|details| details.attention.get(self.attention_index))
             .map(|attention| attention.id)
+    }
+
+    /// Whether apply/discard review actions are offered for the selected run.
+    ///
+    /// Mirrors the workspace invariant (`WorkspaceManager::apply`): only a
+    /// `Completed` run whose workflow produced a branch workspace can be
+    /// applied. The application layer stays the final guard; this only stops
+    /// the TUI advertising and dispatching an action the domain will reject.
+    pub(crate) fn run_is_applyable(&self) -> bool {
+        self.details.as_ref().is_some_and(|details| {
+            details.status == crate::domain::RunStatus::Completed
+                && details.workflow != WorkflowKind::Review
+        })
     }
 
     pub(crate) fn notify(&mut self, kind: UiMessageKind, text: impl Into<String>) {
