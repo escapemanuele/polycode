@@ -1085,9 +1085,7 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             } else if line.starts_with('-') {
                 Style::default().fg(theme::DANGER)
             } else if line.starts_with("diff --git") || line.starts_with("@@") {
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD)
+               theme::diff_hunk()
             } else {
                 theme::text()
             };

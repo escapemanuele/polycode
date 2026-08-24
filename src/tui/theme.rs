@@ -21,6 +21,13 @@ pub(crate) const DANGER: Color = Color::Red;
 pub(crate) const SUSPENDED: Color = Color::Magenta;
 /// Secondary labels, metadata, structure, inactive pipeline connectors.
 pub(crate) const MUTED: Color = Color::DarkGray;
+/// Structural framing and the architecture role accent: diff hunk headers and
+/// POD designing. Kept distinct from ACCENT so framework reads as structure,
+/// not focus, and never competes with the one active-work accent per screen.
+pub(crate) const STRUCTURE: Color = Color::Blue;
+/// Foreground of a reversed chip: black on the chip's own color keeps its word
+/// legible on any accent hue.
+pub(crate) const CHIP_FG: Color = Color::Black;
 
 /// Primary content: the terminal's own foreground.
 pub(crate) fn text() -> Style {
@@ -46,12 +53,12 @@ pub(crate) fn section(label: &str) -> Line<'static> {
 pub(crate) fn chip(label: &str, color: Color) -> Span<'static> {
     Span::styled(
         format!(" {label} "),
-        Style::default()
-            .bg(color)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD),
-    )
-}
+                Style::default()
+                     .bg(color)
+                     .fg(CHIP_FG)
+                     .add_modifier(Modifier::BOLD),
+             )
+        }
 
 /// Keyboard affordance: the key reads as the interactive part, the verb as
 /// plain content.
@@ -65,9 +72,15 @@ pub(crate) fn action(key: &str, label: &str, color: Color) -> Vec<Span<'static>>
 /// Horizontal rule used where a border would be too heavy.
 pub(crate) fn rule(width: u16) -> Line<'static> {
     Line::from(Span::styled(
-        "─".repeat(width as usize),
+          "─".repeat(width as usize),
         Style::default().fg(MUTED),
-    ))
+      ))
+}
+
+/// Diff hunk header — the `diff --git` line and the `@@` range: structural
+/// framing in bold so it reads as a boundary, not as changed content.
+pub(crate) fn diff_hunk() -> Style {
+    Style::default().fg(STRUCTURE).add_modifier(Modifier::BOLD)
 }
 
 /// Centered short rule, used to seat POD under the pipeline instead of
@@ -146,7 +159,59 @@ mod tests {
 
     #[test]
     fn centered_rule_stays_short_and_bounded() {
-        assert!(centered_rule(200).spans[0].content.chars().count() <= 14);
-        assert!(centered_rule(2).spans[0].content.chars().count() >= 4);
-    }
-}
+                assert!(centered_rule(200).spans[0].content.chars().count() <= 14);
+                assert!(centered_rule(2).spans[0].content.chars().count() >= 4);
+            }
+
+// Regression guard for the "one palette" invariant: a raw Color:: may live only
+     // in theme.rs, the canonical source of truth. Every other tui source file must
+     // reference colors solely through theme constants/helpers. The one permitted
+     // exception is the ratatui Color::Reset assertion in render.rs, which proves a
+     // rail was *not* painted rather than choosing a hue. Scanning recursively means
+     // a future submodule under src/tui can't hide a leak either.
+     #[test]
+    fn raw_color_lives_only_in_theme() {
+         // Nested helpers must be declared before any statement (items_after_statements).
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                 } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                 }
+             }
+         }
+
+         // Permitted raw Color:: usages OUTSIDE theme.rs: the single entry is the reset
+         // assertion in render.rs. Any occurrence not covered here fails with its location,
+         // so an edit can't silently reintroduce a raw hue.
+        let allow: &[(&str, &str)] = &[("render.rs", "Color::Reset")];
+
+        let tui_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui");
+        let mut files: Vec<_> = Vec::new();
+        collect_rs(&tui_dir, &mut files);
+        files.sort();
+
+        for path in &files {
+            let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if file_name == "theme.rs" {
+                continue; // canonical palette source of truth — raw Color:: belongs here
+             }
+            let contents = std::fs::read_to_string(path).unwrap_or_default();
+            for (i, line) in contents.lines().enumerate() {
+                if !line.contains("Color::") {
+                    continue;
+                 }
+                let allowed =
+                    allow.iter().any(|(name, sub)| file_name == *name && line.contains(sub));
+                assert!(
+                    allowed,
+                     "raw Color:: leaked outside theme.rs at {file_name}:{line_no}\n      {snippet}",
+                    line_no = i + 1,
+                    snippet = line.trim(),
+                 );
+             }
+         }
+     }
+        }

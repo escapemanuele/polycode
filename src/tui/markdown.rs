@@ -6,7 +6,8 @@
 //! Markdown. Malformed or partial input degrades to literal text and never
 //! panics.
 
-use ratatui::style::{Color, Modifier, Style};
+use super::theme;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 const CODE_INDENT: &str = "  ";
@@ -23,7 +24,7 @@ pub(crate) fn render_markdown(source: &str) -> Vec<Line<'static>> {
         if in_fence {
             lines.push(Line::from(Span::styled(
                 format!("{CODE_INDENT}{raw}"),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme::ACCENT),
             )));
             continue;
         }
@@ -38,9 +39,9 @@ fn block_line(raw: &str, trimmed: &str) -> Line<'static> {
     }
     if is_separator(trimmed) {
         return Line::from(Span::styled(
-            "─".repeat(32),
-            Style::default().fg(Color::DarkGray),
-        ));
+             "─".repeat(32),
+            Style::default().fg(theme::MUTED),
+         ));
     }
     if let Some(heading) = heading_line(trimmed) {
         return heading;
@@ -49,13 +50,13 @@ fn block_line(raw: &str, trimmed: &str) -> Line<'static> {
         .strip_prefix("> ")
         .or_else(|| trimmed.strip_prefix('>'))
     {
-        let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
+        let mut spans = vec![Span::styled("│ ", Style::default().fg(theme::MUTED))];
         spans.extend(inline_spans(
-            rest,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ));
+               rest,
+               Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC),
+            ));
         return Line::from(spans);
     }
     if let Some(rest) = unordered_item(trimmed) {
@@ -82,9 +83,9 @@ fn heading_line(trimmed: &str) -> Option<Line<'static>> {
     let text = trimmed[hashes..].strip_prefix(' ')?;
     let style = if hashes <= 2 {
         Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
+             .fg(theme::ACCENT)
+             .add_modifier(Modifier::BOLD)
+      } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
     Some(Line::from(Span::styled(text.to_owned(), style)))
@@ -136,8 +137,8 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
                 flush(&mut spans, &mut plain, base);
                 spans.push(Span::styled(
                     after[..end].to_owned(),
-                    base.fg(Color::Yellow),
-                ));
+                    base.fg(theme::ATTENTION),
+                 ));
                 remainder = &after[end + 1..];
             } else {
                 plain.push('`');
@@ -211,9 +212,9 @@ mod tests {
         let lines = render_markdown("# Top");
         assert_eq!(
             lines[0].spans[0].style.fg,
-            Some(Color::Cyan),
-            "H1 is prominent"
-        );
+            Some(theme::ACCENT),
+             "H1 is prominent"
+         );
     }
 
     #[test]
@@ -238,7 +239,7 @@ mod tests {
             .iter()
             .find(|span| span.content == "cargo test")
             .unwrap();
-        assert_eq!(code.style.fg, Some(Color::Yellow));
+        assert_eq!(code.style.fg, Some(theme::ATTENTION));
         assert!(!rendered_text("run `cargo test` now").contains('`'));
     }
 
