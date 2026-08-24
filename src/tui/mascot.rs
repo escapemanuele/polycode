@@ -150,17 +150,17 @@ const fn state_style(state: MascotState) -> Style {
         MascotState::NeedsUser => Style::new().fg(theme::ATTENTION),
         MascotState::Completed => Style::new().fg(theme::SUCCESS),
         MascotState::Failed => Style::new().fg(theme::DANGER),
-     }
+    }
 }
 
 const fn accent_style(activity: MascotActivity) -> Style {
     match activity {
         MascotActivity::Architecture => Style::new().fg(theme::STRUCTURE),
         MascotActivity::Implementation
-         | MascotActivity::QualityReview
-         | MascotActivity::SpecReview
-         | MascotActivity::Decision => Style::new().fg(theme::MUTED),
-     }
+        | MascotActivity::QualityReview
+        | MascotActivity::SpecReview
+        | MascotActivity::Decision => Style::new().fg(theme::MUTED),
+    }
 }
 
 /// The label POD wears: state wins outright; only Running yields the line

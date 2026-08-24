@@ -39,9 +39,9 @@ fn block_line(raw: &str, trimmed: &str) -> Line<'static> {
     }
     if is_separator(trimmed) {
         return Line::from(Span::styled(
-             "─".repeat(32),
+            "─".repeat(32),
             Style::default().fg(theme::MUTED),
-         ));
+        ));
     }
     if let Some(heading) = heading_line(trimmed) {
         return heading;
@@ -52,11 +52,11 @@ fn block_line(raw: &str, trimmed: &str) -> Line<'static> {
     {
         let mut spans = vec![Span::styled("│ ", Style::default().fg(theme::MUTED))];
         spans.extend(inline_spans(
-               rest,
-               Style::default()
-                    .fg(theme::MUTED)
-                    .add_modifier(Modifier::ITALIC),
-            ));
+            rest,
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::ITALIC),
+        ));
         return Line::from(spans);
     }
     if let Some(rest) = unordered_item(trimmed) {
@@ -83,9 +83,9 @@ fn heading_line(trimmed: &str) -> Option<Line<'static>> {
     let text = trimmed[hashes..].strip_prefix(' ')?;
     let style = if hashes <= 2 {
         Style::default()
-             .fg(theme::ACCENT)
-             .add_modifier(Modifier::BOLD)
-      } else {
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
     Some(Line::from(Span::styled(text.to_owned(), style)))
@@ -138,7 +138,7 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
                 spans.push(Span::styled(
                     after[..end].to_owned(),
                     base.fg(theme::ATTENTION),
-                 ));
+                ));
                 remainder = &after[end + 1..];
             } else {
                 plain.push('`');
@@ -213,8 +213,8 @@ mod tests {
         assert_eq!(
             lines[0].spans[0].style.fg,
             Some(theme::ACCENT),
-             "H1 is prominent"
-         );
+            "H1 is prominent"
+        );
     }
 
     #[test]
