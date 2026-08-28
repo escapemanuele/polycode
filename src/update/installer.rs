@@ -93,15 +93,28 @@ pub trait AssetDownloader {
     fn fetch_text(&self, url: &str) -> Result<String, InstallError>;
 }
 
+/// Every asset name an official release publishes, in the order the release
+/// workflow builds them.
+///
+/// This is the bootstrap contract: `install.sh` maps a detected platform to
+/// one of these names, the release workflow uploads exactly these names, and
+/// [`target_asset_name`] resolves one of them for the running build. A test
+/// cross-checks all three against this list so they cannot drift apart.
+pub const OFFICIAL_TARGETS: [&str; 3] = [
+    "polycode-aarch64-apple-darwin",
+    "polycode-x86_64-apple-darwin",
+    "polycode-x86_64-unknown-linux-gnu",
+];
+
 /// The asset name for the platform this binary was compiled for, or `None`
 /// where Polycode publishes no official build. Windows is absent because
 /// Polycode requires tmux and is neither supported nor tested there.
 #[must_use]
 pub const fn target_asset_name() -> Option<&'static str> {
     match (cfg!(target_os = "macos"), cfg!(target_os = "linux")) {
-        (true, _) if cfg!(target_arch = "aarch64") => Some("polycode-aarch64-apple-darwin"),
-        (true, _) if cfg!(target_arch = "x86_64") => Some("polycode-x86_64-apple-darwin"),
-        (_, true) if cfg!(target_arch = "x86_64") => Some("polycode-x86_64-unknown-linux-gnu"),
+        (true, _) if cfg!(target_arch = "aarch64") => Some(OFFICIAL_TARGETS[0]),
+        (true, _) if cfg!(target_arch = "x86_64") => Some(OFFICIAL_TARGETS[1]),
+        (_, true) if cfg!(target_arch = "x86_64") => Some(OFFICIAL_TARGETS[2]),
         _ => None,
     }
 }
