@@ -164,6 +164,97 @@ pub fn detect_install_source() -> anyhow::Result<InstallSource> {
     Ok(classify(&executable, receipt.as_ref()))
 }
 
+/// Classifies an arbitrary executable path against the receipt on this
+/// machine, without executing it. The bootstrap installer uses this to decide
+/// whether an existing file at the destination is a Polycode installation it
+/// may replace.
+///
+/// # Errors
+/// Returns an error only when the data directory cannot be resolved.
+pub fn classify_path(executable: &Path) -> anyhow::Result<InstallSource> {
+    let receipt = crate::store::install_receipt_file()
+        .ok()
+        .and_then(|path| load_receipt(&path));
+    Ok(classify(executable, receipt.as_ref()))
+}
+
+/// Why a path may not be registered as an official installation.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistrationError {
+    #[error("{0} does not exist or is not a file")]
+    NotAFile(PathBuf),
+    #[error("{0} is not executable")]
+    NotExecutable(PathBuf),
+    #[error("{path} does not identify itself as Polycode")]
+    NotPolycode { path: PathBuf },
+    #[error("{path} reports version {reported}, but this build is {expected}")]
+    VersionMismatch {
+        path: PathBuf,
+        reported: String,
+        expected: String,
+    },
+}
+
+/// Records an installed executable as officially managed, so later processes
+/// classify it as [`InstallSource::OfficialBinary`] and self-update becomes
+/// available for it.
+///
+/// This exists so the bootstrap installer never reproduces the receipt schema,
+/// the data-directory rules, or the path semantics in shell. The path is
+/// validated first: it must be an executable file that identifies itself as
+/// Polycode at exactly this build's version, so an arbitrary file cannot be
+/// promoted into an official installation by name alone.
+///
+/// # Errors
+/// Returns [`RegistrationError`] when the path fails any of those checks.
+pub fn register_official_install(
+    executable: &Path,
+    asset: &str,
+    installed_at: DateTime<Utc>,
+) -> anyhow::Result<InstallReceipt> {
+    if !executable.is_file() {
+        return Err(RegistrationError::NotAFile(executable.to_path_buf()).into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::fs::metadata(executable)?.permissions().mode() & 0o111 == 0 {
+            return Err(RegistrationError::NotExecutable(executable.to_path_buf()).into());
+        }
+    }
+    let output = std::process::Command::new(executable)
+        .arg("--version")
+        .output()?;
+    let reported = String::from_utf8_lossy(&output.stdout);
+    // `polycode <version>`: both halves must be right, so neither an unrelated
+    // executable nor a differently versioned Polycode can be registered.
+    let mut words = reported.split_whitespace();
+    if words.next() != Some("polycode") {
+        return Err(RegistrationError::NotPolycode {
+            path: executable.to_path_buf(),
+        }
+        .into());
+    }
+    let version = words.next().unwrap_or_default();
+    if version != super::CURRENT_VERSION {
+        return Err(RegistrationError::VersionMismatch {
+            path: executable.to_path_buf(),
+            reported: version.to_owned(),
+            expected: super::CURRENT_VERSION.to_owned(),
+        }
+        .into());
+    }
+    // Canonicalize through the same rules classification uses, so the receipt
+    // matches the executable however it is later reached.
+    let canonical = executable
+        .canonicalize()
+        .unwrap_or_else(|_| executable.to_path_buf());
+    let receipt = InstallReceipt::new(canonical, version, asset, installed_at);
+    let path = crate::store::install_receipt_file()?;
+    store_receipt(&path, &receipt);
+    Ok(receipt)
+}
+
 /// Pure classification, so every branch is testable without installing
 /// anything.
 #[must_use]

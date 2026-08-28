@@ -21,6 +21,10 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             Ok(())
         }
         Some(Command::VerifyReleaseTag { tag }) => verify_release_tag(tag),
+        Some(Command::RegisterOfficialInstall { executable, asset }) => {
+            register_official_install(executable, asset.as_deref())
+        }
+        Some(Command::InstallSourceOf { executable }) => install_source_of(executable.as_deref()),
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
         Some(Command::Eval { command }) => eval(command),
         Some(Command::Update(args)) => update(*args),
@@ -111,6 +115,37 @@ fn parse_effort(value: Option<&str>) -> Result<crate::domain::EffortSetting> {
             anyhow::bail!("unsupported effort {other:?}; supported: native, low, medium, high")
         }
     }
+}
+
+/// Bootstrap hook: records an installed executable as officially managed so
+/// self-update becomes available for it. Validation lives in the update
+/// module, so the installer never reproduces the receipt schema, the data
+/// directory rules, or the path semantics in shell.
+fn register_official_install(executable: &std::path::Path, asset: Option<&str>) -> Result<()> {
+    let asset = asset.map_or_else(
+        || crate::update::target_asset_name().unwrap_or("unknown"),
+        |asset| asset,
+    );
+    let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    let receipt = crate::update::register_official_install(executable, asset, now)?;
+    println!(
+        "registered {} as an official Polycode {} installation",
+        receipt.executable.display(),
+        receipt.version
+    );
+    Ok(())
+}
+
+/// Bootstrap hook: reports how an executable would be classified, without
+/// executing it. The installer uses this to decide whether a file already at
+/// the destination is a Polycode installation it may replace.
+fn install_source_of(executable: Option<&std::path::Path>) -> Result<()> {
+    let executable = match executable {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe()?,
+    };
+    println!("{}", crate::update::classify_path(&executable)?.label());
+    Ok(())
 }
 
 /// Release-pipeline gate. Read-only and offline: it compares a candidate tag

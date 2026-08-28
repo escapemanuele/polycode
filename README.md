@@ -6,6 +6,52 @@ Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It
 
 Polycode is early-stage software. This repository contains **Milestone 11 role evaluation harness and routing evidence** above role-routed native Claude Code, Codex CLI, deterministic FakeProvider adapters, and Ratatui local control room. Polycode uses locally installed `claude` and `codex` executables with existing authentication/native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees, DAG scheduling, crash-reconcilable tmux supervision, and immutable versioned Recommended routing (`recommended_v1` frozen, `recommended_v2` current) remain intact. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain future work.
 
+## Install
+
+macOS (Apple Silicon and Intel) and Linux x86_64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/escapemanuele/polycode/main/install.sh | sh
+```
+
+The installer downloads an official release binary, verifies its SHA-256 against the
+release's own `SHA256SUMS`, confirms the binary reports the version the release
+claims, and installs it into `~/.local/bin/polycode`. It never uses `sudo`, never
+writes outside that directory and the Polycode data directory, and never edits your
+shell configuration — if `~/.local/bin` is not on `PATH` it prints the line to add.
+
+Options are environment variables, because a piped script cannot take flags:
+
+```bash
+POLYCODE_VERSION=0.1.1 sh install.sh      # install a specific release
+POLYCODE_INSTALL_DIR=~/bin sh install.sh  # install somewhere else
+POLYCODE_FORCE=1 sh install.sh            # replace a file Polycode does not manage
+```
+
+Windows is not supported: Polycode requires tmux. Linux ARM has no official build yet.
+
+### Verify
+
+```bash
+polycode --version
+polycode doctor
+```
+
+`doctor` reports the install source; a bootstrap installation reads
+`install source: official binary` and `automatic update: supported`.
+
+### Update
+
+Polycode checks for new official releases automatically, at most once a day, and stays
+quiet when there is nothing to say.
+
+```bash
+polycode update --check   # report status, change nothing
+polycode update           # install after explicit confirmation
+```
+
+See [Updates](#updates) for what a check sends and how to switch it off.
+
 ## Principles
 
 - Native coding-agent CLIs remain first-class providers.
@@ -209,7 +255,11 @@ Normal blocked states (`needs_user`, paused, interrupted, failed) exit successfu
 
 `doctor` reports paths/schema, tmux, Claude/Codex CLI versions and auth status, plus names of known credential/config override variables without printing values or creating missing database. `status` shows immutable routing and per-stage configured/actual provider, configured/confirmed model, provider session, native session, conversation, and managed-process status. `runs` leaves missing database untouched. Public APIs are under `polycode::app`, `polycode::domain`, `polycode::engine`, `polycode::process`, `polycode::providers`, `polycode::store`, `polycode::git`, and `polycode::workspace`.
 
-## Build
+## Build from source
+
+Source builds are for development. They are not automatically updatable — `polycode
+update` will report that and name the command that owns the installation instead of
+replacing it.
 
 Prerequisites:
 

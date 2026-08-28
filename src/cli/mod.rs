@@ -25,6 +25,17 @@ pub enum Command {
     /// Internal release-pipeline gate: canonical tag matching this build.
     #[command(name = "__verify-release-tag", hide = true)]
     VerifyReleaseTag { tag: String },
+    /// Internal bootstrap hook: record an installed executable as official.
+    #[command(name = "__register-official-install", hide = true)]
+    RegisterOfficialInstall {
+        executable: PathBuf,
+        /// Release asset the executable was installed from.
+        #[arg(long)]
+        asset: Option<String>,
+    },
+    /// Internal bootstrap hook: classify an executable without running it.
+    #[command(name = "__install-source", hide = true)]
+    InstallSourceOf { executable: Option<PathBuf> },
     /// Open interactive local control room.
     Tui,
     /// Experimental role-specific provider/model evaluation tools.
