@@ -22,6 +22,9 @@ pub enum Command {
     /// Internal signal-normalizing exec bridge.
     #[command(name = "__exec-process", hide = true)]
     ExecProcess { manifest: PathBuf },
+    /// Internal release-pipeline gate: canonical tag matching this build.
+    #[command(name = "__verify-release-tag", hide = true)]
+    VerifyReleaseTag { tag: String },
     /// Open interactive local control room.
     Tui,
     /// Experimental role-specific provider/model evaluation tools.
@@ -57,8 +60,20 @@ pub enum Command {
     Apply { run_id: RunId },
     /// Discard run and remove owned workspace resources.
     Discard { run_id: RunId },
+    /// Check for a newer official Polycode release.
+    Update(UpdateArgs),
     /// Check Polycode's local environment.
     Doctor,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Args)]
+pub struct UpdateArgs {
+    /// Report update status without installing anything.
+    #[arg(long)]
+    pub check: bool,
+    /// Install without the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]

@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 
 use crate::app::{AppError, RunService, RuntimeProviderFactory};
 use crate::domain::{StageId, StageStatus};
+use crate::update::{InstallSource, UpdateInfo};
 
 use super::input::{Intent, map_key, map_text_key};
 use super::render;
@@ -15,10 +17,22 @@ use super::worker::{Worker, WorkerCommand, WorkerResult, WorkerSuccess};
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// One completed background update check: the newer release when there is
+/// one, and how this executable was installed.
+type UpdateOutcome = (Option<UpdateInfo>, Option<InstallSource>);
+
+/// One completed installation attempt.
+type InstallOutcome = Result<String, String>;
+
 pub(crate) struct TuiApp {
     state: TuiState,
     reader: RunService<RuntimeProviderFactory>,
     worker: Worker,
+    /// Delivers the background update check exactly once. Startup never waits
+    /// on it, and a dropped sender simply means no update will be offered.
+    update: Receiver<UpdateOutcome>,
+    /// Present only while an installation this session started is running.
+    installing: Option<Receiver<InstallOutcome>>,
     last_refresh: Instant,
 }
 
@@ -30,6 +44,8 @@ impl TuiApp {
             state: TuiState::new(repository),
             reader,
             worker: Worker::spawn(actions),
+            update: spawn_update_check(),
+            installing: None,
             last_refresh: Instant::now()
                 .checked_sub(REFRESH_INTERVAL)
                 .unwrap_or_else(Instant::now),
@@ -40,6 +56,8 @@ impl TuiApp {
         self.refresh();
         while !self.state.quit {
             self.receive_worker_results();
+            self.receive_update();
+            self.receive_install();
             self.state.clear_expired_message(Instant::now());
             if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
                 self.refresh();
@@ -52,6 +70,24 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    /// Absorbs the background check without ever blocking, then opens the
+    /// prompt only when the interface has nothing more important to say.
+    fn receive_update(&mut self) {
+        match self.update.try_recv() {
+            Ok((info, source)) => {
+                self.state.update = info;
+                self.state.update_install = source;
+            }
+            // Empty means still checking; disconnected means the check
+            // finished or failed and will never speak again. Neither is worth
+            // telling the user about.
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+        if self.state.update_prompt_is_due() {
+            self.state.overlay = Some(Overlay::Update);
+        }
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -138,6 +174,10 @@ impl TuiApp {
     }
 
     fn handle_overlay_intent(&mut self, overlay: Overlay, intent: Intent) {
+        if overlay == Overlay::Update {
+            self.handle_update_intent(intent);
+            return;
+        }
         if matches!(intent, Intent::Escape | Intent::Help) {
             self.state.overlay = None;
             return;
@@ -156,7 +196,67 @@ impl TuiApp {
                     self.state.overlay = None;
                 }
             }
-            Overlay::Help | Overlay::ApplyConfirm | Overlay::DiscardConfirm => {}
+            Overlay::Help | Overlay::ApplyConfirm | Overlay::DiscardConfirm | Overlay::Update => {}
+        }
+    }
+
+    /// Any answer closes the prompt for the lifetime of this process; the
+    /// 24-hour cache decides whether the next process asks again. Only an
+    /// explicit Yes on an installation Polycode owns starts an install.
+    fn handle_update_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::Up | Intent::Down => {
+                if self.state.update_is_installable() {
+                    self.state.update_install_selected = !self.state.update_install_selected;
+                }
+            }
+            Intent::Enter => {
+                let install =
+                    self.state.update_is_installable() && self.state.update_install_selected;
+                self.state.update_dismissed = true;
+                self.state.overlay = None;
+                if install {
+                    self.begin_update_install();
+                }
+            }
+            Intent::Escape | Intent::Help => {
+                self.state.update_dismissed = true;
+                self.state.overlay = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Runs the installation off the render loop so the interface stays
+    /// responsive, and reports its outcome as an ordinary notification.
+    fn begin_update_install(&mut self) {
+        let Some(info) = self.state.update.clone() else {
+            return;
+        };
+        self.state
+            .notify(UiMessageKind::Info, "Installing update…".to_owned());
+        self.installing = Some(spawn_update_install(info));
+    }
+
+    /// Absorbs an installation result without ever blocking the loop.
+    fn receive_install(&mut self) {
+        let Some(receiver) = self.installing.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(notice)) => {
+                self.state.set_message(notice);
+                self.installing = None;
+            }
+            Ok(Err(error)) => {
+                // A failed install is recoverable: the existing executable is
+                // untouched and the interface carries on normally.
+                self.state
+                    .set_error(format!("Update not installed: {error}"));
+                self.installing = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.installing = None,
         }
     }
 
@@ -571,6 +671,55 @@ const fn is_viewer(screen: Screen) -> bool {
     matches!(screen, Screen::Artifact | Screen::Logs | Screen::Diff)
 }
 
+/// Downloads, verifies, and installs one release on a detached thread. Every
+/// safety decision lives in the installer; this only moves it off the render
+/// loop and turns the outcome into a message.
+fn spawn_update_install(info: UpdateInfo) -> Receiver<InstallOutcome> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(install_release(&info).map_err(|error| error.to_string()));
+    });
+    receiver
+}
+
+/// Re-reads the release so the binary and its checksums come from one
+/// consistent listing rather than from cached metadata.
+fn install_release(info: &UpdateInfo) -> anyhow::Result<String> {
+    use crate::update::ReleaseSource as _;
+    let source = crate::update::GitHubReleases::new(
+        crate::update::OFFICIAL_REPOSITORY,
+        Duration::from_secs(10),
+    );
+    let release = source
+        .latest_stable()?
+        .filter(|release| release.version == info.available_version)
+        .ok_or_else(|| anyhow::anyhow!("release {} is no longer published", info.tag))?;
+    let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    let downloader = crate::update::HttpDownloader::new(Duration::from_secs(120));
+    let installed = crate::update::install(&release, &std::env::current_exe()?, &downloader, now)?;
+    Ok(installed.restart_notice())
+}
+
+/// Runs one update check on a detached thread so startup never waits on the
+/// network. Every failure — including an unresolvable data directory — simply
+/// produces no update.
+fn spawn_update_check() -> Receiver<UpdateOutcome> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok(service) = crate::update::UpdateService::from_environment() else {
+            return;
+        };
+        let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+        let info = service.status(now).available().cloned();
+        // Install source is only interesting when an update exists.
+        let source = info
+            .as_ref()
+            .and_then(|_| crate::update::detect_install_source().ok());
+        let _ = sender.send((info, source));
+    });
+    receiver
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -593,6 +742,10 @@ mod tests {
             state,
             reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
             worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            // Tests never check for updates: an immediately dropped sender
+            // reads as "no update will ever arrive".
+            update: mpsc::channel().1,
+            installing: None,
             last_refresh: Instant::now(),
         };
         (app, fixture)
@@ -727,6 +880,10 @@ mod tests {
             state,
             reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
             worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            // Tests never check for updates: an immediately dropped sender
+            // reads as "no update will ever arrive".
+            update: mpsc::channel().1,
+            installing: None,
             last_refresh: Instant::now(),
         };
         assert!(app.state.run_is_applyable());
@@ -751,6 +908,87 @@ mod tests {
 
         let (app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Review));
         assert!(apply_unavailable_reason(&app.state).contains("no workspace changes"));
+    }
+
+    fn update_info() -> crate::update::UpdateInfo {
+        crate::update::UpdateInfo {
+            current_version: semver::Version::parse("0.1.0").unwrap(),
+            available_version: semver::Version::parse("0.2.0").unwrap(),
+            tag: "v0.2.0".to_owned(),
+            release_url: "https://example.invalid/r".to_owned(),
+            published_at: None,
+        }
+    }
+
+    #[test]
+    fn declining_the_update_dismisses_it_without_installing() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::Runs;
+        app.state.update = Some(update_info());
+        app.state.update_install = Some(crate::update::InstallSource::OfficialBinary);
+        app.state.overlay = Some(Overlay::Update);
+
+        // Moving the selection to No and confirming must not start anything.
+        app.handle_intent(Intent::Down);
+        assert!(!app.state.update_install_selected);
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        assert!(app.state.update_dismissed);
+        assert!(
+            app.installing.is_none(),
+            "declining never starts an installation"
+        );
+        assert!(!app.state.update_prompt_is_due(), "it does not reopen");
+    }
+
+    #[test]
+    fn escape_dismisses_the_update_for_the_session() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::Runs;
+        app.state.update = Some(update_info());
+        app.state.update_install = Some(crate::update::InstallSource::OfficialBinary);
+        app.state.overlay = Some(Overlay::Update);
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        assert!(app.state.update_dismissed);
+        assert!(app.installing.is_none());
+    }
+
+    #[test]
+    fn an_unsupported_installation_can_never_start_an_install() {
+        for source in [
+            crate::update::InstallSource::Source,
+            crate::update::InstallSource::Cargo,
+            crate::update::InstallSource::Homebrew,
+            crate::update::InstallSource::Unknown,
+        ] {
+            let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+            app.state.screen = Screen::Runs;
+            app.state.update = Some(update_info());
+            app.state.update_install = Some(source);
+            app.state.overlay = Some(Overlay::Update);
+            // Even with the install answer selected, the strategy refuses.
+            app.state.update_install_selected = true;
+            app.handle_intent(Intent::Enter);
+            assert!(
+                app.installing.is_none(),
+                "{source:?} must never begin an installation"
+            );
+            assert!(app.state.update_dismissed);
+        }
+    }
+
+    #[test]
+    fn the_update_prompt_does_not_hijack_run_keys() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::Runs;
+        app.state.update = Some(update_info());
+        app.state.update_install = Some(crate::update::InstallSource::OfficialBinary);
+        app.state.overlay = Some(Overlay::Update);
+        // Run actions are inert while the prompt owns the keyboard.
+        app.handle_intent(Intent::Apply);
+        assert_eq!(app.state.overlay, Some(Overlay::Update));
+        assert!(app.state.worker_busy.is_none());
     }
 
     #[test]

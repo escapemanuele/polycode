@@ -8,7 +8,7 @@ use crate::app::{
 use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
 
-use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs};
+use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs, UpdateArgs};
 
 pub fn execute(command: Option<&Command>) -> Result<()> {
     match command {
@@ -20,8 +20,10 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             crate::process::exec_managed_process(manifest)?;
             Ok(())
         }
+        Some(Command::VerifyReleaseTag { tag }) => verify_release_tag(tag),
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
         Some(Command::Eval { command }) => eval(command),
+        Some(Command::Update(args)) => update(*args),
         Some(Command::Doctor) => doctor(),
         Some(Command::Runs) => runs(),
         Some(Command::Fast(args)) => start(WorkflowKind::Fast, args),
@@ -111,12 +113,148 @@ fn parse_effort(value: Option<&str>) -> Result<crate::domain::EffortSetting> {
     }
 }
 
+/// Release-pipeline gate. Read-only and offline: it compares a candidate tag
+/// against the version this checkout compiles as, and fails the process when
+/// they disagree, so a mismatched tag cannot reach publication.
+fn verify_release_tag(tag: &str) -> Result<()> {
+    let version = crate::update::verify_release_tag(tag)?;
+    println!("release tag {tag} matches package version {version}");
+    Ok(())
+}
+
+/// Reports update status and, when explicitly confirmed, installs an
+/// official release over this executable.
+///
+/// `--check` never mutates anything. Without it the command still refuses to
+/// install unless the installation is one Polycode recognizes as its own and
+/// the user confirms — `--yes` is the only way to skip the prompt, and a
+/// non-interactive invocation without it reports instead of guessing.
+fn update(args: UpdateArgs) -> Result<()> {
+    let service = crate::update::UpdateService::from_environment()?;
+    let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    let status = if args.check {
+        service.status(now)
+    } else {
+        service.check_now(now)
+    };
+    println!("Current version: {}", crate::update::CURRENT_VERSION);
+    let crate::update::UpdateStatus::Available(info) = &status else {
+        match status {
+            crate::update::UpdateStatus::Current => println!("Polycode is up to date."),
+            _ if crate::update::checks_disabled() => println!(
+                "Update checks are disabled ({}).",
+                crate::update::DISABLE_ENVIRONMENT_VARIABLE
+            ),
+            _ => println!("Update status is unavailable right now."),
+        }
+        return Ok(());
+    };
+    println!(
+        "Update available: {} \u{2192} {}",
+        info.current_version, info.available_version
+    );
+    if !info.release_url.is_empty() {
+        println!("Release: {}", info.release_url);
+    }
+    let source = crate::update::detect_install_source()?;
+    println!("Install source: {}", source.label());
+    let strategy = source.strategy();
+    if !strategy.is_automatic() {
+        println!("{}", strategy.guidance());
+        return Ok(());
+    }
+    if args.check {
+        println!("Automatic installation is supported. Run `polycode update` to install.");
+        return Ok(());
+    }
+    if !args.yes && !confirm_install(&info.available_version.to_string())? {
+        println!("Not installing.");
+        return Ok(());
+    }
+    let installed = install_update(info, now)?;
+    println!("{}", installed.restart_notice());
+    Ok(())
+}
+
+/// Explicit confirmation before an irreversible action, matching how apply
+/// and discard behave. A non-interactive stdin is never treated as consent.
+fn confirm_install(version: &str) -> Result<bool> {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+    if !std::io::stdin().is_terminal() {
+        println!("Re-run with `--yes` to install {version} without a prompt.");
+        return Ok(false);
+    }
+    print!("Install {version} now? It applies when Polycode restarts. [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Re-reads the release so the download and its checksums come from one
+/// consistent listing rather than from cached metadata.
+fn install_update(
+    info: &crate::update::UpdateInfo,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::update::Installed> {
+    use crate::update::ReleaseSource as _;
+    let source = crate::update::GitHubReleases::new(
+        crate::update::OFFICIAL_REPOSITORY,
+        std::time::Duration::from_secs(10),
+    );
+    let release = source
+        .latest_stable()?
+        .filter(|release| release.version == info.available_version)
+        .ok_or_else(|| anyhow::anyhow!("release {} is no longer published", info.tag))?;
+    let executable = std::env::current_exe()?;
+    let downloader = crate::update::HttpDownloader::new(std::time::Duration::from_secs(120));
+    Ok(crate::update::install(
+        &release,
+        &executable,
+        &downloader,
+        now,
+    )?)
+}
+
+/// Version and distribution diagnostics. Never touches the network: how
+/// Polycode was installed is knowable offline, and internet reachability is
+/// not a doctor failure.
+fn print_distribution() {
+    println!("  version: {}", crate::update::CURRENT_VERSION);
+    match crate::update::detect_install_source() {
+        Ok(source) => {
+            println!("  install source: {}", source.label());
+            println!(
+                "  automatic update: {}",
+                if source.strategy().is_automatic() {
+                    "supported"
+                } else {
+                    "unavailable for this build"
+                }
+            );
+        }
+        Err(error) => println!("  install source: undetermined ({error})"),
+    }
+    println!(
+        "  update checks: {}",
+        if crate::update::checks_disabled() {
+            "disabled"
+        } else {
+            "enabled (public GitHub release metadata, at most once per day)"
+        }
+    );
+}
+
 fn doctor() -> Result<()> {
     let config_file = crate::config::config_file()?;
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
     println!("  status: Milestone 11 role evaluation harness");
+    print_distribution();
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {

@@ -257,7 +257,7 @@ Resolution order:
 2. `$XDG_CONFIG_HOME/polycode/config.toml`
 3. `$HOME/.config/polycode/config.toml`
 
-Repository overrides will eventually live at `<repo>/.polycode.toml`. Current code resolves paths but does not read or create configuration files.
+Repository overrides will eventually live at `<repo>/.polycode.toml`. Current code resolves paths but does not read or create configuration files, so the update opt-out below is an environment variable rather than a configuration key.
 
 Default SQLite path:
 
@@ -300,6 +300,43 @@ Native-provider stage artifacts live under:
 ```
 
 Direct dependency artifacts are included in downstream prompts. Artifact metadata records provider, confirmed model when available, attempt, base commit, path, size, and SHA-256; reads verify bytes before use.
+
+## Updates
+
+Polycode checks for newer official releases at most once every 24 hours and stays
+silent unless there is something to say. A check reads public release metadata for
+`escapemanuele/polycode` from the documented GitHub REST API and sends nothing but a
+`polycode/<version>` user agent — no repository paths, task text, run identifiers,
+provider or model information, telemetry, or hostname. No token is required, and
+network problems are never an error: an unreachable or rate-limited GitHub simply
+leaves the status unknown and startup continues unchanged.
+
+The result is cached under the Polycode data directory (`$POLYCODE_DATA_DIR`, else
+`~/.polycode/update.json`), never inside a repository you are working in and never in
+the run database.
+
+```bash
+polycode update --check   # report status, change nothing
+polycode update           # install after explicit confirmation, where supported
+polycode update --yes     # install without the prompt
+```
+
+Automatic installation applies only to an official release binary that Polycode
+itself installed and recorded. Source builds, `cargo install` destinations, and
+package-manager prefixes are reported with the command that owns them rather than
+overwritten. An install downloads to a staging file beside the target, verifies its
+SHA-256 against the release's `SHA256SUMS`, checks the staged binary reports the
+version the release claims, and only then renames it into place; the running process
+keeps using the binary it already loaded, and the new one is used at the next start.
+
+Disable automatic checks entirely:
+
+```bash
+export POLYCODE_DISABLE_UPDATE_CHECK=1
+```
+
+`polycode doctor` reports the current version, the detected install source, and
+whether automatic updates are available for that installation.
 
 ## Architecture
 
