@@ -1368,15 +1368,29 @@ fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if installable {
         lines.push(Line::from(Span::styled("Install now?", theme::text())));
         lines.push(Line::from(Span::styled(
-            "The new version is used the next time Polycode starts.",
+            "It applies when Polycode restarts.",
             theme::muted(),
         )));
         lines.push(Line::from(""));
-        lines.push(Line::from(theme::action(
-            "Enter",
-            "Continue",
-            theme::ACCENT,
-        )));
+        for (selected, label) in [
+            (state.update_install_selected, "Yes"),
+            (!state.update_install_selected, "No"),
+        ] {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "  → " } else { "    " },
+                    Style::default().fg(theme::ACCENT),
+                ),
+                Span::styled(
+                    label,
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::muted()
+                    },
+                ),
+            ]));
+        }
     } else {
         lines.push(Line::from(Span::styled(
             state
@@ -1393,7 +1407,7 @@ fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
     // The prompt is an aside, not a takeover: it occupies a compact band
     // rather than the whole screen.
-    let popup = update_rect(area, lines.len());
+    let popup = update_rect(area, &lines);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1403,10 +1417,17 @@ fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
-/// A band wide enough for one version line and tall enough for its content,
-/// centered, and always inside the terminal.
-fn update_rect(area: Rect, rows: usize) -> Rect {
+/// A band wide enough for one version line and tall enough for its content
+/// *after wrapping*, centered, and always inside the terminal.
+fn update_rect(area: Rect, lines: &[Line<'_>]) -> Rect {
     let width = area.width.saturating_sub(4).clamp(20, 62);
+    // Borders take two columns and the block pads one on each side, so the
+    // band must be measured against the width the text actually wraps to.
+    let inner = usize::from(width).saturating_sub(4).max(1);
+    let rows: usize = lines
+        .iter()
+        .map(|line| span_width(&line.spans).div_ceil(inner).max(1))
+        .sum();
     let height = u16::try_from(rows + 2).unwrap_or(u16::MAX).min(area.height);
     Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -2373,7 +2394,9 @@ mod tests {
         assert!(text.contains("0.1.0"));
         assert!(text.contains("0.2.0"));
         assert!(text.contains("Install now?"));
-        assert!(text.contains("next time Polycode starts"));
+        assert!(text.contains("It applies when Polycode restarts."));
+        assert!(text.contains("→ Yes"), "the default answer is highlighted");
+        assert!(text.contains("No"));
     }
 
     #[test]
@@ -2449,9 +2472,23 @@ mod tests {
             );
         }
         // The band is an aside, never a takeover.
-        let band = update_rect(Rect::new(0, 0, 160, 40), 9);
+        let band = update_rect(
+            Rect::new(0, 0, 160, 40),
+            &[Line::from("one"), Line::from("two")],
+        );
         assert!(band.width <= 62 && band.height <= 12);
         assert!(band.x > 0 && band.y > 0);
+
+        // A long guidance line wraps, and the band grows so the action row
+        // stays visible instead of being clipped.
+        let tall = update_rect(
+            Rect::new(0, 0, 160, 40),
+            &[Line::from("x".repeat(200)), Line::from("[Enter] Continue")],
+        );
+        assert!(
+            tall.height > band.height,
+            "wrapped content is accounted for"
+        );
     }
 
     #[test]

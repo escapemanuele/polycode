@@ -318,6 +318,10 @@ pub(crate) struct TuiState {
     pub update_install: Option<crate::update::InstallSource>,
     /// Set once the user answers the prompt; it never reopens in this process.
     pub update_dismissed: bool,
+    /// Which answer the update prompt has highlighted. Installing is the
+    /// default only because the prompt appears solely when installing is
+    /// possible and nothing more urgent is happening.
+    pub update_install_selected: bool,
     pub quit: bool,
 }
 
@@ -349,6 +353,7 @@ impl TuiState {
             update: None,
             update_install: None,
             update_dismissed: false,
+            update_install_selected: true,
             quit: false,
         }
     }

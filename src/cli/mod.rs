@@ -68,6 +68,9 @@ pub struct UpdateArgs {
     /// Report update status without installing anything.
     #[arg(long)]
     pub check: bool,
+    /// Install without the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]

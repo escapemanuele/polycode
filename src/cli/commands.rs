@@ -112,9 +112,13 @@ fn parse_effort(value: Option<&str>) -> Result<crate::domain::EffortSetting> {
     }
 }
 
-/// Reports update status. Installation arrives in M13e.2; until then the
-/// command is non-mutating whichever flag is passed, and says so rather than
-/// implying an install happened.
+/// Reports update status and, when explicitly confirmed, installs an
+/// official release over this executable.
+///
+/// `--check` never mutates anything. Without it the command still refuses to
+/// install unless the installation is one Polycode recognizes as its own and
+/// the user confirms — `--yes` is the only way to skip the prompt, and a
+/// non-interactive invocation without it reports instead of guessing.
 fn update(args: UpdateArgs) -> Result<()> {
     let service = crate::update::UpdateService::from_environment()?;
     let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
@@ -124,32 +128,85 @@ fn update(args: UpdateArgs) -> Result<()> {
         service.check_now(now)
     };
     println!("Current version: {}", crate::update::CURRENT_VERSION);
-    match &status {
-        crate::update::UpdateStatus::Current => println!("Polycode is up to date."),
-        crate::update::UpdateStatus::Available(info) => {
-            println!(
-                "Update available: {} \u{2192} {}",
-                info.current_version, info.available_version
-            );
-            if !info.release_url.is_empty() {
-                println!("Release: {}", info.release_url);
-            }
-            let source = crate::update::detect_install_source()?;
-            println!("Install source: {}", source.label());
-            println!("{}", source.strategy().guidance());
+    let crate::update::UpdateStatus::Available(info) = &status else {
+        match status {
+            crate::update::UpdateStatus::Current => println!("Polycode is up to date."),
+            _ if crate::update::checks_disabled() => println!(
+                "Update checks are disabled ({}).",
+                crate::update::DISABLE_ENVIRONMENT_VARIABLE
+            ),
+            _ => println!("Update status is unavailable right now."),
         }
-        crate::update::UpdateStatus::Unavailable => {
-            if crate::update::checks_disabled() {
-                println!(
-                    "Update checks are disabled ({}).",
-                    crate::update::DISABLE_ENVIRONMENT_VARIABLE
-                );
-            } else {
-                println!("Update status is unavailable right now.");
-            }
-        }
+        return Ok(());
+    };
+    println!(
+        "Update available: {} \u{2192} {}",
+        info.current_version, info.available_version
+    );
+    if !info.release_url.is_empty() {
+        println!("Release: {}", info.release_url);
     }
+    let source = crate::update::detect_install_source()?;
+    println!("Install source: {}", source.label());
+    let strategy = source.strategy();
+    if !strategy.is_automatic() {
+        println!("{}", strategy.guidance());
+        return Ok(());
+    }
+    if args.check {
+        println!("Automatic installation is supported. Run `polycode update` to install.");
+        return Ok(());
+    }
+    if !args.yes && !confirm_install(&info.available_version.to_string())? {
+        println!("Not installing.");
+        return Ok(());
+    }
+    let installed = install_update(info, now)?;
+    println!("{}", installed.restart_notice());
     Ok(())
+}
+
+/// Explicit confirmation before an irreversible action, matching how apply
+/// and discard behave. A non-interactive stdin is never treated as consent.
+fn confirm_install(version: &str) -> Result<bool> {
+    use std::io::{BufRead as _, IsTerminal as _, Write as _};
+    if !std::io::stdin().is_terminal() {
+        println!("Re-run with `--yes` to install {version} without a prompt.");
+        return Ok(false);
+    }
+    print!("Install {version} now? It applies when Polycode restarts. [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Re-reads the release so the download and its checksums come from one
+/// consistent listing rather than from cached metadata.
+fn install_update(
+    info: &crate::update::UpdateInfo,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::update::Installed> {
+    use crate::update::ReleaseSource as _;
+    let source = crate::update::GitHubReleases::new(
+        crate::update::OFFICIAL_REPOSITORY,
+        std::time::Duration::from_secs(10),
+    );
+    let release = source
+        .latest_stable()?
+        .filter(|release| release.version == info.available_version)
+        .ok_or_else(|| anyhow::anyhow!("release {} is no longer published", info.tag))?;
+    let executable = std::env::current_exe()?;
+    let downloader = crate::update::HttpDownloader::new(std::time::Duration::from_secs(120));
+    Ok(crate::update::install(
+        &release,
+        &executable,
+        &downloader,
+        now,
+    )?)
 }
 
 /// Version and distribution diagnostics. Never touches the network: how

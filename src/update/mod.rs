@@ -9,6 +9,7 @@
 
 mod cache;
 mod install;
+mod installer;
 mod release;
 
 use std::path::PathBuf;
@@ -21,6 +22,10 @@ pub use cache::{CACHE_SCHEMA_VERSION, UpdateCache};
 pub use install::{
     InstallReceipt, InstallSource, InstallStrategy, RECEIPT_SCHEMA_VERSION, classify,
     detect_install_source, load_receipt, store_receipt,
+};
+pub use installer::{
+    AssetDownloader, CHECKSUM_ASSET, HttpDownloader, InstallError, Installed, checksum_for,
+    install, target_asset_name, target_description,
 };
 pub use release::{GitHubReleases, Release, ReleaseAsset, ReleaseError, ReleaseSource};
 
