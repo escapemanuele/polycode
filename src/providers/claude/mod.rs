@@ -846,7 +846,7 @@ fn permission_summary(denials: &[PermissionDenial]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::io::SeekFrom;
     use std::path::Path;
     use std::process::Command;
     use std::sync::{Arc, Mutex};

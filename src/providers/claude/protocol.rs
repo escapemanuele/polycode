@@ -114,15 +114,11 @@ impl PermissionDenial {
             return false;
         }
         if std::fs::symlink_metadata(requested)
-            .ok()
-            .is_some_and(|metadata| metadata.file_type().is_symlink())
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
         {
             return false;
         }
-        if std::fs::metadata(requested)
-            .ok()
-            .is_some_and(|metadata| metadata.is_dir())
-        {
+        if std::fs::metadata(requested).is_ok_and(|metadata| metadata.is_dir()) {
             return false;
         }
         let Ok(root) = std::fs::canonicalize(workspace_path) else {

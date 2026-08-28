@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 
 use chrono::{DateTime, Utc};
 
@@ -10,10 +10,14 @@ use crate::app::{RunDetails, StageSummary};
 use crate::domain::{AttentionKind, RunStatus, StageKind, StageStatus};
 
 use super::state::{Overlay, Screen, TuiState, UiMessageKind};
-use super::{format, markdown, mascot};
+use super::{format, markdown, mascot, theme};
 
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 10;
+
+/// Below this width the header drops the run's workflow and repository and
+/// keeps only product identity and top-level state.
+const HEADER_IDENTITY_WIDTH: u16 = 96;
 
 pub(crate) fn render(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
@@ -51,27 +55,75 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &TuiState) {
     }
 }
 
+/// Product signature on the left, the run's identity and top-level state on
+/// the right. Nothing here repeats the hero: the header speaks for the run,
+/// the hero speaks for the stage.
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let title = match state.screen {
-        Screen::Runs => "POLYCODE · RUNS CONTROL ROOM",
-        Screen::RunDetail => "POLYCODE · RUN DETAIL",
-        Screen::Artifact => "POLYCODE · VERIFIED ARTIFACT",
-        Screen::Logs => "POLYCODE · RAW LOGS",
-        Screen::Diff => "POLYCODE · WORKSPACE DIFF",
-        Screen::NewRun => "POLYCODE · NEW RUN",
+    let screen = match state.screen {
+        Screen::Runs => "RUNS",
+        Screen::RunDetail => "MISSION DECK",
+        Screen::Artifact => "ARTIFACT",
+        Screen::Logs => "LOGS",
+        Screen::Diff => "DIFF",
+        Screen::NewRun => "NEW RUN",
     };
-    let busy = state
-        .worker_busy
-        .as_deref()
-        .map_or(String::new(), |busy| format!("  ·  {busy}…"));
+    let mut left = vec![
+        Span::styled(
+            "POLYCODE",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ▌ ", theme::muted()),
+        Span::styled(screen, Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(busy) = state.worker_busy.as_deref() {
+        left.push(Span::styled(
+            format!("  {busy}…"),
+            Style::default().fg(theme::ACCENT),
+        ));
+    }
+    let right = state
+        .details
+        .as_ref()
+        .filter(|_| state.screen != Screen::NewRun)
+        .map_or_else(Vec::new, |details| header_identity(details, area.width));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(busy, Style::default().fg(Color::Cyan)),
-        ]))
-        .block(Block::default().borders(Borders::BOTTOM)),
+        Paragraph::new(theme::spread(left, right, area.width)).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(theme::muted()),
+        ),
         area,
     );
+}
+
+/// Run identity for the header: workflow and repository first, then the
+/// canonical run state and its wall-clock elapsed. Narrow terminals keep the
+/// state and drop the identity.
+fn header_identity(details: &RunDetails, width: u16) -> Vec<Span<'static>> {
+    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+    let mut spans = Vec::new();
+    if width >= HEADER_IDENTITY_WIDTH {
+        let mut identity = enum_text(details.workflow);
+        if let Some(path) = details.repository.as_deref() {
+            identity.push_str(" · ");
+            identity.push_str(&format::repository_name(path));
+        }
+        identity.push_str(" · ");
+        spans.push(Span::styled(identity, theme::muted()));
+    }
+    spans.push(Span::styled(
+        run_status_label(details.status).to_owned(),
+        status_style(details.status).add_modifier(Modifier::BOLD),
+    ));
+    if let Some(span) = format::elapsed(details.started_at, details.finished_at, now) {
+        spans.push(Span::styled(
+            format!(" · {}", format::format_duration(span)),
+            theme::muted(),
+        ));
+    }
+    spans
 }
 
 fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -83,112 +135,174 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             lines.extend(mascot::mascot_lines(mascot::MascotState::Idle, None));
             lines.push(Line::from(""));
         }
-        lines.push(Line::from("No runs yet."));
+        lines.push(Line::from(Span::styled(
+            "No runs yet.",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         lines.push(Line::from(""));
-        lines.push(Line::from("[n] Start your first run"));
+        lines.push(Line::from(theme::action(
+            "n",
+            "Start your first run",
+            theme::ACCENT,
+        )));
         frame.render_widget(
             Paragraph::new(lines)
                 .alignment(Alignment::Center)
-                .block(Block::default().borders(Borders::ALL).title(" Runs ")),
+                .block(Block::default().padding(Padding::new(2, 2, 1, 0))),
             area,
         );
         return;
     }
+    let now: DateTime<Utc> = std::time::SystemTime::now().into();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(area);
+    let list_width = columns[0].width.saturating_sub(3);
     let items = state.runs.iter().enumerate().map(|(index, run)| {
-        let selected = index == state.selected_run_index;
-        let line = Line::from(vec![
-            Span::styled(
-                format!("{} ", run_glyph(run.status)),
-                status_style(run.status),
-            ),
-            Span::styled(
-                format!("{:<8} ", enum_text(run.workflow)),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(&run.task_summary),
-        ]);
-        ListItem::new(line).style(if selected {
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        })
+        ListItem::new(run_row(
+            run,
+            index == state.selected_run_index,
+            list_width,
+            now,
+        ))
     });
     frame.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).title(" Runs ")),
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(theme::muted())
+                .padding(Padding::new(1, 1, 1, 0)),
+        ),
         columns[0],
     );
     if let Some(details) = state.details.as_ref() {
-        render_run_overview(frame, columns[1], details);
+        render_run_overview(frame, columns[1], details, now);
     } else {
         frame.render_widget(
-            Paragraph::new("Loading selected run…").block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Selected run "),
-            ),
+            Paragraph::new("Loading selected run…")
+                .style(theme::muted())
+                .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
             columns[1],
         );
     }
 }
 
-fn render_run_overview(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
+/// One run row: cursor, state glyph, task, then quiet workflow and age. The
+/// run's ULID is never the row's identity; technical detail keeps it.
+fn run_row(
+    run: &crate::app::RunListItem,
+    selected: bool,
+    width: u16,
+    now: DateTime<Utc>,
+) -> Line<'static> {
+    let age = format::elapsed(Some(run.updated_at), None, now)
+        .map(|span| format!("{} ago", format::format_duration(span)))
+        .unwrap_or_default();
+    let meta = format!("{}  {age}", enum_text(run.workflow));
+    // Budget: cursor, glyph, the meta column, and a gap wide enough that the
+    // ellipsis can never push the row past the rail.
+    let task_width = (width as usize).saturating_sub(meta.chars().count() + 7);
+    let task = format::truncate_title(&run.task_summary, task_width.max(8));
+    let left = vec![
+        Span::styled(
+            if selected { "▸ " } else { "  " },
+            Style::default().fg(theme::ACCENT),
+        ),
+        Span::styled(
+            format!("{} ", run_glyph(run.status)),
+            status_style(run.status),
+        ),
+        Span::styled(
+            task,
+            if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                theme::text()
+            },
+        ),
+    ];
+    theme::spread(left, vec![Span::styled(meta, theme::muted())], width)
+}
+
+/// The Runs screen's right column: enough of the selected run to decide
+/// whether to open it, in the same visual language as the Mission Deck.
+fn render_run_overview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    details: &RunDetails,
+    now: DateTime<Utc>,
+) {
+    let width = area.width.saturating_sub(3);
     let mut lines = vec![
-        status_heading(details.status),
         Line::from(Span::styled(
-            details
-                .task
-                .as_deref()
-                .unwrap_or("<legacy input unavailable>"),
+            format::truncate_title(
+                details
+                    .task
+                    .as_deref()
+                    .unwrap_or("<legacy input unavailable>"),
+                width.saturating_sub(1) as usize,
+            ),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!(
-            "{} · {} ({})",
-            enum_text(details.workflow),
-            details.profile,
-            details.profile_version
+        Line::from(Span::styled(
+            details.repository.as_deref().map_or_else(
+                || enum_text(details.workflow),
+                |path| {
+                    format!(
+                        "{} · {}",
+                        enum_text(details.workflow),
+                        format::repository_name(path)
+                    )
+                },
+            ),
+            theme::muted(),
         )),
         Line::from(""),
+        theme::section("STAGES"),
     ];
     for stage in &details.stages {
-        lines.push(stage_line(stage));
+        lines.push(pipeline_line(stage, false, width, now));
     }
     if details.status == RunStatus::Completed
         && details.workflow != crate::domain::WorkflowKind::Review
     {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "READY TO REVIEW  [d] diff  [a] apply  [X] discard",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )));
+        lines.push(Line::from(theme::chip("READY TO REVIEW", theme::SUCCESS)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("[Enter]", Style::default().fg(theme::ACCENT)),
+            Span::styled(" Open the mission deck to review", theme::text()),
+        ]));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("run {}", details.id),
+        theme::muted(),
+    )));
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Selected run "),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
 }
 
 fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let Some(details) = state.details.as_ref() else {
-        frame.render_widget(Paragraph::new("Run unavailable"), area);
+        frame.render_widget(
+            Paragraph::new("Run unavailable")
+                .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
+            area,
+        );
         return;
     };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(area);
-    render_pipeline(frame, columns[0], state, details);
+    // Technical mode spends POD's rows on diagnostics instead.
+    render_pipeline(frame, columns[0], state, details, !state.technical);
     if state.technical {
         render_technical(frame, columns[1], state, details);
     } else {
@@ -196,66 +310,53 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
 }
 
-/// Left rail: the run's stages in workflow order with their semantic
-/// durations, and POD in whatever room is left over.
-fn render_pipeline(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &RunDetails) {
+/// Left rail: the run's task, its stages in workflow order with their
+/// semantic durations, and POD seated under a short rule when room remains.
+/// One vertical rule separates the rail from the hero — no boxes.
+fn render_pipeline(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    details: &RunDetails,
+    show_mascot: bool,
+) {
     let now: DateTime<Utc> = std::time::SystemTime::now().into();
-    let mut lines = vec![status_heading(details.status)];
-    // Operational identity: what this run is and where, without the full
-    // path — technical mode keeps that.
-    lines.push(Line::from(Span::styled(
-        format::truncate_title(
-            details.task.as_deref().unwrap_or("<legacy input>"),
-            area.width.saturating_sub(4) as usize,
-        ),
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
-    let mut identity = details.repository.as_deref().map_or_else(
-        || enum_text(details.workflow),
-        |path| {
-            format!(
-                "{} · {}",
-                enum_text(details.workflow),
-                format::repository_name(path)
-            )
-        },
-    );
-    if let Some(span) = format::elapsed(details.started_at, details.finished_at, now) {
-        identity.push_str(" · ");
-        identity.push_str(&format::format_duration(span));
-    }
-    lines.push(Line::from(Span::styled(
-        identity,
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(""));
+    let width = area.width.saturating_sub(3);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format::truncate_title(
+                details.task.as_deref().unwrap_or("<legacy input>"),
+                width.saturating_sub(1) as usize,
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        theme::section("PIPELINE"),
+    ];
     // Connector segments cost one row per gap; they are the first thing to
     // go when the rail is short.
     let stage_rows = details.stages.len() * 2 - details.stages.len().min(1);
     let connectors = area.height as usize > stage_rows + 6;
     for (index, stage) in details.stages.iter().enumerate() {
         if connectors && index > 0 {
-            lines.push(Line::from(Span::styled(
-                "  │",
-                Style::default().fg(Color::DarkGray),
-            )));
+            lines.push(Line::from(Span::styled("  │", theme::muted())));
         }
-        let mut line = pipeline_line(stage, area.width, now);
-        if index == state.selected_stage_index {
-            line = line.style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
-        }
-        lines.push(line);
+        lines.push(pipeline_line(
+            stage,
+            index == state.selected_stage_index,
+            width,
+            now,
+        ));
     }
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let mascot_rows = mascot::MASCOT_HEIGHT as usize;
-    if area.width >= mascot::MASCOT_WIDTH + 20 && inner_height > lines.len() + mascot_rows {
-        while lines.len() < inner_height - mascot_rows {
-            lines.push(Line::from(""));
-        }
+    let inner_height = area.height.saturating_sub(1) as usize;
+    // POD's seat: one blank row, a short rule, another blank row, then POD —
+    // attached to the pipeline it belongs to rather than pinned to the bottom
+    // edge with a dead zone above it.
+    let seat = mascot::MASCOT_HEIGHT as usize + 3;
+    if show_mascot && area.width >= mascot::MASCOT_WIDTH + 20 && inner_height > lines.len() + seat {
+        lines.push(Line::from(""));
+        lines.push(theme::centered_rule(width));
+        lines.push(Line::from(""));
         let selected = details.stages.get(state.selected_stage_index);
         lines.extend(mascot::mascot_lines(
             mascot::mascot_state(Some(details.status), selected.map(|stage| stage.status)),
@@ -265,142 +366,190 @@ fn render_pipeline(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details:
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .borders(Borders::ALL)
-                .title(" PIPELINE ")
-                .title_style(Style::default().add_modifier(Modifier::BOLD)),
+                .borders(Borders::RIGHT)
+                .border_style(theme::muted())
+                .padding(Padding::new(1, 1, 1, 0)),
         ),
         area,
     );
 }
 
-/// One rail row: status glyph, human stage name, and duration when the run
-/// carries evidence for one. Pending stages show no fabricated `0s`.
-fn pipeline_line(stage: &StageSummary, width: u16, now: DateTime<Utc>) -> Line<'static> {
+/// One rail row. The cursor marks what is *selected*; the glyph and its color
+/// carry what the stage is actually *doing* — the two are independent, since
+/// the user can read a finished stage while another one runs.
+fn pipeline_line(
+    stage: &StageSummary,
+    selected: bool,
+    width: u16,
+    now: DateTime<Utc>,
+) -> Line<'static> {
     let name = stage_title(stage.kind);
-    let duration = format::elapsed(stage.started_at, stage.finished_at, now)
+    let mut duration = format::elapsed(stage.started_at, stage.finished_at, now)
         .map(format::format_duration)
         .unwrap_or_default();
-    // Narrow rails drop the duration column rather than wrapping the name.
-    let name_width = (width as usize).saturating_sub(duration.len() + 6);
-    Line::from(vec![
+    // Narrow rails give up the duration column rather than clipping either it
+    // or the stage name.
+    if 5 + name.chars().count() + duration.chars().count() > width as usize {
+        duration.clear();
+    }
+    let left = vec![
+        Span::styled(
+            if selected { "▸ " } else { "  " },
+            Style::default().fg(theme::ACCENT),
+        ),
         Span::styled(
             format!("{} ", stage_glyph(stage.status)),
             stage_style(stage.status),
         ),
-        Span::raw(format!("{name:<name_width$}")),
-        Span::styled(duration, Style::default().fg(Color::DarkGray)),
-    ])
+        Span::styled(name, stage_name_style(stage.status, selected)),
+    ];
+    theme::spread(left, vec![Span::styled(duration, theme::muted())], width)
+}
+
+/// Completed work stays calm and pending work recedes, so the live stage is
+/// the only row with full contrast.
+fn stage_name_style(status: StageStatus, selected: bool) -> Style {
+    let base = match status {
+        StageStatus::Running => Style::default().add_modifier(Modifier::BOLD),
+        StageStatus::NeedsUser => Style::default()
+            .fg(theme::ATTENTION)
+            .add_modifier(Modifier::BOLD),
+        StageStatus::Failed => Style::default().fg(theme::DANGER),
+        StageStatus::Pending | StageStatus::Ready | StageStatus::Skipped => theme::muted(),
+        StageStatus::Completed | StageStatus::Paused | StageStatus::Interrupted => theme::text(),
+    };
+    if selected {
+        base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        base
+    }
 }
 
 /// Right panel, operational view: what is happening, for how long, on which
 /// runtime, what needs the user, what came out, and what can be done next.
 fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &RunDetails) {
     let now: DateTime<Utc> = std::time::SystemTime::now().into();
+    let width = area.width.saturating_sub(3);
     let Some(selected) = details.stages.get(state.selected_stage_index) else {
         frame.render_widget(
             Paragraph::new("No stage selected")
-                .block(Block::default().borders(Borders::ALL).title(" STAGE ")),
+                .style(theme::muted())
+                .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
             area,
         );
         return;
     };
     let applyable = state.run_is_applyable();
-    let mut lines = Vec::new();
-    if applyable {
-        lines.extend(completed_hero(details, now));
+    let mut lines = if applyable {
+        completed_hero(details, width, now)
     } else {
-        lines.extend(stage_hero(selected, now));
+        stage_hero(selected, width, now)
+    };
+    // Attention outranks every remaining section, runtime included.
+    if let Some(attention) = details.attention.first() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(theme::chip(
+            "⚠ ACTION REQUIRED",
+            theme::ATTENTION,
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            attention.summary.clone(),
+            theme::text(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(theme::action(
+            "u",
+            "Review and resolve",
+            theme::ATTENTION,
+        )));
+    }
+    if applyable {
+        lines.push(Line::from(""));
+        lines.push(Line::from(theme::chip("READY TO REVIEW", theme::SUCCESS)));
+        lines.push(Line::from(""));
+        lines.extend(hero_actions(applyable, selected.status));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         runtime_summary(selected),
-        Style::default(),
+        theme::muted(),
     )));
-    // Attention outranks every remaining section.
-    if let Some(attention) = details.attention.first() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "⚠ ACTION REQUIRED",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            attention.summary.clone(),
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.push(Line::from(Span::styled(
-            "[u] Review and resolve",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-    } else {
+    if details.attention.is_empty() && !applyable {
         lines.push(Line::from(Span::styled(
             activity_message(selected.status),
-            Style::default().fg(Color::DarkGray),
+            theme::text(),
         )));
     }
     lines.push(Line::from(""));
     // After the pivot the panel speaks for the run, so the result section
     // says which stage's artifact it is offering.
     lines.push(if applyable {
-        Line::from(Span::styled(
-            format!("RESULT · {}", stage_title(selected.kind).to_uppercase()),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+        theme::section(&format!(
+            "RESULT · {}",
+            stage_title(selected.kind).to_uppercase()
         ))
     } else {
-        section("RESULT")
+        theme::section("RESULT")
     });
     lines.extend(result_lines(state, selected));
     lines.push(Line::from(""));
-    lines.push(section("RESOURCES"));
+    lines.push(theme::section("RESOURCES"));
     lines.push(Line::from(Span::styled(
         resource_summary(details),
-        Style::default(),
+        theme::text(),
     )));
-    lines.push(Line::from(""));
-    lines.extend(hero_actions(applyable, selected.status));
+    if !applyable {
+        let actions = hero_actions(applyable, selected.status);
+        if actions
+            .iter()
+            .all(|line| span_width(&line.spans) <= width as usize)
+        {
+            lines.push(Line::from(""));
+            lines.extend(actions);
+        }
+    }
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(if applyable {
-                    " RUN ".to_owned()
-                } else {
-                    format!(" {} ", stage_title(selected.kind).to_uppercase())
-                })
-                .title_style(Style::default().add_modifier(Modifier::BOLD)),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
 }
 
-fn stage_hero(stage: &StageSummary, now: DateTime<Utc>) -> Vec<Line<'static>> {
+/// The hero's opening statement: which stage, in what state, for how long.
+fn stage_hero(stage: &StageSummary, width: u16, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let clock = format::elapsed(stage.started_at, stage.finished_at, now)
-        .map(format::format_clock)
+        .map(hero_clock)
         .unwrap_or_default();
-    vec![Line::from(vec![
-        Span::styled(
+    vec![
+        theme::spread(
+            vec![Span::styled(
+                stage_title(stage.kind).to_uppercase(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
+            vec![Span::styled(
+                clock,
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
+            width,
+        ),
+        Line::from(Span::styled(
             format!(
                 "{} {}",
                 stage_glyph(stage.status),
                 hero_status(stage.status)
             ),
             stage_style(stage.status).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled(clock, Style::default().add_modifier(Modifier::BOLD)),
-    ])]
+        )),
+    ]
 }
 
 /// Once the run is applyable the panel stops monitoring and starts offering
 /// review.
-fn completed_hero(details: &RunDetails, now: DateTime<Utc>) -> Vec<Line<'static>> {
+fn completed_hero(details: &RunDetails, width: u16, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let clock = format::elapsed(details.started_at, details.finished_at, now)
-        .map(format::format_clock)
+        .map(hero_clock)
         .unwrap_or_default();
     let completed = details
         .stages
@@ -408,21 +557,34 @@ fn completed_hero(details: &RunDetails, now: DateTime<Utc>) -> Vec<Line<'static>
         .filter(|stage| stage.status == StageStatus::Completed)
         .count();
     vec![
-        Line::from(vec![
-            Span::styled(
-                "✓ RUN COMPLETE",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("   "),
-            Span::styled(clock, Style::default().add_modifier(Modifier::BOLD)),
-        ]),
+        theme::spread(
+            vec![Span::styled(
+                "RUN COMPLETE",
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
+            vec![Span::styled(
+                clock,
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
+            width,
+        ),
         Line::from(Span::styled(
-            format!("{completed} of {} stages completed", details.stages.len()),
-            Style::default().fg(Color::DarkGray),
+            format!("✓ {completed} of {} stages completed", details.stages.len()),
+            Style::default()
+                .fg(theme::SUCCESS)
+                .add_modifier(Modifier::BOLD),
         )),
     ]
+}
+
+/// The prominent figure. A span the clock cannot express honestly reads as a
+/// span, never as a fabricated `00:00`.
+fn hero_clock(span: chrono::TimeDelta) -> String {
+    if span.num_seconds() < 1 {
+        format::format_duration(span)
+    } else {
+        format::format_clock(span)
+    }
 }
 
 const fn hero_status(status: StageStatus) -> &'static str {
@@ -439,13 +601,29 @@ const fn hero_status(status: StageStatus) -> &'static str {
     }
 }
 
+const fn run_status_label(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::NeedsUser => "⚠ NEEDS YOU",
+        RunStatus::Interrupted => "↻ INTERRUPTED",
+        RunStatus::Paused => "‖ PAUSED",
+        RunStatus::Failed => "✗ FAILED",
+        RunStatus::Completed => "✓ COMPLETED",
+        RunStatus::Applied => "✓ APPLIED",
+        RunStatus::Running => "● RUNNING",
+        RunStatus::Created | RunStatus::Preparing | RunStatus::Ready => "○ WAITING",
+        RunStatus::Discarded => "× DISCARDED",
+    }
+}
+
+/// Typed, state-driven activity text. Never inferred from logs or model prose,
+/// and never repeating an action the actions row already offers.
 const fn activity_message(status: StageStatus) -> &'static str {
     match status {
         StageStatus::Running => "Agent is working…",
         StageStatus::Pending | StageStatus::Ready => "Waiting for the previous stage",
         StageStatus::Completed => "Stage finished",
-        StageStatus::Failed => "Stage failed — [l] inspect logs, [t] retry",
-        StageStatus::Paused | StageStatus::Interrupted => "Stage suspended — [r] resume",
+        StageStatus::Failed => "The provider ended this stage before it completed",
+        StageStatus::Paused | StageStatus::Interrupted => "Stage suspended",
         StageStatus::NeedsUser => "Waiting on you",
         StageStatus::Skipped => "Stage skipped by the workflow",
     }
@@ -497,13 +675,10 @@ fn result_lines(state: &TuiState, selected: &StageSummary) -> Vec<Line<'static>>
             Line::from(Span::styled(
                 "✓ Verified artifact available",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme::SUCCESS)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(
-                "[Enter/o] Open result",
-                Style::default().fg(Color::Green),
-            )),
+            Line::from(theme::action("Enter/o", "Open result", theme::SUCCESS)),
         ];
     }
     // Expected absence stays informational; only a completed stage without an
@@ -514,25 +689,22 @@ fn result_lines(state: &TuiState, selected: &StageSummary) -> Vec<Line<'static>>
         StageStatus::Failed => "No completed result",
         _ => "No verified artifact",
     };
-    vec![Line::from(Span::styled(
-        text,
-        Style::default().fg(Color::DarkGray),
-    ))]
+    vec![Line::from(Span::styled(text, theme::muted()))]
 }
 
-/// Provider-native units, compactly. Never normalized across providers and
-/// never presented as cost.
+/// Provider-native units in human words. Never normalized across providers
+/// and never presented as cost.
 fn resource_summary(details: &RunDetails) -> String {
     use std::fmt::Write as _;
     let mut summary = format!(
-        "{} in · {} out",
+        "{} input · {} output",
         format::format_units(details.usage.input_units),
         format::format_units(details.usage.output_units)
     );
     for (label, value) in [
         ("cache read", details.usage.cache_read_units),
         ("cache write", details.usage.cache_write_units),
-        ("reasoning out", details.usage.reasoning_output_units),
+        ("reasoning output", details.usage.reasoning_output_units),
     ] {
         if let Some(value) = value {
             let _ = write!(summary, " · {} {label}", format::format_units(value));
@@ -544,43 +716,29 @@ fn resource_summary(details: &RunDetails) -> String {
 /// Actions offered by the panel, gated on canonical state: apply and discard
 /// appear only for a run the workspace layer would accept.
 fn hero_actions(applyable: bool, status: StageStatus) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    let mut spans = Vec::new();
     if applyable {
-        lines.push(Line::from(Span::styled(
-            "READY TO REVIEW",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(vec![
-            Span::styled("[d] Review diff   ", Style::default()),
-            Span::styled("[a] Apply changes   ", Style::default().fg(Color::Green)),
-            Span::styled("[X] Discard", Style::default().fg(Color::Red)),
-        ]));
+        spans.extend(theme::action("d", "Review diff", theme::ACCENT));
+        spans.push(Span::raw("   "));
+        spans.extend(theme::action("a", "Apply changes", theme::SUCCESS));
+        spans.push(Span::raw("   "));
+        spans.extend(theme::action("X", "Discard", theme::DANGER));
+    } else if status == StageStatus::Failed {
+        spans.extend(theme::action("l", "Logs", theme::ACCENT));
+        spans.push(Span::raw("   "));
+        spans.extend(theme::action("t", "Retry", theme::ATTENTION));
+        spans.push(Span::raw("   "));
+        spans.extend(theme::action("d", "Diff", theme::ACCENT));
     } else {
-        let mut actions = "[o] result   [l] logs   [d] diff".to_owned();
-        if status == StageStatus::Failed {
-            actions.push_str("   [t] retry");
-        }
-        lines.push(Line::from(Span::styled(
-            actions,
-            Style::default().fg(Color::DarkGray),
-        )));
+        spans.extend(theme::action("o", "Result", theme::ACCENT));
+        spans.push(Span::raw("   "));
+        spans.extend(theme::action("l", "Logs", theme::ACCENT));
+        spans.push(Span::raw("   "));
+        spans.extend(theme::action("d", "Diff", theme::ACCENT));
     }
-    lines.push(Line::from(Span::styled(
-        "[i] technical details",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines
-}
-
-fn section(title: &'static str) -> Line<'static> {
-    Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    ))
+    spans.push(Span::raw("   "));
+    spans.extend(theme::action("i", "Details", theme::MUTED));
+    vec![Line::from(spans)]
 }
 
 /// Human stage name for operational rows; technical mode keeps the raw
@@ -601,104 +759,103 @@ const fn stage_title(kind: StageKind) -> &'static str {
     }
 }
 
+/// One aligned `label  value` row inside a technical group.
+fn technical_row(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<13}"), theme::muted()),
+        Span::styled(value, theme::text()),
+    ])
+}
+
 /// Right panel, technical view: every diagnostic the operational view hides,
-/// reorganized rather than removed.
+/// grouped rather than listed.
 #[allow(
     clippy::too_many_lines,
-    reason = "one diagnostic panel keeps identity, runtime, usage, and provenance aligned"
+    reason = "one diagnostic panel keeps execution, runtime, evidence, workspace, and routing aligned"
 )]
 fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &RunDetails) {
+    let width = area.width.saturating_sub(3);
     let Some(selected) = details.stages.get(state.selected_stage_index) else {
         frame.render_widget(
             Paragraph::new("No stage selected")
-                .block(Block::default().borders(Borders::ALL).title(" TECHNICAL ")),
+                .style(theme::muted())
+                .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
             area,
         );
         return;
     };
     let mut lines = vec![
+        theme::spread(
+            vec![Span::styled(
+                "TECHNICAL",
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
+            vec![Span::styled(selected.id.to_string(), theme::muted())],
+            width,
+        ),
+        Line::from(""),
+        theme::section("EXECUTION"),
+        technical_row("Stage", selected.id.to_string()),
+        technical_row("Kind", enum_text(selected.kind)),
+        technical_row("Role", enum_text(selected.role)),
         Line::from(vec![
-            Span::raw("Stage       "),
-            Span::styled(selected.id.to_string(), Modifier::BOLD),
-        ]),
-        Line::from(format!("Kind        {}", enum_text(selected.kind))),
-        Line::from(format!("Role        {}", enum_text(selected.role))),
-        Line::from(vec![
-            Span::raw("Status      "),
+            Span::styled(format!("  {:<13}", "Status"), theme::muted()),
             Span::styled(enum_text(selected.status), stage_style(selected.status)),
         ]),
-        Line::from(""),
-        Line::from(format!(
-            "Configured  {} / {}",
-            selected.configured_provider,
+        technical_row(
+            "Process",
             selected
-                .configured_model
+                .process_status
                 .as_deref()
-                .unwrap_or("native default")
-        )),
-        Line::from(format!("Effort      {}", selected.requested_effort.label())),
-        Line::from(format!(
-            "Actual      {} / {}",
-            selected.actual_provider.as_deref().unwrap_or("not started"),
-            selected.actual_model.as_deref().unwrap_or("unconfirmed")
-        )),
-        Line::from(format!(
-            "Session     {}",
+                .unwrap_or("unavailable")
+                .to_owned(),
+        ),
+        technical_row("Effort", selected.requested_effort.label().to_owned()),
+        Line::from(""),
+        theme::section("RUNTIME"),
+        technical_row(
+            "Configured",
+            format!(
+                "{} / {}",
+                selected.configured_provider,
+                selected
+                    .configured_model
+                    .as_deref()
+                    .unwrap_or("native default")
+            ),
+        ),
+        technical_row(
+            "Actual",
+            format!(
+                "{} / {}",
+                selected.actual_provider.as_deref().unwrap_or("not started"),
+                selected.actual_model.as_deref().unwrap_or("unconfirmed")
+            ),
+        ),
+        technical_row(
+            "Session",
             selected
                 .provider_session_status
                 .as_deref()
                 .unwrap_or("unavailable")
-        )),
-        Line::from(format!(
-            "Native      {}",
+                .to_owned(),
+        ),
+        technical_row(
+            "Native",
             selected
                 .native_session
                 .as_deref()
                 .map_or("unavailable", short_id)
-        )),
-        Line::from(format!(
-            "Process     {}",
-            selected.process_status.as_deref().unwrap_or("unavailable")
-        )),
-    ];
-    // Per-stage execution evidence: provider latency stays here and is never
-    // presented as the stage's wall-clock elapsed time.
-    if let Some(evidence) = state.evidence.as_ref() {
-        lines.push(Line::from(format!(
-            "Invocations {}",
-            evidence.invocation_count
-        )));
-        lines.push(Line::from(format!(
-            "Latency     {}",
-            evidence.latency_ms.map_or_else(
-                || "unavailable".to_owned(),
-                |ms| format!("{ms} ms provider")
-            )
-        )));
-        lines.push(Line::from(format!(
-            "Prompt      {}",
-            evidence.injected_prompt_bytes.map_or_else(
-                || "unavailable".to_owned(),
-                |bytes| format!("{bytes} injected bytes")
-            )
-        )));
-        if let Some(version) = evidence.provider_cli_version.as_deref() {
-            lines.push(Line::from(format!("CLI         {version}")));
-        }
-    }
-    lines.extend([
+                .to_owned(),
+        ),
         Line::from(""),
-        Line::from(format!(
-            "Profile     {} ({})",
-            details.profile, details.profile_version
-        )),
-        Line::from(format!("Run         {}", details.id)),
-        Line::from({
+        theme::section("RESOURCE EVIDENCE"),
+        technical_row("Usage", {
             use std::fmt::Write as _;
             // Provider-native units; optional dimensions appear only when the
             // runtime reported them.
             let mut usage = format!(
-                "Usage       {} in / {} out",
+                "{} in / {} out",
                 details.usage.input_units, details.usage.output_units
             );
             for (label, value) in [
@@ -712,291 +869,417 @@ fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details
             }
             usage
         }),
-        Line::from(format!(
-            "Workspace   {}",
-            details
-                .workspace_status
-                .map_or("unavailable".to_owned(), |status| format!("{status:?}")
-                    .to_lowercase())
-        )),
-        Line::from(format!(
-            "Base        {}",
-            details.base_commit.as_deref().unwrap_or("unavailable")
-        )),
-        Line::from(format!(
-            "Repository  {}",
-            details
-                .repository
-                .as_deref()
-                .map_or("unavailable".to_owned(), |path| path.display().to_string())
-        )),
-        Line::from(""),
-        Line::from(Span::styled("Persisted routes", Modifier::BOLD)),
-    ]);
-    for route in &details.routes {
-        lines.push(Line::from(format!(
-            "{} → {}/{} ({})",
-            enum_text(route.role),
-            route.configured_provider,
-            route
-                .configured_model
-                .as_deref()
-                .unwrap_or("native default"),
-            route.reason
-        )));
+    ];
+    // Per-stage execution evidence: provider latency stays here and is never
+    // presented as the stage's wall-clock elapsed time.
+    if let Some(evidence) = state.evidence.as_ref() {
+        lines.push(technical_row(
+            "Invocations",
+            evidence.invocation_count.to_string(),
+        ));
+        lines.push(technical_row(
+            "Latency",
+            evidence.latency_ms.map_or_else(
+                || "unavailable".to_owned(),
+                |ms| format!("{ms} ms provider"),
+            ),
+        ));
+        lines.push(technical_row(
+            "Prompt",
+            evidence.injected_prompt_bytes.map_or_else(
+                || "unavailable".to_owned(),
+                |bytes| format!("{bytes} injected bytes"),
+            ),
+        ));
+        if let Some(version) = evidence.provider_cli_version.as_deref() {
+            lines.push(technical_row("CLI", version.to_owned()));
+        }
     }
     lines.extend([
         Line::from(""),
-        Line::from(Span::styled(
-            "[i] operational view",
-            Style::default().fg(Color::DarkGray),
-        )),
+        theme::section("WORKSPACE"),
+        technical_row(
+            "State",
+            details
+                .workspace_status
+                .map_or("unavailable".to_owned(), |status| {
+                    format!("{status:?}").to_lowercase()
+                }),
+        ),
+        technical_row(
+            "Base commit",
+            details
+                .base_commit
+                .as_deref()
+                .unwrap_or("unavailable")
+                .to_owned(),
+        ),
+        technical_row(
+            "Repository",
+            details
+                .repository
+                .as_deref()
+                .map_or("unavailable".to_owned(), |path| path.display().to_string()),
+        ),
+        Line::from(""),
+        theme::section("ROUTING"),
+        technical_row("Run", details.id.to_string()),
+        technical_row(
+            "Profile",
+            format!("{} ({})", details.profile, details.profile_version),
+        ),
+    ]);
+    for route in &details.routes {
+        // Role names run long enough to collide with an aligned value column,
+        // so routes read as one sentence per line instead.
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", enum_text(route.role)), theme::text()),
+            Span::styled(
+                format!(
+                    "→ {} / {} ({})",
+                    route.configured_provider,
+                    route
+                        .configured_model
+                        .as_deref()
+                        .unwrap_or("native default"),
+                    route.reason
+                ),
+                theme::muted(),
+            ),
+        ]));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(theme::action("i", "operational view", theme::MUTED)),
     ]);
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" TECHNICAL ")
-                .title_style(Style::default().fg(Color::DarkGray)),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
 }
 
+/// A viewer's own heading: what is being read, and in which mode. The screen
+/// is already framed by the header and footer rules, so no box is added.
+fn viewer_heading(title: String, meta: String, width: u16) -> Vec<Line<'static>> {
+    vec![
+        theme::spread(
+            vec![Span::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
+            vec![Span::styled(meta, theme::muted())],
+            width,
+        ),
+        theme::rule(width),
+    ]
+}
+
 fn render_artifact(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let (title, lines) = state.artifact.as_ref().map_or_else(
-        || {
-            (
-                " Artifact ".to_owned(),
-                vec![Line::from("Artifact unavailable")],
-            )
-        },
+    let width = area.width.saturating_sub(3);
+    let mut lines = state.artifact.as_ref().map_or_else(
+        || viewer_heading("ARTIFACT".to_owned(), "unavailable".to_owned(), width),
         |artifact| {
-            let mode = if state.artifact_raw {
-                "raw · [m] rendered"
-            } else {
-                "rendered · [m] raw"
-            };
-            let lines = if state.artifact_raw {
-                artifact
-                    .text
-                    .lines()
-                    .map(|line| Line::from(line.to_owned()))
-                    .collect()
-            } else {
-                markdown::render_markdown(&artifact.text)
-            };
-            (
+            viewer_heading(
+                stage_title_for(&artifact.summary.stage_id.to_string()),
                 format!(
-                    " {} · attempt {} · {mode} ",
-                    artifact.summary.stage_id, artifact.summary.attempt
+                    "attempt {} · {}",
+                    artifact.summary.attempt,
+                    if state.artifact_raw {
+                        "raw · [m] rendered"
+                    } else {
+                        "rendered · [m] raw"
+                    }
                 ),
-                lines,
+                width,
             )
         },
     );
+    if let Some(artifact) = state.artifact.as_ref() {
+        if state.artifact_raw {
+            lines.extend(
+                artifact
+                    .text
+                    .lines()
+                    .map(|line| Line::from(line.to_owned())),
+            );
+        } else {
+            lines.extend(markdown::render_markdown(&artifact.text));
+        }
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((state.scroll, 0))
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(title)),
+            .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
 }
 
+/// Artifact headings read as the stage that produced them.
+fn stage_title_for(stage_id: &str) -> String {
+    stage_id.replace('_', " ").to_uppercase()
+}
+
 fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let text = state.logs.as_ref().map_or_else(
-        || Text::from("Logs unavailable"),
-        |logs| {
-            Text::from(vec![
-                Line::from(Span::styled("STDOUT", Modifier::BOLD)),
-                Line::from(if logs.stdout.truncated {
-                    "[tail truncated]"
-                } else {
-                    ""
-                }),
-                Line::from(logs.stdout.text.clone()),
-                Line::from(""),
-                Line::from(Span::styled("STDERR", Modifier::BOLD)),
-                Line::from(if logs.stderr.truncated {
-                    "[tail truncated]"
-                } else {
-                    ""
-                }),
-                Line::from(logs.stderr.text.clone()),
-            ])
-        },
+    let width = area.width.saturating_sub(3);
+    let mut lines = viewer_heading(
+        "RAW OUTPUT".to_owned(),
+        state.logs.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |logs| {
+                format!(
+                    "{} · {} · read-only",
+                    short_id(&logs.process_id.to_string()),
+                    logs.process_status
+                )
+            },
+        ),
+        width,
     );
-    let title = state.logs.as_ref().map_or_else(
-        || " Raw retained output · read-only ".to_owned(),
-        |logs| {
-            format!(
-                " Raw retained output · {} · {} · read-only ",
-                short_id(&logs.process_id.to_string()),
-                logs.process_status
-            )
-        },
-    );
+    if let Some(logs) = state.logs.as_ref() {
+        for (label, stream) in [("STDOUT", &logs.stdout), ("STDERR", &logs.stderr)] {
+            lines.push(Line::from(""));
+            lines.push(theme::section(label));
+            if stream.truncated {
+                lines.push(Line::from(Span::styled("[tail truncated]", theme::muted())));
+            }
+            lines.extend(stream.text.lines().map(|line| Line::from(line.to_owned())));
+        }
+    }
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(Text::from(lines))
             .scroll((state.scroll, 0))
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(title)),
+            .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
 }
 
 fn render_diff(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let lines = state.diff.as_ref().map_or_else(
-        || vec![Line::from("Diff unavailable")],
-        |diff| {
-            let mut lines = Vec::new();
-            if diff.truncated {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "[preview truncated at 2 MiB; total {} bytes]",
-                        diff.total_bytes
-                    ),
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            for line in diff.text.lines() {
-                let style = if line.starts_with("+++") || line.starts_with("---") {
-                    Style::default().fg(Color::Cyan)
-                } else if line.starts_with('+') {
-                    Style::default().fg(Color::Green)
-                } else if line.starts_with('-') {
-                    Style::default().fg(Color::Red)
-                } else if line.starts_with("diff --git") || line.starts_with("@@") {
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                lines.push(Line::styled(line.to_owned(), style));
-            }
-            lines
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(lines).scroll((state.scroll, 0)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Unified diff · read-only "),
+    let width = area.width.saturating_sub(3);
+    let mut lines = viewer_heading(
+        "WORKSPACE DIFF".to_owned(),
+        state.diff.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |diff| format!("{} files · read-only", diff.changed_files.len()),
         ),
+        width,
+    );
+    if let Some(diff) = state.diff.as_ref() {
+        if diff.truncated {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "[preview truncated at 2 MiB; total {} bytes]",
+                    diff.total_bytes
+                ),
+                Style::default().fg(theme::ATTENTION),
+            )));
+        }
+        for line in diff.text.lines() {
+            let style = if line.starts_with("+++") || line.starts_with("---") {
+                Style::default().fg(theme::ACCENT)
+            } else if line.starts_with('+') {
+                Style::default().fg(theme::SUCCESS)
+            } else if line.starts_with('-') {
+                Style::default().fg(theme::DANGER)
+            } else if line.starts_with("diff --git") || line.starts_with("@@") {
+                theme::diff_hunk()
+            } else {
+                theme::text()
+            };
+            lines.push(Line::styled(line.to_owned(), style));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((state.scroll, 0))
+            .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
 }
 
+/// The entry point to the Mission Deck: the same field semantics, presented
+/// as a briefing rather than a raw form.
 fn render_new_run(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let form = &state.new_run;
+    let width = area.width.saturating_sub(3);
     let workflow = enum_text(form.workflow);
     let task = field_display(&form.task, form.focus == 0);
     let repository = field_display(&form.repository, form.focus == 2);
-    let lines = vec![
-        form_line("Task", &task, form.focus == 0),
-        Line::from(""),
-        form_line("Workflow", &workflow, form.focus == 1),
-        Line::from(""),
-        form_line("Repository", &repository, form.focus == 2),
-        Line::from(""),
-        form_line("Execution", form.execution.label(), form.focus == 3),
-        Line::from(""),
-        form_line("Effort", form.effort.label(), form.focus == 4),
-        Line::from(""),
-        Line::from("Tab/Shift-Tab fields · ←/→ choices · Enter start · Esc cancel"),
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "START A RUN",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "One task, routed through specialist agents.",
+            theme::muted(),
+        )),
+        theme::rule(width),
     ];
+    for (label, value, focused) in [
+        ("TASK", task.as_str(), form.focus == 0),
+        ("WORKFLOW", workflow.as_str(), form.focus == 1),
+        ("REPOSITORY", repository.as_str(), form.focus == 2),
+        ("EXECUTION", form.execution.label(), form.focus == 3),
+        ("EFFORT", form.effort.label(), form.focus == 4),
+    ] {
+        lines.push(Line::from(""));
+        lines.push(theme::section(label));
+        lines.push(Line::from(vec![
+            Span::styled(
+                if focused { "▸ " } else { "  " },
+                Style::default().fg(theme::ACCENT),
+            ),
+            Span::styled(
+                value.to_owned(),
+                if focused {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::text()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(theme::rule(width));
+    lines.push(Line::from(""));
+    let mut actions = theme::action("Enter", "Start run", theme::ACCENT);
+    actions.push(Span::raw("   "));
+    actions.extend(theme::action("Esc", "Cancel", theme::MUTED));
+    lines.push(Line::from(actions));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" New run ")),
+            .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
 }
 
-fn form_line<'a>(label: &'a str, value: &'a str, selected: bool) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(
-            format!("{label:<12}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            value,
-            if selected {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+/// The screen's contextual actions, gated on canonical state so the footer
+/// never advertises something the domain would refuse. Apply and discard
+/// appear only for an applyable run.
+fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut push = |key: &str, label: &str, color: Color| {
+        if !spans.is_empty() {
+            spans.push(Span::raw("   "));
+        }
+        spans.extend(theme::action(key, label, color));
+    };
+    match screen {
+        Screen::Runs => {
+            push("Enter", "Open", theme::ACCENT);
+            push("n", "New run", theme::ACCENT);
+        }
+        Screen::RunDetail => {
+            let needs_user = state
+                .details
+                .as_ref()
+                .is_some_and(|details| !details.attention.is_empty());
+            let stage_status = state
+                .details
+                .as_ref()
+                .and_then(|details| details.stages.get(state.selected_stage_index))
+                .map(|stage| stage.status);
+            let run_status = state.details.as_ref().map(|details| details.status);
+            if needs_user {
+                push("u", "Resolve attention", theme::ATTENTION);
+                push("l", "Logs", theme::ACCENT);
+            } else if state.run_is_applyable() {
+                push("d", "Review diff", theme::ACCENT);
+                push("a", "Apply", theme::SUCCESS);
+                push("X", "Discard", theme::DANGER);
             } else {
-                Style::default()
-            },
-        ),
-    ])
+                push("o", "Result", theme::ACCENT);
+                push("l", "Logs", theme::ACCENT);
+                push("d", "Diff", theme::ACCENT);
+                if stage_status == Some(StageStatus::Failed) {
+                    push("t", "Retry", theme::ATTENTION);
+                }
+                if matches!(
+                    run_status,
+                    Some(RunStatus::Paused | RunStatus::Interrupted | RunStatus::Ready)
+                ) {
+                    push("r", "Resume", theme::ATTENTION);
+                }
+            }
+            push(
+                "i",
+                if state.technical {
+                    "Operational"
+                } else {
+                    "Details"
+                },
+                theme::MUTED,
+            );
+        }
+        Screen::Artifact => push("m", "Raw/rendered", theme::ACCENT),
+        Screen::Logs | Screen::Diff => push("Esc", "Back", theme::ACCENT),
+        Screen::NewRun => {
+            push("Enter", "Start run", theme::ACCENT);
+            push("Esc", "Cancel", theme::MUTED);
+        }
+    }
+    spans
 }
 
-/// Key hints per screen; the compact variant is chosen deterministically
-/// when the full hints do not fit, so navigation is never hidden. Run Detail
-/// hints are additionally gated on canonical state so the footer never
-/// advertises an action the domain would refuse.
-fn footer_hints(screen: Screen, width: u16, state: &TuiState) -> &'static str {
-    let (full, compact) = match screen {
-        Screen::Runs => (
-            "↑↓/jk run · Enter open · n new · ? help · q quit/detach",
-            "↑↓ · Enter open · n new · ? help · q quit",
+/// Quiet navigation, in full and compact shapes. Navigation is what gets
+/// dropped when the row is tight — never the contextual actions.
+const fn navigation_hints(screen: Screen) -> (&'static str, &'static str) {
+    match screen {
+        Screen::Runs => ("↑↓ runs · n new · ? help · q quit/detach", "↑↓ · ? help"),
+        Screen::RunDetail => (
+            "↑↓ stages · Esc runs · ? help · q quit/detach",
+            "↑↓ · Esc runs",
         ),
-        Screen::RunDetail => detail_hints(state),
-        Screen::Artifact => (
-            "↑↓/PgUp/PgDn scroll · m raw/rendered · Esc run detail · q quit/detach",
-            "↑↓ scroll · m raw · Esc run detail",
-        ),
-        Screen::Logs | Screen::Diff => (
-            "↑↓/PgUp/PgDn scroll · Esc run detail · q quit/detach",
+        Screen::Artifact | Screen::Logs | Screen::Diff => (
+            "↑↓/PgUp/PgDn scroll · Esc run detail · ? help",
             "↑↓ scroll · Esc run detail",
         ),
         Screen::NewRun => (
-            "Tab/Shift-Tab fields · ←→ choices/edit · Enter start · Esc cancel",
-            "Tab fields · Enter start · Esc cancel",
+            "Tab/Shift-Tab fields · ←→ choices/edit · ? help",
+            "Tab fields",
         ),
-    };
-    if full.chars().count() <= width as usize {
-        full
-    } else {
-        compact
     }
 }
 
-/// Run Detail hints in three shapes: attention first when the run needs the
-/// user, review actions once the run is applyable, monitoring otherwise.
-/// Apply and discard never appear outside the applyable state.
-fn detail_hints(state: &TuiState) -> (&'static str, &'static str) {
-    let needs_user = state
-        .details
-        .as_ref()
-        .is_some_and(|details| !details.attention.is_empty());
-    if needs_user {
-        return (
-            "u ATTENTION · ↑↓ stage · Enter/o result · l logs · d diff · Esc runs · i details · ? help",
-            "u ATTENTION · ↑↓ stage · Esc runs · ? help",
-        );
-    }
-    if state.run_is_applyable() {
-        return (
-            "d diff · a apply · X discard · ↑↓ stage · Enter/o result · l logs · Esc runs · i details · ? help",
-            "d diff · a apply · X discard · Esc runs",
-        );
-    }
-    (
-        "↑↓ stage · Enter/o result · l logs · d diff · r resume · t retry · Esc runs · i details · ? help",
-        "↑↓ stage · o result · Esc runs · i details",
+fn span_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
+}
+
+/// Footer row: contextual actions on the left, quiet navigation right-aligned
+/// and dropped progressively as the terminal narrows.
+fn footer_line(screen: Screen, state: &TuiState, width: u16) -> Line<'static> {
+    let actions = primary_actions(screen, state);
+    let (full, compact) = navigation_hints(screen);
+    let used = span_width(&actions);
+    let navigation = if used + full.chars().count() + 3 <= width as usize {
+        full
+    } else if used + compact.chars().count() + 3 <= width as usize {
+        compact
+    } else {
+        ""
+    };
+    theme::spread(
+        actions,
+        vec![Span::styled(navigation, theme::muted())],
+        width,
     )
 }
 
 fn message_presentation(kind: UiMessageKind) -> (&'static str, Style) {
     match kind {
-        UiMessageKind::Info => ("ℹ", Style::default().fg(Color::Cyan)),
-        UiMessageKind::Success => ("✓", Style::default().fg(Color::Green)),
-        UiMessageKind::Warning => ("⚠", Style::default().fg(Color::Yellow)),
+        UiMessageKind::Info => ("ℹ", Style::default().fg(theme::ACCENT)),
+        UiMessageKind::Success => ("✓", Style::default().fg(theme::SUCCESS)),
+        UiMessageKind::Warning => ("⚠", Style::default().fg(theme::ATTENTION)),
         UiMessageKind::Error => (
             "✗",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::DANGER)
+                .add_modifier(Modifier::BOLD),
         ),
     }
 }
@@ -1005,18 +1288,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let mut lines = Vec::new();
     if let Some(message) = state.message.as_ref() {
         let (glyph, style) = message_presentation(message.kind);
-        lines.push(Line::from(vec![
-            Span::styled(format!("{glyph} "), style),
-            Span::styled(message.text.clone(), style),
-            Span::styled("  · x dismiss", Style::default().fg(Color::DarkGray)),
-        ]));
+        lines.push(theme::spread(
+            vec![
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(message.text.clone(), style),
+            ],
+            vec![Span::styled("x dismiss", theme::muted())],
+            area.width,
+        ));
     }
-    lines.push(Line::from(Span::styled(
-        footer_hints(state.screen, area.width, state),
-        Style::default().fg(Color::DarkGray),
-    )));
+    lines.push(footer_line(state.screen, state, area.width));
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(theme::muted()),
+        ),
         area,
     );
 }
@@ -1029,7 +1316,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
             Paragraph::new(
                 "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
-            .block(Block::default().borders(Borders::ALL).title(" Help · Esc closes ")),
+            .block(overlay_block(" Help · Esc closes ", theme::MUTED)),
             popup,
         ),
         Overlay::Attention => render_attention(frame, popup, state),
@@ -1038,35 +1325,41 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     }
 }
 
+/// Overlays are the one place a full border earns its keep: they float over
+/// the deck and need their own edge.
+fn overlay_block(title: &'static str, color: Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(title)
+        .title_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        .padding(Padding::new(1, 1, 0, 0))
+}
+
 fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let Some(details) = state.details.as_ref() else {
         return;
     };
-    let mut lines = vec![Line::from(Span::styled(
-        "⚠ NEEDS YOU",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    ))];
+    let mut lines = vec![
+        Line::from(theme::chip("⚠ NEEDS YOU", theme::ATTENTION)),
+        Line::from(""),
+    ];
     for (index, attention) in details.attention.iter().enumerate() {
-        lines.push(Line::styled(
-            format!(
-                "{} {} · {} · {}",
-                if index == state.attention_index {
-                    ">"
-                } else {
-                    " "
-                },
-                attention.stage_id,
-                enum_text(attention.kind),
-                attention.summary
+        let selected = index == state.attention_index;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "▸ " } else { "  " },
+                Style::default().fg(theme::ATTENTION),
             ),
-            if index == state.attention_index {
-                Style::default().bg(Color::DarkGray)
-            } else {
-                Style::default()
-            },
-        ));
+            Span::styled(
+                format!("{} · {}", enum_text(attention.kind), attention.summary),
+                if selected {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::text()
+                },
+            ),
+        ]));
     }
     lines.push(Line::from(""));
     let selected_kind = details
@@ -1078,22 +1371,24 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             "Permission request — no text response required",
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(
+        lines.push(Line::from(Span::styled(
             "↑/↓ select request · Enter approve/resolve · Esc cancel",
-        ));
+            theme::muted(),
+        )));
     } else {
         lines.push(Line::from(format!(
             "Response: {}",
             field_display(&state.attention_response, true)
         )));
-        lines.push(Line::from(
+        lines.push(Line::from(Span::styled(
             "↑/↓ select request · type response · Enter submit · Esc cancel",
-        ));
+            theme::muted(),
+        )));
     }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" Attention ")),
+            .block(overlay_block(" Attention ", theme::ATTENTION)),
         area,
     );
 }
@@ -1102,40 +1397,49 @@ fn render_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState, appl
     let Some(details) = state.details.as_ref() else {
         return;
     };
-    let action = if apply { "APPLY" } else { "DISCARD" };
+    let (action, color) = if apply {
+        ("APPLY", theme::SUCCESS)
+    } else {
+        ("DISCARD", theme::DANGER)
+    };
     let mut lines = vec![
+        Line::from(theme::chip(action, color)),
+        Line::from(""),
         Line::from(Span::styled(
-            format!("Confirm {action}"),
-            Style::default()
-                .fg(if apply { Color::Green } else { Color::Red })
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("Run:  {}", details.id)),
-        Line::from(format!(
-            "Task: {}",
             details
                 .task
                 .as_deref()
                 .unwrap_or("<legacy input unavailable>")
+                .to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!(
-            "Repo: {}",
+        Line::from(Span::styled(
             details
                 .repository
                 .as_deref()
-                .map_or("unavailable".to_owned(), |path| path.display().to_string())
+                .map_or("unavailable".to_owned(), |path| path.display().to_string()),
+            theme::muted(),
         )),
+        Line::from(Span::styled(format!("run {}", details.id), theme::muted())),
+        Line::from(""),
     ];
     if apply {
         if let Some(diff) = state.diff.as_ref() {
-            lines.push(Line::from(format!("Files: {}", diff.changed_files.len())));
+            lines.push(theme::section(&format!(
+                "{} FILES",
+                diff.changed_files.len()
+            )));
             for file in diff.changed_files.iter().take(8) {
-                lines.push(Line::from(format!(
-                    "  {}{}",
-                    file.path,
-                    if file.binary { " [binary]" } else { "" }
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}{}",
+                        file.path,
+                        if file.binary { " [binary]" } else { "" }
+                    ),
+                    theme::text(),
                 )));
             }
+            lines.push(Line::from(""));
         }
         lines.push(Line::from(
             "Review [d] diff first when needed. Enter confirms apply.",
@@ -1146,13 +1450,14 @@ fn render_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState, appl
         ));
         lines.push(Line::from("Enter confirms discard."));
     }
-    lines.push(Line::from("Esc cancels"));
+    lines.push(Line::from(Span::styled("Esc cancels", theme::muted())));
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {action} ")),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(
+                if apply { " APPLY " } else { " DISCARD " },
+                color,
+            )),
         area,
     );
 }
@@ -1174,38 +1479,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
-}
-
-fn stage_line(stage: &StageSummary) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{} ", stage_glyph(stage.status)),
-            stage_style(stage.status),
-        ),
-        Span::raw(format!("{:<22}", enum_text(stage.kind))),
-        Span::styled(
-            stage.configured_provider.clone(),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ])
-}
-
-fn status_heading(status: RunStatus) -> Line<'static> {
-    let label = match status {
-        RunStatus::NeedsUser => "⚠ NEEDS YOU",
-        RunStatus::Interrupted => "↻ INTERRUPTED",
-        RunStatus::Paused => "‖ PAUSED",
-        RunStatus::Failed => "✗ FAILED",
-        RunStatus::Completed => "✓ COMPLETED",
-        RunStatus::Applied => "✓ APPLIED",
-        RunStatus::Running => "● RUNNING",
-        RunStatus::Created | RunStatus::Preparing | RunStatus::Ready => "○ WAITING",
-        RunStatus::Discarded => "DISCARDED",
-    };
-    Line::from(Span::styled(
-        label,
-        status_style(status).add_modifier(Modifier::BOLD),
-    ))
 }
 
 const fn run_glyph(status: RunStatus) -> &'static str {
@@ -1235,25 +1508,25 @@ const fn stage_glyph(status: StageStatus) -> &'static str {
 
 const fn status_style(status: RunStatus) -> Style {
     match status {
-        RunStatus::Completed | RunStatus::Applied => Style::new().fg(Color::Green),
-        RunStatus::Running => Style::new().fg(Color::Cyan),
-        RunStatus::NeedsUser | RunStatus::Ready => Style::new().fg(Color::Yellow),
-        RunStatus::Failed => Style::new().fg(Color::Red),
-        RunStatus::Paused | RunStatus::Interrupted => Style::new().fg(Color::Magenta),
+        RunStatus::Completed | RunStatus::Applied => Style::new().fg(theme::SUCCESS),
+        RunStatus::Running => Style::new().fg(theme::ACCENT),
+        RunStatus::NeedsUser | RunStatus::Ready => Style::new().fg(theme::ATTENTION),
+        RunStatus::Failed => Style::new().fg(theme::DANGER),
+        RunStatus::Paused | RunStatus::Interrupted => Style::new().fg(theme::SUSPENDED),
         RunStatus::Created | RunStatus::Preparing | RunStatus::Discarded => {
-            Style::new().fg(Color::DarkGray)
+            Style::new().fg(theme::MUTED)
         }
     }
 }
 
 const fn stage_style(status: StageStatus) -> Style {
     match status {
-        StageStatus::Completed => Style::new().fg(Color::Green),
-        StageStatus::Running => Style::new().fg(Color::Cyan),
-        StageStatus::NeedsUser | StageStatus::Ready => Style::new().fg(Color::Yellow),
-        StageStatus::Failed => Style::new().fg(Color::Red),
-        StageStatus::Paused | StageStatus::Interrupted => Style::new().fg(Color::Magenta),
-        StageStatus::Pending | StageStatus::Skipped => Style::new().fg(Color::DarkGray),
+        StageStatus::Completed => Style::new().fg(theme::SUCCESS),
+        StageStatus::Running => Style::new().fg(theme::ACCENT),
+        StageStatus::NeedsUser | StageStatus::Ready => Style::new().fg(theme::ATTENTION),
+        StageStatus::Failed => Style::new().fg(theme::DANGER),
+        StageStatus::Paused | StageStatus::Interrupted => Style::new().fg(theme::SUSPENDED),
+        StageStatus::Pending | StageStatus::Skipped => Style::new().fg(theme::MUTED),
     }
 }
 
@@ -1304,6 +1577,14 @@ mod tests {
             .content
             .iter()
             .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// The footer's contextual half as plain text.
+    fn actions_text(state: &TuiState) -> String {
+        primary_actions(state.screen, state)
+            .iter()
+            .map(|span| span.content.as_ref())
             .collect()
     }
 
@@ -1430,6 +1711,22 @@ mod tests {
     }
 
     #[test]
+    fn header_carries_product_identity_and_run_state() {
+        let text = render_text(&running_state(), 160, 40);
+        assert!(text.contains("POLYCODE"));
+        assert!(text.contains("MISSION DECK"));
+        assert!(text.contains("wp-calypso-2"), "concise repository identity");
+        assert!(
+            !text.contains("/Users/e/Code/wp-calypso-2"),
+            "the full path stays in technical mode"
+        );
+        // Narrow terminals keep the state and drop the identity.
+        let narrow = render_text(&running_state(), 70, 24);
+        assert!(narrow.contains("POLYCODE"));
+        assert!(!narrow.contains("wp-calypso-2"));
+    }
+
+    #[test]
     fn runs_screen_renders_summary_and_needs_user_prominently() {
         let mut state = TuiState::new(std::path::Path::new("/repo"));
         let id = RunId::from_u128(1);
@@ -1445,6 +1742,7 @@ mod tests {
         let text = render_text(&state, 120, 30);
         assert!(text.contains("OAuth provider"));
         assert!(text.contains("NEEDS YOU"));
+        assert!(text.contains("▸ "), "the selected run carries a cursor");
         state.overlay = Some(Overlay::Help);
         assert!(render_text(&state, 120, 30).contains("Help · Esc closes"));
     }
@@ -1466,6 +1764,33 @@ mod tests {
     }
 
     #[test]
+    fn selection_and_execution_are_distinct_in_the_rail() {
+        let mut state = running_state();
+        // Reading a finished stage while another one runs.
+        state.selected_stage_index = 0;
+        state.selected_stage = Some(StageId::new("architecture").unwrap());
+        let text = render_text(&state, 160, 40);
+        let cursor = text.find("▸ ").expect("the cursor marks the selection");
+        let architecture = text.find("Architecture").unwrap();
+        let implementation = text.find("Implementation").unwrap();
+        assert!(
+            cursor < architecture && cursor < implementation,
+            "the cursor sits on the selected row, not the running one"
+        );
+        assert_eq!(
+            text.matches("▸ ").count(),
+            1,
+            "exactly one row is selected at a time"
+        );
+        // The running stage keeps its own glyph regardless of the cursor.
+        assert!(text.contains("● "), "execution state stays on the live row");
+        assert!(
+            text.contains("COMPLETED"),
+            "the hero follows the selection, not the running stage"
+        );
+    }
+
+    #[test]
     fn running_hero_leads_with_state_clock_runtime_and_activity() {
         let text = render_text(&running_state(), 160, 40);
         assert!(text.contains("IMPLEMENTATION"), "stage names the panel");
@@ -1474,13 +1799,13 @@ mod tests {
         assert!(text.contains("codex"), "runtime summary is present");
         assert!(text.contains("native default"));
         assert!(
-            !text.contains("Kind        "),
+            !text.contains("Kind         "),
             "operational view drops technical field rows"
         );
     }
 
     #[test]
-    fn operational_view_hides_diagnostics_and_technical_view_shows_them() {
+    fn operational_view_hides_diagnostics_and_technical_view_groups_them() {
         let mut state = running_state();
         let operational = render_text(&state, 160, 40);
         assert!(!operational.contains("native-session-id"), "no native ids");
@@ -1489,17 +1814,30 @@ mod tests {
             !operational.contains("/Users/e/Code/wp-calypso-2"),
             "operational view keeps the full path out"
         );
-        assert!(operational.contains("[i] technical details"));
+        assert!(operational.contains("[i] Details"));
 
         state.technical = true;
         let technical = render_text(&state, 160, 40);
         assert!(technical.contains("TECHNICAL"), "mode is labelled");
+        for group in [
+            "EXECUTION",
+            "RUNTIME",
+            "RESOURCE EVIDENCE",
+            "WORKSPACE",
+            "ROUTING",
+        ] {
+            assert!(technical.contains(group), "{group} group is present");
+        }
         assert!(technical.contains("native-session-id".get(..8).unwrap()));
         assert!(technical.contains("/Users/e/Code/wp-calypso-2"));
         assert!(technical.contains("recommended_v2"));
         assert!(technical.contains("recommended_role_assignment"));
         assert!(technical.contains("abc1234"), "base commit stays available");
         assert!(technical.contains("[i] operational view"));
+        assert!(
+            !technical.contains(POD_SHELL),
+            "technical mode spends POD's rows on diagnostics"
+        );
     }
 
     #[test]
@@ -1534,16 +1872,16 @@ mod tests {
     }
 
     #[test]
-    fn resources_stay_provider_native_and_compact() {
+    fn resources_read_in_words_and_stay_provider_native() {
         let summary = resource_summary(&details(RunStatus::Running, Vec::new()));
-        assert!(summary.contains("12.2k in"));
-        assert!(summary.contains("33.1k out"));
+        assert!(summary.contains("12.2k input"), "human label, not `in`");
+        assert!(summary.contains("33.1k output"));
         assert!(summary.contains("2.3M cache read"));
         assert!(!summary.contains('$'), "usage never implies cost");
     }
 
     #[test]
-    fn needs_user_dominates_the_hero_and_precedes_resources() {
+    fn needs_user_dominates_the_hero_and_precedes_everything_secondary() {
         let mut state = running_state();
         let details = state.details.as_mut().unwrap();
         details.status = RunStatus::NeedsUser;
@@ -1559,11 +1897,15 @@ mod tests {
         assert!(text.contains("Claude requests permission to use Bash"));
         assert!(text.contains("[u] Review and resolve"));
         let action = text.find("ACTION REQUIRED").unwrap();
-        let resources = text.find("RESOURCES").unwrap();
-        assert!(action < resources, "attention outranks resource evidence");
+        for secondary in ["RESOURCES", "RESULT", "codex · native default"] {
+            assert!(
+                action < text.find(secondary).unwrap(),
+                "attention outranks {secondary}"
+            );
+        }
         assert!(
-            render_text(&state, 160, 40).contains("u ATTENTION"),
-            "footer prioritizes the attention shortcut"
+            actions_text(&state).starts_with("[u] Resolve attention"),
+            "the footer leads with the attention shortcut"
         );
     }
 
@@ -1579,24 +1921,71 @@ mod tests {
             !text.contains("Agent is working"),
             "monitoring language is gone after completion"
         );
+        assert!(
+            !text.contains("Stage finished"),
+            "the run, not the stage, speaks after the pivot"
+        );
+    }
+
+    #[test]
+    fn failed_state_is_legible_and_offers_recovery_once() {
+        let mut state = running_state();
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::Failed;
+        details.stages[1].status = StageStatus::Failed;
+        details.stages[1].finished_at = Some(at(12, 3, 0));
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("✗ FAILED"));
+        assert!(text.contains("No completed result"));
+        assert!(text.contains("[t] Retry"));
+        assert!(text.contains("[l] Logs"));
+        assert_eq!(
+            text.matches("[t] Retry").count(),
+            2,
+            "hero and footer each offer retry exactly once"
+        );
+        assert!(
+            !text.contains("provider exited"),
+            "raw provider metadata stays out of the operational view"
+        );
     }
 
     #[test]
     fn footer_advertises_apply_only_when_the_run_is_applyable() {
         let running = running_state();
-        let hints = footer_hints(Screen::RunDetail, 200, &running);
-        assert!(!hints.contains("a apply"), "no apply hint while running");
-        assert!(hints.contains("Esc runs"));
+        let actions = actions_text(&running);
+        assert!(!actions.contains("[a] Apply"), "no apply while running");
+        assert!(actions.contains("[o] Result"));
 
         let completed = completed_state();
-        let hints = footer_hints(Screen::RunDetail, 200, &completed);
-        assert!(hints.contains("a apply"));
-        assert!(hints.contains("X discard"));
+        let actions = actions_text(&completed);
+        assert!(actions.contains("[a] Apply"));
+        assert!(actions.contains("[X] Discard"));
 
-        // Narrow terminals abbreviate but never invent unavailable actions.
-        let compact = footer_hints(Screen::RunDetail, 55, &running);
-        assert!(compact.chars().count() <= 55);
-        assert!(!compact.contains("a apply"));
+        // Narrow terminals drop navigation, never the contextual actions.
+        let wide: String = footer_line(Screen::RunDetail, &running, 200)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(wide.contains("Esc runs"));
+        let narrow: String = footer_line(Screen::RunDetail, &running, 46)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(narrow.contains("[o] Result"), "actions survive");
+        assert!(!narrow.contains("? help"), "navigation yields first");
+    }
+
+    #[test]
+    fn footer_offers_resume_only_for_a_suspended_run() {
+        let running = running_state();
+        assert!(!actions_text(&running).contains("[r] Resume"));
+
+        let mut paused = running_state();
+        paused.details.as_mut().unwrap().status = RunStatus::Paused;
+        assert!(actions_text(&paused).contains("[r] Resume"));
     }
 
     #[test]
@@ -1616,12 +2005,6 @@ mod tests {
         let text = render_text(&completed, 160, 40);
         assert!(text.contains("✓ Verified artifact available"));
         assert!(text.contains("[Enter/o] Open result"));
-
-        let mut failed = running_state();
-        failed.details.as_mut().unwrap().stages[1].status = StageStatus::Failed;
-        let text = render_text(&failed, 160, 40);
-        assert!(text.contains("No completed result"));
-        assert!(text.contains("[t] retry"), "failed stage offers recovery");
     }
 
     #[test]
@@ -1671,6 +2054,7 @@ mod tests {
         });
         let text = render_text(&state, 120, 30);
         assert!(text.contains("Esc run detail"), "viewer advertises back");
+        assert!(text.contains("IMPLEMENTATION"), "viewer names its stage");
         assert!(text.contains("Result"), "heading text renders");
         assert!(!text.contains("## Result"), "no literal markdown heading");
         assert!(!text.contains("**done**"), "no literal bold markers");
@@ -1682,6 +2066,19 @@ mod tests {
             "raw mode shows markdown verbatim"
         );
         assert!(raw.contains("**done**"));
+    }
+
+    #[test]
+    fn new_run_reads_as_a_briefing_with_a_focused_field() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.screen = Screen::NewRun;
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("START A RUN"));
+        for label in ["TASK", "WORKFLOW", "REPOSITORY", "EXECUTION", "EFFORT"] {
+            assert!(text.contains(label), "{label} field is labelled");
+        }
+        assert!(text.contains("[Enter] Start run"));
+        assert!(text.contains("▸ "), "the focused field carries a cursor");
     }
 
     #[test]
@@ -1703,8 +2100,92 @@ mod tests {
     }
 
     #[test]
+    fn pod_is_seated_under_the_pipeline_rather_than_floating() {
+        let text = render_text(&running_state(), 160, 40);
+        let last_stage = text.find("Quality review").unwrap();
+        let tail = &text[last_stage..];
+        let rule = tail.find("──────────").expect("POD sits under a rule");
+        let pod = tail.find(POD_SHELL).unwrap();
+        assert!(rule < pod, "the rule separates the rail from its operator");
+    }
+
+    #[test]
+    fn selection_uses_no_background_so_pod_keeps_its_contrast() {
+        // M13d.1 noted that POD's solid eyes lose contrast on a
+        // background-highlighted row. The rail marks selection with a cursor
+        // and modifiers only, so nothing in the left column paints a surface.
+        for status in [
+            StageStatus::Running,
+            StageStatus::Completed,
+            StageStatus::Pending,
+            StageStatus::NeedsUser,
+            StageStatus::Failed,
+        ] {
+            for selected in [true, false] {
+                assert!(
+                    stage_name_style(status, selected).bg.is_none(),
+                    "{status:?} selected={selected} paints a background"
+                );
+            }
+        }
+        let state = running_state();
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rail = 160_u16 * 38 / 100;
+        for y in 2..38 {
+            for x in 0..rail {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    ratatui::style::Color::Reset,
+                    "the pipeline rail stays unpainted at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_is_never_carried_by_color_alone() {
+        // Each state pairs its color with a glyph and a word, so a monochrome
+        // terminal reads the same interface.
+        for (status, word) in [
+            (StageStatus::Running, "RUNNING"),
+            (StageStatus::NeedsUser, "NEEDS YOU"),
+            (StageStatus::Failed, "FAILED"),
+            (StageStatus::Completed, "COMPLETED"),
+        ] {
+            assert_eq!(hero_status(status), word);
+            assert!(!stage_glyph(status).is_empty());
+        }
+        let mut state = running_state();
+        state.details.as_mut().unwrap().status = RunStatus::Failed;
+        state.details.as_mut().unwrap().stages[1].status = StageStatus::Failed;
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("✗ FAILED"), "glyph and word travel together");
+    }
+
+    #[test]
+    fn footer_shapes_follow_canonical_state() {
+        let running = actions_text(&running_state());
+        assert!(running.starts_with("[o] Result"));
+        assert!(!running.contains("Apply") && !running.contains("Resolve"));
+
+        let completed = actions_text(&completed_state());
+        assert!(completed.starts_with("[d] Review diff"));
+        assert!(!completed.contains("[o] Result"), "review, not monitoring");
+
+        let mut technical = running_state();
+        technical.technical = true;
+        assert!(
+            actions_text(&technical).contains("[i] Operational"),
+            "the toggle names the mode it leads to"
+        );
+    }
+
+    #[test]
     fn operational_information_survives_every_supported_size() {
-        for (width, height) in [(160, 40), (100, 30), (70, 24)] {
+        for (width, height) in [(160, 40), (120, 35), (100, 30), (80, 26), (70, 24)] {
             let text = render_text(&running_state(), width, height);
             assert!(
                 text.contains("RUNNING"),
@@ -1715,13 +2196,37 @@ mod tests {
                 "current stage survives at {width}x{height}"
             );
             assert!(
-                text.contains("Esc runs"),
-                "actions survive at {width}x{height}"
+                text.contains("[o] Result"),
+                "the primary action survives at {width}x{height}"
+            );
+            assert!(
+                text.contains("2m 14s") || text.contains("14s"),
+                "elapsed survives at {width}x{height}"
             );
         }
         // POD is the first thing to go, and only after operational content fits.
         assert!(render_text(&running_state(), 160, 40).contains(POD_SHELL));
         assert!(!render_text(&running_state(), 70, 24).contains(POD_SHELL));
+    }
+
+    #[test]
+    fn narrow_attention_keeps_the_state_action() {
+        let mut state = running_state();
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::NeedsUser;
+        details.stages[1].status = StageStatus::NeedsUser;
+        details.attention = vec![crate::app::AttentionSummary {
+            id: crate::domain::AttentionRequestId::from_u128(1),
+            stage_id: StageId::new("implementation").unwrap(),
+            kind: AttentionKind::Permission,
+            summary: "Claude requests permission to use Bash".to_owned(),
+        }];
+        let text = render_text(&state, 70, 24);
+        assert!(
+            text.contains("ACTION REQUIRED"),
+            "attention cannot be missed"
+        );
+        assert!(text.contains("[u] Resolve attention"));
     }
 
     #[test]

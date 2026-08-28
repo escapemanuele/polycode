@@ -10,7 +10,8 @@
 //! █ ▄ ▀ ▌ ▐ (see `GLYPH_WHITELIST`); no emoji, no ambiguous-width glyphs,
 //! no animation.
 
-use ratatui::style::{Color, Modifier, Style};
+use super::theme;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::domain::{Role, RunStatus, StageStatus};
@@ -144,21 +145,21 @@ const fn activity_accent(activity: MascotActivity) -> &'static str {
 
 const fn state_style(state: MascotState) -> Style {
     match state {
-        MascotState::Idle | MascotState::Running => Style::new().fg(Color::Cyan),
-        MascotState::Waiting => Style::new().fg(Color::DarkGray),
-        MascotState::NeedsUser => Style::new().fg(Color::Yellow),
-        MascotState::Completed => Style::new().fg(Color::Green),
-        MascotState::Failed => Style::new().fg(Color::Red),
+        MascotState::Idle | MascotState::Running => Style::new().fg(theme::ACCENT),
+        MascotState::Waiting => Style::new().fg(theme::MUTED),
+        MascotState::NeedsUser => Style::new().fg(theme::ATTENTION),
+        MascotState::Completed => Style::new().fg(theme::SUCCESS),
+        MascotState::Failed => Style::new().fg(theme::DANGER),
     }
 }
 
 const fn accent_style(activity: MascotActivity) -> Style {
     match activity {
-        MascotActivity::Architecture => Style::new().fg(Color::Blue),
+        MascotActivity::Architecture => Style::new().fg(theme::STRUCTURE),
         MascotActivity::Implementation
         | MascotActivity::QualityReview
         | MascotActivity::SpecReview
-        | MascotActivity::Decision => Style::new().fg(Color::DarkGray),
+        | MascotActivity::Decision => Style::new().fg(theme::MUTED),
     }
 }
 

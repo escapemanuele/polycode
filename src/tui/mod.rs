@@ -8,6 +8,7 @@ mod mascot;
 mod render;
 mod state;
 mod terminal;
+mod theme;
 mod worker;
 
 use anyhow::Result;
