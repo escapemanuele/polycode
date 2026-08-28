@@ -20,6 +20,7 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             crate::process::exec_managed_process(manifest)?;
             Ok(())
         }
+        Some(Command::VerifyReleaseTag { tag }) => verify_release_tag(tag),
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
         Some(Command::Eval { command }) => eval(command),
         Some(Command::Update(args)) => update(*args),
@@ -110,6 +111,15 @@ fn parse_effort(value: Option<&str>) -> Result<crate::domain::EffortSetting> {
             anyhow::bail!("unsupported effort {other:?}; supported: native, low, medium, high")
         }
     }
+}
+
+/// Release-pipeline gate. Read-only and offline: it compares a candidate tag
+/// against the version this checkout compiles as, and fails the process when
+/// they disagree, so a mismatched tag cannot reach publication.
+fn verify_release_tag(tag: &str) -> Result<()> {
+    let version = crate::update::verify_release_tag(tag)?;
+    println!("release tag {tag} matches package version {version}");
+    Ok(())
 }
 
 /// Reports update status and, when explicitly confirmed, installs an

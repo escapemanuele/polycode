@@ -22,6 +22,9 @@ pub enum Command {
     /// Internal signal-normalizing exec bridge.
     #[command(name = "__exec-process", hide = true)]
     ExecProcess { manifest: PathBuf },
+    /// Internal release-pipeline gate: canonical tag matching this build.
+    #[command(name = "__verify-release-tag", hide = true)]
+    VerifyReleaseTag { tag: String },
     /// Open interactive local control room.
     Tui,
     /// Experimental role-specific provider/model evaluation tools.

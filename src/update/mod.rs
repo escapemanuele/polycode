@@ -27,7 +27,9 @@ pub use installer::{
     AssetDownloader, CHECKSUM_ASSET, HttpDownloader, InstallError, Installed, checksum_for,
     install, target_asset_name, target_description,
 };
-pub use release::{GitHubReleases, Release, ReleaseAsset, ReleaseError, ReleaseSource};
+pub use release::{
+    GitHubReleases, Release, ReleaseAsset, ReleaseError, ReleaseSource, canonical_tag_version,
+};
 
 /// The one canonical application version: whatever this build was compiled as.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -99,6 +101,42 @@ fn disabled_with(mut get_var: impl FnMut(&str) -> Option<String>) -> bool {
         let value = value.trim().to_ascii_lowercase();
         !matches!(value.as_str(), "" | "0" | "false" | "no")
     })
+}
+
+/// Why a candidate release tag may not be published.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReleaseTagError {
+    #[error(
+        "tag {0:?} is not a canonical Polycode release tag (expected vMAJOR.MINOR.PATCH with no prerelease or build metadata)"
+    )]
+    NotCanonical(String),
+    #[error("tag {tag} does not match the package version {package} it would publish")]
+    VersionMismatch { tag: String, package: String },
+}
+
+/// Gate for the release pipeline: a tag may only be published when it is
+/// canonical *and* names exactly the version this checkout would build.
+///
+/// Both halves reuse the rules the updater already relies on —
+/// [`canonical_tag_version`] for shape and [`CURRENT_VERSION`] for the
+/// package version — so a tag that passes here is by construction one the
+/// updater would later recognize and one whose assets report the same
+/// version.
+///
+/// # Errors
+/// Returns [`ReleaseTagError`] for a non-canonical tag or for a canonical tag
+/// that disagrees with the compiled package version.
+pub fn verify_release_tag(tag: &str) -> Result<Version, ReleaseTagError> {
+    let version =
+        canonical_tag_version(tag).ok_or_else(|| ReleaseTagError::NotCanonical(tag.to_owned()))?;
+    if version.to_string() == CURRENT_VERSION {
+        Ok(version)
+    } else {
+        Err(ReleaseTagError::VersionMismatch {
+            tag: tag.to_owned(),
+            package: CURRENT_VERSION.to_owned(),
+        })
+    }
 }
 
 /// Reads cached release metadata, refreshes it when stale, and compares
@@ -267,6 +305,69 @@ mod tests {
             fixture.path().join("update.json"),
             Version::parse(current).unwrap(),
         )
+    }
+
+    #[test]
+    fn only_a_canonical_tag_naming_this_build_may_be_released() {
+        // The version this checkout compiles as is the one a release would
+        // publish, so the gate is expressed against it directly.
+        let package = CURRENT_VERSION;
+        let matching = format!("v{package}");
+        assert_eq!(
+            verify_release_tag(&matching).unwrap().to_string(),
+            package,
+            "a canonical tag naming this build is allowed"
+        );
+
+        // A tag ahead of (or behind) Cargo.toml is the mistake this gate
+        // exists to catch.
+        let ahead = {
+            let mut version = current_version().unwrap();
+            version.patch += 1;
+            format!("v{version}")
+        };
+        assert_eq!(
+            verify_release_tag(&ahead).unwrap_err(),
+            ReleaseTagError::VersionMismatch {
+                tag: ahead.clone(),
+                package: package.to_owned(),
+            }
+        );
+
+        // Shape failures are rejected before any version comparison, so the
+        // pipeline cannot publish a tag the updater would later ignore.
+        for tag in [
+            package.to_owned(),
+            format!("v{package}-rc.1"),
+            format!("v{package}+build.7"),
+            "release-2".to_owned(),
+            "v0.2".to_owned(),
+            String::new(),
+        ] {
+            assert!(
+                matches!(
+                    verify_release_tag(&tag),
+                    Err(ReleaseTagError::NotCanonical(_))
+                ),
+                "tag {tag:?} must be rejected as non-canonical"
+            );
+        }
+    }
+
+    #[test]
+    fn the_release_gate_and_the_updater_share_one_tag_rule() {
+        // Anything the gate accepts, the updater recognizes as an official
+        // release tag, and anything it rejects for shape, the updater ignores.
+        let accepted = format!("v{CURRENT_VERSION}");
+        assert!(canonical_tag_version(&accepted).is_some());
+        assert!(verify_release_tag(&accepted).is_ok());
+        for rejected in ["0.1.0", "v0.1.0-rc.1", "nightly"] {
+            assert!(canonical_tag_version(rejected).is_none());
+            assert!(matches!(
+                verify_release_tag(rejected),
+                Err(ReleaseTagError::NotCanonical(_))
+            ));
+        }
     }
 
     #[test]

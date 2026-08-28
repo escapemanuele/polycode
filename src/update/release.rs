@@ -100,7 +100,7 @@ fn select_stable(raw: Vec<RawRelease>) -> Option<Release> {
     raw.into_iter()
         .filter(|release| !release.draft && !release.prerelease)
         .filter_map(|release| {
-            let version = parse_tag(&release.tag_name)?;
+            let version = canonical_tag_version(&release.tag_name)?;
             Some(Release {
                 version,
                 tag: release.tag_name,
@@ -121,7 +121,14 @@ fn select_stable(raw: Vec<RawRelease>) -> Option<Release> {
 }
 
 /// Canonical Polycode tags are `v` followed by a plain semver release.
-fn parse_tag(tag: &str) -> Option<Version> {
+///
+/// This is the single rule for what counts as an official release tag: the
+/// updater uses it to decide which releases exist, and the release workflow
+/// uses it — through `polycode __verify-release-tag` — to decide whether a
+/// tag may be published at all. Both call this function, so the two can never
+/// disagree about a tag's shape.
+#[must_use]
+pub fn canonical_tag_version(tag: &str) -> Option<Version> {
     let version = Version::parse(tag.strip_prefix('v')?).ok()?;
     (version.pre.is_empty() && version.build.is_empty()).then_some(version)
 }
@@ -192,20 +199,32 @@ mod tests {
 
     #[test]
     fn canonical_tags_parse_and_everything_else_is_rejected() {
-        assert_eq!(parse_tag("v0.2.0"), Some(Version::parse("0.2.0").unwrap()));
         assert_eq!(
-            parse_tag("v1.10.3"),
+            canonical_tag_version("v0.2.0"),
+            Some(Version::parse("0.2.0").unwrap())
+        );
+        assert_eq!(
+            canonical_tag_version("v1.10.3"),
             Some(Version::parse("1.10.3").unwrap())
         );
-        assert!(parse_tag("0.2.0").is_none(), "the v prefix is canonical");
-        assert!(parse_tag("release-2").is_none(), "malformed tag");
-        assert!(parse_tag("v0.2").is_none(), "not a full semver release");
-        assert!(parse_tag("vbanana").is_none());
         assert!(
-            parse_tag("v0.2.0-rc.1").is_none(),
+            canonical_tag_version("0.2.0").is_none(),
+            "the v prefix is canonical"
+        );
+        assert!(
+            canonical_tag_version("release-2").is_none(),
+            "malformed tag"
+        );
+        assert!(
+            canonical_tag_version("v0.2").is_none(),
+            "not a full semver release"
+        );
+        assert!(canonical_tag_version("vbanana").is_none());
+        assert!(
+            canonical_tag_version("v0.2.0-rc.1").is_none(),
             "a prerelease tag is never stable"
         );
-        assert!(parse_tag("v0.2.0+build.7").is_none());
+        assert!(canonical_tag_version("v0.2.0+build.7").is_none());
     }
 
     #[test]

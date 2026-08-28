@@ -18,8 +18,33 @@ env:
   CARGO_TERM_COLOR: never
 
 jobs:
+  # Nothing is built or published until the tag is proven to be a canonical
+  # release tag naming exactly the version this checkout compiles as. The rule
+  # lives in Rust (`update::verify_release_tag`), the same one the updater uses
+  # to decide which tags are official, so the pipeline and the client can never
+  # disagree. Both the tag push and workflow_dispatch pass through here.
+  guard:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Tag must match Cargo.toml package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "candidate tag: $tag"
+          cargo run --quiet --locked -- __verify-release-tag "$tag"
+
   build:
     name: ${{ matrix.target }}
+    needs: guard
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -48,6 +73,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # The guard proved tag == Cargo.toml version. This proves the *built
+      # asset* reports it too, which is the property the updater checks before
+      # installing.
       - name: Verify the binary reports the tagged version
         shell: bash
         run: |
