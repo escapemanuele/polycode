@@ -6,6 +6,8 @@ use super::StoreError;
 const DATABASE_FILE: &str = "polycode.db";
 const WORKTREE_DIRECTORY: &str = "worktrees";
 const RUN_DIRECTORY: &str = "runs";
+const UPDATE_CACHE_FILE: &str = "update.json";
+const INSTALL_RECEIPT_FILE: &str = "install.json";
 
 /// Resolves default database path without creating directories or files.
 ///
@@ -23,6 +25,27 @@ pub fn database_file() -> Result<PathBuf, StoreError> {
 /// directory is available.
 pub fn worktree_root() -> Result<PathBuf, StoreError> {
     Ok(data_directory_with(|name| std::env::var_os(name))?.join(WORKTREE_DIRECTORY))
+}
+
+/// Resolves the update-check cache path without creating it.
+///
+/// Update state is application cache state, so it lives beside the run store
+/// rather than inside it, and never inside a user's repository.
+///
+/// # Errors
+/// Returns [`StoreError::DataPathUnavailable`] when neither override nor home
+/// directory is available.
+pub fn update_cache_file() -> Result<PathBuf, StoreError> {
+    Ok(data_directory_with(|name| std::env::var_os(name))?.join(UPDATE_CACHE_FILE))
+}
+
+/// Resolves the install-receipt path without creating it.
+///
+/// # Errors
+/// Returns [`StoreError::DataPathUnavailable`] when neither override nor home
+/// directory is available.
+pub fn install_receipt_file() -> Result<PathBuf, StoreError> {
+    Ok(data_directory_with(|name| std::env::var_os(name))?.join(INSTALL_RECEIPT_FILE))
 }
 
 /// Resolves durable per-run infrastructure root without creating it.

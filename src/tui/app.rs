@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 
 use crate::app::{AppError, RunService, RuntimeProviderFactory};
 use crate::domain::{StageId, StageStatus};
+use crate::update::{InstallSource, UpdateInfo};
 
 use super::input::{Intent, map_key, map_text_key};
 use super::render;
@@ -15,10 +17,17 @@ use super::worker::{Worker, WorkerCommand, WorkerResult, WorkerSuccess};
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
+/// One completed background update check: the newer release when there is
+/// one, and how this executable was installed.
+type UpdateOutcome = (Option<UpdateInfo>, Option<InstallSource>);
+
 pub(crate) struct TuiApp {
     state: TuiState,
     reader: RunService<RuntimeProviderFactory>,
     worker: Worker,
+    /// Delivers the background update check exactly once. Startup never waits
+    /// on it, and a dropped sender simply means no update will be offered.
+    update: Receiver<UpdateOutcome>,
     last_refresh: Instant,
 }
 
@@ -30,6 +39,7 @@ impl TuiApp {
             state: TuiState::new(repository),
             reader,
             worker: Worker::spawn(actions),
+            update: spawn_update_check(),
             last_refresh: Instant::now()
                 .checked_sub(REFRESH_INTERVAL)
                 .unwrap_or_else(Instant::now),
@@ -40,6 +50,7 @@ impl TuiApp {
         self.refresh();
         while !self.state.quit {
             self.receive_worker_results();
+            self.receive_update();
             self.state.clear_expired_message(Instant::now());
             if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
                 self.refresh();
@@ -52,6 +63,24 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    /// Absorbs the background check without ever blocking, then opens the
+    /// prompt only when the interface has nothing more important to say.
+    fn receive_update(&mut self) {
+        match self.update.try_recv() {
+            Ok((info, source)) => {
+                self.state.update = info;
+                self.state.update_install = source;
+            }
+            // Empty means still checking; disconnected means the check
+            // finished or failed and will never speak again. Neither is worth
+            // telling the user about.
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+        if self.state.update_prompt_is_due() {
+            self.state.overlay = Some(Overlay::Update);
+        }
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -138,6 +167,10 @@ impl TuiApp {
     }
 
     fn handle_overlay_intent(&mut self, overlay: Overlay, intent: Intent) {
+        if overlay == Overlay::Update {
+            self.handle_update_intent(intent);
+            return;
+        }
         if matches!(intent, Intent::Escape | Intent::Help) {
             self.state.overlay = None;
             return;
@@ -156,7 +189,16 @@ impl TuiApp {
                     self.state.overlay = None;
                 }
             }
-            Overlay::Help | Overlay::ApplyConfirm | Overlay::DiscardConfirm => {}
+            Overlay::Help | Overlay::ApplyConfirm | Overlay::DiscardConfirm | Overlay::Update => {}
+        }
+    }
+
+    /// Any answer closes the prompt for the lifetime of this process; the
+    /// 24-hour cache decides whether the next process asks again.
+    fn handle_update_intent(&mut self, intent: Intent) {
+        if matches!(intent, Intent::Enter | Intent::Escape | Intent::Help) {
+            self.state.update_dismissed = true;
+            self.state.overlay = None;
         }
     }
 
@@ -571,6 +613,26 @@ const fn is_viewer(screen: Screen) -> bool {
     matches!(screen, Screen::Artifact | Screen::Logs | Screen::Diff)
 }
 
+/// Runs one update check on a detached thread so startup never waits on the
+/// network. Every failure — including an unresolvable data directory — simply
+/// produces no update.
+fn spawn_update_check() -> Receiver<UpdateOutcome> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok(service) = crate::update::UpdateService::from_environment() else {
+            return;
+        };
+        let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+        let info = service.status(now).available().cloned();
+        // Install source is only interesting when an update exists.
+        let source = info
+            .as_ref()
+            .and_then(|_| crate::update::detect_install_source().ok());
+        let _ = sender.send((info, source));
+    });
+    receiver
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -593,6 +655,9 @@ mod tests {
             state,
             reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
             worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            // Tests never check for updates: an immediately dropped sender
+            // reads as "no update will ever arrive".
+            update: mpsc::channel().1,
             last_refresh: Instant::now(),
         };
         (app, fixture)
@@ -727,6 +792,9 @@ mod tests {
             state,
             reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
             worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            // Tests never check for updates: an immediately dropped sender
+            // reads as "no update will ever arrive".
+            update: mpsc::channel().1,
             last_refresh: Instant::now(),
         };
         assert!(app.state.run_is_applyable());

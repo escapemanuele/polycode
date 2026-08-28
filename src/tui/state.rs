@@ -25,6 +25,9 @@ pub(crate) enum Overlay {
     Attention,
     ApplyConfirm,
     DiscardConfirm,
+    /// Application-level software update. Deliberately the lowest-priority
+    /// overlay: run attention always outranks it.
+    Update,
 }
 
 /// Presentation-level notification severity. TUI-only; durable state that
@@ -279,6 +282,10 @@ const fn cycle(index: usize, length: usize, forward: bool) -> usize {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent presentation toggles, each owned by one key; grouping them would not simplify any caller"
+)]
 pub(crate) struct TuiState {
     pub screen: Screen,
     pub overlay: Option<Overlay>,
@@ -303,6 +310,14 @@ pub(crate) struct TuiState {
     pub worker_busy: Option<String>,
     pub message: Option<UiMessage>,
     pub quiescent: Option<QuiescentState>,
+    /// Newer official release, once a background check has concluded. Absent
+    /// while the check is in flight, disabled, or inconclusive.
+    pub update: Option<crate::update::UpdateInfo>,
+    /// How this executable was installed, which decides whether Polycode may
+    /// offer to install the update itself.
+    pub update_install: Option<crate::update::InstallSource>,
+    /// Set once the user answers the prompt; it never reopens in this process.
+    pub update_dismissed: bool,
     pub quit: bool,
 }
 
@@ -331,6 +346,9 @@ impl TuiState {
             worker_busy: None,
             message: None,
             quiescent: None,
+            update: None,
+            update_install: None,
+            update_dismissed: false,
             quit: false,
         }
     }
@@ -415,6 +433,31 @@ impl TuiState {
     /// `Completed` run whose workflow produced a branch workspace can be
     /// applied. The application layer stays the final guard; this only stops
     /// the TUI advertising and dispatching an action the domain will reject.
+    /// Whether the update prompt may open right now.
+    ///
+    /// Software update is the lowest-priority interaction in the interface: it
+    /// waits for the Runs screen, never covers another overlay, and never
+    /// competes with a run that needs the user or an action in flight.
+    pub(crate) fn update_prompt_is_due(&self) -> bool {
+        self.update.is_some()
+            && !self.update_dismissed
+            && self.overlay.is_none()
+            && self.screen == Screen::Runs
+            && self.worker_busy.is_none()
+            && !self.runs.iter().any(|run| {
+                matches!(
+                    run.status,
+                    crate::domain::RunStatus::NeedsUser | crate::domain::RunStatus::Failed
+                )
+            })
+    }
+
+    /// Whether Polycode may install the pending update itself.
+    pub(crate) fn update_is_installable(&self) -> bool {
+        self.update_install
+            .is_some_and(|source| source.strategy().is_automatic())
+    }
+
     pub(crate) fn run_is_applyable(&self) -> bool {
         self.details.as_ref().is_some_and(|details| {
             details.status == crate::domain::RunStatus::Completed

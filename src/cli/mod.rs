@@ -57,8 +57,17 @@ pub enum Command {
     Apply { run_id: RunId },
     /// Discard run and remove owned workspace resources.
     Discard { run_id: RunId },
+    /// Check for a newer official Polycode release.
+    Update(UpdateArgs),
     /// Check Polycode's local environment.
     Doctor,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Args)]
+pub struct UpdateArgs {
+    /// Report update status without installing anything.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]

@@ -14,7 +14,9 @@ mod workspace;
 pub use config_snapshot::ResolvedConfigSnapshot;
 pub use error::StoreError;
 pub use migrations::DATABASE_SCHEMA_VERSION;
-pub use path::{database_file, process_root, worktree_root};
+pub use path::{
+    database_file, install_receipt_file, process_root, update_cache_file, worktree_root,
+};
 pub use run_input::{RUN_INPUT_SCHEMA_VERSION, RunInput, RunInputError};
 pub use snapshot::RUN_SNAPSHOT_SCHEMA_VERSION;
 pub use sqlite::{CommitResult, LoadedRun, RunRevision, RunSummary, SequencedEvent, SqliteStore};

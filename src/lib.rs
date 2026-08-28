@@ -10,6 +10,7 @@ pub mod process;
 pub mod providers;
 pub mod store;
 pub mod tui;
+pub mod update;
 pub mod workspace;
 
 use anyhow::{Context, Result};

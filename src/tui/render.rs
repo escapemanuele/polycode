@@ -1320,6 +1320,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
             popup,
         ),
         Overlay::Attention => render_attention(frame, popup, state),
+        Overlay::Update => render_update(frame, area, state),
         Overlay::ApplyConfirm => render_confirmation(frame, popup, state, true),
         Overlay::DiscardConfirm => render_confirmation(frame, popup, state, false),
     }
@@ -1334,6 +1335,85 @@ fn overlay_block(title: &'static str, color: Color) -> Block<'static> {
         .title(title)
         .title_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
         .padding(Padding::new(1, 1, 0, 0))
+}
+
+/// The update prompt: compact, Mission Deck-native, and never larger than it
+/// needs to be. It states both versions, says what installing would mean, and
+/// — when Polycode cannot install safely — says so instead of offering a
+/// button that would lie.
+fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(info) = state.update.as_ref() else {
+        return;
+    };
+    let installable = state.update_is_installable();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "UPDATE AVAILABLE",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Polycode ", theme::text()),
+            Span::styled(info.current_version.to_string(), theme::muted()),
+            Span::styled(" → ", theme::muted()),
+            Span::styled(
+                info.available_version.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    if installable {
+        lines.push(Line::from(Span::styled("Install now?", theme::text())));
+        lines.push(Line::from(Span::styled(
+            "The new version is used the next time Polycode starts.",
+            theme::muted(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(theme::action(
+            "Enter",
+            "Continue",
+            theme::ACCENT,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            state
+                .update_install
+                .map_or_else(String::new, |source| source.strategy().guidance()),
+            theme::text(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(theme::action(
+            "Enter",
+            "Continue",
+            theme::ACCENT,
+        )));
+    }
+    // The prompt is an aside, not a takeover: it occupies a compact band
+    // rather than the whole screen.
+    let popup = update_rect(area, lines.len());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" UPDATE ", theme::ACCENT)),
+        popup,
+    );
+}
+
+/// A band wide enough for one version line and tall enough for its content,
+/// centered, and always inside the terminal.
+fn update_rect(area: Rect, rows: usize) -> Rect {
+    let width = area.width.saturating_sub(4).clamp(20, 62);
+    let height = u16::try_from(rows + 2).unwrap_or(u16::MAX).min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
 }
 
 fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -2252,6 +2332,126 @@ mod tests {
             "question keeps editable response"
         );
         assert!(text.contains("Enter submit"));
+    }
+
+    fn update_info(current: &str, available: &str) -> crate::update::UpdateInfo {
+        crate::update::UpdateInfo {
+            current_version: semver::Version::parse(current).unwrap(),
+            available_version: semver::Version::parse(available).unwrap(),
+            tag: format!("v{available}"),
+            release_url: "https://example.invalid/r".to_owned(),
+            published_at: None,
+        }
+    }
+
+    #[test]
+    fn no_update_overlay_exists_without_an_available_release() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        assert!(
+            !state.update_prompt_is_due(),
+            "nothing is offered before a check concludes"
+        );
+        // A concluded check that found nothing leaves the field empty.
+        state.update = None;
+        state.overlay = Some(Overlay::Update);
+        let text = render_text(&state, 120, 30);
+        assert!(
+            !text.contains("UPDATE AVAILABLE"),
+            "the overlay renders nothing without an update"
+        );
+    }
+
+    #[test]
+    fn an_available_update_prompts_with_both_versions() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.update = Some(update_info("0.1.0", "0.2.0"));
+        state.update_install = Some(crate::update::InstallSource::OfficialBinary);
+        assert!(state.update_prompt_is_due());
+        state.overlay = Some(Overlay::Update);
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("UPDATE AVAILABLE"));
+        assert!(text.contains("0.1.0"));
+        assert!(text.contains("0.2.0"));
+        assert!(text.contains("Install now?"));
+        assert!(text.contains("next time Polycode starts"));
+    }
+
+    #[test]
+    fn an_unsupported_installation_is_told_the_truth() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.update = Some(update_info("0.1.0", "0.2.0"));
+        state.update_install = Some(crate::update::InstallSource::Source);
+        state.overlay = Some(Overlay::Update);
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("UPDATE AVAILABLE"));
+        assert!(text.contains("managed from source"));
+        assert!(
+            !text.contains("Install now?"),
+            "an install that cannot happen is never offered"
+        );
+    }
+
+    #[test]
+    fn the_update_prompt_yields_to_run_attention_and_stays_on_the_runs_screen() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.update = Some(update_info("0.1.0", "0.2.0"));
+        assert!(state.update_prompt_is_due(), "quiet Runs screen");
+
+        state.screen = Screen::RunDetail;
+        assert!(!state.update_prompt_is_due(), "never on the mission deck");
+        state.screen = Screen::Runs;
+
+        state.overlay = Some(Overlay::Attention);
+        assert!(!state.update_prompt_is_due(), "never over another overlay");
+        state.overlay = None;
+
+        state.worker_busy = Some("applying changes".to_owned());
+        assert!(!state.update_prompt_is_due(), "never during an action");
+        state.worker_busy = None;
+
+        state.replace_runs(vec![RunListItem {
+            id: RunId::from_u128(1),
+            workflow: WorkflowKind::Standard,
+            status: RunStatus::NeedsUser,
+            task_summary: "OAuth".to_owned(),
+            repository: None,
+            updated_at: at(12, 0, 0),
+        }]);
+        assert!(
+            !state.update_prompt_is_due(),
+            "a run that needs the user outranks a software update"
+        );
+    }
+
+    #[test]
+    fn a_dismissed_update_never_reopens_in_this_process() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.update = Some(update_info("0.1.0", "0.2.0"));
+        state.update_dismissed = true;
+        assert!(!state.update_prompt_is_due());
+    }
+
+    #[test]
+    fn the_update_prompt_uses_mission_deck_theme_and_fits_narrow_terminals() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.update = Some(update_info("0.1.0", "0.2.0"));
+        state.update_install = Some(crate::update::InstallSource::OfficialBinary);
+        state.overlay = Some(Overlay::Update);
+        for (width, height) in [(160, 40), (100, 30), (70, 24), (50, 12)] {
+            let text = render_text(&state, width, height);
+            assert!(
+                text.contains("UPDATE AVAILABLE"),
+                "prompt survives {width}x{height}"
+            );
+            assert!(
+                text.contains("0.2.0"),
+                "the new version survives {width}x{height}"
+            );
+        }
+        // The band is an aside, never a takeover.
+        let band = update_rect(Rect::new(0, 0, 160, 40), 9);
+        assert!(band.width <= 62 && band.height <= 12);
+        assert!(band.x > 0 && band.y > 0);
     }
 
     #[test]

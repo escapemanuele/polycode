@@ -8,7 +8,7 @@ use crate::app::{
 use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
 
-use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs};
+use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs, UpdateArgs};
 
 pub fn execute(command: Option<&Command>) -> Result<()> {
     match command {
@@ -22,6 +22,7 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
         }
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
         Some(Command::Eval { command }) => eval(command),
+        Some(Command::Update(args)) => update(*args),
         Some(Command::Doctor) => doctor(),
         Some(Command::Runs) => runs(),
         Some(Command::Fast(args)) => start(WorkflowKind::Fast, args),
@@ -111,12 +112,82 @@ fn parse_effort(value: Option<&str>) -> Result<crate::domain::EffortSetting> {
     }
 }
 
+/// Reports update status. Installation arrives in M13e.2; until then the
+/// command is non-mutating whichever flag is passed, and says so rather than
+/// implying an install happened.
+fn update(args: UpdateArgs) -> Result<()> {
+    let service = crate::update::UpdateService::from_environment()?;
+    let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    let status = if args.check {
+        service.status(now)
+    } else {
+        service.check_now(now)
+    };
+    println!("Current version: {}", crate::update::CURRENT_VERSION);
+    match &status {
+        crate::update::UpdateStatus::Current => println!("Polycode is up to date."),
+        crate::update::UpdateStatus::Available(info) => {
+            println!(
+                "Update available: {} \u{2192} {}",
+                info.current_version, info.available_version
+            );
+            if !info.release_url.is_empty() {
+                println!("Release: {}", info.release_url);
+            }
+            let source = crate::update::detect_install_source()?;
+            println!("Install source: {}", source.label());
+            println!("{}", source.strategy().guidance());
+        }
+        crate::update::UpdateStatus::Unavailable => {
+            if crate::update::checks_disabled() {
+                println!(
+                    "Update checks are disabled ({}).",
+                    crate::update::DISABLE_ENVIRONMENT_VARIABLE
+                );
+            } else {
+                println!("Update status is unavailable right now.");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Version and distribution diagnostics. Never touches the network: how
+/// Polycode was installed is knowable offline, and internet reachability is
+/// not a doctor failure.
+fn print_distribution() {
+    println!("  version: {}", crate::update::CURRENT_VERSION);
+    match crate::update::detect_install_source() {
+        Ok(source) => {
+            println!("  install source: {}", source.label());
+            println!(
+                "  automatic update: {}",
+                if source.strategy().is_automatic() {
+                    "supported"
+                } else {
+                    "unavailable for this build"
+                }
+            );
+        }
+        Err(error) => println!("  install source: undetermined ({error})"),
+    }
+    println!(
+        "  update checks: {}",
+        if crate::update::checks_disabled() {
+            "disabled"
+        } else {
+            "enabled (public GitHub release metadata, at most once per day)"
+        }
+    );
+}
+
 fn doctor() -> Result<()> {
     let config_file = crate::config::config_file()?;
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
     println!("  status: Milestone 11 role evaluation harness");
+    print_distribution();
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
     if database_file.exists() {
