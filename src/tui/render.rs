@@ -1002,7 +1002,7 @@ fn render_artifact(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 artifact
                     .text
                     .lines()
-                    .map(|line| Line::from(line.to_owned())),
+                    .map(|line| Line::from(format::viewer_line(line))),
             );
         } else {
             lines.extend(markdown::render_markdown(&artifact.text));
@@ -1045,7 +1045,12 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             if stream.truncated {
                 lines.push(Line::from(Span::styled("[tail truncated]", theme::muted())));
             }
-            lines.extend(stream.text.lines().map(|line| Line::from(line.to_owned())));
+            lines.extend(
+                stream
+                    .text
+                    .lines()
+                    .map(|line| Line::from(format::viewer_line(line))),
+            );
         }
     }
     frame.render_widget(
@@ -1089,7 +1094,7 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             } else {
                 theme::text()
             };
-            lines.push(Line::styled(line.to_owned(), style));
+            lines.push(Line::styled(format::viewer_line(line), style));
         }
     }
     frame.render_widget(
@@ -2138,6 +2143,98 @@ mod tests {
                 assert!(glyph != other_glyph || style != other_style);
             }
         }
+    }
+
+    /// Viewer content is external: a diff carries repository source, logs
+    /// carry provider stdout. A control character written into a cell measures
+    /// zero columns for Ratatui but still moves the terminal cursor, so the
+    /// two disagree and the diff-based repaint can no longer erase what it
+    /// drew — content survives on screen after the viewer is closed. The
+    /// invariant is therefore checked at the buffer, where it is deterministic:
+    /// nothing a viewer renders may be a control character.
+    #[test]
+    fn viewers_never_write_control_characters_into_the_buffer() {
+        const HOSTILE: &str =
+            "fn main() {\n\tlet x = 1;\r\n\u{1b}[31mred\u{1b}[0m\n\u{0}nul\u{7}bell\n";
+
+        fn control_cells(text: &str) -> Vec<char> {
+            text.chars()
+                .filter(|character| {
+                    character.is_control()
+                        || matches!(character, '\u{7f}'..='\u{9f}' | '\u{200b}'..='\u{200f}')
+                })
+                .collect()
+        }
+
+        let mut state = completed_state();
+
+        state.screen = Screen::Diff;
+        state.diff = Some(crate::app::RunDiffPreview {
+            text: format!("diff --git a/x b/x\n@@ -1 +1 @@\n+{HOSTILE}"),
+            changed_files: vec![crate::app::ChangedFileSummary {
+                path: "x".to_owned(),
+                binary: false,
+            }],
+            total_bytes: 64,
+            truncated: false,
+        });
+        let diff = render_text(&state, 120, 30);
+        assert!(
+            control_cells(&diff).is_empty(),
+            "diff viewer leaked control characters: {:?}",
+            control_cells(&diff)
+        );
+        assert!(diff.contains("let x = 1;"), "content still renders: {diff}");
+
+        state.screen = Screen::Logs;
+        state.logs = Some(crate::app::ProcessLogView {
+            process_id: crate::process::ManagedProcessId::new(),
+            process_status: "running".to_owned(),
+            stdout: crate::app::ProcessLogStream {
+                text: HOSTILE.to_owned(),
+                total_bytes: 32,
+                truncated: false,
+            },
+            stderr: crate::app::ProcessLogStream {
+                text: String::new(),
+                total_bytes: 0,
+                truncated: false,
+            },
+        });
+        let logs = render_text(&state, 120, 30);
+        assert!(
+            control_cells(&logs).is_empty(),
+            "log viewer leaked control characters: {:?}",
+            control_cells(&logs)
+        );
+
+        state.screen = Screen::Artifact;
+        state.artifact = Some(crate::app::ArtifactView {
+            summary: crate::app::ArtifactSummary {
+                stage_id: StageId::new("implementation").unwrap(),
+                kind: crate::domain::ArtifactKind::Implementation,
+                status: crate::domain::ArtifactStatus::Complete,
+                attempt: 1,
+                provider: None,
+                model: None,
+                content_size: 10,
+                created_at: at(12, 0, 0),
+            },
+            text: HOSTILE.to_owned(),
+        });
+        let rendered = render_text(&state, 120, 30);
+        assert!(
+            control_cells(&rendered).is_empty(),
+            "artifact viewer leaked control characters: {:?}",
+            control_cells(&rendered)
+        );
+        state.artifact_raw = true;
+        let raw = render_text(&state, 120, 30);
+        assert!(
+            control_cells(&raw).is_empty(),
+            "raw artifact viewer leaked control characters: {:?}",
+            control_cells(&raw)
+        );
     }
 
     #[test]

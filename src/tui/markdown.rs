@@ -15,7 +15,11 @@ const CODE_INDENT: &str = "  ";
 pub(crate) fn render_markdown(source: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_fence = false;
-    for raw in source.lines() {
+    for source_line in source.lines() {
+        // Artifacts are agent output: sanitize once here so no control
+        // character reaches a span, however the line is later classified.
+        let owned = super::format::viewer_line(source_line);
+        let raw = owned.as_str();
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             in_fence = !in_fence;
