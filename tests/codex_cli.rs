@@ -97,7 +97,13 @@ fn doctor_reports_codex_health_without_leaking_auth_output_or_creating_db() {
     let healthy = fixture.polycode(&["doctor"], false, false);
     assert_success(&healthy);
     let stdout = String::from_utf8(healthy.stdout).unwrap();
-    assert!(stdout.contains("Milestone 11 role evaluation harness"));
+    // Operational readiness, not development history.
+    assert!(
+        !stdout.contains("Milestone"),
+        "doctor describes the product, not the milestone it was built in: {stdout}"
+    );
+    // Git is a runtime prerequisite, so it is diagnosed like the providers are.
+    assert!(stdout.contains("Git: available ("), "{stdout}");
     assert!(stdout.contains("Codex CLI: available (codex-cli fixture-1)"));
     assert!(stdout.contains("Codex auth: ready (ChatGPT)"));
     assert!(!stdout.contains("fixture-secret"));
