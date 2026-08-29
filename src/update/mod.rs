@@ -196,10 +196,16 @@ impl<S: ReleaseSource> UpdateService<S> {
         &self.current
     }
 
-    /// The status a normal invocation uses: a fresh cache answers offline, a
-    /// stale or unreadable one triggers exactly one bounded network check.
+    /// The cache-aware status, for automatic background checking only.
+    ///
+    /// A fresh cache answers without any network use; a missing, stale, or
+    /// unreadable one triggers exactly one bounded check. Never use this for a
+    /// command the user typed: someone who explicitly asks Polycode to check
+    /// must get a real check, not a day-old answer. That is [`check_now`].
+    ///
+    /// [`check_now`]: Self::check_now
     #[must_use]
-    pub fn status(&self, now: DateTime<Utc>) -> UpdateStatus {
+    pub fn cached_status(&self, now: DateTime<Utc>) -> UpdateStatus {
         if self.disabled {
             return UpdateStatus::Unavailable;
         }
@@ -211,7 +217,16 @@ impl<S: ReleaseSource> UpdateService<S> {
         }
     }
 
-    /// Forces one check regardless of cache age. Still honors the opt-out.
+    /// Forces one check regardless of cache age: what every explicitly typed
+    /// update command uses.
+    ///
+    /// A successful check refreshes the cache, so an automatic check shortly
+    /// afterwards costs nothing. A failed one reports `Unavailable` and leaves
+    /// any existing cache untouched — the user asked for a fresh answer, so a
+    /// stale "up to date" would be a lie, but the cache is still good evidence
+    /// for the automatic path.
+    ///
+    /// Still honors the opt-out.
     #[must_use]
     pub fn check_now(&self, now: DateTime<Utc>) -> UpdateStatus {
         if self.disabled {
@@ -392,6 +407,93 @@ mod tests {
         }
     }
 
+    /// The exact situation found during the real v0.1.1 → v0.1.2 round trip:
+    /// a still-fresh cache from before the release was published.
+    #[test]
+    fn a_fresh_cache_never_answers_a_manual_check() {
+        let fixture = TempDir::new().unwrap();
+        // A check five minutes ago concluded 0.1.1 was the newest release.
+        cache::store(
+            &fixture.path().join("update.json"),
+            &UpdateCache {
+                schema_version: cache::CACHE_SCHEMA_VERSION,
+                checked_at: at(12),
+                latest_version: Some("0.1.1".to_owned()),
+                latest_tag: Some("v0.1.1".to_owned()),
+                release_url: Some("https://example.invalid/r".to_owned()),
+                published_at: None,
+            },
+        );
+        let five_minutes_later = at(12) + TimeDelta::minutes(5);
+
+        // 0.1.2 has since been published.
+        let automatic = service(&fixture, FakeSource::new(|| release("0.1.2")), "0.1.1");
+        assert_eq!(
+            automatic.cached_status(five_minutes_later),
+            UpdateStatus::Current,
+            "the background path keeps honoring the cache"
+        );
+        assert_eq!(
+            automatic.source.calls.get(),
+            0,
+            "and stays off the network entirely"
+        );
+
+        let manual = service(&fixture, FakeSource::new(|| release("0.1.2")), "0.1.1");
+        let status = manual.check_now(five_minutes_later);
+        assert_eq!(manual.source.calls.get(), 1, "a typed check really checks");
+        assert_eq!(
+            status.available().unwrap().available_version.to_string(),
+            "0.1.2",
+            "and reports the release the cache had not seen yet"
+        );
+    }
+
+    #[test]
+    fn a_successful_manual_check_refreshes_the_cache_for_the_automatic_path() {
+        let fixture = TempDir::new().unwrap();
+        let manual = service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0");
+        assert!(manual.check_now(at(12)).available().is_some());
+
+        // The automatic path now has a fresh answer and no reason to ask again.
+        let automatic = service(&fixture, FakeSource::new(|| release("0.9.0")), "0.1.0");
+        let status = automatic.cached_status(at(13));
+        assert_eq!(automatic.source.calls.get(), 0);
+        assert_eq!(
+            status.available().unwrap().available_version.to_string(),
+            "0.2.0"
+        );
+    }
+
+    #[test]
+    fn a_failed_manual_check_reports_unavailable_and_preserves_the_cache() {
+        let fixture = TempDir::new().unwrap();
+        let seeded = service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0");
+        assert!(seeded.check_now(at(12)).available().is_some());
+        let before = std::fs::read_to_string(fixture.path().join("update.json")).unwrap();
+
+        let offline = service(
+            &fixture,
+            FakeSource::new(|| Err(ReleaseError::Unreachable("dns".to_owned()))),
+            "0.1.0",
+        );
+        assert_eq!(
+            offline.check_now(at(13)),
+            UpdateStatus::Unavailable,
+            "an explicit check reports its own failure rather than a cached answer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("update.json")).unwrap(),
+            before,
+            "and never overwrites a good cache with a failure"
+        );
+
+        // The automatic path may still use that untouched cache.
+        let automatic = service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0");
+        assert!(automatic.cached_status(at(13)).available().is_some());
+        assert_eq!(automatic.source.calls.get(), 0);
+    }
+
     #[test]
     fn a_repository_without_stable_releases_is_not_behind_anything() {
         let fixture = TempDir::new().unwrap();
@@ -403,11 +505,11 @@ mod tests {
     fn a_fresh_cache_answers_without_touching_the_network() {
         let fixture = TempDir::new().unwrap();
         let first = service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0");
-        assert!(first.status(at(12)).available().is_some());
+        assert!(first.cached_status(at(12)).available().is_some());
         assert_eq!(first.source.calls.get(), 1);
 
         let second = service(&fixture, FakeSource::new(|| release("0.9.0")), "0.1.0");
-        let status = second.status(at(20));
+        let status = second.cached_status(at(20));
         assert_eq!(second.source.calls.get(), 0, "the fresh cache answered");
         assert_eq!(
             status.available().unwrap().available_version.to_string(),
@@ -419,9 +521,10 @@ mod tests {
     #[test]
     fn a_stale_cache_triggers_exactly_one_refresh() {
         let fixture = TempDir::new().unwrap();
-        let _ = service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0").status(at(12));
+        let _ =
+            service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0").cached_status(at(12));
         let later = service(&fixture, FakeSource::new(|| release("0.3.0")), "0.1.0");
-        let status = later.status(at(12) + TimeDelta::hours(25));
+        let status = later.cached_status(at(12) + TimeDelta::hours(25));
         assert_eq!(later.source.calls.get(), 1);
         assert_eq!(
             status.available().unwrap().available_version.to_string(),
@@ -434,7 +537,7 @@ mod tests {
         let fixture = TempDir::new().unwrap();
         std::fs::write(fixture.path().join("update.json"), "{ not json").unwrap();
         let service = service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0");
-        assert!(service.status(at(12)).available().is_some());
+        assert!(service.cached_status(at(12)).available().is_some());
         assert_eq!(service.source.calls.get(), 1);
     }
 
@@ -453,7 +556,7 @@ mod tests {
             let fixture = TempDir::new().unwrap();
             let service = service(&fixture, FakeSource::new(failure), "0.1.0");
             assert_eq!(
-                service.status(at(12)),
+                service.cached_status(at(12)),
                 UpdateStatus::Unavailable,
                 "a failed check never becomes an update or an error"
             );
@@ -469,7 +572,7 @@ mod tests {
         let fixture = TempDir::new().unwrap();
         let service =
             service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0").with_disabled(true);
-        assert_eq!(service.status(at(12)), UpdateStatus::Unavailable);
+        assert_eq!(service.cached_status(at(12)), UpdateStatus::Unavailable);
         assert_eq!(service.check_now(at(12)), UpdateStatus::Unavailable);
         assert_eq!(service.source.calls.get(), 0);
     }
@@ -477,10 +580,11 @@ mod tests {
     #[test]
     fn a_custom_ttl_is_honored() {
         let fixture = TempDir::new().unwrap();
-        let _ = service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0").status(at(12));
+        let _ =
+            service(&fixture, FakeSource::new(|| release("0.2.0")), "0.1.0").cached_status(at(12));
         let short = service(&fixture, FakeSource::new(|| release("0.4.0")), "0.1.0")
             .with_ttl(TimeDelta::minutes(1));
-        let _ = short.status(at(12) + TimeDelta::minutes(2));
+        let _ = short.cached_status(at(12) + TimeDelta::minutes(2));
         assert_eq!(short.source.calls.get(), 1);
     }
 

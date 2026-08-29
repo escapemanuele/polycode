@@ -167,11 +167,10 @@ fn verify_release_tag(tag: &str) -> Result<()> {
 fn update(args: UpdateArgs) -> Result<()> {
     let service = crate::update::UpdateService::from_environment()?;
     let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
-    let status = if args.check {
-        service.status(now)
-    } else {
-        service.check_now(now)
-    };
+    // Both forms are explicitly typed by the user, so both get a real check.
+    // Answering `--check` from a day-old cache made Polycode report "up to
+    // date" minutes after a release was published.
+    let status = service.check_now(now);
     println!("Current version: {}", crate::update::CURRENT_VERSION);
     let crate::update::UpdateStatus::Available(info) = &status else {
         match status {
@@ -198,7 +197,7 @@ fn update(args: UpdateArgs) -> Result<()> {
         println!("{}", strategy.guidance());
         return Ok(());
     }
-    if args.check {
+    if manual_update(args.check) == ManualUpdate::Report {
         println!("Automatic installation is supported. Run `polycode update` to install.");
         return Ok(());
     }
@@ -209,6 +208,24 @@ fn update(args: UpdateArgs) -> Result<()> {
     let installed = install_update(info, now)?;
     println!("{}", installed.restart_notice());
     Ok(())
+}
+
+/// What an explicitly typed update command may do to the executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManualUpdate {
+    /// Report only. `--check` can never reach the installer.
+    Report,
+    /// Offer installation, still subject to confirmation and every
+    /// install-source, checksum, and version rule.
+    Offer,
+}
+
+const fn manual_update(check: bool) -> ManualUpdate {
+    if check {
+        ManualUpdate::Report
+    } else {
+        ManualUpdate::Offer
+    }
 }
 
 /// Explicit confirmation before an irreversible action, matching how apply
@@ -688,5 +705,34 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
             unreachable!("formatted separately")
         }
         DomainEventKind::ProviderResumed { .. } => "provider resumed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `--check` form is report-only by construction: there is one path to
+    /// the installer, and this decision closes it.
+    #[test]
+    fn an_explicit_check_can_never_reach_the_installer() {
+        assert_eq!(manual_update(true), ManualUpdate::Report);
+        assert_eq!(manual_update(false), ManualUpdate::Offer);
+    }
+
+    /// Both typed forms must perform a real check. The cache-aware entry point
+    /// exists for background detection only, so its name must not appear here
+    /// — answering a typed `--check` from a day-old cache is the bug this
+    /// module was fixed for.
+    #[test]
+    fn typed_update_commands_never_use_the_cache_aware_entry_point() {
+        // Only the non-test half of this file is the call graph under test.
+        let source = include_str!("commands.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !code.contains("cached_status"),
+            "CLI update commands must call check_now, not cached_status"
+        );
+        assert!(code.contains("service.check_now(now)"));
     }
 }

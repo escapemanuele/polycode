@@ -710,7 +710,9 @@ fn spawn_update_check() -> Receiver<UpdateOutcome> {
             return;
         };
         let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
-        let info = service.status(now).available().cloned();
+        // Background detection stays cache-aware: it is not a check the user
+        // asked for, and it must never make starting the TUI wait on GitHub.
+        let info = service.cached_status(now).available().cloned();
         // Install source is only interesting when an update exists.
         let source = info
             .as_ref()
