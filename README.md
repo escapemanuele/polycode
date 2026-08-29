@@ -43,11 +43,11 @@ polycode doctor
 ### Update
 
 Polycode checks for new official releases automatically, at most once a day, and stays
-quiet when there is nothing to say.
+quiet when there is nothing to say. Asking it yourself always checks now.
 
 ```bash
-polycode update --check   # report status, change nothing
-polycode update           # install after explicit confirmation
+polycode update --check   # check now, report, change nothing
+polycode update           # check now, install after explicit confirmation
 ```
 
 See [Updates](#updates) for what a check sends and how to switch it off.
@@ -363,11 +363,12 @@ leaves the status unknown and startup continues unchanged.
 
 The result is cached under the Polycode data directory (`$POLYCODE_DATA_DIR`, else
 `~/.polycode/update.json`), never inside a repository you are working in and never in
-the run database.
+the run database. That cache only serves the automatic check — a command you type
+always performs a fresh one, so a release published minutes ago is reported as such.
 
 ```bash
-polycode update --check   # report status, change nothing
-polycode update           # install after explicit confirmation, where supported
+polycode update --check   # check now, report, change nothing
+polycode update           # check now, install after explicit confirmation, where supported
 polycode update --yes     # install without the prompt
 ```
 
@@ -379,7 +380,9 @@ SHA-256 against the release's `SHA256SUMS`, checks the staged binary reports the
 version the release claims, and only then renames it into place; the running process
 keeps using the binary it already loaded, and the new one is used at the next start.
 
-Disable automatic checks entirely:
+Switch update checking off. This is a full kill switch, not only a background one:
+while it is set, `polycode update` and `polycode update --check` also stop reaching
+the network and report that checks are disabled.
 
 ```bash
 export POLYCODE_DISABLE_UPDATE_CHECK=1
