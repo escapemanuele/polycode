@@ -56,3 +56,16 @@ pub enum EngineError {
     #[error("provider checkpoint counter overflow")]
     CheckpointOverflow,
 }
+
+impl EngineError {
+    /// Whether this is an optimistic-concurrency loss beneath the engine.
+    /// Delegated downwards so a new nesting needs no change here.
+    #[must_use]
+    pub const fn is_lost_revision(&self) -> bool {
+        match self {
+            Self::Store(error) => error.is_lost_revision(),
+            Self::Process(error) => error.is_lost_revision(),
+            _ => false,
+        }
+    }
+}
