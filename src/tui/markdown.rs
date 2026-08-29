@@ -28,7 +28,7 @@ pub(crate) fn render_markdown(source: &str) -> Vec<Line<'static>> {
         if in_fence {
             lines.push(Line::from(Span::styled(
                 format!("{CODE_INDENT}{raw}"),
-                Style::default().fg(theme::ACCENT),
+                Style::default().fg(theme::accent()),
             )));
             continue;
         }
@@ -44,7 +44,7 @@ fn block_line(raw: &str, trimmed: &str) -> Line<'static> {
     if is_separator(trimmed) {
         return Line::from(Span::styled(
             "─".repeat(32),
-            Style::default().fg(theme::MUTED),
+            Style::default().fg(theme::muted_color()),
         ));
     }
     if let Some(heading) = heading_line(trimmed) {
@@ -54,11 +54,14 @@ fn block_line(raw: &str, trimmed: &str) -> Line<'static> {
         .strip_prefix("> ")
         .or_else(|| trimmed.strip_prefix('>'))
     {
-        let mut spans = vec![Span::styled("│ ", Style::default().fg(theme::MUTED))];
+        let mut spans = vec![Span::styled(
+            "│ ",
+            Style::default().fg(theme::muted_color()),
+        )];
         spans.extend(inline_spans(
             rest,
             Style::default()
-                .fg(theme::MUTED)
+                .fg(theme::muted_color())
                 .add_modifier(Modifier::ITALIC),
         ));
         return Line::from(spans);
@@ -87,7 +90,7 @@ fn heading_line(trimmed: &str) -> Option<Line<'static>> {
     let text = trimmed[hashes..].strip_prefix(' ')?;
     let style = if hashes <= 2 {
         Style::default()
-            .fg(theme::ACCENT)
+            .fg(theme::accent())
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
@@ -141,7 +144,7 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
                 flush(&mut spans, &mut plain, base);
                 spans.push(Span::styled(
                     after[..end].to_owned(),
-                    base.fg(theme::ATTENTION),
+                    base.fg(theme::attention()),
                 ));
                 remainder = &after[end + 1..];
             } else {
@@ -216,7 +219,7 @@ mod tests {
         let lines = render_markdown("# Top");
         assert_eq!(
             lines[0].spans[0].style.fg,
-            Some(theme::ACCENT),
+            Some(theme::accent()),
             "H1 is prominent"
         );
     }
@@ -243,7 +246,7 @@ mod tests {
             .iter()
             .find(|span| span.content == "cargo test")
             .unwrap();
-        assert_eq!(code.style.fg, Some(theme::ATTENTION));
+        assert_eq!(code.style.fg, Some(theme::attention()));
         assert!(!rendered_text("run `cargo test` now").contains('`'));
     }
 

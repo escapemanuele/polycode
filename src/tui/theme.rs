@@ -9,25 +9,169 @@ use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+/// What the terminal can actually paint. Detected once at startup; the
+/// palette is chosen from it, so nothing downstream has to ask again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColorCapability {
+    /// No color at all: `NO_COLOR`, a dumb terminal, or output the user has
+    /// asked to keep plain. Every semantic token collapses to the terminal's
+    /// own foreground, so meaning has to survive on glyphs and words alone.
+    Mono,
+    /// The sixteen ANSI colors, named rather than specified — they resolve to
+    /// whatever the user's terminal theme defines, so Polycode sits inside
+    /// their palette instead of imposing one.
+    Ansi16,
+}
+
+impl ColorCapability {
+    /// Resolves capability from the environment, taking the values rather
+    /// than reading them, so the decision is testable without mutating the
+    /// process environment.
+    ///
+    /// `NO_COLOR` follows the convention at no-color.org: present and
+    /// non-empty disables color regardless of its value.
+    pub(crate) fn resolve(no_color: Option<&str>, term: Option<&str>) -> Self {
+        if no_color.is_some_and(|value| !value.is_empty()) || term == Some("dumb") {
+            return Self::Mono;
+        }
+        Self::Ansi16
+    }
+
+    /// Reads the process environment. Kept separate from `resolve` so the
+    /// policy stays a pure function.
+    pub(crate) fn from_environment() -> Self {
+        Self::resolve(
+            std::env::var("NO_COLOR").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+        )
+    }
+}
+
+/// The eight semantic tokens, materialised for one capability. Code names the
+/// meaning; only this struct knows the hue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Palette {
+    accent: Color,
+    success: Color,
+    attention: Color,
+    danger: Color,
+    suspended: Color,
+    muted: Color,
+    structure: Color,
+    chip_fg: Color,
+}
+
+impl Palette {
+    pub(crate) const fn for_capability(capability: ColorCapability) -> Self {
+        match capability {
+            ColorCapability::Ansi16 => Self {
+                // Primary Polycode accent: active work, current stage,
+                // product identity.
+                accent: Color::Cyan,
+                // Completion, verified artifacts, apply.
+                success: Color::Green,
+                // The run needs the user. Never used for failure.
+                attention: Color::Yellow,
+                // Failure and destructive actions.
+                danger: Color::Red,
+                // Suspended work: paused and interrupted.
+                suspended: Color::Magenta,
+                // Secondary labels, metadata, structure, inactive connectors.
+                muted: Color::DarkGray,
+                // Structural framing and the architecture role accent. Kept
+                // distinct from the accent so framework reads as structure,
+                // not focus, and never competes with the one active-work
+                // accent per screen.
+                structure: Color::Blue,
+                // Foreground of a reversed chip: black on the chip's own
+                // color keeps its word legible on any accent hue.
+                chip_fg: Color::Black,
+            },
+            // Every token is the terminal's own foreground. Surfaces that
+            // relied on hue alone become indistinguishable here — which is
+            // the point: the monochrome test reads this palette to prove the
+            // interface still tells the truth without color.
+            ColorCapability::Mono => Self {
+                accent: Color::Reset,
+                success: Color::Reset,
+                attention: Color::Reset,
+                danger: Color::Reset,
+                suspended: Color::Reset,
+                muted: Color::Reset,
+                structure: Color::Reset,
+                // A reversed chip still inverts, so its text takes the
+                // background the terminal paints behind it.
+                chip_fg: Color::Reset,
+            },
+        }
+    }
+}
+
+thread_local! {
+    /// The palette this thread paints with. Thread-local rather than global
+    /// so a test can render one variant monochrome without disturbing the
+    /// others; the TUI resolves it once at startup and never changes it.
+    static PALETTE: std::cell::Cell<Palette> =
+        const { std::cell::Cell::new(Palette::for_capability(ColorCapability::Ansi16)) };
+}
+
+/// Installs the palette for this thread. Called once at TUI startup.
+pub(crate) fn set_palette(palette: Palette) {
+    PALETTE.with(|current| current.set(palette));
+}
+
+/// Runs `body` with `palette` installed, restoring the previous one even if
+/// `body` panics. Tests render monochrome without leaking that choice into
+/// whatever else the harness runs on this thread.
+#[cfg(test)]
+pub(crate) fn with_palette<T>(palette: Palette, body: impl FnOnce() -> T) -> T {
+    struct Restore(Palette);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_palette(self.0);
+        }
+    }
+    let _restore = Restore(self::palette());
+    set_palette(palette);
+    body()
+}
+
+fn palette() -> Palette {
+    PALETTE.with(std::cell::Cell::get)
+}
+
 /// Primary Polycode accent: active work, current stage, product identity.
-pub(crate) const ACCENT: Color = Color::Cyan;
+pub(crate) fn accent() -> Color {
+    palette().accent
+}
 /// Completion, verified artifacts, apply.
-pub(crate) const SUCCESS: Color = Color::Green;
+pub(crate) fn success() -> Color {
+    palette().success
+}
 /// The run needs the user. Never used for failure.
-pub(crate) const ATTENTION: Color = Color::Yellow;
+pub(crate) fn attention() -> Color {
+    palette().attention
+}
 /// Failure and destructive actions.
-pub(crate) const DANGER: Color = Color::Red;
+pub(crate) fn danger() -> Color {
+    palette().danger
+}
 /// Suspended work: paused and interrupted.
-pub(crate) const SUSPENDED: Color = Color::Magenta;
+pub(crate) fn suspended() -> Color {
+    palette().suspended
+}
 /// Secondary labels, metadata, structure, inactive pipeline connectors.
-pub(crate) const MUTED: Color = Color::DarkGray;
-/// Structural framing and the architecture role accent: diff hunk headers and
-/// POD designing. Kept distinct from ACCENT so framework reads as structure,
-/// not focus, and never competes with the one active-work accent per screen.
-pub(crate) const STRUCTURE: Color = Color::Blue;
-/// Foreground of a reversed chip: black on the chip's own color keeps its word
-/// legible on any accent hue.
-pub(crate) const CHIP_FG: Color = Color::Black;
+pub(crate) fn muted_color() -> Color {
+    palette().muted
+}
+/// Structural framing and the architecture role accent.
+pub(crate) fn structure() -> Color {
+    palette().structure
+}
+/// Foreground of a reversed chip.
+pub(crate) fn chip_fg() -> Color {
+    palette().chip_fg
+}
 
 /// Primary content: the terminal's own foreground.
 pub(crate) fn text() -> Style {
@@ -36,7 +180,7 @@ pub(crate) fn text() -> Style {
 
 /// Secondary content: labels, metadata, connectors, quiet hints.
 pub(crate) fn muted() -> Style {
-    Style::default().fg(MUTED)
+    Style::default().fg(muted_color())
 }
 
 /// Section label inside a panel — the only structural device that replaces a
@@ -44,7 +188,9 @@ pub(crate) fn muted() -> Style {
 pub(crate) fn section(label: &str) -> Line<'static> {
     Line::from(Span::styled(
         label.to_owned(),
-        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(muted_color())
+            .add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -55,7 +201,7 @@ pub(crate) fn chip(label: &str, color: Color) -> Span<'static> {
         format!(" {label} "),
         Style::default()
             .bg(color)
-            .fg(CHIP_FG)
+            .fg(chip_fg())
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -73,14 +219,16 @@ pub(crate) fn action(key: &str, label: &str, color: Color) -> Vec<Span<'static>>
 pub(crate) fn rule(width: u16) -> Line<'static> {
     Line::from(Span::styled(
         "─".repeat(width as usize),
-        Style::default().fg(MUTED),
+        Style::default().fg(muted_color()),
     ))
 }
 
 /// Diff hunk header — the `diff --git` line and the `@@` range: structural
 /// framing in bold so it reads as a boundary, not as changed content.
 pub(crate) fn diff_hunk() -> Style {
-    Style::default().fg(STRUCTURE).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(structure())
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Centered short rule, used to seat POD under the pipeline instead of
@@ -89,7 +237,7 @@ pub(crate) fn centered_rule(width: u16) -> Line<'static> {
     let span = width.saturating_sub(4).clamp(4, 14);
     Line::from(Span::styled(
         "─".repeat(span as usize),
-        Style::default().fg(MUTED),
+        Style::default().fg(muted_color()),
     ))
     .alignment(Alignment::Center)
 }
@@ -116,6 +264,78 @@ pub(crate) fn spread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_color_and_dumb_terminals_resolve_to_monochrome() {
+        // The no-color.org convention: present and non-empty, whatever the
+        // value. An empty NO_COLOR is explicitly not a request for mono.
+        assert_eq!(
+            ColorCapability::resolve(Some("1"), None),
+            ColorCapability::Mono
+        );
+        assert_eq!(
+            ColorCapability::resolve(Some("0"), None),
+            ColorCapability::Mono
+        );
+        assert_eq!(
+            ColorCapability::resolve(Some(""), None),
+            ColorCapability::Ansi16
+        );
+        assert_eq!(
+            ColorCapability::resolve(None, None),
+            ColorCapability::Ansi16
+        );
+        assert_eq!(
+            ColorCapability::resolve(None, Some("xterm-256color")),
+            ColorCapability::Ansi16
+        );
+        assert_eq!(
+            ColorCapability::resolve(None, Some("dumb")),
+            ColorCapability::Mono
+        );
+    }
+
+    /// Under Mono every token is the same colour, so anything that survives
+    /// there is carried by a glyph or a word. This is what lets the palette
+    /// grow later without the aesthetic layer quietly acquiring meaning.
+    #[test]
+    fn the_monochrome_palette_leaves_no_token_distinguishable_by_colour() {
+        let mono = Palette::for_capability(ColorCapability::Mono);
+        let tokens = [
+            mono.accent,
+            mono.success,
+            mono.attention,
+            mono.danger,
+            mono.suspended,
+            mono.muted,
+            mono.structure,
+            mono.chip_fg,
+        ];
+        for token in tokens {
+            assert_eq!(
+                token, tokens[0],
+                "a token that keeps its own hue under Mono can still smuggle meaning in colour"
+            );
+        }
+
+        // And the coloured palette must genuinely distinguish them, or the
+        // monochrome check above would be vacuous.
+        let ansi = Palette::for_capability(ColorCapability::Ansi16);
+        let coloured = [
+            ansi.accent,
+            ansi.success,
+            ansi.attention,
+            ansi.danger,
+            ansi.suspended,
+            ansi.muted,
+            ansi.structure,
+        ];
+        for (index, token) in coloured.iter().enumerate() {
+            for other in coloured.iter().skip(index + 1) {
+                assert_ne!(token, other, "semantic tokens must not share a hue");
+            }
+        }
+    }
 
     #[test]
     fn spread_pushes_the_secondary_half_to_the_right_edge() {
@@ -148,11 +368,11 @@ mod tests {
     #[test]
     fn chips_and_actions_carry_a_word_not_only_a_color() {
         assert!(
-            chip("READY TO REVIEW", SUCCESS)
+            chip("READY TO REVIEW", success())
                 .content
                 .contains("READY TO REVIEW")
         );
-        let spans = action("a", "Apply changes", SUCCESS);
+        let spans = action("a", "Apply changes", success());
         let rendered: String = spans.iter().map(|span| span.content.as_ref()).collect();
         assert_eq!(rendered, "[a] Apply changes");
     }

@@ -16,6 +16,12 @@ pub(crate) struct TerminalSession {
 
 impl TerminalSession {
     pub(crate) fn enter() -> io::Result<Self> {
+        // Resolved once, before the first frame: the terminal's colour
+        // capability cannot change under us, and every surface reads the
+        // palette rather than asking the environment again.
+        super::theme::set_palette(super::theme::Palette::for_capability(
+            super::theme::ColorCapability::from_environment(),
+        ));
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {
