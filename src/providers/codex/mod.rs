@@ -255,7 +255,11 @@ impl<B: ProcessBackend> CodexProvider<B> {
         if inspection.process.status().is_active() {
             return Ok(ProviderPoll::Pending);
         }
-        if !chunk.bytes().is_empty() {
+        // Execution cannot act on half a record, so it says so. Observation
+        // can: a truncated record is how this process died, not a reason to
+        // refuse to stop the run. Raising here instead leaves a run whose
+        // Codex process was killed mid-write permanently unstoppable.
+        if !chunk.bytes().is_empty() && !request.observe_only() {
             return Err(CodexProviderError::Protocol(
                 "Codex process ended with incomplete JSON record".to_owned(),
             ));
@@ -913,6 +917,37 @@ mod tests {
             1
         );
         assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
+    }
+
+    /// A Codex process killed mid-write leaves half a record behind. Execution
+    /// cannot act on it and says so; a stop must still be able to stop the
+    /// run, or the truncation makes it unstoppable for good.
+    #[test]
+    fn a_truncated_record_is_reported_by_execution_and_survived_by_a_stop() {
+        let truncated = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"thread-A\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"typ"
+        );
+        let (_temp, _database, run_id, mut store, provider) = fixture(truncated);
+        let mut engine = WorkflowEngine::new(provider, "fixture task");
+
+        let failure = loop {
+            match engine.drive(&mut store, run_id) {
+                Ok(EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. }) => {}
+                Ok(status) => panic!("execution must not settle on half a record: {status:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            failure
+                .to_string()
+                .contains("ended with incomplete JSON record"),
+            "execution reports what it cannot parse: {failure}"
+        );
+
+        engine
+            .drive_observing(&mut store, run_id)
+            .expect("observing a process that died mid-record must not fail the stop");
     }
 
     #[test]
