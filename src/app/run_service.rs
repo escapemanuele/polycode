@@ -20,6 +20,11 @@ use super::{
 
 const DIFF_PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
 const PROCESS_LOG_TAIL_LIMIT: usize = 256 * 1024;
+/// How many times a stop retries after losing a revision race with the process
+/// that is still driving the run. Small: the driver is being interrupted, so
+/// contention ends quickly.
+const STOP_CONCURRENCY_ATTEMPTS: u32 = 5;
+const STOP_CONCURRENCY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -285,6 +290,30 @@ where
     /// Returns reconciliation, process, lifecycle, or store errors. Runs that
     /// have reached a terminal disposition cannot be stopped.
     pub fn stop_run(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
+        // A run is normally stopped while another Polycode process is still
+        // driving it, and that driver keeps reconciling the same managed
+        // process rows. Losing an optimistic-concurrency race here used to
+        // abort the stop after the provider had already been signalled,
+        // reporting failure while leaving the run marked Running with an
+        // interrupted stage. Retry the whole stop instead: every step is
+        // idempotent, so a later attempt observes the newer revisions and
+        // commits the run-level interruption the user asked for.
+        let mut attempt = 0;
+        loop {
+            match self.stop_run_once(run_id) {
+                Err(error) if error.is_concurrent_modification() => {
+                    attempt += 1;
+                    if attempt >= STOP_CONCURRENCY_ATTEMPTS {
+                        return Err(error);
+                    }
+                    std::thread::sleep(STOP_CONCURRENCY_BACKOFF);
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    fn stop_run_once(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
         self.reconcile(&mut store, run_id)?;
@@ -305,7 +334,19 @@ where
                 process_manager.interrupt(&mut store, process.id())?;
             }
         }
+        // Signalling the provider is not the same as recording that the stage
+        // stopped. Let the engine observe the now-interrupted processes and
+        // commit the stage-level interruption before the run-level one.
+        // ResumeAction::Continue is deliberate: this pass must only reconcile
+        // what already happened, never resume or start anything. Without it
+        // the stage still reads Running under an Interrupted run, and the
+        // first resume recovers only the run, leaving the user to issue
+        // resume a second time.
+        self.drive(&mut store, run_id, ResumeAction::Continue)?;
         let loaded = store.load_run(run_id)?;
+        if loaded.run.status() == RunStatus::Interrupted {
+            return Self::report(&mut store, run_id, before, None);
+        }
         let mut run = loaded.run;
         let at = now();
         let event = run.transition(
@@ -485,11 +526,15 @@ where
                 RunStatus::Interrupted => {
                     engine.recover_run(store, run_id)?;
                 }
-                RunStatus::Running => {
-                    resume_suspended_stages(&mut engine, store, &loaded.run)?;
-                }
                 _ => {}
             }
+            // Recovering the run cascades stage *status* in the domain, but a
+            // provider-backed stage also has to be resumed through the engine.
+            // Reload so the cascade is visible, then bring every suspended
+            // stage back in this same call — otherwise a stopped run reports
+            // Running and needs a second resume to actually continue.
+            let reloaded = store.load_run(run_id)?;
+            resume_suspended_stages(&mut engine, store, &reloaded.run)?;
         }
         Ok(Some(drive_attached(&mut engine, store, run_id)?))
     }
@@ -1318,10 +1363,24 @@ mod tests {
             .resume_run(run_id)
             .unwrap();
         assert_eq!(resumed.details.id, run_id, "the same logical run continues");
+        // One resume must recover the run AND its stages. Asserting merely
+        // "no longer Interrupted" at the run level hid a real defect: the
+        // run-level recovery landed while the stage stayed suspended, so the
+        // run sat in Running and the user had to issue resume a second time.
+        // This scenario blocks on its delay gate, so Running is the correct
+        // resting state here — what matters is that no stage is left behind.
         assert_ne!(
             resumed.details.status,
             RunStatus::Interrupted,
             "recovery leaves the interrupted state"
+        );
+        assert!(
+            resumed
+                .details
+                .stages
+                .iter()
+                .all(|stage| stage.status != StageStatus::Interrupted),
+            "one resume left a stage suspended, forcing a second resume"
         );
         assert_eq!(
             attempt_count(&fixture, run_id),

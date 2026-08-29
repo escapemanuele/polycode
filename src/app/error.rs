@@ -64,3 +64,57 @@ pub enum AppError {
     #[error("run {run_id} has no stage {stage_id}")]
     StageNotFound { run_id: RunId, stage_id: StageId },
 }
+
+impl AppError {
+    /// Whether this error is an optimistic-concurrency loss rather than a real
+    /// failure. Callers that are safe to repeat — every step of a stop is
+    /// idempotent — retry instead of surfacing a revision number to the user.
+    #[must_use]
+    pub fn is_concurrent_modification(&self) -> bool {
+        matches!(
+            self,
+            Self::Store(StoreError::ConcurrentModification { .. })
+                | Self::Process(
+                    ProcessError::ConcurrentModification { .. }
+                        | ProcessError::CursorConcurrentModification { .. }
+                )
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::RunId;
+    use crate::process::ManagedProcessId;
+
+    // The stop path retries only what this predicate classifies as a lost
+    // revision race. If an arm is dropped, stop silently goes back to
+    // aborting mid-way and reporting a revision number to the user, so the
+    // classification is pinned here rather than only through the racy
+    // end-to-end fixture.
+    #[test]
+    fn only_lost_revision_races_are_retryable() {
+        assert!(
+            AppError::Store(StoreError::ConcurrentModification {
+                run_id: RunId::new(),
+                expected: 3,
+            })
+            .is_concurrent_modification()
+        );
+        assert!(
+            AppError::Process(ProcessError::ConcurrentModification {
+                process_id: ManagedProcessId::new(),
+                expected: 3,
+            })
+            .is_concurrent_modification()
+        );
+
+        // A real refusal must never be retried into success.
+        assert!(
+            !AppError::RunNotStoppable(RunId::new(), crate::domain::RunStatus::Completed)
+                .is_concurrent_modification()
+        );
+        assert!(!AppError::DirtySourceRepository.is_concurrent_modification());
+    }
+}
