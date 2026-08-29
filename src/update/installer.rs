@@ -57,6 +57,21 @@ pub enum InstallError {
     Replace(String),
 }
 
+/// Whether the installed executable was recorded as officially managed.
+///
+/// Binary replacement and receipt persistence are separate facts, and this
+/// keeps them separate: claiming a fully successful self-update after the
+/// receipt failed would leave the next process unrecognized with no
+/// explanation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Registration {
+    /// The receipt names the installed executable; self-update stays available.
+    Recorded,
+    /// The binary is installed and working, but automatic updates are not
+    /// registered for it.
+    Failed(String),
+}
+
 /// A completed installation. The running process keeps executing the binary
 /// it already loaded; the new one takes effect on the next start.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +79,7 @@ pub struct Installed {
     pub version: Version,
     pub executable: PathBuf,
     pub asset: String,
+    pub registration: Registration,
 }
 
 impl Installed {
@@ -74,6 +90,20 @@ impl Installed {
             "Update installed. Polycode {} will be used next time you start it.",
             self.version
         )
+    }
+
+    /// Present only when the executable was replaced but its registration was
+    /// not. Callers must show it: the alternative is a silent loss of
+    /// automatic updates.
+    #[must_use]
+    pub fn registration_warning(&self) -> Option<String> {
+        match &self.registration {
+            Registration::Recorded => None,
+            Registration::Failed(reason) => Some(format!(
+                "Automatic updates are no longer registered for this installation ({reason}). \
+                 Re-run the Polycode installer to restore them."
+            )),
+        }
     }
 }
 
@@ -161,7 +191,13 @@ fn discard(path: &Path) {
     }
 }
 
-/// Downloads, verifies, and installs the release's binary over `executable`.
+/// Downloads, verifies, and installs the release's binary over `executable`,
+/// recording the result in the application's own receipt.
+///
+/// This is the production entry point; it resolves the receipt destination and
+/// defers to [`install_with_receipt_path`]. Tests must use that function with a
+/// fixture path instead, so no test can resolve — or overwrite — a real user's
+/// receipt.
 ///
 /// # Errors
 /// Returns a typed failure at the first problem. The existing executable is
@@ -169,6 +205,30 @@ fn discard(path: &Path) {
 pub fn install(
     release: &Release,
     executable: &Path,
+    downloader: &dyn AssetDownloader,
+    now: DateTime<Utc>,
+) -> Result<Installed, InstallError> {
+    let receipt_path = crate::store::install_receipt_file()
+        .map_err(|error| InstallError::Staging(error.to_string()))?;
+    install_with_receipt_path(release, executable, &receipt_path, downloader, now)
+}
+
+/// Downloads, verifies, and installs the release's binary over `executable`,
+/// writing the receipt to an explicit destination.
+///
+/// The receipt destination is a parameter rather than an ambient lookup so the
+/// installation transaction and the metadata it records are separable, and so
+/// a test can never reach a real receipt by omission.
+///
+/// # Errors
+/// Returns a typed failure at the first problem. The existing executable is
+/// untouched unless the function returns `Ok`. A receipt that cannot be
+/// written is *not* an error — the binary really was installed — but it is
+/// reported through [`Installed::registration`].
+pub fn install_with_receipt_path(
+    release: &Release,
+    executable: &Path,
+    receipt_path: &Path,
     downloader: &dyn AssetDownloader,
     now: DateTime<Utc>,
 ) -> Result<Installed, InstallError> {
@@ -207,19 +267,27 @@ pub fn install(
         return Err(InstallError::Replace(error.to_string()));
     }
 
+    // The executable is in place and verified. A receipt failure from here on
+    // is real but not fatal: destroying a working binary over metadata would
+    // be worse, so the outcome is reported instead of hidden.
     let receipt = InstallReceipt::new(
         executable.to_path_buf(),
         release.version.to_string(),
         asset_name,
         now,
     );
-    if let Ok(path) = crate::store::install_receipt_file() {
-        super::store_receipt(&path, &receipt);
-    }
+    let registration = match super::write_receipt(receipt_path, &receipt) {
+        Ok(()) => Registration::Recorded,
+        Err(error) => {
+            tracing::warn!(%error, "install receipt not persisted");
+            Registration::Failed(error.to_string())
+        }
+    };
     Ok(Installed {
         version: release.version.clone(),
         executable: executable.to_path_buf(),
         asset: asset_name.to_owned(),
+        registration,
     })
 }
 
@@ -449,6 +517,19 @@ mod tests {
         (release, downloader, binary)
     }
 
+    /// Fixture-local receipt destination. Nothing in these tests may resolve
+    /// the application receipt path, so a `cargo test` run cannot touch a real
+    /// installation's registration.
+    trait ReceiptFixture {
+        fn receipt(&self) -> PathBuf;
+    }
+
+    impl ReceiptFixture for TempDir {
+        fn receipt(&self) -> PathBuf {
+            self.path().join("data").join("install.json")
+        }
+    }
+
     fn existing(fixture: &TempDir) -> PathBuf {
         let path = fixture.path().join("polycode");
         std::fs::write(&path, b"#!/bin/sh\necho \"polycode 0.1.0\"\n").unwrap();
@@ -502,7 +583,14 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
         let fixture = TempDir::new().unwrap();
         let executable = existing(&fixture);
         let (release, downloader, binary) = healthy("0.2.0");
-        let installed = install(&release, &executable, &downloader, now()).unwrap();
+        let installed = install_with_receipt_path(
+            &release,
+            &executable,
+            &fixture.receipt(),
+            &downloader,
+            now(),
+        )
+        .unwrap();
 
         assert_eq!(installed.version.to_string(), "0.2.0");
         assert_eq!(std::fs::read(&executable).unwrap(), binary);
@@ -519,6 +607,117 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
         );
     }
 
+    /// The field failure this seam exists to prevent: an installer unit test
+    /// writing its fixture receipt into a real user's data directory. A
+    /// sentinel standing in for `~/.polycode/install.json` must survive a full
+    /// install byte for byte.
+    #[test]
+    fn an_installer_test_can_never_reach_a_receipt_outside_its_fixture() {
+        let user = TempDir::new().unwrap();
+        let sentinel = user.path().join("install.json");
+        let real = "{\n  \"schema_version\": 1,\n  \"executable\": \"/Users/e/.local/bin/polycode\",\n  \"version\": \"0.1.3\"\n}\n";
+        std::fs::write(&sentinel, real).unwrap();
+
+        let fixture = TempDir::new().unwrap();
+        let executable = existing(&fixture);
+        let (release, downloader, _) = healthy("0.2.0");
+        let installed = install_with_receipt_path(
+            &release,
+            &executable,
+            &fixture.receipt(),
+            &downloader,
+            now(),
+        )
+        .unwrap();
+
+        assert_eq!(installed.registration, Registration::Recorded);
+        assert!(
+            fixture.receipt().is_file(),
+            "the fixture receipt is written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            real,
+            "a receipt outside the fixture is never touched"
+        );
+    }
+
+    #[test]
+    fn a_receipt_that_cannot_be_written_is_reported_rather_than_hidden() {
+        let fixture = TempDir::new().unwrap();
+        let executable = existing(&fixture);
+        // A regular file where the receipt's parent directory must go, so
+        // creating it fails and the write cannot succeed.
+        let blocked = fixture.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let receipt_path = blocked.join("install.json");
+
+        let (release, downloader, binary) = healthy("0.2.0");
+        let installed =
+            install_with_receipt_path(&release, &executable, &receipt_path, &downloader, now())
+                .unwrap();
+
+        // The binary really was installed; pretending otherwise would be just
+        // as untruthful as claiming full success.
+        assert_eq!(std::fs::read(&executable).unwrap(), binary);
+        assert!(matches!(installed.registration, Registration::Failed(_)));
+        let warning = installed
+            .registration_warning()
+            .expect("a failed registration must be surfaced");
+        assert!(warning.contains("no longer registered"));
+        assert!(
+            !installed.restart_notice().is_empty(),
+            "the restart notice still describes what did happen"
+        );
+    }
+
+    #[test]
+    fn a_successful_install_reports_registration_and_offers_no_warning() {
+        let fixture = TempDir::new().unwrap();
+        let executable = existing(&fixture);
+        let (release, downloader, _) = healthy("0.2.0");
+        let installed = install_with_receipt_path(
+            &release,
+            &executable,
+            &fixture.receipt(),
+            &downloader,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(installed.registration, Registration::Recorded);
+        assert!(installed.registration_warning().is_none());
+    }
+
+    #[test]
+    fn a_failed_receipt_write_leaves_the_previous_receipt_intact() {
+        let fixture = TempDir::new().unwrap();
+        let path = fixture.path().join("install.json");
+        let good = InstallReceipt::new(
+            PathBuf::from("/usr/local/bin/polycode"),
+            "0.1.3",
+            "polycode-aarch64-apple-darwin",
+            now(),
+        );
+        super::super::write_receipt(&path, &good).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // A directory where the temporary file must go makes the write fail
+        // after the previous receipt already exists.
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        let replacement = InstallReceipt::new(
+            PathBuf::from("/usr/local/bin/polycode"),
+            "9.9.9",
+            "polycode-aarch64-apple-darwin",
+            now(),
+        );
+        assert!(super::super::write_receipt(&path, &replacement).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "an interrupted write never truncates the valid receipt"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_installed_binary_is_executable() {
@@ -526,7 +725,14 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
         let fixture = TempDir::new().unwrap();
         let executable = existing(&fixture);
         let (release, downloader, _) = healthy("0.2.0");
-        install(&release, &executable, &downloader, now()).unwrap();
+        install_with_receipt_path(
+            &release,
+            &executable,
+            &fixture.receipt(),
+            &downloader,
+            now(),
+        )
+        .unwrap();
         let mode = std::fs::metadata(&executable).unwrap().permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "owner, group, and other can execute");
     }
@@ -548,7 +754,14 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
                 format!("{}  {name}\n", "0".repeat(64)).as_bytes(),
             ),
         ]);
-        let error = install(&release, &executable, &downloader, now()).unwrap_err();
+        let error = install_with_receipt_path(
+            &release,
+            &executable,
+            &fixture.receipt(),
+            &downloader,
+            now(),
+        )
+        .unwrap_err();
         assert!(matches!(error, InstallError::ChecksumMismatch { .. }));
         assert_eq!(std::fs::read(&executable).unwrap(), original);
         assert!(
@@ -568,7 +781,14 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
             &format!("https://example.invalid/{name}"),
             fake_binary("0.2.0").as_slice(),
         )]);
-        let error = install(&release, &executable, &downloader, now()).unwrap_err();
+        let error = install_with_receipt_path(
+            &release,
+            &executable,
+            &fixture.receipt(),
+            &downloader,
+            now(),
+        )
+        .unwrap_err();
         assert!(matches!(error, InstallError::MissingChecksums(_)));
         assert_eq!(std::fs::read(&executable).unwrap(), original);
     }
@@ -590,7 +810,14 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
             ),
         ]);
         assert!(matches!(
-            install(&release, &executable, &downloader, now()).unwrap_err(),
+            install_with_receipt_path(
+                &release,
+                &executable,
+                &fixture.receipt(),
+                &downloader,
+                now()
+            )
+            .unwrap_err(),
             InstallError::MissingChecksum(_)
         ));
     }
@@ -602,7 +829,14 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
         let release = release("0.2.0", vec![asset(CHECKSUM_ASSET)]);
         let downloader = FakeDownloader::new(&[]);
         assert!(matches!(
-            install(&release, &executable, &downloader, now()).unwrap_err(),
+            install_with_receipt_path(
+                &release,
+                &executable,
+                &fixture.receipt(),
+                &downloader,
+                now()
+            )
+            .unwrap_err(),
             InstallError::MissingAsset(_, _)
         ));
         assert!(!fixture.path().join(".polycode.update").exists());
@@ -629,7 +863,14 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
                 manifest.as_bytes(),
             ),
         ]);
-        let error = install(&release, &executable, &downloader, now()).unwrap_err();
+        let error = install_with_receipt_path(
+            &release,
+            &executable,
+            &fixture.receipt(),
+            &downloader,
+            now(),
+        )
+        .unwrap_err();
         assert!(matches!(error, InstallError::VersionMismatch { .. }));
         assert_eq!(std::fs::read(&executable).unwrap(), original);
         assert!(!fixture.path().join(".polycode.update").exists());
@@ -647,11 +888,45 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *polycode-aarch
             format!("{}  {name}\n", "a".repeat(64)).as_bytes(),
         )]);
         assert!(matches!(
-            install(&release, &executable, &downloader, now()).unwrap_err(),
+            install_with_receipt_path(
+                &release,
+                &executable,
+                &fixture.receipt(),
+                &downloader,
+                now()
+            )
+            .unwrap_err(),
             InstallError::Download(_)
         ));
         assert_eq!(std::fs::read(&executable).unwrap(), original);
         assert!(!fixture.path().join(".polycode.update").exists());
+    }
+
+    /// Structural fence for the whole module: the production wrapper resolves
+    /// the real receipt path, so no test here may call it.
+    #[test]
+    fn no_test_in_this_module_uses_the_production_receipt_path() {
+        let source = include_str!("installer.rs");
+        let tests = source
+            .split("#[cfg(test)]")
+            .nth(1)
+            .expect("this module has tests");
+        let bare_calls = tests
+            .match_indices("install(")
+            .filter(|(index, _)| {
+                // `install_with_receipt_path(` also ends in `install(`-free
+                // text; only a call spelled exactly `install(` counts.
+                !tests[..*index].ends_with('_')
+            })
+            .count();
+        assert_eq!(
+            bare_calls, 0,
+            "installer tests must call install_with_receipt_path with a fixture destination"
+        );
+        assert!(
+            !tests.contains("install_receipt_file"),
+            "no test may resolve the application receipt path"
+        );
     }
 
     #[test]

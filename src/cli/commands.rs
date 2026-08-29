@@ -127,6 +127,9 @@ fn register_official_install(executable: &std::path::Path, asset: Option<&str>) 
         |asset| asset,
     );
     let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    // A failed receipt write is returned as an error, so install.sh sees a
+    // non-zero exit and tells the user automatic updates were not registered
+    // rather than implying they were.
     let receipt = crate::update::register_official_install(executable, asset, now)?;
     println!(
         "registered {} as an official Polycode {} installation",
@@ -207,6 +210,9 @@ fn update(args: UpdateArgs) -> Result<()> {
     }
     let installed = install_update(info, now)?;
     println!("{}", installed.restart_notice());
+    if let Some(warning) = installed.registration_warning() {
+        println!("{warning}");
+    }
     Ok(())
 }
 
