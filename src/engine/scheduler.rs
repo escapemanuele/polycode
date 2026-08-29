@@ -522,6 +522,9 @@ where
                 if !emitted.is_empty() {
                     commit_execution(store, &loaded.run, loaded.revision, &emitted)?;
                 }
+                if self.observe_only && emitted.is_empty() {
+                    return self.observation_settled(&request, stage_id);
+                }
                 Ok(EngineStatus::Advanced {
                     run_status: loaded.run.status(),
                 })
@@ -544,11 +547,35 @@ where
                     )?);
                 }
                 commit_emission(store, &loaded, &emitted, &commit)?;
+                if self.observe_only && emitted.is_empty() {
+                    return self.observation_settled(&request, stage_id);
+                }
                 Ok(EngineStatus::Advanced {
                     run_status: loaded.run.status(),
                 })
             }
         }
+    }
+
+    /// Ends an observing drive that has stopped learning anything.
+    ///
+    /// Observation reports what it finds; it never moves the run forward. A
+    /// pass that records no event has reached its fixed point, and reporting it
+    /// as progress would spin the drive loop until the limit — a stage that is
+    /// still Ready keeps producing the same terminal fact about a process that
+    /// died before it ever started.
+    ///
+    /// # Errors
+    /// Returns provider failures raised while reading attachment.
+    fn observation_settled(
+        &mut self,
+        request: &ProviderRequest,
+        stage_id: &StageId,
+    ) -> Result<EngineStatus, EngineError> {
+        Ok(EngineStatus::WaitingForProvider {
+            stage_id: stage_id.clone(),
+            keep_attached: self.provider.keep_attached_for(request)?,
+        })
     }
 
     #[allow(
@@ -683,6 +710,14 @@ where
             // nothing to record keeps the stop from failing and leaving the
             // run torn: process interrupted while the run still reads Running.
             ProviderSignal::Interrupted if stage_status == StageStatus::Ready => {}
+            // The same window, reached by a launch that died rather than one
+            // that was interrupted. Only observation may treat this as nothing
+            // to record: a stop needs to finish, and the stage genuinely never
+            // started. Execution keeps raising, because there a launch that
+            // keeps dying is something the user has to be told about rather
+            // than something to silently retry.
+            ProviderSignal::Failed(_)
+                if self.observe_only && stage_status == StageStatus::Ready => {}
             ProviderSignal::Resumed if stage_status == StageStatus::Running => {
                 let session_id = session_id.ok_or_else(|| EngineError::ProviderProtocol {
                     stage_id: stage_id.clone(),

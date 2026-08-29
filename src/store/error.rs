@@ -140,3 +140,19 @@ pub enum StoreError {
     #[error("artifact file does not match persisted metadata: {0}")]
     ArtifactIntegrity(PathBuf),
 }
+
+impl StoreError {
+    /// Whether this is an optimistic-concurrency loss: the row moved under a
+    /// reader that had already decided what to write. Idempotent callers
+    /// repeat instead of surfacing a revision number.
+    #[must_use]
+    pub const fn is_lost_revision(&self) -> bool {
+        matches!(
+            self,
+            Self::ConcurrentModification { .. }
+                | Self::WorkspaceConcurrentModification { .. }
+                | Self::ApplyOperationConcurrentModification { .. }
+                | Self::ProviderSessionConcurrentModification { .. }
+        )
+    }
+}

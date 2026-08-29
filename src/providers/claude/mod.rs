@@ -152,18 +152,13 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             self.manager.start(store, orphan.id())?;
             return Ok(ProviderPoll::Pending);
         }
-        let command = if invocation == 1 {
-            let artifacts = store.list_artifacts(request.run_id())?;
-            let handoff = change_handoff::for_request(store, request)?;
-            command::initial(
-                &prompt::compose(request, &artifacts, handoff.as_ref())?,
-                self.model.as_ref(),
-                self.effort,
-            )
-        } else {
-            let native = session.native_session_id().ok_or_else(|| {
-                ClaudeProviderError::Protocol("resume has no native session ID".to_owned())
-            })?;
+        // What decides between a fresh command and a resume is whether there is
+        // a native session to resume, not which invocation this is. An
+        // invocation that died before Claude emitted init leaves the session
+        // without one, and starting over is the only thing left to do — keying
+        // on the invocation number would strand that stage on a resume it can
+        // never issue. Codex already selects this way.
+        let command = if let Some(native) = session.native_session_id() {
             let denials = session
                 .pending_attention()
                 .map(|pending| Self::pending_new_denials(store, &session, pending))
@@ -202,6 +197,14 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 self.model.as_ref(),
                 self.effort,
             )?
+        } else {
+            let artifacts = store.list_artifacts(request.run_id())?;
+            let handoff = change_handoff::for_request(store, request)?;
+            command::initial(
+                &prompt::compose(request, &artifacts, handoff.as_ref())?,
+                self.model.as_ref(),
+                self.effort,
+            )
         };
         let process = self.manager.prepare_with_input(
             store,
@@ -241,6 +244,15 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 session.status(),
                 ProviderSessionStatus::NeedsUser | ProviderSessionStatus::Interrupted
             ) && request.stage_status() == crate::domain::StageStatus::Running
+            {
+                return self.start_invocation(store, request, session);
+            }
+            // A stage stopped before it ever started keeps its Ready status,
+            // with the session left interrupted over a dead process. There is
+            // nothing to poll there and nothing to recover — the stage simply
+            // has to be launched again.
+            if session.status() == ProviderSessionStatus::Interrupted
+                && request.stage_status() == crate::domain::StageStatus::Ready
             {
                 return self.start_invocation(store, request, session);
             }
@@ -445,7 +457,11 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         chunk: OutputChunk,
         status: ManagedProcessStatus,
     ) -> Result<ProviderPoll, ClaudeProviderError> {
-        if session.native_session_id().is_none() {
+        // Execution cannot continue a session Claude never established, so it
+        // says so. Observation can: a stop is asking what happened, and "the
+        // invocation died before it ever started" is an answer, not a failure.
+        // Raising here instead would make the run unstoppable.
+        if session.native_session_id().is_none() && !request.observe_only() {
             return Err(ClaudeProviderError::Command {
                 operation: "session initialization",
                 message: format!(
@@ -880,6 +896,15 @@ mod tests {
     use crate::store::{ResolvedConfigSnapshot, RunInput};
     use crate::workspace::WorkspaceManager;
 
+    /// Holds the backend inside `start`, so a test can act on a run while its
+    /// process is durably persisted and its stage has not yet started. Real
+    /// process launches occupy that window for as long as the native CLI takes
+    /// to come up; here it is opened deterministically instead of raced for.
+    struct StartGate {
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
     #[derive(Clone, Default)]
     struct FixtureBackend {
         started: Arc<Mutex<HashSet<ManagedProcessId>>>,
@@ -889,6 +914,11 @@ mod tests {
         /// Files written when an invocation starts, simulating an approved
         /// native Edit taking effect in the worktree.
         effects: Arc<Mutex<BTreeMap<u32, (PathBuf, String)>>>,
+        /// Stdout for an invocation whose process then vanishes without exit
+        /// evidence, so a launch that dies before Claude announces itself can
+        /// be reproduced.
+        raw: Arc<Mutex<BTreeMap<u32, (String, bool)>>>,
+        gate: Arc<Mutex<Option<StartGate>>>,
     }
 
     impl FixtureBackend {
@@ -916,6 +946,33 @@ mod tests {
             self.started.lock().unwrap().len()
         }
 
+        fn set_vanishing_output(&self, invocation: u32, output: impl Into<String>) {
+            self.raw
+                .lock()
+                .unwrap()
+                .insert(invocation, (output.into(), false));
+        }
+
+        /// Output for an invocation whose process then exits normally, leaving
+        /// exit evidence but never having announced a session.
+        fn set_silent_exit(&self, invocation: u32, output: impl Into<String>) {
+            self.raw
+                .lock()
+                .unwrap()
+                .insert(invocation, (output.into(), true));
+        }
+
+        /// Freezes the next launch inside the backend. Returns the signal that
+        /// the launch has been reached and the handle that lets it proceed.
+        fn install_start_gate(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (reached, reached_rx) = std::sync::mpsc::channel();
+            let (release_tx, release) = std::sync::mpsc::channel();
+            *self.gate.lock().unwrap() = Some(StartGate { reached, release });
+            (reached_rx, release_tx)
+        }
+
         fn set_edit_effect(&self, invocation: u32, path: PathBuf, content: impl Into<String>) {
             self.effects
                 .lock()
@@ -941,8 +998,25 @@ mod tests {
         }
 
         fn start(&self, process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
+            // Nothing has been launched yet, and the process is already
+            // durably Starting: this is the window a stop can land in.
+            // One-shot: only the launch under test is held.
+            if let Some(gate) = self.gate.lock().unwrap().take() {
+                gate.reached.send(()).ok();
+                gate.release.recv().ok();
+            }
             if let Some((path, content)) = self.effects.lock().unwrap().get(&process.invocation()) {
                 std::fs::write(path, content)?;
+            }
+            // Deliberately not recorded as started: with no exit evidence and
+            // no owned session, this process reconciles to Missing, the way a
+            // supervisor session that disappeared under a live launch does.
+            if let Some((raw, exits)) = self.raw.lock().unwrap().get(&process.invocation()) {
+                std::fs::write(process.spec().stdout_path(), raw)?;
+                if *exits {
+                    self.started.lock().unwrap().insert(process.id());
+                }
+                return Ok(());
             }
             let scripted = self
                 .scripted
@@ -1047,6 +1121,175 @@ mod tests {
         fn cleanup(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
             Ok(())
         }
+    }
+
+    /// The race behind `a_stage_interrupted_before_it_starts_never_fails_the_stop`
+    /// is only worth handling if the state it describes is reachable. Rather
+    /// than race for it, the backend is held inside the launch and the durable
+    /// state is read from a second connection, exactly as a concurrent stop
+    /// would read it.
+    #[test]
+    fn the_launch_window_leaves_a_live_process_under_a_stage_that_is_still_ready() {
+        let backend = FixtureBackend::default();
+        let (temp, database, run_id, store, provider) = fixture_with_backend(backend.clone(), true);
+        let process_root = temp.path().join("runs");
+        let (reached, release) = backend.install_start_gate();
+
+        let driver = std::thread::spawn(move || {
+            let mut store = store;
+            let mut engine = WorkflowEngine::new(provider, "make fixture change");
+            engine.drive(&mut store, run_id)
+        });
+        // Bounded, so a launch that stops honouring the gate fails the test
+        // instead of hanging it.
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the driver must reach the backend launch");
+
+        let mut observer = SqliteStore::open(&database).unwrap();
+        let run = observer.load_run(run_id).unwrap().run;
+        let stage_id = crate::domain::StageId::new("implementation").unwrap();
+        assert_eq!(
+            run.stage(&stage_id).unwrap().status(),
+            crate::domain::StageStatus::Ready,
+            "the stage has not crossed the semantic Started boundary yet"
+        );
+        let processes = observer.list_managed_processes(run_id).unwrap();
+        assert_eq!(processes.len(), 1, "the process record is already durable");
+        assert!(
+            processes[0].status().is_active(),
+            "a concurrent stop would signal this process: {:?}",
+            processes[0].status()
+        );
+        assert_eq!(
+            backend.started_count(),
+            0,
+            "the window opens before anything is launched, not after"
+        );
+
+        // What a stop does once it has signalled the active processes: observe,
+        // never resume. The stage is still Ready, so the interruption the
+        // engine sees belongs to a stage that never semantically started.
+        let mut observing = WorkflowEngine::new(
+            claude_provider(backend.clone(), &process_root, true),
+            "make fixture change",
+        );
+        observing
+            .drive_observing(&mut observer, run_id)
+            .expect("observing a stage interrupted before it started must not fail the stop");
+        let run = observer.load_run(run_id).unwrap().run;
+        assert_eq!(
+            run.stage(&stage_id).unwrap().status(),
+            crate::domain::StageStatus::Ready,
+            "a stage that never started keeps its Ready status through a stop"
+        );
+        assert_eq!(
+            backend.started_count(),
+            0,
+            "an observing pass never launches anything"
+        );
+
+        release.send(()).unwrap();
+        driver.join().ok();
+    }
+
+    /// A launch that dies before Claude announces itself leaves a session with
+    /// no native ID. Execution says so and stops; a stop observes it and
+    /// records the interruption; and the next attempt has to start a fresh
+    /// command, because there is no native session left to resume.
+    #[test]
+    fn an_invocation_that_dies_before_init_is_stoppable_and_then_starts_over() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        // The launch vanished having written nothing at all.
+        backend.set_vanishing_output(1, "");
+        let mut engine = WorkflowEngine::new(provider, "make fixture change");
+
+        let failure = loop {
+            match engine.drive(&mut store, run_id) {
+                Ok(EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. }) => {}
+                Ok(status) => panic!("execution must not settle on a dead launch: {status:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            failure
+                .to_string()
+                .contains("before Claude emitted structured init"),
+            "execution reports what it cannot continue: {failure}"
+        );
+
+        // A stop must still be able to stop this run.
+        engine
+            .drive_observing(&mut store, run_id)
+            .expect("observing a launch that died before init must not fail the stop");
+        let stage_id = crate::domain::StageId::new("implementation").unwrap();
+
+        // The next attempt starts over instead of resuming a session that
+        // never existed.
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished { run_status } => {
+                    assert_eq!(run_status, RunStatus::Completed);
+                    break;
+                }
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+        assert_eq!(
+            store
+                .load_run(run_id)
+                .unwrap()
+                .run
+                .stage(&stage_id)
+                .unwrap()
+                .status(),
+            crate::domain::StageStatus::Completed
+        );
+    }
+
+    /// The same window reached by a launch that exited rather than vanished.
+    /// A stop still has to be able to stop the run; recovering the stage is
+    /// then a retry, because the invocation genuinely failed.
+    #[test]
+    fn a_launch_that_exits_before_init_still_lets_the_stop_finish() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), true);
+        backend.set_silent_exit(1, "");
+        let mut engine = WorkflowEngine::new(provider, "make fixture change");
+
+        let failure = loop {
+            match engine.drive(&mut store, run_id) {
+                Ok(EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. }) => {}
+                Ok(status) => panic!("execution must not settle on a dead launch: {status:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            failure
+                .to_string()
+                .contains("before Claude emitted structured init"),
+            "execution reports what it cannot continue: {failure}"
+        );
+
+        engine
+            .drive_observing(&mut store, run_id)
+            .expect("observing a launch that exited before init must not fail the stop");
+        let stage_id = crate::domain::StageId::new("implementation").unwrap();
+        assert_eq!(
+            store
+                .load_run(run_id)
+                .unwrap()
+                .run
+                .stage(&stage_id)
+                .unwrap()
+                .status(),
+            crate::domain::StageStatus::Ready,
+            "a stage whose launch died before it started never started"
+        );
     }
 
     #[test]
@@ -2456,16 +2699,26 @@ mod tests {
         WorkspaceManager::new(temp.path().join("worktrees"))
             .prepare_run_workspace(&mut store, run_id, &source)
             .unwrap();
-        let provider = ClaudeProvider {
+        let provider = claude_provider(backend, &process_root, eval_auto_approve);
+        (temp, database, run_id, store, provider)
+    }
+
+    /// A provider over an already-built backend, so a test can hold a second
+    /// one that shares the backend and the process root.
+    fn claude_provider(
+        backend: FixtureBackend,
+        process_root: &Path,
+        eval_auto_approve: bool,
+    ) -> ClaudeProvider<FixtureBackend> {
+        ClaudeProvider {
             id: ProviderId::new("claude").unwrap(),
             installation: ClaudeInstallation::fixture(PathBuf::from("/bin/true")),
             model: None,
             effort: EffortSetting::NativeDefault,
-            manager: ProcessManager::new(&process_root, backend),
-            artifact_root: process_root,
+            manager: ProcessManager::new(process_root, backend),
+            artifact_root: process_root.to_path_buf(),
             eval_auto_approve,
-        };
-        (temp, database, run_id, store, provider)
+        }
     }
 
     #[test]

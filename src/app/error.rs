@@ -69,32 +69,24 @@ impl AppError {
     /// Whether this error is an optimistic-concurrency loss rather than a real
     /// failure. Callers that are safe to repeat — every step of a stop is
     /// idempotent — retry instead of surfacing a revision number to the user.
+    /// Each wrapper asks the layer beneath it, instead of this one predicate
+    /// enumerating every shape a lost race can arrive in. The same store error
+    /// reaches here through several nestings — bare, through the engine, and
+    /// through a process error that itself wraps a store error — and listing
+    /// them by hand has now missed one twice, each time turning a retryable
+    /// race into a stop that aborts and shows the user a revision number. With
+    /// the question delegated downwards, a new nesting is covered by the layer
+    /// that introduced it. (The source chain cannot be walked instead: these
+    /// errors are transparent, so `source` skips past the very error that
+    /// carries the answer.)
     #[must_use]
-    pub fn is_concurrent_modification(&self) -> bool {
-        matches!(
-            self,
-            Self::Store(
-                StoreError::ConcurrentModification { .. }
-                    | StoreError::ProviderSessionConcurrentModification { .. }
-            )
-                | Self::Process(
-                    ProcessError::ConcurrentModification { .. }
-                        | ProcessError::CursorConcurrentModification { .. }
-                )
-                // Stop reconciles through the engine, so the same lost race
-                // also arrives wrapped as an engine error. Classifying only the
-                // bare form would leave that path reporting a revision number.
-                | Self::Engine(
-                    EngineError::Store(
-                        StoreError::ConcurrentModification { .. }
-                            | StoreError::ProviderSessionConcurrentModification { .. }
-                    )
-                        | EngineError::Process(
-                            ProcessError::ConcurrentModification { .. }
-                                | ProcessError::CursorConcurrentModification { .. }
-                        )
-                )
-        )
+    pub const fn is_concurrent_modification(&self) -> bool {
+        match self {
+            Self::Store(error) => error.is_lost_revision(),
+            Self::Process(error) => error.is_lost_revision(),
+            Self::Engine(error) => error.is_lost_revision(),
+            _ => false,
+        }
     }
 }
 
@@ -143,6 +135,27 @@ mod tests {
                 id: crate::providers::ProviderSessionRecordId::new(),
                 expected: 2,
             })
+            .is_concurrent_modification()
+        );
+
+        // The nesting that actually escaped in the field: a provider-session
+        // race, lost inside the process manager, reached through the engine.
+        // Three layers, none of which the shape-matching form enumerated.
+        assert!(
+            AppError::Engine(EngineError::Process(ProcessError::Store(
+                StoreError::ProviderSessionConcurrentModification {
+                    id: crate::providers::ProviderSessionRecordId::new(),
+                    expected: 2,
+                }
+            )))
+            .is_concurrent_modification(),
+            "a lost revision is retryable however deeply it is wrapped"
+        );
+        assert!(
+            AppError::Process(ProcessError::Store(StoreError::ConcurrentModification {
+                run_id: RunId::new(),
+                expected: 1,
+            }))
             .is_concurrent_modification()
         );
 
