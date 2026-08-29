@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use polycode::domain::{ArtifactKind, Role, RunId, RunStatus};
+use polycode::process::ManagedProcess;
 use polycode::store::SqliteStore;
 
 #[test]
@@ -372,6 +373,106 @@ fn detached_frontend_leaves_tmux_provider_alive_and_resume_consumes_retained_out
     let store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
     assert_eq!(store.list_provider_sessions(run_id).unwrap().len(), 1);
     assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 1);
+}
+
+// Stopping a run is normally done while a second Polycode process is still
+// driving it, and that driver keeps bumping the revision of the very managed
+// process rows the stop has to transition. This exercises that contention for
+// real: the frontend stays attached and blocked inside the provider turn while
+// `polycode stop` runs against the same database.
+#[test]
+fn stop_interrupts_a_live_run_while_its_driver_is_still_attached() {
+    let fixture = Fixture::new();
+    let mut frontend = fixture.spawn_waiting_codex(&[
+        "standard",
+        "stop fixture task",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--provider",
+        "codex",
+    ]);
+    // Generous: the whole suite runs in parallel, and this test waits for a
+    // real tmux-backed provider to reach its blocking point.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (run_id, worktree) = loop {
+        if fixture.data.join("polycode.db").exists()
+            && fixture.data.join("release-provider.waiting").exists()
+            && let Ok(store) = SqliteStore::open(fixture.data.join("polycode.db"))
+            && let Ok(runs) = store.list_runs()
+            && let Some(run) = runs.first()
+            && let Ok(processes) = store.list_managed_processes(run.id)
+            && let Some(process) = processes.first()
+            && process.status().is_active()
+            && let Ok(Some(workspace)) = store.load_workspace(run.id)
+        {
+            break (run.id, workspace.worktree_path().to_path_buf());
+        }
+        assert!(Instant::now() < deadline, "managed provider did not start");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(worktree.exists(), "worktree missing before stop");
+
+    // The driver is deliberately still alive here: this is the race.
+    let stopped = fixture.polycode(&["stop", &run_id.to_string()], false, false);
+    let stderr = String::from_utf8(stopped.stderr.clone()).unwrap();
+    assert!(
+        !stderr.contains("changed since revision"),
+        "stop surfaced a revision race instead of retrying: {stderr}"
+    );
+    assert_success(&stopped);
+    assert!(
+        String::from_utf8(stopped.stdout)
+            .unwrap()
+            .contains("Status     interrupted"),
+        "stop did not durably interrupt the run"
+    );
+
+    let _ = frontend.kill();
+    let _ = frontend.wait();
+
+    // Stop keeps the work: the run stays interrupted, its workspace and its
+    // managed-process record survive, and no new attempt was created.
+    let mut store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
+    assert_eq!(
+        store.load_run(run_id).unwrap().run.status(),
+        RunStatus::Interrupted
+    );
+    assert!(worktree.exists(), "stop deleted the worktree");
+    assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 1);
+
+    // Idempotent: a second stop neither errors nor changes the state.
+    let again = fixture.polycode(&["stop", &run_id.to_string()], false, false);
+    assert_success(&again);
+    assert_eq!(
+        store.load_run(run_id).unwrap().run.status(),
+        RunStatus::Interrupted
+    );
+
+    // One resume is enough. Stop must leave the stage durably interrupted, so
+    // that recovery both restores the lifecycle and resumes the provider in
+    // the same command instead of stranding the run in Running.
+    let resumed = fixture.polycode(&["resume", &run_id.to_string()], false, false);
+    assert_success(&resumed);
+    assert!(
+        String::from_utf8(resumed.stdout)
+            .unwrap()
+            .contains("Status     completed"),
+        "a stopped run needed more than one resume to continue"
+    );
+    // Recovery continued the interrupted attempt rather than starting a new
+    // one. Resuming a native thread legitimately costs a second invocation,
+    // so the invariant is the attempt number, not the process count.
+    let attempts: Vec<u32> = store
+        .list_managed_processes(run_id)
+        .unwrap()
+        .iter()
+        .filter(|process| process.stage_id().as_str() == "architecture")
+        .map(ManagedProcess::attempt)
+        .collect();
+    assert!(
+        !attempts.is_empty() && attempts.iter().all(|attempt| *attempt == attempts[0]),
+        "stop cost the run a retry attempt: {attempts:?}"
+    );
 }
 
 struct Fixture {
