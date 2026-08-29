@@ -113,10 +113,7 @@ fn header_identity(details: &RunDetails, width: u16) -> Vec<Span<'static>> {
         identity.push_str(" · ");
         spans.push(Span::styled(identity, theme::muted()));
     }
-    spans.push(Span::styled(
-        run_status_label(details.status).to_owned(),
-        status_style(details.status).add_modifier(Modifier::BOLD),
-    ));
+    spans.push(run_visual(details.status).badge_bold());
     if let Some(span) = format::elapsed(details.started_at, details.finished_at, now) {
         spans.push(Span::styled(
             format!(" · {}", format::format_duration(span)),
@@ -209,10 +206,7 @@ fn run_row(
             if selected { "▸ " } else { "  " },
             Style::default().fg(theme::accent()),
         ),
-        Span::styled(
-            format!("{} ", run_glyph(run.status)),
-            status_style(run.status),
-        ),
+        run_visual(run.status).glyph(),
         Span::styled(
             task,
             if selected {
@@ -397,10 +391,7 @@ fn pipeline_line(
             if selected { "▸ " } else { "  " },
             Style::default().fg(theme::accent()),
         ),
-        Span::styled(
-            format!("{} ", stage_glyph(stage.status)),
-            stage_style(stage.status),
-        ),
+        stage_visual(stage.status).glyph(),
         Span::styled(name, stage_name_style(stage.status, selected)),
     ];
     theme::spread(left, vec![Span::styled(duration, theme::muted())], width)
@@ -534,14 +525,7 @@ fn stage_hero(stage: &StageSummary, width: u16, now: DateTime<Utc>) -> Vec<Line<
             )],
             width,
         ),
-        Line::from(Span::styled(
-            format!(
-                "{} {}",
-                stage_glyph(stage.status),
-                hero_status(stage.status)
-            ),
-            stage_style(stage.status).add_modifier(Modifier::BOLD),
-        )),
+        Line::from(stage_visual(stage.status).badge_bold()),
     ]
 }
 
@@ -584,34 +568,6 @@ fn hero_clock(span: chrono::TimeDelta) -> String {
         format::format_duration(span)
     } else {
         format::format_clock(span)
-    }
-}
-
-const fn hero_status(status: StageStatus) -> &'static str {
-    match status {
-        StageStatus::Running => "RUNNING",
-        StageStatus::NeedsUser => "NEEDS YOU",
-        StageStatus::Completed => "COMPLETED",
-        StageStatus::Failed => "FAILED",
-        StageStatus::Paused => "PAUSED",
-        StageStatus::Interrupted => "INTERRUPTED",
-        StageStatus::Ready => "READY",
-        StageStatus::Pending => "PENDING",
-        StageStatus::Skipped => "SKIPPED",
-    }
-}
-
-const fn run_status_label(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::NeedsUser => "⚠ NEEDS YOU",
-        RunStatus::Interrupted => "↻ INTERRUPTED",
-        RunStatus::Paused => "‖ PAUSED",
-        RunStatus::Failed => "✗ FAILED",
-        RunStatus::Completed => "✓ COMPLETED",
-        RunStatus::Applied => "✓ APPLIED",
-        RunStatus::Running => "● RUNNING",
-        RunStatus::Created | RunStatus::Preparing | RunStatus::Ready => "○ WAITING",
-        RunStatus::Discarded => "× DISCARDED",
     }
 }
 
@@ -800,7 +756,7 @@ fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details
         technical_row("Role", enum_text(selected.role)),
         Line::from(vec![
             Span::styled(format!("  {:<13}", "Status"), theme::muted()),
-            Span::styled(enum_text(selected.status), stage_style(selected.status)),
+            stage_visual(selected.status).badge(),
         ]),
         technical_row(
             "Process",
@@ -1591,52 +1547,85 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-const fn run_glyph(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Completed | RunStatus::Applied => "✓",
-        RunStatus::Running => "●",
-        RunStatus::NeedsUser => "⚠",
-        RunStatus::Failed => "✗",
-        RunStatus::Paused => "‖",
-        RunStatus::Interrupted => "↻",
-        RunStatus::Created | RunStatus::Preparing | RunStatus::Ready => "○",
-        RunStatus::Discarded => "×",
+/// One state made visible: the glyph, the word, and the colour, bound
+/// together.
+///
+/// Nothing here hands out a bare colour. A caller that wants to show a state
+/// gets a span that already carries the state in characters, so stripping
+/// every colour — `NO_COLOR`, a monochrome terminal, a colour-blind reader —
+/// leaves the meaning intact. That rule used to hold by discipline, with
+/// `run_glyph` and `status_style` sitting side by side and nothing stopping a
+/// caller from reaching for the second alone; it now holds by construction.
+///
+/// It is also the single source for the glyph. The run status line used to
+/// spell out its own `"✗ FAILED"`, duplicating the glyph table a few hundred
+/// lines away and free to drift from it.
+#[derive(Clone, Copy)]
+struct StatusVisual {
+    glyph: &'static str,
+    label: &'static str,
+    color: Color,
+}
+
+impl StatusVisual {
+    /// The glyph alone, for rails where a neighbouring column carries the word.
+    fn glyph(self) -> Span<'static> {
+        Span::styled(format!("{} ", self.glyph), Style::new().fg(self.color))
+    }
+
+    /// Glyph and word together, for a single span that must stand on its own.
+    fn badge(self) -> Span<'static> {
+        Span::styled(
+            format!("{} {}", self.glyph, self.label),
+            Style::new().fg(self.color),
+        )
+    }
+
+    /// As `badge`, emphasised where the state is the headline of its panel.
+    fn badge_bold(self) -> Span<'static> {
+        Span::styled(
+            format!("{} {}", self.glyph, self.label),
+            Style::new().fg(self.color).add_modifier(Modifier::BOLD),
+        )
     }
 }
 
-const fn stage_glyph(status: StageStatus) -> &'static str {
-    match status {
-        StageStatus::Completed => "✓",
-        StageStatus::Running => "●",
-        StageStatus::NeedsUser => "⚠",
-        StageStatus::Failed => "✗",
-        StageStatus::Paused => "‖",
-        StageStatus::Interrupted => "↻",
-        StageStatus::Pending | StageStatus::Ready | StageStatus::Skipped => "○",
+fn run_visual(status: RunStatus) -> StatusVisual {
+    let (glyph, label, color) = match status {
+        RunStatus::Completed => ("✓", "COMPLETED", theme::success()),
+        RunStatus::Applied => ("✓", "APPLIED", theme::success()),
+        RunStatus::Running => ("●", "RUNNING", theme::accent()),
+        RunStatus::NeedsUser => ("⚠", "NEEDS YOU", theme::attention()),
+        RunStatus::Failed => ("✗", "FAILED", theme::danger()),
+        RunStatus::Paused => ("‖", "PAUSED", theme::suspended()),
+        RunStatus::Interrupted => ("↻", "INTERRUPTED", theme::suspended()),
+        RunStatus::Ready => ("○", "WAITING", theme::attention()),
+        RunStatus::Created | RunStatus::Preparing => ("○", "WAITING", theme::muted_color()),
+        RunStatus::Discarded => ("×", "DISCARDED", theme::muted_color()),
+    };
+    StatusVisual {
+        glyph,
+        label,
+        color,
     }
 }
 
-fn status_style(status: RunStatus) -> Style {
-    match status {
-        RunStatus::Completed | RunStatus::Applied => Style::new().fg(theme::success()),
-        RunStatus::Running => Style::new().fg(theme::accent()),
-        RunStatus::NeedsUser | RunStatus::Ready => Style::new().fg(theme::attention()),
-        RunStatus::Failed => Style::new().fg(theme::danger()),
-        RunStatus::Paused | RunStatus::Interrupted => Style::new().fg(theme::suspended()),
-        RunStatus::Created | RunStatus::Preparing | RunStatus::Discarded => {
-            Style::new().fg(theme::muted_color())
-        }
-    }
-}
-
-fn stage_style(status: StageStatus) -> Style {
-    match status {
-        StageStatus::Completed => Style::new().fg(theme::success()),
-        StageStatus::Running => Style::new().fg(theme::accent()),
-        StageStatus::NeedsUser | StageStatus::Ready => Style::new().fg(theme::attention()),
-        StageStatus::Failed => Style::new().fg(theme::danger()),
-        StageStatus::Paused | StageStatus::Interrupted => Style::new().fg(theme::suspended()),
-        StageStatus::Pending | StageStatus::Skipped => Style::new().fg(theme::muted_color()),
+fn stage_visual(status: StageStatus) -> StatusVisual {
+    let (glyph, label, color) = match status {
+        StageStatus::Completed => ("✓", "COMPLETED", theme::success()),
+        StageStatus::Running => ("●", "RUNNING", theme::accent()),
+        StageStatus::NeedsUser => ("⚠", "NEEDS YOU", theme::attention()),
+        StageStatus::Failed => ("✗", "FAILED", theme::danger()),
+        StageStatus::Paused => ("‖", "PAUSED", theme::suspended()),
+        StageStatus::Interrupted => ("↻", "INTERRUPTED", theme::suspended()),
+        StageStatus::Ready => ("○", "READY", theme::attention()),
+        StageStatus::Pending => ("○", "PENDING", theme::muted_color()),
+        StageStatus::Skipped => ("○", "SKIPPED", theme::muted_color()),
+    };
+    StatusVisual {
+        glyph,
+        label,
+        color,
     }
 }
 
@@ -1677,6 +1666,48 @@ mod tests {
 
     const POD_SHELL: &str = "▄██████████▄";
 
+    /// The contract guarded where it can actually be reopened.
+    ///
+    /// `every_state_stays_distinguishable_with_all_colour_removed` proves the
+    /// states are distinguishable today. It cannot prove they will stay that
+    /// way: a caller only has to reach past the glyph for the colour, and that
+    /// test keeps passing while the interface quietly loses its meaning for
+    /// anyone without colour. So the two ways of reaching past it are closed
+    /// here — `StatusVisual` may only produce spans, and production code may
+    /// not read its colour field directly.
+    #[test]
+    fn a_status_visual_never_hands_out_a_bare_colour() {
+        let source = include_str!("render.rs");
+        let implementation = source
+            .split("impl StatusVisual {")
+            .nth(1)
+            .expect("StatusVisual has an impl block")
+            .split("\n}\n")
+            .next()
+            .expect("impl block body");
+        for signature in implementation
+            .lines()
+            .filter(|line| line.trim_start().starts_with("fn "))
+        {
+            assert!(
+                signature.contains("-> Span<'static>"),
+                "a status must reach the screen carrying its glyph: {signature}"
+            );
+        }
+
+        // Outside its own impl block, where reading the field is how the
+        // spans get built in the first place.
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production half")
+            .replace(implementation, "");
+        assert!(
+            !production.contains(".color"),
+            "production code must take a span from StatusVisual, never its colour"
+        );
+    }
+
     /// The contract that lets the palette get richer later: strip every
     /// colour and the interface must still say which state each thing is in.
     /// Under Mono all tokens collapse to one value, so anything still legible
@@ -1700,16 +1731,16 @@ mod tests {
                 for (index, status) in runs.iter().enumerate() {
                     for other in runs.iter().skip(index + 1) {
                         assert_ne!(
-                            run_glyph(*status),
-                            run_glyph(*other),
+                            run_visual(*status).glyph,
+                            run_visual(*other).glyph,
                             "{status:?} and {other:?} are told apart only by colour"
                         );
                     }
                     // And colour genuinely carries nothing here, so the glyph above
                     // is doing the whole job rather than merely helping.
                     assert_eq!(
-                        status_style(*status),
-                        status_style(runs[0]),
+                        run_visual(*status).color,
+                        run_visual(runs[0]).color,
                         "a status keeping its own colour under Mono is still using hue"
                     );
                 }
@@ -1725,12 +1756,12 @@ mod tests {
                 for (index, status) in stages.iter().enumerate() {
                     for other in stages.iter().skip(index + 1) {
                         assert_ne!(
-                            stage_glyph(*status),
-                            stage_glyph(*other),
+                            stage_visual(*status).glyph,
+                            stage_visual(*other).glyph,
                             "{status:?} and {other:?} are told apart only by colour"
                         );
                     }
-                    assert_eq!(stage_style(*status), stage_style(stages[0]));
+                    assert_eq!(stage_visual(*status).color, stage_visual(stages[0]).color);
                 }
             },
         );
@@ -2416,8 +2447,9 @@ mod tests {
             (StageStatus::Failed, "FAILED"),
             (StageStatus::Completed, "COMPLETED"),
         ] {
-            assert_eq!(hero_status(status), word);
-            assert!(!stage_glyph(status).is_empty());
+            let visual = stage_visual(status);
+            assert_eq!(visual.label, word);
+            assert!(!visual.glyph.is_empty());
         }
         let mut state = running_state();
         state.details.as_mut().unwrap().status = RunStatus::Failed;
