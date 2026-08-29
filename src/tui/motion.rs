@@ -29,21 +29,22 @@ use super::state::{Overlay, Screen};
 const BLINK_PERIOD: Duration = Duration::from_secs(3);
 const BLINK_LENGTH: Duration = Duration::from_millis(200);
 
-/// How much movement a surface will tolerate, ordered from most to least
-/// restrictive so the two inputs combine with `min`.
+/// How much movement is permitted, ordered from most to least restrictive so
+/// the two inputs combine with `min`. An allowance rather than a policy: a
+/// surface naming one is stating a ceiling, not a wish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum MotionPolicy {
+pub(crate) enum MotionAllowance {
     /// Nothing moves. Every frame of this surface is identical to the last
     /// until the underlying state changes.
     Disabled,
     /// A finite reaction may play when state changes, but nothing repeats on
     /// its own.
-    StateTransitionsOnly,
+    TransitionsOnly,
     /// Work that is genuinely running may also show that it is alive.
     LivenessAndTransitions,
 }
 
-impl MotionPolicy {
+impl MotionAllowance {
     pub(crate) fn allows_liveness(self) -> bool {
         self == Self::LivenessAndTransitions
     }
@@ -62,11 +63,11 @@ pub(crate) enum MotionSetting {
 }
 
 impl MotionSetting {
-    const fn ceiling(self) -> MotionPolicy {
+    const fn ceiling(self) -> MotionAllowance {
         match self {
-            Self::Off => MotionPolicy::Disabled,
-            Self::Reduced => MotionPolicy::StateTransitionsOnly,
-            Self::Full => MotionPolicy::LivenessAndTransitions,
+            Self::Off => MotionAllowance::Disabled,
+            Self::Reduced => MotionAllowance::TransitionsOnly,
+            Self::Full => MotionAllowance::LivenessAndTransitions,
         }
     }
 
@@ -123,26 +124,28 @@ pub(crate) fn motion_setting() -> MotionSetting {
 /// for a decision — and one of those decisions discards work — the surface
 /// under the question stops moving too. Otherwise "reading surfaces never
 /// move" would hold only for as long as nobody looked past the overlay.
-pub(crate) const fn surface_ceiling(screen: Screen, overlay: Option<Overlay>) -> MotionPolicy {
+pub(crate) const fn surface_ceiling(screen: Screen, overlay: Option<Overlay>) -> MotionAllowance {
     if overlay.is_some() {
-        return MotionPolicy::Disabled;
+        return MotionAllowance::Disabled;
     }
     match screen {
         // Operating surfaces: what they show is work in progress, so time is
         // part of the information.
-        Screen::Runs | Screen::RunDetail => MotionPolicy::LivenessAndTransitions,
+        Screen::Runs | Screen::RunDetail => MotionAllowance::LivenessAndTransitions,
         // Reading surfaces: prose, logs, a diff, a form being filled in.
-        Screen::Artifact | Screen::Logs | Screen::Diff | Screen::NewRun => MotionPolicy::Disabled,
+        Screen::Artifact | Screen::Logs | Screen::Diff | Screen::NewRun => {
+            MotionAllowance::Disabled
+        }
     }
 }
 
-/// The policy actually in force: the more restrictive of what the surface
-/// permits and what the user asked for.
-pub(crate) fn policy(
+/// What is actually allowed: the more restrictive of what the surface permits
+/// and what the user asked for.
+pub(crate) fn allowance(
     screen: Screen,
     overlay: Option<Overlay>,
     setting: MotionSetting,
-) -> MotionPolicy {
+) -> MotionAllowance {
     surface_ceiling(screen, overlay).min(setting.ceiling())
 }
 
@@ -157,17 +160,17 @@ pub(crate) fn liveness_phase(elapsed: Duration) -> u8 {
 /// One frame's permission to move, handed to whatever draws it.
 ///
 /// The phase is private on purpose. A renderer cannot read the clock around
-/// the policy: it asks for `liveness_phase`, which is zero — the resting
+/// the allowance: it asks for `liveness_phase`, which is zero — the resting
 /// frame — whenever motion is not permitted here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MotionFrame {
-    policy: MotionPolicy,
+    allowance: MotionAllowance,
     phase: u8,
 }
 
 impl MotionFrame {
-    pub(crate) const fn new(policy: MotionPolicy, phase: u8) -> Self {
-        Self { policy, phase }
+    pub(crate) const fn new(allowance: MotionAllowance, phase: u8) -> Self {
+        Self { allowance, phase }
     }
 
     /// A frame that never moves. Production always resolves a real policy
@@ -176,13 +179,13 @@ impl MotionFrame {
     #[cfg(test)]
     pub(crate) const fn still() -> Self {
         Self {
-            policy: MotionPolicy::Disabled,
+            allowance: MotionAllowance::Disabled,
             phase: 0,
         }
     }
 
     pub(crate) fn liveness_phase(self) -> u8 {
-        if self.policy.allows_liveness() {
+        if self.allowance.allows_liveness() {
             self.phase
         } else {
             0
@@ -222,8 +225,8 @@ mod tests {
         for screen in READING_SCREENS {
             for setting in ALL_SETTINGS {
                 assert_eq!(
-                    policy(screen, None, setting),
-                    MotionPolicy::Disabled,
+                    allowance(screen, None, setting),
+                    MotionAllowance::Disabled,
                     "{screen:?} is read, not operated, so it may not move under {setting:?}"
                 );
             }
@@ -236,7 +239,7 @@ mod tests {
             for overlay in ALL_OVERLAYS.map(Some).into_iter().chain([None]) {
                 let ceiling = surface_ceiling(screen, overlay);
                 for setting in ALL_SETTINGS {
-                    let resolved = policy(screen, overlay, setting);
+                    let resolved = allowance(screen, overlay, setting);
                     assert!(
                         resolved <= ceiling,
                         "{setting:?} raised {screen:?}/{overlay:?} above its ceiling {ceiling:?}"
@@ -255,8 +258,8 @@ mod tests {
         for screen in ALL_SCREENS {
             for overlay in ALL_OVERLAYS {
                 assert_eq!(
-                    policy(screen, Some(overlay), MotionSetting::Full),
-                    MotionPolicy::Disabled,
+                    allowance(screen, Some(overlay), MotionSetting::Full),
+                    MotionAllowance::Disabled,
                     "{overlay:?} asks a question, so {screen:?} behind it holds still"
                 );
             }
@@ -266,7 +269,7 @@ mod tests {
     #[test]
     fn an_operating_surface_is_the_only_one_that_may_show_liveness() {
         for screen in ALL_SCREENS {
-            let allows = policy(screen, None, MotionSetting::Full).allows_liveness();
+            let allows = allowance(screen, None, MotionSetting::Full).allows_liveness();
             assert_eq!(
                 allows,
                 matches!(screen, Screen::Runs | Screen::RunDetail),
@@ -333,16 +336,16 @@ mod tests {
 
     #[test]
     fn a_frame_that_may_not_move_reports_the_resting_phase_whatever_the_clock_says() {
-        for policy in [MotionPolicy::Disabled, MotionPolicy::StateTransitionsOnly] {
+        for allowance in [MotionAllowance::Disabled, MotionAllowance::TransitionsOnly] {
             assert_eq!(
-                MotionFrame::new(policy, 1).liveness_phase(),
+                MotionFrame::new(allowance, 1).liveness_phase(),
                 0,
-                "{policy:?} handed out a moving phase"
+                "{allowance:?} handed out a moving phase"
             );
         }
         assert_eq!(MotionFrame::still().liveness_phase(), 0);
         assert_eq!(
-            MotionFrame::new(MotionPolicy::LivenessAndTransitions, 1).liveness_phase(),
+            MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1).liveness_phase(),
             1
         );
     }

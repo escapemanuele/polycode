@@ -245,7 +245,7 @@ pub(crate) fn mascot_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::motion::MotionPolicy;
+    use crate::tui::motion::MotionAllowance;
 
     const ALL_STATES: [MascotState; 6] = [
         MascotState::Idle,
@@ -266,7 +266,7 @@ mod tests {
     /// Every liveness phase a frame can hand out.
     const ALL_PHASES: [MotionFrame; 2] = [
         MotionFrame::still(),
-        MotionFrame::new(MotionPolicy::LivenessAndTransitions, 1),
+        MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1),
     ];
 
     fn rows(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
@@ -480,7 +480,7 @@ mod tests {
             let moving = rows_in(
                 state,
                 None,
-                MotionFrame::new(MotionPolicy::LivenessAndTransitions, 1),
+                MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1),
             );
             if matches!(state, MascotState::Running) {
                 assert_ne!(resting, moving, "Running work has to look alive");
