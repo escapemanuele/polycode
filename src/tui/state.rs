@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use super::motion::{self, MotionFrame};
 use crate::app::{
     ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails, RunDiffPreview,
     RunListItem, StageExecutionEvidence, UniformProvider,
@@ -322,6 +323,10 @@ pub(crate) struct TuiState {
     /// default only because the prompt appears solely when installing is
     /// possible and nothing more urgent is happening.
     pub update_install_selected: bool,
+    /// Which liveness frame the loop is on. Owned by the loop rather than
+    /// read from the clock here, so a drawn frame stays a pure function of
+    /// state and no test has to wait for one.
+    pub motion_phase: u8,
     pub quit: bool,
 }
 
@@ -354,8 +359,18 @@ impl TuiState {
             update_install: None,
             update_dismissed: false,
             update_install_selected: true,
+            motion_phase: 0,
             quit: false,
         }
+    }
+
+    /// What this frame may do: the surface's ceiling, lowered by whatever
+    /// the user asked for. Nothing that draws gets to decide this itself.
+    pub(crate) fn motion_frame(&self) -> MotionFrame {
+        MotionFrame::new(
+            motion::policy(self.screen, self.overlay, motion::motion_setting()),
+            self.motion_phase,
+        )
     }
 
     pub(crate) fn replace_runs(&mut self, runs: Vec<RunListItem>) {

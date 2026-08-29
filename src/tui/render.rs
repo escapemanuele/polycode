@@ -129,7 +129,11 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         // Decoration yields to content: the mascot appears only when the
         // empty state has room for it.
         if area.width >= 60 && area.height >= 14 {
-            lines.extend(mascot::mascot_lines(mascot::MascotState::Idle, None));
+            lines.extend(mascot::mascot_lines(
+                mascot::MascotState::Idle,
+                None,
+                state.motion_frame(),
+            ));
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
@@ -355,6 +359,7 @@ fn render_pipeline(
         lines.extend(mascot::mascot_lines(
             mascot::mascot_state(Some(details.status), selected.map(|stage| stage.status)),
             selected.map(|stage| mascot::mascot_activity(stage.role)),
+            state.motion_frame(),
         ));
     }
     frame.render_widget(

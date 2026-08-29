@@ -9,6 +9,7 @@ use crate::domain::{StageId, StageStatus};
 use crate::update::{InstallSource, UpdateInfo};
 
 use super::input::{Intent, map_key, map_text_key};
+use super::motion;
 use super::render;
 use super::state::{Overlay, Screen, TuiState, UiMessageKind};
 use super::terminal::TerminalSession;
@@ -34,6 +35,10 @@ pub(crate) struct TuiApp {
     /// Present only while an installation this session started is running.
     installing: Option<Receiver<InstallOutcome>>,
     last_refresh: Instant,
+    /// When this session started drawing. Only the liveness phase reads it,
+    /// so POD's breathing is tied to the session rather than to whichever
+    /// redraw happened to come first.
+    started: Instant,
 }
 
 impl TuiApp {
@@ -49,6 +54,7 @@ impl TuiApp {
             last_refresh: Instant::now()
                 .checked_sub(REFRESH_INTERVAL)
                 .unwrap_or_else(Instant::now),
+            started: Instant::now(),
         })
     }
 
@@ -62,6 +68,7 @@ impl TuiApp {
             if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
                 self.refresh();
             }
+            self.state.motion_phase = motion::liveness_phase(self.started.elapsed());
             terminal
                 .terminal_mut()
                 .draw(|frame| render::render(frame, &self.state))?;
@@ -789,6 +796,7 @@ mod tests {
             update: mpsc::channel().1,
             installing: None,
             last_refresh: Instant::now(),
+            started: Instant::now(),
         };
         (app, fixture)
     }
@@ -927,6 +935,7 @@ mod tests {
             update: mpsc::channel().1,
             installing: None,
             last_refresh: Instant::now(),
+            started: Instant::now(),
         };
         assert!(app.state.run_is_applyable());
         app.handle_intent(Intent::Apply);

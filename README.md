@@ -309,6 +309,20 @@ Resolution order:
 
 Repository overrides will eventually live at `<repo>/.polycode.toml`. Current code resolves paths but does not read or create configuration files, so the update opt-out below is an environment variable rather than a configuration key.
 
+### Appearance
+
+The interface reads two environment variables at startup and never again:
+
+| Variable | Effect |
+| --- | --- |
+| `NO_COLOR` | Present and non-empty: every semantic colour collapses to the terminal's own foreground. `TERM=dumb` does the same. Nothing becomes unreadable — state is always carried by a glyph or a word as well as a colour. |
+| `POLYCODE_MOTION` | `off` stops all movement; `reduced` keeps state changes but stops anything that repeats; anything else is the default. |
+
+Movement is bounded by the surface, not only by the preference: screens you
+read — an artifact, logs, a diff, the new-run form — and every open overlay
+never move, whatever `POLYCODE_MOTION` says. The preference can only lower
+what a screen already permits.
+
 Default SQLite path:
 
 ```text
