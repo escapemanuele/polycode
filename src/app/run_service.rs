@@ -27,6 +27,14 @@ const PROCESS_LOG_TAIL_LIMIT: usize = 256 * 1024;
 /// total: the driver is being interrupted, so contention ends quickly.
 const STOP_CONCURRENCY_ATTEMPTS: u32 = 12;
 const STOP_CONCURRENCY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
+/// How long a run must sit untouched before a read is allowed to settle it.
+///
+/// Reading a run must never race the process driving it. A driver commits on
+/// every provider signal it observes, so a run still under execution keeps a
+/// fresh `updated_at`; only a run nothing has touched for this long is treated
+/// as abandoned. Long enough to cover a stage handover, short enough that a
+/// dead run tells the truth on the next refresh instead of the next stop.
+const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -58,6 +66,7 @@ pub struct RunService<F> {
     database: PathBuf,
     worktrees: PathBuf,
     provider_factory: F,
+    abandoned_after: std::time::Duration,
 }
 
 impl<F> RunService<F>
@@ -70,7 +79,19 @@ where
             database,
             worktrees,
             provider_factory,
+            abandoned_after: ABANDONED_AFTER,
         }
+    }
+
+    /// Overrides how long a run must sit untouched before a read settles it.
+    ///
+    /// The default, [`ABANDONED_AFTER`], is what keeps a read off a run some
+    /// other process is still driving. Only a caller that owns both sides of
+    /// that race has any business shortening it.
+    #[must_use]
+    pub const fn abandoning_after(mut self, idle: std::time::Duration) -> Self {
+        self.abandoned_after = idle;
+        self
     }
 
     /// Uses Polycode data paths from environment.
@@ -408,15 +429,32 @@ where
         if !self.database.exists() {
             return Ok(Vec::new());
         }
-        query::list(&SqliteStore::open(&self.database)?)
+        let mut store = SqliteStore::open(&self.database)?;
+        let listed = query::list(&store)?;
+        let running = listed
+            .iter()
+            .filter(|item| item.status == RunStatus::Running)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let mut settled = false;
+        for run_id in running {
+            settled |= self.settle_if_abandoned(&mut store, run_id);
+        }
+        if settled {
+            return query::list(&store);
+        }
+        Ok(listed)
     }
 
-    /// Returns detailed persisted state without mutation.
+    /// Returns detailed persisted state, settling the run first if it was
+    /// abandoned.
     ///
     /// # Errors
     /// Returns not-found, corrupt state, or query errors.
     pub fn inspect_run(&self, run_id: RunId) -> Result<RunDetails, AppError> {
-        query::inspect(&mut SqliteStore::open(&self.database)?, run_id)
+        let mut store = SqliteStore::open(&self.database)?;
+        self.settle_if_abandoned(&mut store, run_id);
+        query::inspect(&mut store, run_id)
     }
 
     /// Lists integrity-verified artifact metadata for one run.
@@ -483,6 +521,56 @@ where
         stage_id: &StageId,
     ) -> Result<StageExecutionEvidence, AppError> {
         query::stage_execution_evidence(&mut SqliteStore::open(&self.database)?, run_id, stage_id)
+    }
+
+    /// Commits what already happened to a run nothing is driving any more.
+    ///
+    /// Nothing observes a run unless a command drives the engine, so a
+    /// provider process that died leaves its run reading Running for as long
+    /// as the user only ever reads it. Reads are how a user notices a run at
+    /// all, so they settle it: a run whose processes have all ended and that
+    /// nothing has touched for [`ABANDONED_AFTER`] is observed exactly the way
+    /// a stop observes it, and the truth is committed once.
+    ///
+    /// Three conditions keep this from becoming a write on a live run. The run
+    /// must be Running, no managed process may still be active — an active
+    /// process means a driver is attached, and racing its commits would fail
+    /// the run this call only meant to display — and the run must have been
+    /// idle long enough that no driver can be mid-handover between processes.
+    ///
+    /// Best effort by construction: reading a run the engine cannot observe is
+    /// still reading a run the user is entitled to see, so every failure here
+    /// leaves the persisted state exactly as it was and the caller reports it
+    /// unchanged. Returns whether observation ran.
+    fn settle_if_abandoned(&self, store: &mut SqliteStore, run_id: RunId) -> bool {
+        let Ok(loaded) = store.load_run(run_id) else {
+            return false;
+        };
+        if loaded.run.status() != RunStatus::Running {
+            return false;
+        }
+        let Ok(idle) = now()
+            .signed_duration_since(*loaded.run.updated_at())
+            .to_std()
+        else {
+            // Updated in the future: a clock this read cannot reason about.
+            return false;
+        };
+        if idle < self.abandoned_after {
+            return false;
+        }
+        let Ok(processes) = store.list_managed_processes(run_id) else {
+            return false;
+        };
+        if processes.iter().any(|process| process.status().is_active()) {
+            return false;
+        }
+        if self.reconcile(store, run_id).is_err() {
+            return false;
+        }
+        // Observe, never Continue or Resume: a read must never become the
+        // reason a provider starts working again.
+        self.drive(store, run_id, ResumeAction::Observe).is_ok()
     }
 
     fn reconcile(&self, store: &mut SqliteStore, run_id: RunId) -> Result<(), AppError> {
@@ -1435,6 +1523,160 @@ mod tests {
             !stop.contains("ResumeAction::Continue") && !stop.contains("ResumeAction::Resume"),
             "stop must never drive with an action that lets an adapter resume"
         );
+    }
+
+    /// A provider process that died is a process nothing will ever drive
+    /// again, so the run it belonged to has already ended — only the record
+    /// still says otherwise. Reading the run is how a user notices it at all,
+    /// so the read has to commit that truth rather than report work that
+    /// stopped hours ago as still running.
+    #[test]
+    fn reading_settles_a_run_whose_provider_already_ended() {
+        let fixture = Fixture::new();
+        let started = fixture
+            .scripted_service(delayed_scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "abandoned task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = started.details.id;
+        assert_eq!(started.details.status, RunStatus::Running);
+
+        let details = fixture
+            .scripted_service(ended_scenario())
+            .abandoning_after(std::time::Duration::ZERO)
+            .inspect_run(run_id)
+            .unwrap();
+        assert_eq!(
+            details.status,
+            RunStatus::Failed,
+            "reading an abandoned run reports what actually happened to it"
+        );
+        assert!(
+            details
+                .stages
+                .iter()
+                .all(|stage| stage.status != StageStatus::Running),
+            "no stage is left advertising execution"
+        );
+    }
+
+    /// The run list is the first thing a user sees, and it lies in exactly the
+    /// same way the detail view does.
+    #[test]
+    fn listing_settles_a_run_whose_provider_already_ended() {
+        let fixture = Fixture::new();
+        let started = fixture
+            .scripted_service(delayed_scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "abandoned task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = started.details.id;
+
+        let listed = fixture
+            .scripted_service(ended_scenario())
+            .abandoning_after(std::time::Duration::ZERO)
+            .list_runs()
+            .unwrap();
+        let item = listed
+            .iter()
+            .find(|item| item.id == run_id)
+            .expect("the run must still be listed");
+        assert_eq!(item.status, RunStatus::Failed);
+    }
+
+    /// A run is normally read while another process is still driving it, and
+    /// that driver owns every row a settling read would touch. The idle grace
+    /// is what keeps the two apart: a run touched a moment ago is a run
+    /// someone else is working on, and reading it must change nothing.
+    #[test]
+    fn reading_leaves_a_run_another_process_is_still_driving_alone() {
+        let fixture = Fixture::new();
+        let started = fixture
+            .scripted_service(delayed_scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "driven task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = started.details.id;
+        let revision_before = SqliteStore::open(&fixture.database)
+            .unwrap()
+            .load_run(run_id)
+            .unwrap()
+            .revision;
+
+        let details = fixture
+            .scripted_service(ended_scenario())
+            .inspect_run(run_id)
+            .unwrap();
+        assert_eq!(
+            details.status,
+            RunStatus::Running,
+            "a run inside its idle grace is left to its driver"
+        );
+        assert_eq!(
+            SqliteStore::open(&fixture.database)
+                .unwrap()
+                .load_run(run_id)
+                .unwrap()
+                .revision,
+            revision_before,
+            "reading commits nothing while the grace holds"
+        );
+    }
+
+    /// Settling on a read is the one place a read touches the engine, and it
+    /// has two fences. It must observe, never resume — a read is not a reason
+    /// for a provider to start working — and it must refuse to settle a run
+    /// whose process is still alive, because that process is a driver whose
+    /// commits this read would lose a revision race with. Both are call-site
+    /// properties nothing downstream would notice going missing.
+    #[test]
+    fn reading_settles_without_ever_authorising_provider_work() {
+        // Only the non-test half of this file is the call graph under test.
+        let source = include_str!("run_service.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let settle = code
+            .split("fn settle_if_abandoned(")
+            .nth(1)
+            .expect("settle_if_abandoned must exist")
+            .split("\n    fn ")
+            .next()
+            .expect("settle_if_abandoned body");
+        assert!(
+            settle.contains("ResumeAction::Observe"),
+            "a read must drive the engine in observing mode"
+        );
+        assert!(
+            !settle.contains("ResumeAction::Continue") && !settle.contains("ResumeAction::Resume"),
+            "a read must never drive with an action that lets an adapter resume"
+        );
+        assert!(
+            settle.contains("is_active"),
+            "a read must never settle a run whose process is still alive"
+        );
+    }
+
+    /// A provider that has already ended: the stage reports its failure the
+    /// moment anything polls it again.
+    fn ended_scenario() -> FakeScenario {
+        FakeScenario::new().stage("implementation").events([
+            FakeEvent::Started,
+            FakeEvent::failed("provider process ended without a result"),
+        ])
     }
 
     /// Total stage attempts recorded for the run, so a Stop can be shown not
