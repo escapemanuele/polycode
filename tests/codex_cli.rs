@@ -305,7 +305,11 @@ fn detached_frontend_leaves_tmux_provider_alive_and_resume_consumes_retained_out
         "--provider",
         "codex",
     ]);
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // Generous on purpose: this waits for a real process under tmux to come
+    // up, which is setup rather than the property under test. A budget tight
+    // enough to be tripped by a loaded runner makes the gate report on the
+    // machine instead of on the code — the sibling wait below already uses 30s.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let (run_id, process_id, session_name) = loop {
         if fixture.data.join("polycode.db").exists()
             && let Ok(store) = SqliteStore::open(fixture.data.join("polycode.db"))
@@ -346,7 +350,7 @@ fn detached_frontend_leaves_tmux_provider_alive_and_resume_consumes_retained_out
     );
     fs::write(fixture.data.join("release-provider"), b"continue").unwrap();
 
-    let finished = Instant::now() + Duration::from_secs(8);
+    let finished = Instant::now() + Duration::from_secs(30);
     loop {
         let store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
         let process = store.load_managed_process(process_id).unwrap();
