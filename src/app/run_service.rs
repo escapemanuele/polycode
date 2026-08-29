@@ -21,10 +21,12 @@ use super::{
 const DIFF_PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
 const PROCESS_LOG_TAIL_LIMIT: usize = 256 * 1024;
 /// How many times a stop retries after losing a revision race with the process
-/// that is still driving the run. Small: the driver is being interrupted, so
-/// contention ends quickly.
-const STOP_CONCURRENCY_ATTEMPTS: u32 = 5;
-const STOP_CONCURRENCY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+/// that is still driving the run. A stop reconciles through the engine, which
+/// touches the run, its managed processes, and its provider sessions, so a busy
+/// driver offers several rows to collide on. Bounded well under a second in
+/// total: the driver is being interrupted, so contention ends quickly.
+const STOP_CONCURRENCY_ATTEMPTS: u32 = 12;
+const STOP_CONCURRENCY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {

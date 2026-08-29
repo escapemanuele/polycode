@@ -73,10 +73,26 @@ impl AppError {
     pub fn is_concurrent_modification(&self) -> bool {
         matches!(
             self,
-            Self::Store(StoreError::ConcurrentModification { .. })
+            Self::Store(
+                StoreError::ConcurrentModification { .. }
+                    | StoreError::ProviderSessionConcurrentModification { .. }
+            )
                 | Self::Process(
                     ProcessError::ConcurrentModification { .. }
                         | ProcessError::CursorConcurrentModification { .. }
+                )
+                // Stop reconciles through the engine, so the same lost race
+                // also arrives wrapped as an engine error. Classifying only the
+                // bare form would leave that path reporting a revision number.
+                | Self::Engine(
+                    EngineError::Store(
+                        StoreError::ConcurrentModification { .. }
+                            | StoreError::ProviderSessionConcurrentModification { .. }
+                    )
+                        | EngineError::Process(
+                            ProcessError::ConcurrentModification { .. }
+                                | ProcessError::CursorConcurrentModification { .. }
+                        )
                 )
         )
     }
@@ -106,6 +122,26 @@ mod tests {
             AppError::Process(ProcessError::ConcurrentModification {
                 process_id: ManagedProcessId::new(),
                 expected: 3,
+            })
+            .is_concurrent_modification()
+        );
+
+        // The same race arrives wrapped when it is lost inside the engine,
+        // which is exactly the path a stop reconciles through.
+        assert!(
+            AppError::Engine(EngineError::Store(StoreError::ConcurrentModification {
+                run_id: RunId::new(),
+                expected: 5,
+            }))
+            .is_concurrent_modification()
+        );
+
+        // Reconciling a stop also writes provider sessions, which carry their
+        // own revision and therefore their own lost race.
+        assert!(
+            AppError::Store(StoreError::ProviderSessionConcurrentModification {
+                id: crate::providers::ProviderSessionRecordId::new(),
+                expected: 2,
             })
             .is_concurrent_modification()
         );
