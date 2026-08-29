@@ -515,7 +515,13 @@ where
                     checkpoint.session_id,
                     signal,
                 )?;
-                commit_execution(store, &loaded.run, loaded.revision, &emitted)?;
+                // A signal can be legitimately unrecordable — a stage
+                // interrupted before it ever started has nothing to transition
+                // and nothing to record. Committing an empty batch is refused
+                // by the store, so skip the write instead of failing the call.
+                if !emitted.is_empty() {
+                    commit_execution(store, &loaded.run, loaded.revision, &emitted)?;
+                }
                 Ok(EngineStatus::Advanced {
                     run_status: loaded.run.status(),
                 })
@@ -537,12 +543,7 @@ where
                         signal,
                     )?);
                 }
-                store.commit_provider_execution_update(
-                    &loaded.run,
-                    loaded.revision,
-                    &emitted,
-                    &commit,
-                )?;
+                commit_emission(store, &loaded, &emitted, &commit)?;
                 Ok(EngineStatus::Advanced {
                     run_status: loaded.run.status(),
                 })
@@ -672,6 +673,16 @@ where
                     metadata,
                 )?);
             }
+            // A stage can be interrupted before it ever starts: stopping a run
+            // signals every active managed process, and one may belong to a
+            // stage the domain still holds as Ready. That stage never ran, so
+            // there is nothing to record against it — the domain refuses both
+            // a stage interruption and a provider event here, and it is right
+            // to. The interruption is already durable where it belongs, on the
+            // provider session the adapter marked. Treating the signal as
+            // nothing to record keeps the stop from failing and leaving the
+            // run torn: process interrupted while the run still reads Running.
+            ProviderSignal::Interrupted if stage_status == StageStatus::Ready => {}
             ProviderSignal::Resumed if stage_status == StageStatus::Running => {
                 let session_id = session_id.ok_or_else(|| EngineError::ProviderProtocol {
                     stage_id: stage_id.clone(),
@@ -775,6 +786,26 @@ fn load_execution_boundary(
         });
     }
     Ok((loaded, workspace))
+}
+
+/// Persists one provider emission.
+///
+/// A signal can be legitimately unrecordable: a stage interrupted before it
+/// ever started has nothing to transition and nothing to record, and the store
+/// refuses an empty batch. The output that produced the signal must still be
+/// consumed, or it would be read again on every poll.
+fn commit_emission(
+    store: &mut SqliteStore,
+    loaded: &LoadedRun,
+    emitted: &[DomainEvent],
+    commit: &crate::providers::ProviderCommit,
+) -> Result<(), EngineError> {
+    if emitted.is_empty() {
+        store.commit_provider_checkpoint(commit)?;
+    } else {
+        store.commit_provider_execution_update(&loaded.run, loaded.revision, emitted, commit)?;
+    }
+    Ok(())
 }
 
 fn commit_execution(
@@ -1058,6 +1089,70 @@ mod tests {
         drop(fixture.store);
         let mut reopened = SqliteStore::open(&fixture.database).unwrap();
         assert_eq!(reopened.load_run(fixture.run_id).unwrap().run, original);
+    }
+
+    /// Stopping a run signals every active managed process, and one can
+    /// belong to a stage the domain still has as Ready — started by the
+    /// adapter, not yet transitioned. The interruption must be recorded as
+    /// provider evidence without inventing a stage transition the domain
+    /// refuses, or the stop fails and leaves the run torn: the process
+    /// interrupted while the run still reads Running.
+    #[test]
+    fn a_stage_interrupted_before_it_starts_never_fails_the_stop() {
+        let mut fixture = Fixture::new(WorkflowKind::Fast, 700_000);
+        let scenario = FakeScenario::new()
+            .stage("implementation")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let mut engine = WorkflowEngine::with_context(
+            FakeProvider::new(scenario).unwrap(),
+            "interrupted before start".to_owned(),
+            TestContext::new(800_000),
+        );
+
+        // Bring the stage to Ready — prepared, with the domain not yet holding
+        // it as Running — which is the state a stop can catch it in.
+        let stage_id = crate::domain::StageId::new("implementation").unwrap();
+        let loaded = fixture.store.load_run(fixture.run_id).unwrap();
+        let mut run = loaded.run;
+        let created_at: DateTime<Utc> = std::time::SystemTime::now().into();
+        let started = run
+            .transition(
+                RunTransition::Start,
+                EventMetadata::new(EventId::from_u128(810_000), created_at),
+            )
+            .unwrap();
+        let ready = run
+            .transition_stage(
+                &stage_id,
+                StageTransition::MarkReady,
+                EventMetadata::new(EventId::from_u128(810_001), created_at),
+            )
+            .unwrap();
+        let events = vec![started, ready];
+        fixture
+            .store
+            .commit_run_update(&run, loaded.revision, &events)
+            .unwrap();
+        assert_eq!(run.stage(&stage_id).unwrap().status(), StageStatus::Ready);
+
+        // The signal a stop produces for a process that was already launched.
+        let produced = engine.consume_signal(
+            &mut run,
+            &stage_id,
+            &ProviderId::new("fake").unwrap(),
+            None,
+            ProviderSignal::Interrupted,
+        );
+        let produced = produced.expect("an interruption before start must not fail the stop");
+        assert!(
+            produced.is_empty(),
+            "a stage that never ran has nothing to record: {produced:?}"
+        );
+        assert_eq!(
+            run.stage(&stage_id).unwrap().status(),
+            StageStatus::Ready,
+            "a stage that never started must not be given a stage transition"
+        );
     }
 
     #[test]
