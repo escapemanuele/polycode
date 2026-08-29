@@ -8,6 +8,7 @@ use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowK
 pub(crate) enum ActionKind {
     Start,
     Resume,
+    Stop,
     Retry,
     ResolveAttention,
     Apply,
@@ -19,6 +20,7 @@ impl ActionKind {
         match self {
             Self::Start => "starting run",
             Self::Resume => "resuming run",
+            Self::Stop => "stopping run",
             Self::Retry => "retrying stage",
             Self::ResolveAttention => "resolving attention",
             Self::Apply => "applying changes",
@@ -37,6 +39,9 @@ pub(crate) enum WorkerCommand {
         effort: EffortSetting,
     },
     ResumeRun {
+        run_id: RunId,
+    },
+    StopRun {
         run_id: RunId,
     },
     RetryStage {
@@ -61,6 +66,7 @@ impl WorkerCommand {
         match self {
             Self::StartRun { .. } => ActionKind::Start,
             Self::ResumeRun { .. } => ActionKind::Resume,
+            Self::StopRun { .. } => ActionKind::Stop,
             Self::RetryStage { .. } => ActionKind::Retry,
             Self::ResolveAttention { .. } => ActionKind::ResolveAttention,
             Self::ApplyRun { .. } => ActionKind::Apply,
@@ -72,6 +78,7 @@ impl WorkerCommand {
         match self {
             Self::StartRun { .. } => None,
             Self::ResumeRun { run_id }
+            | Self::StopRun { run_id }
             | Self::RetryStage { run_id, .. }
             | Self::ResolveAttention { run_id, .. }
             | Self::ApplyRun { run_id }
@@ -174,6 +181,7 @@ where
         WorkerCommand::ResumeRun { run_id } => {
             service.resume_run(run_id).map(WorkerSuccess::Execution)
         }
+        WorkerCommand::StopRun { run_id } => service.stop_run(run_id).map(WorkerSuccess::Execution),
         WorkerCommand::RetryStage { run_id, stage_id } => service
             .retry_stage(run_id, &stage_id)
             .map(WorkerSuccess::Execution),

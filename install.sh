@@ -225,18 +225,26 @@ main() {
     echo
     echo "Location:"
     echo "  $target"
-    case ":$PATH:" in
-        *":$install_dir:"*)
-            echo
-            echo "Run:"
-            echo "  polycode doctor"
-            ;;
-        *)
-            echo
-            echo "Add Polycode to PATH:"
-            echo "  export PATH=\"$install_dir:\$PATH\""
-            ;;
-    esac
+    # Being on PATH is not the same as winning PATH: an older polycode earlier
+    # in the search order would keep answering. Resolve what the shell would
+    # actually run and say so when it is not what we just installed.
+    resolved="$(command -v polycode 2>/dev/null || true)"
+    if [ -z "$resolved" ]; then
+        echo
+        echo "Add Polycode to PATH:"
+        echo "  export PATH=\"$install_dir:\$PATH\""
+    elif [ "$resolved" = "$target" ]; then
+        echo
+        echo "Run:"
+        echo "  polycode doctor"
+    else
+        echo
+        echo "Warning: your shell currently resolves \`polycode\` to:"
+        echo "  $resolved"
+        echo
+        echo "Put $install_dir before that directory in PATH,"
+        echo "or remove the older installation."
+    fi
     if [ "$registered" -eq 0 ]; then
         echo
         echo "Note: this installation could not be registered for automatic updates."

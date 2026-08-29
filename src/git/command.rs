@@ -40,6 +40,22 @@ impl GitOutput {
     }
 }
 
+/// Reports the available Git version, for diagnostics only.
+///
+/// Runs `git --version` in a directory that is guaranteed not to be a
+/// repository under test, so the probe cannot create or read repository or
+/// data state.
+pub(crate) fn git_version(git: &Git) -> Option<String> {
+    let output = git
+        .output(Path::new("/"), &[os("--version")], &[])
+        .ok()?
+        .ensure_success()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = text.split_whitespace().nth(2)?;
+    Some(version.to_owned())
+}
+
 impl Default for Git {
     fn default() -> Self {
         Self {

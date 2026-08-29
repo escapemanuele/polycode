@@ -57,8 +57,10 @@ fn no_job_can_publish_without_passing_the_gate() {
         "expected guard, build and publish jobs, found {:?}",
         jobs.keys().collect::<Vec<_>>()
     );
+    assert!(jobs.contains_key("quality"), "the quality gate exists");
     assert_eq!(jobs["guard"], None, "the gate depends on nothing");
-    assert_eq!(jobs["build"].as_deref(), Some("guard"));
+    assert_eq!(jobs["quality"].as_deref(), Some("guard"));
+    assert_eq!(jobs["build"].as_deref(), Some("quality"));
     assert_eq!(jobs["publish"].as_deref(), Some("build"));
 
     // Every job other than the gate must be transitively gated by it.
@@ -68,6 +70,43 @@ fn no_job_can_publish_without_passing_the_gate() {
             "job {name} can run without the release gate"
         );
     }
+    // And nothing may reach publication without passing quality first.
+    for name in ["build", "publish"] {
+        assert!(
+            depends_on(&jobs, name, "quality"),
+            "job {name} can run without the quality gate"
+        );
+    }
+}
+
+/// The release cannot publish assets built from source that fails the checks
+/// normal CI enforces. Each command is named so removing one is a visible edit.
+#[test]
+fn the_quality_gate_runs_the_full_check_suite() {
+    let quality = WORKFLOW
+        .split("  quality:")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  build:").next())
+        .expect("the workflow has a quality job");
+    for command in [
+        "cargo fmt --check",
+        "cargo clippy --all-targets --all-features -- -D warnings",
+        "cargo test --test process_tmux --no-fail-fast",
+        "cargo test",
+    ] {
+        assert!(
+            quality.contains(command),
+            "the quality gate must run `{command}`"
+        );
+    }
+    assert!(
+        quality.contains("install --yes tmux"),
+        "the tmux integration prerequisite is installed"
+    );
+    assert!(
+        quality.contains("inputs.tag || github.ref"),
+        "the quality gate checks out the tagged source, for pushes and dispatches alike"
+    );
 }
 
 /// The gate step must actually invoke the canonical check, on both triggers.
@@ -134,6 +173,23 @@ fn job_dependencies() -> std::collections::BTreeMap<String, Option<String>> {
         }
     }
     jobs
+}
+
+/// Whether `start` transitively depends on `target`.
+fn depends_on(
+    jobs: &std::collections::BTreeMap<String, Option<String>>,
+    start: &str,
+    target: &str,
+) -> bool {
+    let mut cursor = Some(start.to_owned());
+    for _ in 0..jobs.len() {
+        let Some(name) = cursor else { return false };
+        if name == target {
+            return true;
+        }
+        cursor = jobs.get(&name).and_then(Clone::clone);
+    }
+    false
 }
 
 fn reaches_guard(jobs: &std::collections::BTreeMap<String, Option<String>>, start: &str) -> bool {

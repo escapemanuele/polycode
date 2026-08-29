@@ -42,9 +42,37 @@ jobs:
           echo "candidate tag: $tag"
           cargo run --quiet --locked -- __verify-release-tag "$tag"
 
+  # No asset may be built, and therefore none may be published, until the
+  # tagged source passes the same quality gate normal CI enforces. The
+  # dependency is structural: waiting for CI by hand is not a gate.
+  quality:
+    name: Quality gate
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install tmux process-backend prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+          tmux -V
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --test process_tmux --no-fail-fast
+      - run: cargo test
+
   build:
     name: ${{ matrix.target }}
-    needs: guard
+    needs: quality
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:

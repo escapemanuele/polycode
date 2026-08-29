@@ -42,6 +42,13 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             print_report(&service()?.resume_run(*run_id)?);
             Ok(())
         }
+        Some(Command::Stop { run_id }) => {
+            let report = service()?.stop_run(*run_id)?;
+            println!("Run stopped. Workspace and results are preserved.");
+            println!("Resume it with `polycode resume {run_id}`.");
+            print_report(&report);
+            Ok(())
+        }
         Some(Command::Retry { run_id, stage_id }) => {
             print_report(&service()?.retry_stage(*run_id, stage_id)?);
             Ok(())
@@ -311,7 +318,6 @@ fn doctor() -> Result<()> {
     let database_file = crate::store::database_file()?;
 
     println!("Polycode doctor");
-    println!("  status: Milestone 11 role evaluation harness");
     print_distribution();
     println!("  config: {}", config_file.display());
     println!("  database: {}", database_file.display());
@@ -384,6 +390,14 @@ fn doctor() -> Result<()> {
         );
     }
     println!("  fake provider: available (deterministic development/testing)");
+    // Git is as fundamental as tmux here: every run needs a repository and a
+    // managed worktree.
+    if let Some(version) = crate::git::git_version(&crate::git::Git::default()) {
+        println!("  Git: available ({version})");
+    } else {
+        println!("  Git: not found on PATH");
+        println!("  guidance: install Git, verify `git --version` works, then rerun");
+    }
     let tmux = crate::process::TmuxBackend::new(std::env::current_exe()?);
     match tmux.availability() {
         Ok(availability) => println!("  tmux: available ({})", availability.version),
