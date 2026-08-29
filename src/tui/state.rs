@@ -457,6 +457,21 @@ impl TuiState {
             })
     }
 
+    /// Whether Stop is offered for the selected run.
+    ///
+    /// Mirrors the domain's interrupt transition, which is only valid from a
+    /// run that is actually executing or waiting on the user. This only stops
+    /// the TUI advertising an action the domain would refuse; the application
+    /// layer stays the guard.
+    pub(crate) fn run_is_stoppable(&self) -> bool {
+        self.details.as_ref().is_some_and(|details| {
+            matches!(
+                details.status,
+                crate::domain::RunStatus::Running | crate::domain::RunStatus::NeedsUser
+            )
+        })
+    }
+
     /// Whether Polycode may install the pending update itself.
     pub(crate) fn update_is_installable(&self) -> bool {
         self.update_install

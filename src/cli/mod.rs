@@ -57,6 +57,8 @@ pub enum Command {
     Status { run_id: RunId },
     /// Continue one prepared or suspended run.
     Resume { run_id: RunId },
+    /// Stop execution, keeping the run, workspace, and results resumable.
+    Stop { run_id: RunId },
     /// Retry one failed stage explicitly.
     Retry { run_id: RunId, stage_id: StageId },
     /// Resolve one pending attention request and continue.

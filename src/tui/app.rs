@@ -153,6 +153,7 @@ impl TuiApp {
                 self.state.scroll = 0;
             }
             Intent::Resume => self.resume(),
+            Intent::Stop => self.stop(),
             Intent::Retry => self.retry(),
             Intent::Attention => self.open_attention(),
             Intent::Artifact => self.open_artifact(),
@@ -393,6 +394,22 @@ impl TuiApp {
         }
     }
 
+    /// Stop is non-destructive — it preserves the run, its workspace, and its
+    /// results — so it dispatches directly rather than through a confirmation
+    /// overlay, which this interface reserves for apply and discard. States the
+    /// domain cannot interrupt are refused here rather than dispatched.
+    fn stop(&mut self) {
+        let Some(run_id) = self.state.selected_run else {
+            return;
+        };
+        if !self.state.run_is_stoppable() {
+            self.state
+                .notify(UiMessageKind::Info, stop_unavailable_reason(&self.state));
+            return;
+        }
+        self.dispatch(WorkerCommand::StopRun { run_id });
+    }
+
     fn retry(&mut self) {
         let Some(run_id) = self.state.selected_run else {
             return;
@@ -615,6 +632,24 @@ impl TuiApp {
 }
 
 /// Explains, in operational language, why apply is not offered yet.
+/// Why Stop is unavailable, in the run's own terms.
+fn stop_unavailable_reason(state: &TuiState) -> String {
+    let Some(details) = state.details.as_ref() else {
+        return "No run selected.".to_owned();
+    };
+    match details.status {
+        crate::domain::RunStatus::Interrupted => "Run is already stopped — [r] resumes it.",
+        crate::domain::RunStatus::Paused => "Run is already suspended — [r] resumes it.",
+        crate::domain::RunStatus::Completed | crate::domain::RunStatus::Applied => {
+            "Run has already finished."
+        }
+        crate::domain::RunStatus::Failed => "Run already stopped on a failure.",
+        crate::domain::RunStatus::Discarded => "This run was discarded.",
+        _ => "Run is not executing yet.",
+    }
+    .to_owned()
+}
+
 fn apply_unavailable_reason(state: &TuiState) -> String {
     let Some(details) = state.details.as_ref() else {
         return "Select a run before applying.".to_owned();
@@ -996,6 +1031,70 @@ mod tests {
         app.handle_intent(Intent::Apply);
         assert_eq!(app.state.overlay, Some(Overlay::Update));
         assert!(app.state.worker_busy.is_none());
+    }
+
+    #[test]
+    fn stop_dispatches_only_for_an_executing_run_and_never_discards() {
+        for status in [RunStatus::Running, RunStatus::NeedsUser] {
+            let (mut app, _fixture) = app_with(details(status, WorkflowKind::Standard));
+            app.handle_intent(Intent::Stop);
+            assert!(
+                app.state.worker_busy.is_some(),
+                "{status:?} is stoppable, so the action dispatches"
+            );
+            assert_eq!(
+                app.state.overlay, None,
+                "{status:?}: stop is non-destructive and opens no confirmation"
+            );
+        }
+
+        for status in [
+            RunStatus::Completed,
+            RunStatus::Applied,
+            RunStatus::Discarded,
+            RunStatus::Failed,
+            RunStatus::Interrupted,
+            RunStatus::Paused,
+        ] {
+            let (mut app, _fixture) = app_with(details(status, WorkflowKind::Standard));
+            app.handle_intent(Intent::Stop);
+            assert!(
+                app.state.worker_busy.is_none(),
+                "{status:?} must not dispatch a stop"
+            );
+            assert!(
+                app.state.message.is_some(),
+                "{status:?}: the refusal explains itself"
+            );
+            assert_eq!(app.state.overlay, None);
+        }
+    }
+
+    #[test]
+    fn quit_still_detaches_without_stopping_the_run() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.handle_intent(Intent::Quit);
+        assert!(app.state.quit, "q still leaves the frontend");
+        assert!(
+            app.state.worker_busy.is_none(),
+            "detaching never interrupts the run"
+        );
+    }
+
+    #[test]
+    fn stop_refusal_names_the_blocking_state() {
+        for (status, expected) in [
+            (RunStatus::Interrupted, "already stopped"),
+            (RunStatus::Completed, "already finished"),
+            (RunStatus::Discarded, "discarded"),
+        ] {
+            let (app, _fixture) = app_with(details(status, WorkflowKind::Standard));
+            let reason = stop_unavailable_reason(&app.state);
+            assert!(
+                reason.contains(expected),
+                "{status:?}: {reason:?} should mention {expected:?}"
+            );
+        }
     }
 
     #[test]

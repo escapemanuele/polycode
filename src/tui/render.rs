@@ -1188,6 +1188,7 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
             if needs_user {
                 push("u", "Resolve attention", theme::ATTENTION);
                 push("l", "Logs", theme::ACCENT);
+                push("s", "Stop", theme::ATTENTION);
             } else if state.run_is_applyable() {
                 push("d", "Review diff", theme::ACCENT);
                 push("a", "Apply", theme::SUCCESS);
@@ -1204,6 +1205,9 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
                     Some(RunStatus::Paused | RunStatus::Interrupted | RunStatus::Ready)
                 ) {
                     push("r", "Resume", theme::ATTENTION);
+                }
+                if state.run_is_stoppable() {
+                    push("s", "Stop", theme::ATTENTION);
                 }
             }
             push(
@@ -1314,7 +1318,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::MUTED)),
             popup,

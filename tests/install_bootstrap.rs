@@ -473,6 +473,53 @@ fn path_guidance_appears_only_when_the_directory_is_not_on_path() {
         !stdout(&present).contains("Add Polycode to PATH"),
         "no guidance is printed when PATH already covers the directory"
     );
+    assert!(
+        !stdout(&present).contains("Warning:"),
+        "a winning PATH entry stays quiet"
+    );
+}
+
+/// Being on PATH is not the same as winning it: an older installation earlier
+/// in the search order keeps answering, and the installer must say so.
+#[test]
+fn a_shadowing_installation_earlier_in_path_is_reported() {
+    let fixture = Fixture::new();
+    let older = fixture.root.path().join("cargo-bin");
+    std::fs::create_dir_all(&older).unwrap();
+    let shadow = older.join("polycode");
+    std::fs::write(&shadow, "#!/bin/sh\necho \"polycode 0.0.1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // The older installation comes first, so it wins the lookup.
+    let path = format!(
+        "{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
+        older.display(),
+        fixture.bin().display()
+    );
+    let output = fixture.run_with(&[], Some(&path));
+    assert!(output.status.success(), "installation still succeeds");
+    let text = stdout(&output);
+    assert!(text.contains("installed successfully"));
+    assert!(text.contains("Warning:"), "{text}");
+    assert!(
+        text.contains(&shadow.display().to_string()),
+        "the shadowing executable is named: {text}"
+    );
+    assert!(
+        text.contains("before that directory in PATH"),
+        "the fix is spelled out: {text}"
+    );
+    assert!(
+        !text.contains("polycode doctor"),
+        "a shadowed install must not tell the user to run a command that would \
+         reach the wrong binary"
+    );
+    // Never destructive: the other installation is left alone.
+    assert!(shadow.is_file());
 }
 
 #[test]

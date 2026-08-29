@@ -9,7 +9,7 @@ mod worktree;
 pub use error::GitError;
 pub use repository::GitRepository;
 
-pub(crate) use command::Git;
+pub(crate) use command::{Git, git_version};
 #[cfg(test)]
 pub(crate) use patch::ChangeKind;
 pub(crate) use patch::{

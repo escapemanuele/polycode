@@ -26,6 +26,8 @@ pub enum AppError {
     #[error(transparent)]
     Identifier(#[from] IdError),
     #[error(transparent)]
+    RunTransition(#[from] crate::domain::RunTransitionError),
+    #[error(transparent)]
     FakeScenario(#[from] FakeScenarioError),
     #[error(transparent)]
     Claude(#[from] ClaudeProviderError),
@@ -41,6 +43,12 @@ pub enum AppError {
     NoProductionProvider,
     #[error("unsupported provider {0:?}; supported providers: claude, codex, fake")]
     UnsupportedProvider(String),
+    #[error(
+        "Repository has uncommitted changes.\n  Commit or stash them before starting a Polycode run."
+    )]
+    DirtySourceRepository,
+    #[error("run {0} cannot be stopped from status {1:?}")]
+    RunNotStoppable(RunId, crate::domain::RunStatus),
     #[error("run {0} cannot be resumed because its input predates the executable schema")]
     LegacyRunInput(RunId),
     #[error(

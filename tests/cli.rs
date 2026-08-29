@@ -89,15 +89,24 @@ fn current_directory_is_default_repository_and_empty_runs_is_side_effect_free() 
 }
 
 #[test]
-fn doctor_reports_real_tmux_availability_without_creating_database() {
+fn doctor_reports_runtime_prerequisites_without_creating_database() {
     let fixture = Fixture::new();
     let output = fixture.doctor_without_native_providers();
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Milestone 11 role evaluation harness"));
+    // Operational readiness, not development history.
+    assert!(
+        !stdout.contains("Milestone"),
+        "doctor describes the product, not the milestone it was built in"
+    );
+    assert!(stdout.contains("version: "));
+    assert!(stdout.contains("install source: "));
     assert!(stdout.contains("Claude Code:"));
     assert!(stdout.contains("Codex CLI: not found on PATH"));
+    // Git is a runtime prerequisite, so it is diagnosed like tmux is.
+    assert!(stdout.contains("Git: available ("), "{stdout}");
     assert!(stdout.contains("tmux: available (tmux "));
+    // A missing native provider is diagnostic, never fatal.
     assert!(!fixture.data.join("polycode.db").exists());
 }
 
@@ -149,9 +158,14 @@ impl Fixture {
     fn doctor_without_native_providers(&self) -> Output {
         let bin = self.temp.path().join("doctor-bin");
         fs::create_dir_all(&bin).unwrap();
-        let tmux = find_on_path("tmux").expect("tmux is required for CLI integration tests");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(tmux, bin.join("tmux")).unwrap();
+        // Only the runtime prerequisites are present; the native provider CLIs
+        // are deliberately absent, which must stay diagnostic rather than fatal.
+        for tool in ["tmux", "git"] {
+            let found =
+                find_on_path(tool).unwrap_or_else(|| panic!("{tool} is required for CLI tests"));
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
+        }
         Command::new(env!("CARGO_BIN_EXE_polycode"))
             .arg("doctor")
             .env("PATH", &bin)

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     AttentionRequestId, ConfigSnapshotId, EffortSetting, EventId, EventMetadata, Run, RunId,
-    RunStatus, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
+    RunStatus, RunTransition, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
 };
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
@@ -142,6 +142,15 @@ where
         created_at: DateTime<Utc>,
     ) -> Result<ExecutionReport, AppError> {
         let repository = GitRepository::discover(repository_path)?;
+        // A managed worktree is created from the source repository's committed
+        // HEAD, so uncommitted work would be invisible to the agent while
+        // remaining visible to the user. Apply already refuses a dirty source;
+        // refusing at the start means the disagreement never happens, and it
+        // runs before any run ID, config, input, event, or workspace intent is
+        // persisted, so a rejected start leaves nothing behind.
+        if !crate::git::source_is_clean(&crate::git::Git::default(), &repository)? {
+            return Err(AppError::DirtySourceRepository);
+        }
         let input = RunInput::new(run_id, task, created_at)?;
         let config_id = config.id().clone();
         let run = Run::new(run_id, workflow, config_id, created_at);
@@ -255,6 +264,56 @@ where
         };
         let report = Self::report(&mut store, run_id, before, None)?;
         Ok((outcome, report))
+    }
+
+    /// Stops execution while preserving everything the run produced.
+    ///
+    /// Stop is not disposition: the workspace, its changes, artifacts, logs,
+    /// and provider session identity all survive, and `resume_run` recovers
+    /// through the existing `Interrupted -> Recover` path rather than starting
+    /// a new logical run or a new stage attempt.
+    ///
+    /// Ordering matters for crash safety. Managed processes are interrupted
+    /// first — `ProcessManager::interrupt` persists its intent before
+    /// signalling — and the run-level interruption is committed afterwards. A
+    /// crash in between leaves interrupted processes under a still-running
+    /// run, which the existing reconciliation and `ProviderSignal::Interrupted`
+    /// path already resolves. The reverse order could leave a run marked
+    /// stopped while its provider kept working.
+    ///
+    /// # Errors
+    /// Returns reconciliation, process, lifecycle, or store errors. Runs that
+    /// have reached a terminal disposition cannot be stopped.
+    pub fn stop_run(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let before = last_sequence(&store, run_id)?;
+        self.reconcile(&mut store, run_id)?;
+        let loaded = store.load_run(run_id)?;
+        match loaded.run.status() {
+            // Already stopped: report the existing state rather than
+            // committing a second interruption.
+            RunStatus::Interrupted => return Self::report(&mut store, run_id, before, None),
+            RunStatus::Running | RunStatus::NeedsUser => {}
+            status => return Err(AppError::RunNotStoppable(run_id, status)),
+        }
+        let process_manager = ProcessManager::from_environment()?;
+        for process in store.list_managed_processes(run_id)? {
+            let inspection = process_manager.inspect(&mut store, process.id())?;
+            if inspection.process.status().is_active() {
+                // Interrupt only. Cleanup would remove the durable process
+                // record this run needs in order to recover.
+                process_manager.interrupt(&mut store, process.id())?;
+            }
+        }
+        let loaded = store.load_run(run_id)?;
+        let mut run = loaded.run;
+        let at = now();
+        let event = run.transition(
+            RunTransition::Interrupt,
+            EventMetadata::new(EventId::new(), at),
+        )?;
+        store.commit_run_update(&run, loaded.revision, &[event])?;
+        Self::report(&mut store, run_id, before, None)
     }
 
     /// Discards one run and cleans its owned workspace resources.
@@ -781,6 +840,120 @@ mod tests {
         assert!(git_output(&fixture.repo, &["status", "--porcelain"]).is_empty());
     }
 
+    /// The managed worktree is built from committed HEAD, so a dirty source
+    /// would silently hide the user's work from the agent. Every start is
+    /// refused before anything durable exists.
+    #[test]
+    fn a_dirty_source_repository_is_refused_before_any_run_is_persisted() {
+        for (label, dirty) in [("tracked modification", true), ("untracked file", false)] {
+            let fixture = Fixture::new();
+            if dirty {
+                fs::write(fixture.repo.join("README.md"), "uncommitted edit\n").unwrap();
+            } else {
+                fs::write(fixture.repo.join("scratch.txt"), "untracked\n").unwrap();
+            }
+            let error = fixture
+                .default_service()
+                .start_run(
+                    WorkflowKind::Fast,
+                    "task",
+                    &fixture.repo,
+                    Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                    EffortSetting::NativeDefault,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, AppError::DirtySourceRepository),
+                "{label}: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("uncommitted changes"), "{label}");
+            assert!(message.contains("Commit or stash"), "{label}");
+
+            // Nothing durable may survive a refused start.
+            assert!(
+                !fixture.database.exists(),
+                "{label}: a refused start created a database"
+            );
+            assert!(
+                !fixture.worktrees.exists(),
+                "{label}: a refused start created workspace resources"
+            );
+            assert_eq!(
+                fixture.default_service().list_runs().unwrap().len(),
+                0,
+                "{label}: a refused start left a run behind"
+            );
+        }
+    }
+
+    /// Review workflows read the source too, so they take the same preflight.
+    #[test]
+    fn every_workflow_takes_the_dirty_source_preflight() {
+        for kind in [
+            WorkflowKind::Fast,
+            WorkflowKind::Standard,
+            WorkflowKind::Deep,
+            WorkflowKind::Review,
+        ] {
+            let fixture = Fixture::new();
+            fs::write(fixture.repo.join("README.md"), "uncommitted\n").unwrap();
+            let error = fixture
+                .default_service()
+                .start_run(
+                    kind,
+                    "task",
+                    &fixture.repo,
+                    Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                    EffortSetting::NativeDefault,
+                )
+                .unwrap_err();
+            assert!(matches!(error, AppError::DirtySourceRepository), "{kind:?}");
+        }
+    }
+
+    /// Committing the same content makes the identical start succeed, so the
+    /// preflight rejects dirtiness rather than the repository itself.
+    #[test]
+    fn a_clean_source_repository_starts_normally() {
+        let fixture = Fixture::new();
+        fs::write(fixture.repo.join("feature.txt"), "work\n").unwrap();
+        git(&fixture.repo, &["add", "feature.txt"]);
+        git(&fixture.repo, &["commit", "-qm", "feature"]);
+        let report = fixture
+            .default_service()
+            .start_run(
+                WorkflowKind::Fast,
+                "task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(report.details.status, RunStatus::Completed);
+    }
+
+    /// The preflight applies to new runs only: an existing run resumes even if
+    /// the source has since been modified.
+    #[test]
+    fn resuming_an_existing_run_is_not_subject_to_the_preflight() {
+        let fixture = Fixture::new();
+        let report = fixture
+            .default_service()
+            .start_run(
+                WorkflowKind::Fast,
+                "task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = report.details.id;
+        fs::write(fixture.repo.join("README.md"), "dirty after the fact\n").unwrap();
+        let resumed = fixture.default_service().resume_run(run_id).unwrap();
+        assert_eq!(resumed.details.id, run_id);
+    }
+
     #[test]
     fn restart_preserves_completed_run_input_and_does_not_replay_signals() {
         let fixture = Fixture::new();
@@ -1057,6 +1230,182 @@ mod tests {
                 .unwrap();
             assert_eq!(completed.details.status, RunStatus::Completed);
         }
+    }
+
+    /// A run held open by the provider, so Stop has something to interrupt.
+    fn delayed_scenario() -> FakeScenario {
+        FakeScenario::new().stage("implementation").events([
+            FakeEvent::Started,
+            FakeEvent::delay("external-ready"),
+            FakeEvent::Completed,
+        ])
+    }
+
+    #[test]
+    fn stop_interrupts_execution_and_keeps_everything_the_run_produced() {
+        let fixture = Fixture::new();
+        let running = fixture
+            .scripted_service(delayed_scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "stoppable task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = running.details.id;
+        assert_eq!(running.details.status, RunStatus::Running);
+        let workspace_before = {
+            let store = SqliteStore::open(&fixture.database).unwrap();
+            store.load_workspace(run_id).unwrap().unwrap()
+        };
+
+        let stopped = fixture
+            .scripted_service(delayed_scenario())
+            .stop_run(run_id)
+            .unwrap();
+        assert_eq!(stopped.details.status, RunStatus::Interrupted);
+        assert!(
+            stopped
+                .details
+                .stages
+                .iter()
+                .all(|stage| stage.status != StageStatus::Running),
+            "no stage is left executing"
+        );
+
+        // Stop is not disposition: the workspace and its worktree survive.
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        let workspace_after = store.load_workspace(run_id).unwrap().unwrap();
+        assert_eq!(workspace_after.status(), workspace_before.status());
+        assert_eq!(
+            workspace_after.worktree_path(),
+            workspace_before.worktree_path()
+        );
+        assert!(workspace_after.worktree_path().exists());
+    }
+
+    #[test]
+    fn a_stopped_run_survives_restart_and_resumes_without_a_new_attempt() {
+        let fixture = Fixture::new();
+        let started = fixture
+            .scripted_service(delayed_scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "restartable task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = started.details.id;
+        fixture
+            .scripted_service(delayed_scenario())
+            .stop_run(run_id)
+            .unwrap();
+
+        // A brand-new service instance stands in for a process restart.
+        let after_restart = fixture
+            .scripted_service(delayed_scenario())
+            .inspect_run(run_id)
+            .unwrap();
+        assert_eq!(after_restart.status, RunStatus::Interrupted);
+
+        let attempts_before = attempt_count(&fixture, run_id);
+        let resumed = fixture
+            .scripted_service(delayed_scenario())
+            .resume_run(run_id)
+            .unwrap();
+        assert_eq!(resumed.details.id, run_id, "the same logical run continues");
+        assert_ne!(
+            resumed.details.status,
+            RunStatus::Interrupted,
+            "recovery leaves the interrupted state"
+        );
+        assert_eq!(
+            attempt_count(&fixture, run_id),
+            attempts_before,
+            "stopping never creates a retry attempt"
+        );
+    }
+
+    /// Total stage attempts recorded for the run, so a Stop can be shown not
+    /// to have created one.
+    fn attempt_count(fixture: &Fixture, run_id: RunId) -> usize {
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        store
+            .load_events(run_id)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event.kind(),
+                    crate::domain::DomainEventKind::StageStarted
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn stopping_an_already_stopped_run_is_safe() {
+        let fixture = Fixture::new();
+        let started = fixture
+            .scripted_service(delayed_scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "idempotent stop",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = started.details.id;
+        fixture
+            .scripted_service(delayed_scenario())
+            .stop_run(run_id)
+            .unwrap();
+        let again = fixture
+            .scripted_service(delayed_scenario())
+            .stop_run(run_id)
+            .unwrap();
+        assert_eq!(again.details.status, RunStatus::Interrupted);
+        assert!(
+            again.committed_events.is_empty(),
+            "a second stop commits nothing"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_cannot_be_stopped_and_stop_never_discards() {
+        let fixture = Fixture::new();
+        let completed = fixture
+            .default_service()
+            .start_run(
+                WorkflowKind::Fast,
+                "finished task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let run_id = completed.details.id;
+        let error = fixture.default_service().stop_run(run_id).unwrap_err();
+        assert!(
+            matches!(error, AppError::RunNotStoppable(_, RunStatus::Completed)),
+            "{error:?}"
+        );
+        // The refusal changed nothing, least of all into a disposition.
+        let details = fixture.default_service().inspect_run(run_id).unwrap();
+        assert_eq!(details.status, RunStatus::Completed);
+
+        fixture.default_service().discard_run(run_id).unwrap();
+        let discarded = fixture.default_service().inspect_run(run_id).unwrap();
+        assert_eq!(
+            discarded.status,
+            RunStatus::Discarded,
+            "discard semantics are unchanged"
+        );
     }
 
     #[test]
