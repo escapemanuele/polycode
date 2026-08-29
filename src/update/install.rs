@@ -137,18 +137,31 @@ pub fn load_receipt(path: &Path) -> Option<InstallReceipt> {
     (receipt.schema_version == RECEIPT_SCHEMA_VERSION).then_some(receipt)
 }
 
-/// Best-effort persistence; a receipt that cannot be written only costs the
-/// next process its automatic-update eligibility.
-pub fn store_receipt(path: &Path, receipt: &InstallReceipt) {
-    let write = || -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(receipt)?)
-    };
-    if let Err(error) = write() {
-        tracing::debug!(%error, "install receipt not persisted");
+/// Persists a receipt atomically, and says so when it cannot.
+///
+/// The receipt decides whether a future process may update itself, so a
+/// failure here is reported rather than swallowed. The write goes to a
+/// temporary file beside the destination and is renamed over it, so an
+/// interrupted write can never leave truncated JSON where a valid receipt
+/// used to be.
+///
+/// # Errors
+/// Returns the underlying I/O or encoding failure.
+pub fn write_receipt(path: &Path, receipt: &InstallReceipt) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let staging = path.with_extension("json.tmp");
+    let encoded = serde_json::to_vec_pretty(receipt)?;
+    if let Err(error) = std::fs::write(&staging, encoded) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staging, path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Classifies the running executable, using the receipt beside the update
@@ -251,7 +264,7 @@ pub fn register_official_install(
         .unwrap_or_else(|_| executable.to_path_buf());
     let receipt = InstallReceipt::new(canonical, version, asset, installed_at);
     let path = crate::store::install_receipt_file()?;
-    store_receipt(&path, &receipt);
+    write_receipt(&path, &receipt)?;
     Ok(receipt)
 }
 
@@ -427,7 +440,7 @@ mod tests {
         let fixture = TempDir::new().unwrap();
         let path = fixture.path().join("install.json");
         let entry = receipt("/usr/local/bin/polycode");
-        store_receipt(&path, &entry);
+        write_receipt(&path, &entry).unwrap();
         assert_eq!(load_receipt(&path).unwrap(), entry);
 
         std::fs::write(&path, r#"{"schema_version":99,"executable":"/x","version":"1.0.0","asset":"a","installed_at":"2026-08-22T12:00:00Z"}"#).unwrap();

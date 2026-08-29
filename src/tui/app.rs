@@ -697,7 +697,12 @@ fn install_release(info: &UpdateInfo) -> anyhow::Result<String> {
     let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
     let downloader = crate::update::HttpDownloader::new(Duration::from_secs(120));
     let installed = crate::update::install(&release, &std::env::current_exe()?, &downloader, now)?;
-    Ok(installed.restart_notice())
+    // A binary that installed but did not register is reported as such; the
+    // alternative is silently losing automatic updates.
+    Ok(match installed.registration_warning() {
+        Some(warning) => format!("{} {warning}", installed.restart_notice()),
+        None => installed.restart_notice(),
+    })
 }
 
 /// Runs one update check on a detached thread so startup never waits on the

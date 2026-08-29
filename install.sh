@@ -211,6 +211,9 @@ main() {
     # The installed binary writes its own receipt, so the schema, the data
     # directory rules, and the path canonicalization all come from one Rust
     # implementation instead of being reproduced here.
+    # Registration is what makes `polycode update` able to replace this binary
+    # later. A failure here leaves a perfectly working Polycode, so it is
+    # reported rather than treated as an install failure.
     if "$target" __register-official-install "$target" --asset "$asset" >/dev/null 2>&1; then
         registered=1
     else
