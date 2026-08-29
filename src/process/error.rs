@@ -89,3 +89,16 @@ pub enum ProcessError {
     #[error("managed process runner failed: {0}")]
     Runner(String),
 }
+
+impl ProcessError {
+    /// Whether this is an optimistic-concurrency loss, including one that
+    /// arrived through the store beneath it.
+    #[must_use]
+    pub const fn is_lost_revision(&self) -> bool {
+        match self {
+            Self::ConcurrentModification { .. } | Self::CursorConcurrentModification { .. } => true,
+            Self::Store(error) => error.is_lost_revision(),
+            _ => false,
+        }
+    }
+}

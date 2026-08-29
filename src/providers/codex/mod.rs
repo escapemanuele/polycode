@@ -379,7 +379,11 @@ impl<B: ProcessBackend> CodexProvider<B> {
         chunk: OutputChunk,
         status: ManagedProcessStatus,
     ) -> Result<ProviderPoll, CodexProviderError> {
-        if session.native_session_id().is_none() {
+        // Execution cannot continue a thread Codex never started, so it says
+        // so. Observation can: a stop is asking what happened, and "the
+        // invocation died before it ever started" is an answer, not a failure.
+        // Raising here instead would make the run unstoppable.
+        if session.native_session_id().is_none() && !request.observe_only() {
             if matches!(
                 status,
                 ManagedProcessStatus::Interrupted | ManagedProcessStatus::Missing
