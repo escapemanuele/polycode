@@ -92,6 +92,52 @@ pub(crate) fn truncate_title(task: &str, limit: usize) -> String {
     }
 }
 
+/// Columns a tab advances to, matching the terminal default.
+const TAB_STOP: usize = 8;
+
+/// Makes one line of external text safe to place in a terminal cell buffer.
+///
+/// Viewer content is not ours: diffs, artifacts, and provider logs carry
+/// whatever the repository and the agent produced. Control characters must
+/// never reach the buffer. Ratatui measures a cell by its display width, and
+/// a control character measures zero, so it is written without advancing the
+/// column — but the terminal still acts on it, moving the cursor. The two
+/// disagree, every later cell lands in the wrong place, and the diff-based
+/// repaint can no longer erase what it drew: content stays on screen after
+/// the viewer is closed. Tabs expand to the next tab stop so alignment
+/// survives; every other control character becomes a visible placeholder so
+/// the line keeps its shape and nothing is silently dropped.
+pub(crate) fn viewer_line(line: &str) -> String {
+    if !line.chars().any(|character| {
+        character.is_control() || matches!(character, '\u{7f}'..='\u{9f}' | '\u{200b}'..='\u{200f}')
+    }) {
+        return line.to_owned();
+    }
+    let mut safe = String::with_capacity(line.len());
+    let mut column = 0usize;
+    for character in line.chars() {
+        match character {
+            '\t' => {
+                let spaces = TAB_STOP - (column % TAB_STOP);
+                safe.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            character
+                if character.is_control()
+                    || matches!(character, '\u{7f}'..='\u{9f}' | '\u{200b}'..='\u{200f}') =>
+            {
+                safe.push('\u{fffd}');
+                column += 1;
+            }
+            character => {
+                safe.push(character);
+                column += 1;
+            }
+        }
+    }
+    safe
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone as _;
@@ -193,5 +239,24 @@ mod tests {
         assert_eq!(truncate_title("  Add OAuth  \nmore", 40), "Add OAuth");
         assert_eq!(truncate_title("caffè è più", 5), "caffè…");
         assert_eq!(truncate_title("", 10), "");
+    }
+
+    #[test]
+    fn viewer_line_expands_tabs_and_neutralises_control_characters() {
+        // Tabs align to the next stop, measured from the start of the line.
+        assert_eq!(viewer_line("\tx"), "        x");
+        assert_eq!(viewer_line("ab\tc"), "ab      c");
+        assert_eq!(viewer_line("abcdefgh\tc"), "abcdefgh        c");
+
+        // Everything else that would move the cursor becomes one visible cell,
+        // so the line keeps its shape instead of silently losing content.
+        assert_eq!(viewer_line("a\u{1b}[31mb"), "a\u{fffd}[31mb");
+        assert_eq!(viewer_line("a\rb"), "a\u{fffd}b");
+        assert_eq!(viewer_line("a\u{0}b"), "a\u{fffd}b");
+
+        // Ordinary text, including wide and accented characters, is untouched.
+        assert_eq!(viewer_line("fn main() {}"), "fn main() {}");
+        assert_eq!(viewer_line("caffè 日本語"), "caffè 日本語");
+        assert_eq!(viewer_line(""), "");
     }
 }

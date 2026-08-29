@@ -337,15 +337,27 @@ where
         // Signalling the provider is not the same as recording that the stage
         // stopped. Let the engine observe the now-interrupted processes and
         // commit the stage-level interruption before the run-level one.
-        // ResumeAction::Continue is deliberate: this pass must only reconcile
-        // what already happened, never resume or start anything. Without it
-        // the stage still reads Running under an Interrupted run, and the
-        // first resume recovers only the run, leaving the user to issue
-        // resume a second time.
-        self.drive(&mut store, run_id, ResumeAction::Continue)?;
+        // Without it the stage still reads Running under an Interrupted run,
+        // and the first resume recovers only the run, leaving the user to
+        // issue resume a second time.
+        //
+        // Observe, never Continue: the adapters decide on their own whether to
+        // resume, from the persisted session status against the stage status.
+        // A run carrying a stale NeedsUser session with a still-Running stage
+        // would otherwise have its provider resumed by the very command asking
+        // to halt it — and a pending permission that cannot be replayed safely
+        // would surface as a stop failure.
+        self.drive(&mut store, run_id, ResumeAction::Observe)?;
         let loaded = store.load_run(run_id)?;
-        if loaded.run.status() == RunStatus::Interrupted {
-            return Self::report(&mut store, run_id, before, None);
+        match loaded.run.status() {
+            RunStatus::Running | RunStatus::NeedsUser => {}
+            // Observing can settle the run on its own. A process that had
+            // already exited resolves a stale Running into the run's true
+            // resting state — interrupted, or failed for a process that died
+            // without a result. The run is stopped either way, so report what
+            // it actually is instead of forcing an Interrupt the domain would
+            // rightly reject.
+            _ => return Self::report(&mut store, run_id, before, None),
         }
         let mut run = loaded.run;
         let at = now();
@@ -536,6 +548,9 @@ where
             let reloaded = store.load_run(run_id)?;
             resume_suspended_stages(&mut engine, store, &reloaded.run)?;
         }
+        if action == ResumeAction::Observe {
+            return Ok(Some(engine.drive_observing(store, run_id)?));
+        }
         Ok(Some(drive_attached(&mut engine, store, run_id)?))
     }
 
@@ -590,6 +605,9 @@ fn drive_attached<P: crate::engine::Provider>(
 enum ResumeAction {
     Continue,
     Resume,
+    /// Record what already happened without ever starting or resuming
+    /// provider work. The control-plane stop path, and nothing else.
+    Observe,
 }
 
 fn resume_suspended_stages<P: crate::engine::Provider>(
@@ -1386,6 +1404,34 @@ mod tests {
             attempt_count(&fixture, run_id),
             attempts_before,
             "stopping never creates a retry attempt"
+        );
+    }
+
+    /// Stop reconciles through the engine, and the provider adapters decide
+    /// for themselves whether a poll should resume, from the persisted session
+    /// status against the stage status. Only an observing pass tells them not
+    /// to. This is a fence, not a behaviour test: the behaviour is covered by
+    /// the Claude adapter's stale-NeedsUser test, but nothing there notices if
+    /// this call site quietly goes back to a resuming action.
+    #[test]
+    fn stop_reconciles_without_ever_authorising_provider_work() {
+        // Only the non-test half of this file is the call graph under test.
+        let source = include_str!("run_service.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let stop = code
+            .split("fn stop_run_once")
+            .nth(1)
+            .expect("stop_run_once must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("stop_run_once body");
+        assert!(
+            stop.contains("ResumeAction::Observe"),
+            "stop must drive the engine in observing mode"
+        );
+        assert!(
+            !stop.contains("ResumeAction::Continue") && !stop.contains("ResumeAction::Resume"),
+            "stop must never drive with an action that lets an adapter resume"
         );
     }
 

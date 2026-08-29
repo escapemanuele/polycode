@@ -199,23 +199,32 @@ impl<B: ProcessBackend> CodexProvider<B> {
         request: &ProviderRequest,
         session: ProviderSessionRecord,
     ) -> Result<ProviderPoll, CodexProviderError> {
-        if session.status() == ProviderSessionStatus::Created
-            || (session.status() == ProviderSessionStatus::Interrupted
-                && matches!(
-                    request.stage_status(),
-                    StageStatus::Ready | StageStatus::Running
-                ))
+        // See the Claude adapter: an observing poll may never start work.
+        if !request.observe_only()
+            && (session.status() == ProviderSessionStatus::Created
+                || (session.status() == ProviderSessionStatus::Interrupted
+                    && matches!(
+                        request.stage_status(),
+                        StageStatus::Ready | StageStatus::Running
+                    )))
         {
             return self.start_invocation(store, request, session);
         }
-        let process_id = session.current_process_id().ok_or_else(|| {
-            CodexProviderError::Protocol("provider session has no current process".to_owned())
-        })?;
+        let Some(process_id) = session.current_process_id() else {
+            if request.observe_only() {
+                // Nothing was ever launched, so there is nothing to observe.
+                return Ok(ProviderPoll::Pending);
+            }
+            return Err(CodexProviderError::Protocol(
+                "provider session has no current process".to_owned(),
+            ));
+        };
         let inspection = self.manager.inspect(store, process_id)?;
         if matches!(
             inspection.process.status(),
             ManagedProcessStatus::Preparing | ManagedProcessStatus::Starting
-        ) {
+        ) && !request.observe_only()
+        {
             self.manager.start(store, process_id)?;
         }
         let inspection = self.manager.inspect(store, process_id)?;

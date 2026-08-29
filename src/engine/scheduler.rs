@@ -64,6 +64,7 @@ pub struct WorkflowEngine<P, C = SystemExecutionContext> {
     task: String,
     context: C,
     drive_limit: usize,
+    observe_only: bool,
 }
 
 impl<P> WorkflowEngine<P, SystemExecutionContext>
@@ -88,7 +89,28 @@ where
             task,
             context,
             drive_limit: DEFAULT_DRIVE_LIMIT,
+            observe_only: false,
         }
+    }
+
+    /// Drives without ever starting or resuming provider work.
+    ///
+    /// Used by the control plane when stopping a run: the processes have
+    /// already been interrupted and the engine is asked only to record that,
+    /// never to continue the conversation it just halted.
+    ///
+    /// # Errors
+    /// Returns the same lifecycle, persistence, and provider errors as
+    /// [`Self::drive`].
+    pub fn drive_observing(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<EngineStatus, EngineError> {
+        self.observe_only = true;
+        let outcome = self.drive(store, run_id);
+        self.observe_only = false;
+        outcome
     }
 
     #[must_use]
@@ -453,6 +475,12 @@ where
                 .map(|dependency| dependency.stage_id().clone())
                 .collect(),
         );
+        // A stop pass observes; it must never become a reason to resume.
+        let request = if self.observe_only {
+            request.observing()
+        } else {
+            request
+        };
         let provider_id = self.provider.provider_id_for(&request)?;
         if let Some(previous) = checkpoint
             .provider_id

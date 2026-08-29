@@ -87,6 +87,7 @@ pub struct ProviderRequest {
     signal_index: usize,
     session_id: Option<ProviderSessionId>,
     dependency_stage_ids: Vec<StageId>,
+    observe_only: bool,
 }
 
 /// Persisted stage context used to route one human-attention continuation.
@@ -166,7 +167,29 @@ impl ProviderRequest {
             signal_index,
             session_id,
             dependency_stage_ids,
+            observe_only: false,
         }
+    }
+
+    /// Marks this poll as observation only.
+    ///
+    /// The control plane stops a run by interrupting its processes and then
+    /// asking the engine to record what already happened. An adapter must not
+    /// treat that pass as a reason to start or resume provider work: a stale
+    /// session would otherwise be continued by the very command the user
+    /// issued to halt it. Adapters honour this by skipping every branch that
+    /// would launch an invocation, and reporting `Pending` when there is
+    /// nothing left to observe.
+    #[must_use]
+    pub(crate) fn observing(mut self) -> Self {
+        self.observe_only = true;
+        self
+    }
+
+    /// Whether this poll may only observe, never start or resume work.
+    #[must_use]
+    pub const fn observe_only(&self) -> bool {
+        self.observe_only
     }
 
     #[must_use]

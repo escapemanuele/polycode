@@ -230,24 +230,36 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         request: &ProviderRequest,
         session: ProviderSessionRecord,
     ) -> Result<ProviderPoll, ClaudeProviderError> {
-        if session.status() == ProviderSessionStatus::Created {
-            return self.start_invocation(store, request, session);
+        // An observing poll records what already happened; starting or
+        // resuming an invocation here would continue the very conversation the
+        // caller asked to stop.
+        if !request.observe_only() {
+            if session.status() == ProviderSessionStatus::Created {
+                return self.start_invocation(store, request, session);
+            }
+            if matches!(
+                session.status(),
+                ProviderSessionStatus::NeedsUser | ProviderSessionStatus::Interrupted
+            ) && request.stage_status() == crate::domain::StageStatus::Running
+            {
+                return self.start_invocation(store, request, session);
+            }
         }
-        if matches!(
-            session.status(),
-            ProviderSessionStatus::NeedsUser | ProviderSessionStatus::Interrupted
-        ) && request.stage_status() == crate::domain::StageStatus::Running
-        {
-            return self.start_invocation(store, request, session);
-        }
-        let process_id = session.current_process_id().ok_or_else(|| {
-            ClaudeProviderError::Protocol("provider session has no current process".to_owned())
-        })?;
+        let Some(process_id) = session.current_process_id() else {
+            if request.observe_only() {
+                // Nothing was ever launched, so there is nothing to observe.
+                return Ok(ProviderPoll::Pending);
+            }
+            return Err(ClaudeProviderError::Protocol(
+                "provider session has no current process".to_owned(),
+            ));
+        };
         let inspection = self.manager.inspect(store, process_id)?;
         if matches!(
             inspection.process.status(),
             ManagedProcessStatus::Preparing | ManagedProcessStatus::Starting
-        ) {
+        ) && !request.observe_only()
+        {
             self.manager.start(store, process_id)?;
         }
         let inspection = self.manager.inspect(store, process_id)?;
@@ -898,6 +910,12 @@ mod tests {
                 .insert(invocation, result.into());
         }
 
+        /// Processes this backend has actually launched, so a test can prove
+        /// an observing poll started none.
+        fn started_count(&self) -> usize {
+            self.started.lock().unwrap().len()
+        }
+
         fn set_edit_effect(&self, invocation: u32, path: PathBuf, content: impl Into<String>) {
             self.effects
                 .lock()
@@ -1132,6 +1150,81 @@ mod tests {
             RunStatus::NeedsUser
         );
         assert!(store.list_artifacts(run_id).unwrap().is_empty());
+    }
+
+    /// A run can be persisted with a provider session still `NeedsUser` while
+    /// the domain has no matching attention request and the stage still reads
+    /// `Running` — from an older version, a crash, or the window between an
+    /// attention resolution committing and its own drive. Stopping such a run
+    /// must record the interruption, never continue the conversation: an
+    /// ordinary poll would resume the session, and a pending denial that
+    /// cannot be replayed as an exact rule (Bash) would surface
+    /// `UnsafePermission` from the command the user issued to halt the work.
+    #[test]
+    fn an_observing_poll_never_resumes_a_stale_needs_user_session() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), false);
+        let mut engine = WorkflowEngine::new(provider, "stale needs user");
+        let request_id = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+
+        // Reproduce the incoherent persisted shape: attention closed in the
+        // domain (run and stage back to Running) while the provider session
+        // record is left exactly as it was — still NeedsUser.
+        let loaded = store.load_run(run_id).unwrap();
+        let mut run = loaded.run;
+        let event = run
+            .resolve_attention(
+                request_id,
+                EventMetadata::new(EventId::new(), std::time::SystemTime::now().into()),
+            )
+            .unwrap();
+        store
+            .commit_run_update(&run, loaded.revision, &[event])
+            .unwrap();
+        let loaded = store.load_run(run_id).unwrap();
+        assert_eq!(loaded.run.status(), RunStatus::Running);
+        let stage = loaded
+            .run
+            .stages()
+            .iter()
+            .find(|stage| stage.status() == crate::domain::StageStatus::Running);
+        assert!(stage.is_some(), "the stale stage is still Running");
+        let sessions = store.list_provider_sessions(run_id).unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.status() == ProviderSessionStatus::NeedsUser),
+            "the provider session is still NeedsUser"
+        );
+
+        let started_before = backend.started_count();
+
+        // The stop path: observe only.
+        let outcome = engine.drive_observing(&mut store, run_id);
+        assert!(
+            outcome.is_ok(),
+            "stop surfaced a provider error instead of observing: {:?}",
+            outcome.err()
+        );
+        assert_eq!(
+            backend.started_count(),
+            started_before,
+            "an observing poll started provider work"
+        );
+        let sessions = store.list_provider_sessions(run_id).unwrap();
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.status() != ProviderSessionStatus::Completed),
+            "an observing poll advanced the conversation"
+        );
     }
 
     #[test]
