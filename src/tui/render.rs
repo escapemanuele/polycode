@@ -71,7 +71,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::styled(
             "POLYCODE",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ▌ ", theme::muted()),
@@ -80,7 +80,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if let Some(busy) = state.worker_busy.as_deref() {
         left.push(Span::styled(
             format!("  {busy}…"),
-            Style::default().fg(theme::ACCENT),
+            Style::default().fg(theme::accent()),
         ));
     }
     let right = state
@@ -143,7 +143,7 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         lines.push(Line::from(theme::action(
             "n",
             "Start your first run",
-            theme::ACCENT,
+            theme::accent(),
         )));
         frame.render_widget(
             Paragraph::new(lines)
@@ -207,7 +207,7 @@ fn run_row(
     let left = vec![
         Span::styled(
             if selected { "▸ " } else { "  " },
-            Style::default().fg(theme::ACCENT),
+            Style::default().fg(theme::accent()),
         ),
         Span::styled(
             format!("{} ", run_glyph(run.status)),
@@ -268,10 +268,10 @@ fn render_run_overview(
         && details.workflow != crate::domain::WorkflowKind::Review
     {
         lines.push(Line::from(""));
-        lines.push(Line::from(theme::chip("READY TO REVIEW", theme::SUCCESS)));
+        lines.push(Line::from(theme::chip("READY TO REVIEW", theme::success())));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("[Enter]", Style::default().fg(theme::ACCENT)),
+            Span::styled("[Enter]", Style::default().fg(theme::accent())),
             Span::styled(" Open the mission deck to review", theme::text()),
         ]));
     }
@@ -395,7 +395,7 @@ fn pipeline_line(
     let left = vec![
         Span::styled(
             if selected { "▸ " } else { "  " },
-            Style::default().fg(theme::ACCENT),
+            Style::default().fg(theme::accent()),
         ),
         Span::styled(
             format!("{} ", stage_glyph(stage.status)),
@@ -412,9 +412,9 @@ fn stage_name_style(status: StageStatus, selected: bool) -> Style {
     let base = match status {
         StageStatus::Running => Style::default().add_modifier(Modifier::BOLD),
         StageStatus::NeedsUser => Style::default()
-            .fg(theme::ATTENTION)
+            .fg(theme::attention())
             .add_modifier(Modifier::BOLD),
-        StageStatus::Failed => Style::default().fg(theme::DANGER),
+        StageStatus::Failed => Style::default().fg(theme::danger()),
         StageStatus::Pending | StageStatus::Ready | StageStatus::Skipped => theme::muted(),
         StageStatus::Completed | StageStatus::Paused | StageStatus::Interrupted => theme::text(),
     };
@@ -450,7 +450,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         lines.push(Line::from(""));
         lines.push(Line::from(theme::chip(
             "⚠ ACTION REQUIRED",
-            theme::ATTENTION,
+            theme::attention(),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -461,12 +461,12 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         lines.push(Line::from(theme::action(
             "u",
             "Review and resolve",
-            theme::ATTENTION,
+            theme::attention(),
         )));
     }
     if applyable {
         lines.push(Line::from(""));
-        lines.push(Line::from(theme::chip("READY TO REVIEW", theme::SUCCESS)));
+        lines.push(Line::from(theme::chip("READY TO REVIEW", theme::success())));
         lines.push(Line::from(""));
         lines.extend(hero_actions(applyable, selected.status));
     }
@@ -571,7 +571,7 @@ fn completed_hero(details: &RunDetails, width: u16, now: DateTime<Utc>) -> Vec<L
         Line::from(Span::styled(
             format!("✓ {completed} of {} stages completed", details.stages.len()),
             Style::default()
-                .fg(theme::SUCCESS)
+                .fg(theme::success())
                 .add_modifier(Modifier::BOLD),
         )),
     ]
@@ -675,10 +675,10 @@ fn result_lines(state: &TuiState, selected: &StageSummary) -> Vec<Line<'static>>
             Line::from(Span::styled(
                 "✓ Verified artifact available",
                 Style::default()
-                    .fg(theme::SUCCESS)
+                    .fg(theme::success())
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(theme::action("Enter/o", "Open result", theme::SUCCESS)),
+            Line::from(theme::action("Enter/o", "Open result", theme::success())),
         ];
     }
     // Expected absence stays informational; only a completed stage without an
@@ -718,26 +718,26 @@ fn resource_summary(details: &RunDetails) -> String {
 fn hero_actions(applyable: bool, status: StageStatus) -> Vec<Line<'static>> {
     let mut spans = Vec::new();
     if applyable {
-        spans.extend(theme::action("d", "Review diff", theme::ACCENT));
+        spans.extend(theme::action("d", "Review diff", theme::accent()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("a", "Apply changes", theme::SUCCESS));
+        spans.extend(theme::action("a", "Apply changes", theme::success()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("X", "Discard", theme::DANGER));
+        spans.extend(theme::action("X", "Discard", theme::danger()));
     } else if status == StageStatus::Failed {
-        spans.extend(theme::action("l", "Logs", theme::ACCENT));
+        spans.extend(theme::action("l", "Logs", theme::accent()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("t", "Retry", theme::ATTENTION));
+        spans.extend(theme::action("t", "Retry", theme::attention()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("d", "Diff", theme::ACCENT));
+        spans.extend(theme::action("d", "Diff", theme::accent()));
     } else {
-        spans.extend(theme::action("o", "Result", theme::ACCENT));
+        spans.extend(theme::action("o", "Result", theme::accent()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("l", "Logs", theme::ACCENT));
+        spans.extend(theme::action("l", "Logs", theme::accent()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("d", "Diff", theme::ACCENT));
+        spans.extend(theme::action("d", "Diff", theme::accent()));
     }
     spans.push(Span::raw("   "));
-    spans.extend(theme::action("i", "Details", theme::MUTED));
+    spans.extend(theme::action("i", "Details", theme::muted_color()));
     vec![Line::from(spans)]
 }
 
@@ -950,7 +950,7 @@ fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details
     }
     lines.extend([
         Line::from(""),
-        Line::from(theme::action("i", "operational view", theme::MUTED)),
+        Line::from(theme::action("i", "operational view", theme::muted_color())),
     ]);
     frame.render_widget(
         Paragraph::new(lines)
@@ -1079,16 +1079,16 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                     "[preview truncated at 2 MiB; total {} bytes]",
                     diff.total_bytes
                 ),
-                Style::default().fg(theme::ATTENTION),
+                Style::default().fg(theme::attention()),
             )));
         }
         for line in diff.text.lines() {
             let style = if line.starts_with("+++") || line.starts_with("---") {
-                Style::default().fg(theme::ACCENT)
+                Style::default().fg(theme::accent())
             } else if line.starts_with('+') {
-                Style::default().fg(theme::SUCCESS)
+                Style::default().fg(theme::success())
             } else if line.starts_with('-') {
-                Style::default().fg(theme::DANGER)
+                Style::default().fg(theme::danger())
             } else if line.starts_with("diff --git") || line.starts_with("@@") {
                 theme::diff_hunk()
             } else {
@@ -1136,7 +1136,7 @@ fn render_new_run(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         lines.push(Line::from(vec![
             Span::styled(
                 if focused { "▸ " } else { "  " },
-                Style::default().fg(theme::ACCENT),
+                Style::default().fg(theme::accent()),
             ),
             Span::styled(
                 value.to_owned(),
@@ -1151,9 +1151,9 @@ fn render_new_run(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     lines.push(Line::from(""));
     lines.push(theme::rule(width));
     lines.push(Line::from(""));
-    let mut actions = theme::action("Enter", "Start run", theme::ACCENT);
+    let mut actions = theme::action("Enter", "Start run", theme::accent());
     actions.push(Span::raw("   "));
-    actions.extend(theme::action("Esc", "Cancel", theme::MUTED));
+    actions.extend(theme::action("Esc", "Cancel", theme::muted_color()));
     lines.push(Line::from(actions));
     frame.render_widget(
         Paragraph::new(lines)
@@ -1176,8 +1176,8 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
     };
     match screen {
         Screen::Runs => {
-            push("Enter", "Open", theme::ACCENT);
-            push("n", "New run", theme::ACCENT);
+            push("Enter", "Open", theme::accent());
+            push("n", "New run", theme::accent());
         }
         Screen::RunDetail => {
             let needs_user = state
@@ -1191,28 +1191,28 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
                 .map(|stage| stage.status);
             let run_status = state.details.as_ref().map(|details| details.status);
             if needs_user {
-                push("u", "Resolve attention", theme::ATTENTION);
-                push("l", "Logs", theme::ACCENT);
-                push("s", "Stop", theme::ATTENTION);
+                push("u", "Resolve attention", theme::attention());
+                push("l", "Logs", theme::accent());
+                push("s", "Stop", theme::attention());
             } else if state.run_is_applyable() {
-                push("d", "Review diff", theme::ACCENT);
-                push("a", "Apply", theme::SUCCESS);
-                push("X", "Discard", theme::DANGER);
+                push("d", "Review diff", theme::accent());
+                push("a", "Apply", theme::success());
+                push("X", "Discard", theme::danger());
             } else {
-                push("o", "Result", theme::ACCENT);
-                push("l", "Logs", theme::ACCENT);
-                push("d", "Diff", theme::ACCENT);
+                push("o", "Result", theme::accent());
+                push("l", "Logs", theme::accent());
+                push("d", "Diff", theme::accent());
                 if stage_status == Some(StageStatus::Failed) {
-                    push("t", "Retry", theme::ATTENTION);
+                    push("t", "Retry", theme::attention());
                 }
                 if matches!(
                     run_status,
                     Some(RunStatus::Paused | RunStatus::Interrupted | RunStatus::Ready)
                 ) {
-                    push("r", "Resume", theme::ATTENTION);
+                    push("r", "Resume", theme::attention());
                 }
                 if state.run_is_stoppable() {
-                    push("s", "Stop", theme::ATTENTION);
+                    push("s", "Stop", theme::attention());
                 }
             }
             push(
@@ -1222,14 +1222,14 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
                 } else {
                     "Details"
                 },
-                theme::MUTED,
+                theme::muted_color(),
             );
         }
-        Screen::Artifact => push("m", "Raw/rendered", theme::ACCENT),
-        Screen::Logs | Screen::Diff => push("Esc", "Back", theme::ACCENT),
+        Screen::Artifact => push("m", "Raw/rendered", theme::accent()),
+        Screen::Logs | Screen::Diff => push("Esc", "Back", theme::accent()),
         Screen::NewRun => {
-            push("Enter", "Start run", theme::ACCENT);
-            push("Esc", "Cancel", theme::MUTED);
+            push("Enter", "Start run", theme::accent());
+            push("Esc", "Cancel", theme::muted_color());
         }
     }
     spans
@@ -1281,13 +1281,13 @@ fn footer_line(screen: Screen, state: &TuiState, width: u16) -> Line<'static> {
 
 fn message_presentation(kind: UiMessageKind) -> (&'static str, Style) {
     match kind {
-        UiMessageKind::Info => ("ℹ", Style::default().fg(theme::ACCENT)),
-        UiMessageKind::Success => ("✓", Style::default().fg(theme::SUCCESS)),
-        UiMessageKind::Warning => ("⚠", Style::default().fg(theme::ATTENTION)),
+        UiMessageKind::Info => ("ℹ", Style::default().fg(theme::accent())),
+        UiMessageKind::Success => ("✓", Style::default().fg(theme::success())),
+        UiMessageKind::Warning => ("⚠", Style::default().fg(theme::attention())),
         UiMessageKind::Error => (
             "✗",
             Style::default()
-                .fg(theme::DANGER)
+                .fg(theme::danger())
                 .add_modifier(Modifier::BOLD),
         ),
     }
@@ -1325,7 +1325,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
             Paragraph::new(
                 "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
-            .block(overlay_block(" Help · Esc closes ", theme::MUTED)),
+            .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
         ),
         Overlay::Attention => render_attention(frame, popup, state),
@@ -1359,7 +1359,7 @@ fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::from(Span::styled(
             "UPDATE AVAILABLE",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -1388,7 +1388,7 @@ fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             lines.push(Line::from(vec![
                 Span::styled(
                     if selected { "  → " } else { "    " },
-                    Style::default().fg(theme::ACCENT),
+                    Style::default().fg(theme::accent()),
                 ),
                 Span::styled(
                     label,
@@ -1411,7 +1411,7 @@ fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         lines.push(Line::from(theme::action(
             "Enter",
             "Continue",
-            theme::ACCENT,
+            theme::accent(),
         )));
     }
     // The prompt is an aside, not a takeover: it occupies a compact band
@@ -1421,7 +1421,7 @@ fn render_update(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(overlay_block(" UPDATE ", theme::ACCENT)),
+            .block(overlay_block(" UPDATE ", theme::accent())),
         popup,
     );
 }
@@ -1451,7 +1451,7 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     };
     let mut lines = vec![
-        Line::from(theme::chip("⚠ NEEDS YOU", theme::ATTENTION)),
+        Line::from(theme::chip("⚠ NEEDS YOU", theme::attention())),
         Line::from(""),
     ];
     for (index, attention) in details.attention.iter().enumerate() {
@@ -1459,7 +1459,7 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         lines.push(Line::from(vec![
             Span::styled(
                 if selected { "▸ " } else { "  " },
-                Style::default().fg(theme::ATTENTION),
+                Style::default().fg(theme::attention()),
             ),
             Span::styled(
                 format!("{} · {}", enum_text(attention.kind), attention.summary),
@@ -1498,7 +1498,7 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(overlay_block(" Attention ", theme::ATTENTION)),
+            .block(overlay_block(" Attention ", theme::attention())),
         area,
     );
 }
@@ -1508,9 +1508,9 @@ fn render_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState, appl
         return;
     };
     let (action, color) = if apply {
-        ("APPLY", theme::SUCCESS)
+        ("APPLY", theme::success())
     } else {
-        ("DISCARD", theme::DANGER)
+        ("DISCARD", theme::danger())
     };
     let mut lines = vec![
         Line::from(theme::chip(action, color)),
@@ -1616,27 +1616,27 @@ const fn stage_glyph(status: StageStatus) -> &'static str {
     }
 }
 
-const fn status_style(status: RunStatus) -> Style {
+fn status_style(status: RunStatus) -> Style {
     match status {
-        RunStatus::Completed | RunStatus::Applied => Style::new().fg(theme::SUCCESS),
-        RunStatus::Running => Style::new().fg(theme::ACCENT),
-        RunStatus::NeedsUser | RunStatus::Ready => Style::new().fg(theme::ATTENTION),
-        RunStatus::Failed => Style::new().fg(theme::DANGER),
-        RunStatus::Paused | RunStatus::Interrupted => Style::new().fg(theme::SUSPENDED),
+        RunStatus::Completed | RunStatus::Applied => Style::new().fg(theme::success()),
+        RunStatus::Running => Style::new().fg(theme::accent()),
+        RunStatus::NeedsUser | RunStatus::Ready => Style::new().fg(theme::attention()),
+        RunStatus::Failed => Style::new().fg(theme::danger()),
+        RunStatus::Paused | RunStatus::Interrupted => Style::new().fg(theme::suspended()),
         RunStatus::Created | RunStatus::Preparing | RunStatus::Discarded => {
-            Style::new().fg(theme::MUTED)
+            Style::new().fg(theme::muted_color())
         }
     }
 }
 
-const fn stage_style(status: StageStatus) -> Style {
+fn stage_style(status: StageStatus) -> Style {
     match status {
-        StageStatus::Completed => Style::new().fg(theme::SUCCESS),
-        StageStatus::Running => Style::new().fg(theme::ACCENT),
-        StageStatus::NeedsUser | StageStatus::Ready => Style::new().fg(theme::ATTENTION),
-        StageStatus::Failed => Style::new().fg(theme::DANGER),
-        StageStatus::Paused | StageStatus::Interrupted => Style::new().fg(theme::SUSPENDED),
-        StageStatus::Pending | StageStatus::Skipped => Style::new().fg(theme::MUTED),
+        StageStatus::Completed => Style::new().fg(theme::success()),
+        StageStatus::Running => Style::new().fg(theme::accent()),
+        StageStatus::NeedsUser | StageStatus::Ready => Style::new().fg(theme::attention()),
+        StageStatus::Failed => Style::new().fg(theme::danger()),
+        StageStatus::Paused | StageStatus::Interrupted => Style::new().fg(theme::suspended()),
+        StageStatus::Pending | StageStatus::Skipped => Style::new().fg(theme::muted_color()),
     }
 }
 
@@ -1676,6 +1676,65 @@ mod tests {
     use crate::domain::{EffortSetting, Role, RunId, StageId, StageKind, WorkflowKind};
 
     const POD_SHELL: &str = "▄██████████▄";
+
+    /// The contract that lets the palette get richer later: strip every
+    /// colour and the interface must still say which state each thing is in.
+    /// Under Mono all tokens collapse to one value, so anything still legible
+    /// is carried by a glyph or a word — never by hue. Without this, adding a
+    /// vivid theme or motion would quietly let the aesthetic layer own
+    /// meaning, and a colour-blind or piped reader would lose it.
+    #[test]
+    fn every_state_stays_distinguishable_with_all_colour_removed() {
+        theme::with_palette(
+            theme::Palette::for_capability(theme::ColorCapability::Mono),
+            || {
+                // The states a reader must never confuse, whatever the terminal.
+                let runs = [
+                    RunStatus::Running,
+                    RunStatus::Completed,
+                    RunStatus::Failed,
+                    RunStatus::NeedsUser,
+                    RunStatus::Paused,
+                    RunStatus::Interrupted,
+                ];
+                for (index, status) in runs.iter().enumerate() {
+                    for other in runs.iter().skip(index + 1) {
+                        assert_ne!(
+                            run_glyph(*status),
+                            run_glyph(*other),
+                            "{status:?} and {other:?} are told apart only by colour"
+                        );
+                    }
+                    // And colour genuinely carries nothing here, so the glyph above
+                    // is doing the whole job rather than merely helping.
+                    assert_eq!(
+                        status_style(*status),
+                        status_style(runs[0]),
+                        "a status keeping its own colour under Mono is still using hue"
+                    );
+                }
+
+                let stages = [
+                    StageStatus::Running,
+                    StageStatus::Completed,
+                    StageStatus::Failed,
+                    StageStatus::NeedsUser,
+                    StageStatus::Paused,
+                    StageStatus::Interrupted,
+                ];
+                for (index, status) in stages.iter().enumerate() {
+                    for other in stages.iter().skip(index + 1) {
+                        assert_ne!(
+                            stage_glyph(*status),
+                            stage_glyph(*other),
+                            "{status:?} and {other:?} are told apart only by colour"
+                        );
+                    }
+                    assert_eq!(stage_style(*status), stage_style(stages[0]));
+                }
+            },
+        );
+    }
 
     fn render_text(state: &TuiState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);

@@ -143,23 +143,23 @@ const fn activity_accent(activity: MascotActivity) -> &'static str {
     }
 }
 
-const fn state_style(state: MascotState) -> Style {
+fn state_style(state: MascotState) -> Style {
     match state {
-        MascotState::Idle | MascotState::Running => Style::new().fg(theme::ACCENT),
-        MascotState::Waiting => Style::new().fg(theme::MUTED),
-        MascotState::NeedsUser => Style::new().fg(theme::ATTENTION),
-        MascotState::Completed => Style::new().fg(theme::SUCCESS),
-        MascotState::Failed => Style::new().fg(theme::DANGER),
+        MascotState::Idle | MascotState::Running => Style::new().fg(theme::accent()),
+        MascotState::Waiting => Style::new().fg(theme::muted_color()),
+        MascotState::NeedsUser => Style::new().fg(theme::attention()),
+        MascotState::Completed => Style::new().fg(theme::success()),
+        MascotState::Failed => Style::new().fg(theme::danger()),
     }
 }
 
-const fn accent_style(activity: MascotActivity) -> Style {
+fn accent_style(activity: MascotActivity) -> Style {
     match activity {
-        MascotActivity::Architecture => Style::new().fg(theme::STRUCTURE),
+        MascotActivity::Architecture => Style::new().fg(theme::structure()),
         MascotActivity::Implementation
         | MascotActivity::QualityReview
         | MascotActivity::SpecReview
-        | MascotActivity::Decision => Style::new().fg(theme::MUTED),
+        | MascotActivity::Decision => Style::new().fg(theme::muted_color()),
     }
 }
 
