@@ -103,7 +103,7 @@ const fn expression(
         MascotState::Running => ("██", "▀▀", "▀▀", " ▄▄ "),
         MascotState::Waiting => ("zz", "▄▄", "▄▄", " .. "),
         MascotState::NeedsUser => ("!!", "▐█", "█▌", " ██ "),
-        MascotState::Completed => ("██", "^^", "^^", "\\▄▄/"),
+        MascotState::Completed => ("██", "▀▀", "▀▀", "▀▄▄▀"),
         MascotState::Failed => ("xx", "xx", "xx", "▄▀▀▄"),
     }
 }
@@ -382,6 +382,30 @@ mod tests {
                 assert_ne!(accent, other_accent);
             }
         }
+    }
+
+    /// Completed once used caret eyes and a slash mouth. Both kept the
+    /// footprint the generic test checks, while rendering as detached marks
+    /// above a mouth whose lower half merged into the filled shell below.
+    /// Pinned as a relationship rather than as literal art: Completed borrows
+    /// the eyes Running already uses and the mouth Idle already uses, so the
+    /// three stay in one visual language and no glyph is duplicated here.
+    #[test]
+    fn the_completed_face_reuses_the_running_eyes_and_idle_mouth() {
+        let (_, _, _, idle_mouth) = expression(MascotState::Idle);
+        let (_, running_left, running_right, _) = expression(MascotState::Running);
+        let (_, done_left, done_right, done_mouth) = expression(MascotState::Completed);
+
+        assert_eq!(done_left, running_left, "left eye follows Running");
+        assert_eq!(done_right, running_right, "right eye follows Running");
+        assert_eq!(done_mouth, idle_mouth, "mouth follows Idle");
+
+        // The shapes that broke it, named so they cannot come back quietly.
+        let face = [done_left, done_right, done_mouth].concat();
+        assert!(
+            !face.contains('^') && !face.contains('\\') && !face.contains('/'),
+            "the eyes and mouth must stay block glyphs: {face:?}"
+        );
     }
 
     #[test]
