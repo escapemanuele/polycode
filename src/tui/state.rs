@@ -559,6 +559,21 @@ impl TuiState {
         })
     }
 
+    /// Whether this run can be sent back to fix its own result.
+    ///
+    /// The same completed branch-run state apply needs, plus a decision for
+    /// the fix to answer. A workflow that never decides has no verdict to
+    /// remediate, so offering the action there would only produce a refusal.
+    pub(crate) fn run_can_be_fixed(&self) -> bool {
+        self.run_is_applyable()
+            && self.details.as_ref().is_some_and(|details| {
+                details
+                    .stages
+                    .iter()
+                    .any(|stage| stage.kind == crate::domain::StageKind::Decision)
+            })
+    }
+
     pub(crate) fn notify(&mut self, kind: UiMessageKind, text: impl Into<String>) {
         self.notify_at(kind, text, Instant::now());
     }

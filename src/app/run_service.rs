@@ -277,6 +277,30 @@ where
         Self::report(&mut store, run_id, before, Some(&status))
     }
 
+    /// Sends a completed run back for one remediation cycle, then executes to
+    /// quiescence.
+    ///
+    /// The run grows a fix stage and a fresh decision over it, keeping its
+    /// workspace, artifacts and identity. Polycode never reads the previous
+    /// verdict to decide whether this is warranted: the decision artifact is
+    /// prose written for a person, and the operator asking is the whole
+    /// signal. The fix stage reads the verdict it is answering as a dependency
+    /// artifact, together with the run's immutable task.
+    ///
+    /// # Errors
+    /// Returns identity, lifecycle, guard, persistence, or provider errors.
+    /// A run that is not completed, whose workspace is gone, or whose apply is
+    /// under way is refused without being modified.
+    pub fn request_fix(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let before = last_sequence(&store, run_id)?;
+        self.reconcile(&mut store, run_id)?;
+        let mut engine = self.engine(&mut store, run_id)?;
+        engine.request_fix(&mut store, run_id)?;
+        let status = drive_attached(&mut engine, &mut store, run_id)?;
+        Self::report(&mut store, run_id, before, Some(&status))
+    }
+
     /// Applies completed workspace changes to source checkout.
     ///
     /// # Errors

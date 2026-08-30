@@ -319,6 +319,28 @@ where
         self.transition_stage(store, run_id, stage_id, StageTransition::Retry)
     }
 
+    /// Reopens a completed run with one remediation cycle appended.
+    ///
+    /// Goes through the same execution boundary as every other mutation, so a
+    /// run whose workspace is gone or whose apply is already under way is
+    /// refused here rather than discovered halfway through the cycle.
+    ///
+    /// # Errors
+    /// Returns boundary, lifecycle, or persistence failures.
+    pub fn request_fix(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<EngineStatus, EngineError> {
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let metadata = self.metadata_for(&loaded.run);
+        let event = loaded.run.request_fix(metadata)?;
+        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
     fn transition_stage(
         &mut self,
         store: &mut SqliteStore,

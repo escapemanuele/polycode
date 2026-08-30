@@ -168,6 +168,7 @@ impl TuiApp {
             Intent::Logs => self.open_logs(),
             Intent::Diff => self.open_diff(),
             Intent::Apply => self.open_apply_confirmation(),
+            Intent::Fix => self.request_fix(),
             Intent::Discard => self.state.overlay = Some(Overlay::DiscardConfirm),
             Intent::DismissMessage => self.state.dismiss_message(),
             Intent::ToggleRaw if self.state.screen == Screen::Artifact => {
@@ -438,6 +439,25 @@ impl TuiApp {
         });
     }
 
+    /// Sends a completed run back for one remediation cycle.
+    ///
+    /// Deliberately not gated on the decision's own words. The verdict is
+    /// prose written for a person; the operator read it and pressed the key,
+    /// and that is the whole signal. Refusing here for a run the domain would
+    /// decline only avoids dispatching a doomed action; it does not weaken
+    /// that guard.
+    fn request_fix(&mut self) {
+        let Some(run_id) = self.state.selected_run else {
+            return;
+        };
+        if !self.state.run_can_be_fixed() {
+            self.state
+                .notify(UiMessageKind::Info, fix_unavailable_reason(&self.state));
+            return;
+        }
+        self.dispatch(WorkerCommand::RequestFix { run_id });
+    }
+
     fn open_attention(&mut self) {
         if self
             .state
@@ -637,6 +657,23 @@ impl TuiApp {
         };
         self.state.evidence = self.reader.stage_execution_evidence(run_id, &stage_id).ok();
     }
+}
+
+/// Explains, in operational language, why a fix is not offered yet.
+fn fix_unavailable_reason(state: &TuiState) -> String {
+    let Some(details) = state.details.as_ref() else {
+        return "Select a run before asking for a fix.".to_owned();
+    };
+    if details.workflow == crate::domain::WorkflowKind::Review {
+        return "Review runs change nothing, so there is nothing to fix.".to_owned();
+    }
+    if details.status != crate::domain::RunStatus::Completed {
+        return format!(
+            "{} A fix answers a decision, so the run has to reach one first.",
+            apply_unavailable_reason(state)
+        );
+    }
+    "This workflow has no decision stage, so there is no verdict to answer.".to_owned()
 }
 
 /// Explains, in operational language, why apply is not offered yet.
@@ -839,6 +876,61 @@ mod tests {
             usage: crate::app::RunUsage::default(),
             started_at: None,
             finished_at: None,
+        }
+    }
+
+    /// The same run, having reached a verdict a person can reject.
+    fn decided(mut details: RunDetails) -> RunDetails {
+        let mut decision = details.stages[0].clone();
+        decision.id = StageId::new("decision").unwrap();
+        decision.kind = StageKind::Decision;
+        decision.role = Role::EngineeringLead;
+        decision.status = StageStatus::Completed;
+        details.stages.push(decision);
+        details
+    }
+
+    /// "Fix it" answers a decision, so it is offered exactly where one exists
+    /// and the run has finished reaching it.
+    #[test]
+    fn fix_is_dispatched_only_for_a_completed_run_that_reached_a_decision() {
+        let (mut app, _fixture) = app_with(decided(details(
+            RunStatus::Completed,
+            WorkflowKind::Standard,
+        )));
+        app.handle_intent(Intent::Fix);
+        assert_eq!(
+            app.state.worker_busy.as_deref(),
+            Some("fixing run"),
+            "a rejected standard run is exactly what fix is for"
+        );
+
+        for (label, run) in [
+            (
+                "still running",
+                decided(details(RunStatus::Running, WorkflowKind::Standard)),
+            ),
+            (
+                "already applied",
+                decided(details(RunStatus::Applied, WorkflowKind::Standard)),
+            ),
+            (
+                "a review run changes nothing",
+                decided(details(RunStatus::Completed, WorkflowKind::Review)),
+            ),
+            (
+                "no decision stage to answer",
+                details(RunStatus::Completed, WorkflowKind::Fast),
+            ),
+        ] {
+            let (mut app, _fixture) = app_with(run);
+            app.handle_intent(Intent::Fix);
+            assert_eq!(app.state.worker_busy, None, "fix dispatched for {label}");
+            // A refusal explains itself rather than doing nothing visible.
+            assert!(
+                app.state.message.is_some(),
+                "no explanation offered for {label}"
+            );
         }
     }
 

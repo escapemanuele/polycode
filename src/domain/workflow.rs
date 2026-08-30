@@ -159,6 +159,28 @@ impl WorkflowDefinition {
         Self::new(kind, stages).expect("built-in workflow must remain a valid DAG")
     }
 
+    /// Returns this workflow with further stages appended, revalidated whole.
+    ///
+    /// A workflow is data, and the scheduler never branches on
+    /// [`WorkflowKind`], so a run that grows a remediation cycle is still an
+    /// ordinary DAG. Every invariant is rechecked against the combined set —
+    /// duplicate IDs, unknown dependencies and cycles are rejected here rather
+    /// than discovered by the scheduler later.
+    ///
+    /// # Errors
+    /// Rejects an empty extension and any extension that would break the DAG.
+    pub fn extended(
+        &self,
+        additional: Vec<StageDefinition>,
+    ) -> Result<Self, WorkflowDefinitionError> {
+        if additional.is_empty() {
+            return Err(WorkflowDefinitionError::NoStages);
+        }
+        let mut stages = self.stages.clone();
+        stages.extend(additional);
+        Self::new(self.kind, stages)
+    }
+
     #[must_use]
     pub const fn kind(&self) -> WorkflowKind {
         self.kind
@@ -289,6 +311,46 @@ fn review_stages() -> Vec<StageDefinition> {
             StageKind::Decision,
             Role::EngineeringLead,
             vec![required("synthesis")],
+        ),
+    ]
+}
+
+/// The stages of one remediation cycle: an implementer fix, then a fresh
+/// decision over it.
+///
+/// The fix depends on the decision it is answering, so it cannot start before
+/// that verdict exists. The new decision depends on the fix, so no verdict is
+/// ever recorded over work that has not happened. Nothing here re-runs the
+/// reviews: the lead reads the new diff against findings it already has, and
+/// an operator who wants the full review back can say so by starting a review
+/// run over the result.
+///
+/// # Panics
+/// Panics only if `index` could produce an invalid stage identity, which it
+/// cannot: the identities are built from a decimal integer.
+#[must_use]
+pub fn fix_cycle_stages(index: u32, after_decision: &StageId) -> Vec<StageDefinition> {
+    let fix_id = StageId::new(format!("fix_{index}")).expect("fix stage ID must remain valid");
+    let decision_id =
+        StageId::new(format!("decision_{index}")).expect("decision stage ID must remain valid");
+    vec![
+        StageDefinition::new(
+            fix_id.clone(),
+            StageKind::Fix,
+            Role::Implementer,
+            vec![Dependency::required(after_decision.clone())],
+        ),
+        StageDefinition::new(
+            decision_id,
+            StageKind::Decision,
+            Role::EngineeringLead,
+            // Both, and required. The fix alone does not say what it was
+            // meant to resolve, and the verdict alone does not say whether it
+            // was. A decision over one without the other is not a decision.
+            vec![
+                Dependency::required(fix_id),
+                Dependency::required(after_decision.clone()),
+            ],
         ),
     ]
 }

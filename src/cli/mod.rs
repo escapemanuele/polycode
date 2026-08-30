@@ -69,6 +69,8 @@ pub enum Command {
         #[arg(long)]
         response: Option<String>,
     },
+    /// Send a completed run back to fix its own result, then decide again.
+    Fix { run_id: RunId },
     /// Apply completed workspace changes to source repository.
     Apply { run_id: RunId },
     /// Discard run and remove owned workspace resources.

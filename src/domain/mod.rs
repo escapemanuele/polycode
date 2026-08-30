@@ -27,12 +27,12 @@ pub use rehydration::{
 };
 pub use role::Role;
 pub use run::{
-    CompletionBlocker, CompletionBlockerReason, Run, RunAttentionError, RunInvariantError,
-    RunProviderEventError, RunRehydrationError, RunStageError, RunStatus, RunTransition,
-    RunTransitionError,
+    CompletionBlocker, CompletionBlockerReason, Run, RunAttentionError, RunFixError,
+    RunInvariantError, RunProviderEventError, RunRehydrationError, RunStageError, RunStatus,
+    RunTransition, RunTransitionError,
 };
 pub use stage::{Stage, StageRehydrationError, StageStatus, StageTransition, StageTransitionError};
 pub use workflow::{
     Dependency, DependencyKind, StageDefinition, StageKind, WorkflowDefinition,
-    WorkflowDefinitionError, WorkflowKind,
+    WorkflowDefinitionError, WorkflowKind, fix_cycle_stages,
 };

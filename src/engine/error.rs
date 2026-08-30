@@ -1,8 +1,8 @@
 use thiserror::Error;
 
 use crate::domain::{
-    AttentionError, Role, RunAttentionError, RunId, RunProviderEventError, RunStageError,
-    RunStatus, RunTransitionError, StageId,
+    AttentionError, Role, RunAttentionError, RunFixError, RunId, RunProviderEventError,
+    RunStageError, RunStatus, RunTransitionError, StageId,
 };
 use crate::process::ProcessError;
 use crate::store::StoreError;
@@ -28,6 +28,8 @@ pub enum EngineError {
     Attention(#[from] AttentionError),
     #[error(transparent)]
     ProviderEvent(#[from] RunProviderEventError),
+    #[error(transparent)]
+    Fix(#[from] RunFixError),
     #[error("run {0} has no persisted workspace")]
     MissingWorkspace(RunId),
     #[error("run {run_id} requires Ready workspace, found {status:?}")]

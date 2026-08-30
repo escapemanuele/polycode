@@ -453,6 +453,46 @@ impl SqliteStore {
     }
 }
 
+/// A run's stage graph is immutable, with exactly one exception: an operator
+/// sending a completed run back to remediate its own result appends a cycle.
+///
+/// The exception is kept as narrow as the thing it exists for. The kind cannot
+/// change, every stage that already existed must be byte-identical and in the
+/// same position, growth must be an append, and the batch must carry the
+/// `RunFixRequested` event naming exactly the stages that appeared. Anything
+/// else — a reordering, an edited definition, a silent append with no event to
+/// account for it — is still a rejected mutation of persisted identity.
+fn validate_workflow_growth(
+    current: &crate::domain::WorkflowDefinition,
+    next: &crate::domain::WorkflowDefinition,
+    events: &[DomainEvent],
+) -> Result<(), StoreError> {
+    let changed = || StoreError::ImmutableRunFieldChanged("workflow");
+    if current.kind() != next.kind() {
+        return Err(changed());
+    }
+    let existing = current.stages();
+    let grown = next.stages();
+    if grown.len() <= existing.len() || grown[..existing.len()] != *existing {
+        return Err(changed());
+    }
+    let appended = grown[existing.len()..]
+        .iter()
+        .map(crate::domain::StageDefinition::id)
+        .collect::<Vec<_>>();
+    let declared = events
+        .iter()
+        .find_map(|event| match event.kind() {
+            DomainEventKind::RunFixRequested { stage_ids } => Some(stage_ids),
+            _ => None,
+        })
+        .ok_or_else(changed)?;
+    if declared.iter().collect::<Vec<_>>() != appended {
+        return Err(changed());
+    }
+    Ok(())
+}
+
 pub(crate) fn commit_run_update_transaction(
     transaction: &Transaction<'_>,
     run: &Run,
@@ -473,7 +513,7 @@ pub(crate) fn commit_run_update_transaction(
     }
     let current = load_commit_state(transaction, run.id())?;
     if current.run.workflow() != run.workflow() {
-        return Err(StoreError::ImmutableRunFieldChanged("workflow"));
+        validate_workflow_growth(current.run.workflow(), run.workflow(), events)?;
     }
     if current.run.config_snapshot_id() != run.config_snapshot_id() {
         return Err(StoreError::ImmutableRunFieldChanged(
@@ -896,6 +936,119 @@ mod tests {
 
     fn metadata(id: u128, second: u32) -> EventMetadata {
         EventMetadata::new(EventId::from_u128(id), at(second))
+    }
+
+    /// The stage graph is persisted identity. It grows for exactly one reason,
+    /// and every other difference is still a rejected mutation.
+    #[test]
+    fn a_stage_graph_grows_only_by_an_accounted_for_append() {
+        use crate::domain::{RunId, WorkflowKind};
+
+        fn definition(id: &str, kind: StageKind, dependencies: Vec<Dependency>) -> StageDefinition {
+            StageDefinition::new(
+                StageId::new(id).unwrap(),
+                kind,
+                Role::Implementer,
+                dependencies,
+            )
+        }
+        fn workflow(stages: Vec<StageDefinition>) -> WorkflowDefinition {
+            WorkflowDefinition::new(WorkflowKind::Standard, stages).unwrap()
+        }
+        fn fix_event(stage_ids: &[&str]) -> Vec<DomainEvent> {
+            vec![DomainEvent::new(
+                metadata(1, 1),
+                RunId::from_u128(1),
+                None,
+                DomainEventKind::RunFixRequested {
+                    stage_ids: stage_ids
+                        .iter()
+                        .map(|id| StageId::new(*id).unwrap())
+                        .collect(),
+                },
+            )]
+        }
+
+        let current = workflow(vec![
+            definition("implementation", StageKind::Implementation, vec![]),
+            definition(
+                "decision",
+                StageKind::Decision,
+                vec![Dependency::required(
+                    StageId::new("implementation").unwrap(),
+                )],
+            ),
+        ]);
+        let appended = vec![definition(
+            "fix_1",
+            StageKind::Fix,
+            vec![Dependency::required(StageId::new("decision").unwrap())],
+        )];
+        let grown = current.extended(appended.clone()).unwrap();
+
+        // The one sanctioned growth: an append the batch accounts for.
+        validate_workflow_growth(&current, &grown, &fix_event(&["fix_1"])).unwrap();
+
+        // An append no event accounts for is a silent mutation.
+        assert!(matches!(
+            validate_workflow_growth(&current, &grown, &[]),
+            Err(StoreError::ImmutableRunFieldChanged("workflow"))
+        ));
+
+        // An event that does not name what actually appeared is not an
+        // account of it.
+        assert!(matches!(
+            validate_workflow_growth(&current, &grown, &fix_event(&["fix_2"])),
+            Err(StoreError::ImmutableRunFieldChanged("workflow"))
+        ));
+
+        // Editing a stage that already existed is not growth, even alongside a
+        // legitimate append.
+        let edited = workflow(vec![
+            definition("implementation", StageKind::Research, vec![]),
+            definition(
+                "decision",
+                StageKind::Decision,
+                vec![Dependency::required(
+                    StageId::new("implementation").unwrap(),
+                )],
+            ),
+            appended[0].clone(),
+        ]);
+        assert!(matches!(
+            validate_workflow_growth(&current, &edited, &fix_event(&["fix_1"])),
+            Err(StoreError::ImmutableRunFieldChanged("workflow"))
+        ));
+
+        // Nor is reordering what was already there.
+        let reordered = workflow(vec![
+            definition("decision", StageKind::Decision, vec![]),
+            definition(
+                "implementation",
+                StageKind::Implementation,
+                vec![Dependency::required(StageId::new("decision").unwrap())],
+            ),
+            definition(
+                "fix_1",
+                StageKind::Fix,
+                vec![Dependency::required(StageId::new("decision").unwrap())],
+            ),
+        ]);
+        assert!(matches!(
+            validate_workflow_growth(&current, &reordered, &fix_event(&["fix_1"])),
+            Err(StoreError::ImmutableRunFieldChanged("workflow"))
+        ));
+
+        // Shrinking is not growth.
+        let shrunk = workflow(vec![definition(
+            "implementation",
+            StageKind::Implementation,
+            vec![],
+        )]);
+        assert!(matches!(
+            validate_workflow_growth(&current, &shrunk, &fix_event(&["fix_1"])),
+            Err(StoreError::ImmutableRunFieldChanged("workflow"))
+        ));
     }
 
     fn stage_id(value: &str) -> StageId {

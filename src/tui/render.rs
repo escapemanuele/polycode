@@ -436,6 +436,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         return;
     };
     let applyable = state.run_is_applyable();
+    let fixable = state.run_can_be_fixed();
     let mut lines = if applyable {
         completed_hero(details, width, now)
     } else {
@@ -464,7 +465,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         lines.push(Line::from(""));
         lines.push(Line::from(theme::chip("READY TO REVIEW", theme::success())));
         lines.push(Line::from(""));
-        lines.extend(hero_actions(applyable, selected.status));
+        lines.extend(hero_actions(applyable, fixable, selected.status));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -497,7 +498,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
             .map(|line| Line::from(Span::styled(line, theme::text()))),
     );
     if !applyable {
-        let actions = hero_actions(applyable, selected.status);
+        let actions = hero_actions(applyable, fixable, selected.status);
         if actions
             .iter()
             .all(|line| span_width(&line.spans) <= width as usize)
@@ -731,12 +732,16 @@ fn provider_resources(entry: &crate::app::ProviderUsage) -> String {
 
 /// Actions offered by the panel, gated on canonical state: apply and discard
 /// appear only for a run the workspace layer would accept.
-fn hero_actions(applyable: bool, status: StageStatus) -> Vec<Line<'static>> {
+fn hero_actions(applyable: bool, fixable: bool, status: StageStatus) -> Vec<Line<'static>> {
     let mut spans = Vec::new();
     if applyable {
         spans.extend(theme::action("d", "Review diff", theme::accent()));
         spans.push(Span::raw("   "));
         spans.extend(theme::action("a", "Apply changes", theme::success()));
+        if fixable {
+            spans.push(Span::raw("   "));
+            spans.extend(theme::action("f", "Fix it", theme::attention()));
+        }
         spans.push(Span::raw("   "));
         spans.extend(theme::action("X", "Discard", theme::danger()));
     } else if status == StageStatus::Failed {
@@ -1213,6 +1218,9 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
             } else if state.run_is_applyable() {
                 push("d", "Review diff", theme::accent());
                 push("a", "Apply", theme::success());
+                if state.run_can_be_fixed() {
+                    push("f", "Fix it", theme::attention());
+                }
                 push("X", "Discard", theme::danger());
             } else {
                 push("o", "Result", theme::accent());
