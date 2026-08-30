@@ -19,8 +19,9 @@ impl TerminalSession {
         // Resolved once, before the first frame: the terminal's colour
         // capability cannot change under us, and every surface reads the
         // palette rather than asking the environment again.
-        super::theme::set_palette(super::theme::Palette::for_capability(
+        super::theme::set_palette(super::theme::Palette::resolve(
             super::theme::ColorCapability::from_environment(),
+            super::theme::ThemeChoice::from_environment(),
         ));
         // Same reasoning for movement: what the user asked for is read once,
         // and from then on every surface asks the policy rather than the

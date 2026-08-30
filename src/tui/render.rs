@@ -1722,7 +1722,7 @@ mod tests {
     #[test]
     fn every_state_stays_distinguishable_with_all_colour_removed() {
         theme::with_palette(
-            theme::Palette::for_capability(theme::ColorCapability::Mono),
+            theme::Palette::resolve(theme::ColorCapability::Mono, theme::ThemeChoice::Native),
             || {
                 // The states a reader must never confuse, whatever the terminal.
                 let runs = [
@@ -1782,6 +1782,20 @@ mod tests {
             .content
             .iter()
             .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// Every foreground colour a frame actually paints.
+    fn painted_colours(state: &TuiState, width: u16, height: u16) -> Vec<Color> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.fg)
             .collect()
     }
 
@@ -2409,6 +2423,36 @@ mod tests {
         );
         assert!(text.contains("</>"), "coding accent while running");
         assert!(!render_text(&running, 70, 24).contains(POD_SHELL));
+    }
+
+    /// The palette has to arrive through the accessors, not merely resolve
+    /// correctly in isolation. Rendering with Vivid installed paints
+    /// specified colours; the default paints none, so the assertion is about
+    /// the theme rather than about colour existing at all.
+    #[test]
+    fn the_vivid_palette_reaches_the_screen_and_the_native_one_leaves_it_to_the_terminal() {
+        let state = running_state();
+        let specified = |palette| {
+            theme::with_palette(palette, || {
+                painted_colours(&state, 160, 40)
+                    .iter()
+                    .any(|colour| matches!(colour, Color::Rgb(..)))
+            })
+        };
+        assert!(
+            specified(theme::Palette::resolve(
+                theme::ColorCapability::TrueColor,
+                theme::ThemeChoice::Vivid
+            )),
+            "vivid resolved but never reached a cell"
+        );
+        assert!(
+            !specified(theme::Palette::resolve(
+                theme::ColorCapability::TrueColor,
+                theme::ThemeChoice::Native
+            )),
+            "native painted a colour the terminal theme cannot override"
+        );
     }
 
     /// Motion may repaint a cell; it may never move one. A frame drawn mid

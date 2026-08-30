@@ -311,12 +311,20 @@ Repository overrides will eventually live at `<repo>/.polycode.toml`. Current co
 
 ### Appearance
 
-The interface reads two environment variables at startup and never again:
+The interface reads these environment variables at startup and never again:
 
 | Variable | Effect |
 | --- | --- |
 | `NO_COLOR` | Present and non-empty: every semantic colour collapses to the terminal's own foreground. `TERM=dumb` does the same. Nothing becomes unreadable — state is always carried by a glyph or a word as well as a colour. |
+| `POLYCODE_THEME` | `vivid` paints Polycode's own colours; anything else is the default `native`, which uses named ANSI colours so every token resolves to whatever your terminal theme defines. |
 | `POLYCODE_MOTION` | `off` stops all movement; `reduced` keeps state changes but stops anything that repeats; anything else is the default. |
+| `COLORTERM` | Read only to know whether `vivid` can be rendered (`truecolor` or `24bit`). It never changes anything on its own: a terminal that *can* paint Polycode's colours has not asked for them. |
+
+Both themes spell the same eight meanings, so `vivid` is a different
+materialisation rather than a different design. Asked for on a terminal
+without truecolor, it falls back to the named ANSI palette rather than to
+approximated hues, and `NO_COLOR` outranks it either way.
+
 
 Movement is bounded by the surface, not only by the preference: screens you
 read — an artifact, logs, a diff, the new-run form — and every open overlay
