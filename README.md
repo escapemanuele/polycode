@@ -80,6 +80,16 @@ Review:    Research -> Code Quality Review --+
                    `-> Specification Review -+-> Synthesis -> Decision
 ```
 
+A decision is where a run ends, not where the operator's options do. `polycode fix <run-id>`, or `f` in the run detail view, sends a completed run back to remediate its own result:
+
+```text
+... -> Decision --> Fix 1 -> Decision 1 --> Fix 2 -> Decision 2 -> ...
+```
+
+The run grows one cycle per request, keeping its workspace, its artifacts and its identity, so it stays one thing to apply or discard. The fix answers the decision that rejected it and is bounded by that decision's blocking findings; the fresh decision reads both the fix and the verdict it answers, and judges the fix against the code rather than against its own claims. Pressing fix again answers the newest verdict. Nothing re-runs the reviews — start a review run over the result if you want them back.
+
+Polycode never reads the verdict to decide whether a fix is warranted. A decision artifact is prose written for a person; classifying it as a rejection is not something the system can support, so the action is offered on any completed run that reached a decision and your asking is the whole signal.
+
 Code Quality Review inspects actual repository state and judges how implementation is engineered. Specification Review independently compares delivered behavior with immutable task intent and available design evidence, classifying gaps as Missing, Wrong, or Unrequested. Both are read-only and create separate stage-ID-based Markdown artifacts. Existing persisted runs retain their original stored graph, including legacy generic review stages.
 
 ## Local control room
@@ -217,6 +227,7 @@ polycode status <run-id>
 polycode resume <run-id>
 polycode resolve <run-id> <attention-id> [--response "answer"]
 polycode retry <run-id> <stage-id>
+polycode fix <run-id>
 polycode apply <run-id>
 polycode discard <run-id>
 ```
