@@ -664,7 +664,11 @@ fn resource_lines(details: &RunDetails) -> Vec<String> {
     if details.usage.is_empty() {
         return vec!["No usage reported yet".to_owned()];
     }
-    details.usage.providers().map(provider_resources).collect()
+    details
+        .usage
+        .providers()
+        .map(|entry| provider_resources(&entry))
+        .collect()
 }
 
 /// The selected stage's own usage, attributed to the runtime that actually
@@ -687,7 +691,7 @@ fn stage_usage(evidence: &crate::app::StageExecutionEvidence) -> crate::app::Pro
 /// A runtime whose input total already contains its cache reads says so in
 /// place, and its cache read is not repeated as if it were a further
 /// quantity. A runtime that keeps them disjoint lists both.
-fn provider_resources(entry: crate::app::ProviderUsage) -> String {
+fn provider_resources(entry: &crate::app::ProviderUsage) -> String {
     use std::fmt::Write as _;
     let mut line = format!(
         "{} · {} input",
@@ -872,7 +876,7 @@ fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details
     if let Some(evidence) = state.evidence.as_ref() {
         lines.push(technical_row(
             "Usage",
-            provider_resources(stage_usage(evidence)),
+            provider_resources(&stage_usage(evidence)),
         ));
         lines.push(technical_row(
             "Invocations",

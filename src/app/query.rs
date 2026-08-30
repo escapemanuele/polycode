@@ -153,16 +153,16 @@ pub struct RunUsage {
 }
 
 impl RunUsage {
-    fn absorb(&mut self, provider: &str, delta: &UsageDelta) {
+    fn absorb(&mut self, provider: &str, usage: &UsageSummary) {
         self.by_provider
             .entry(provider.to_owned())
             .or_default()
             .absorb(
-                delta.input_units,
-                delta.output_units,
-                delta.cache_read_units,
-                delta.cache_write_units,
-                delta.reasoning_output_units,
+                usage.input_units,
+                usage.output_units,
+                usage.cache_read_units,
+                usage.cache_write_units,
+                usage.reasoning_output_units,
             );
     }
 
@@ -189,15 +189,6 @@ impl RunUsage {
             by_provider: totals.into_iter().collect(),
         }
     }
-}
-
-/// One usage event's reported dimensions, before folding.
-struct UsageDelta {
-    input_units: u64,
-    output_units: u64,
-    cache_read_units: Option<u64>,
-    cache_write_units: Option<u64>,
-    reasoning_output_units: Option<u64>,
 }
 
 fn absorb_dimension(total: &mut Option<u64>, delta: Option<u64>) {
@@ -859,7 +850,7 @@ fn run_usage(events: &[SequencedEvent]) -> RunUsage {
         {
             usage.absorb(
                 provider_id.as_str(),
-                &UsageDelta {
+                &UsageSummary {
                     input_units: *input_units,
                     output_units: *output_units,
                     cache_read_units: *cache_read_units,
