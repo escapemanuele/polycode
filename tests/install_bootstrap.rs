@@ -208,6 +208,7 @@ fn a_verified_release_installs_and_registers_itself_as_official() {
     let classified = std::process::Command::new(fixture.target())
         .args(["__install-source"])
         .env("POLYCODE_DATA_DIR", fixture.data())
+        .env("CODEX_HOME", fixture.data().join("codex-home"))
         .output()
         .unwrap();
     assert_eq!(

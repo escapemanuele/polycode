@@ -48,6 +48,17 @@ pub enum ProviderSignal {
         session_id: Option<ProviderSessionId>,
     },
     Progress(String),
+    /// What the native runtime's own records say it actually ran.
+    ///
+    /// Separate from [`ProviderSignal::Started`] because some runtimes do not
+    /// announce their resolved model when they start — the fact only becomes
+    /// observable later, and a runtime that never makes it observable emits
+    /// nothing here rather than confirming a guess.
+    RuntimeObserved {
+        model_id: Option<ModelId>,
+        /// The runtime's own effort value, verbatim and unmapped.
+        native_effort: Option<String>,
+    },
     NeedsUser {
         kind: AttentionKind,
         summary: String,

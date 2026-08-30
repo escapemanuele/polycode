@@ -13,8 +13,8 @@ pub use provider_factory::{
 };
 pub use query::{
     ArtifactSummary, ArtifactView, AttentionSummary, ChangedFileSummary, CommittedEvent,
-    ProcessLogStream, ProcessLogView, RouteSummary, RunDetails, RunDiffPreview, RunListItem,
-    StageExecutionEvidence, StageSummary, UsageSummary,
+    ProcessLogStream, ProcessLogView, ProviderUsage, RouteSummary, RunDetails, RunDiffPreview,
+    RunListItem, RunUsage, StageExecutionEvidence, StageSummary, UsageSummary,
 };
 pub(crate) use routing::resolve_eval_config;
 pub use routing::{

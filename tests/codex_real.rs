@@ -61,6 +61,7 @@ fn polycode(data: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_polycode"))
         .args(args)
         .env("POLYCODE_DATA_DIR", data)
+        .env("CODEX_HOME", data.join("codex-home"))
         .output()
         .unwrap()
 }

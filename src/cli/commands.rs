@@ -548,6 +548,10 @@ fn print_event(sequence: u64, stage: Option<String>, kind: &DomainEventKind) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one status projection keeps configured and actual columns aligned in source order"
+)]
 fn print_details(details: &RunDetails) {
     println!("Run        {}", details.id);
     println!("Workflow   {}", enum_text(details.workflow));
@@ -614,7 +618,15 @@ fn print_details(details: &RunDetails) {
                 .configured_model
                 .as_deref()
                 .unwrap_or("native default"),
-            stage.requested_effort.label(),
+            stage.observed_effort.as_ref().map_or_else(
+                || format!("{} requested", stage.requested_effort.label()),
+                |observed| {
+                    format!(
+                        "{} requested → {observed} observed",
+                        stage.requested_effort.label()
+                    )
+                }
+            ),
             stage.actual_provider.as_deref().unwrap_or("not started"),
             stage.actual_model.as_deref().unwrap_or("unconfirmed"),
             stage
@@ -645,27 +657,56 @@ fn print_details(details: &RunDetails) {
         }
     }
     println!();
-    println!("{}", usage_line(&details.usage));
+    for line in usage_lines(&details.usage) {
+        println!("{line}");
+    }
 }
 
-/// Provider-native units; optional dimensions appear only when reported.
-/// Totals are not comparable across providers.
-fn usage_line(usage: &crate::app::UsageSummary) -> String {
+/// Provider-native units, one line per runtime that reported any.
+///
+/// Totals are never summed across runtimes: their input figures do not
+/// measure the same thing. A runtime whose input total already contains its
+/// cache reads says so in place instead of listing the cache read again as a
+/// further quantity.
+fn usage_lines(usage: &crate::app::RunUsage) -> Vec<String> {
     use std::fmt::Write as _;
-    let mut line = format!(
-        "Usage      {} input units · {} output units",
-        usage.input_units, usage.output_units
-    );
-    for (label, value) in [
-        ("cache read", usage.cache_read_units),
-        ("cache write", usage.cache_write_units),
-        ("reasoning output", usage.reasoning_output_units),
-    ] {
-        if let Some(value) = value {
-            let _ = write!(line, " · {value} {label} units");
-        }
+    if usage.is_empty() {
+        return vec!["Usage      not reported".to_owned()];
     }
-    line
+    usage
+        .providers()
+        .map(|entry| {
+            let mut line = format!(
+                "Usage      {:<8} {} input units",
+                entry.provider, entry.usage.input_units
+            );
+            let folded_cache_read = entry
+                .input_contains_cache_reads()
+                .then_some(entry.usage.cache_read_units)
+                .flatten();
+            if let Some(cached) = folded_cache_read {
+                let _ = write!(line, " ({cached} of them cached)");
+            }
+            let _ = write!(line, " · {} output units", entry.usage.output_units);
+            for (label, value) in [
+                (
+                    "cache read",
+                    if folded_cache_read.is_some() {
+                        None
+                    } else {
+                        entry.usage.cache_read_units
+                    },
+                ),
+                ("cache write", entry.usage.cache_write_units),
+                ("reasoning output", entry.usage.reasoning_output_units),
+            ] {
+                if let Some(value) = value {
+                    let _ = write!(line, " · {value} {label} units");
+                }
+            }
+            line
+        })
+        .collect()
 }
 
 fn stage_mark(status: StageStatus) -> &'static str {
@@ -715,6 +756,7 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
         DomainEventKind::AttentionResolved { .. } => "attention resolved",
         DomainEventKind::AttentionCancelled { .. } => "attention cancelled",
         DomainEventKind::ProviderStarted { .. } => "provider started",
+        DomainEventKind::ProviderRuntimeObserved { .. } => "provider runtime observed",
         DomainEventKind::ProviderNeedsUser { .. } => "provider awaiting user",
         DomainEventKind::ProviderPaused { .. } => "provider paused",
         DomainEventKind::ProviderInterrupted { .. } => "provider interrupted",

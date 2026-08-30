@@ -365,6 +365,7 @@ impl Fixture {
             .args(args)
             .env("PATH", &self.fake_bin)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .env("POLYCODE_FAKE_CODEX_CAPTURE_DIR", &self.capture)
             .env("POLYCODE_FAKE_CLAUDE_CAPTURE_DIR", &self.capture);
         command
@@ -384,6 +385,7 @@ impl Fixture {
             .args(args)
             .env("PATH", &self.fake_bin)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .env("POLYCODE_FAKE_CODEX_CAPTURE_DIR", &self.capture)
             .env("POLYCODE_FAKE_CLAUDE_CAPTURE_DIR", &self.capture)
             .env(
@@ -399,6 +401,7 @@ impl Fixture {
             .args(args)
             .env("PATH", &self.fake_bin)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .env("POLYCODE_FAKE_CLAUDE_PROBE_FAILURE", "1")
             .output()
             .unwrap()

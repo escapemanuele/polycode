@@ -491,10 +491,11 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
     lines.extend(result_lines(state, selected));
     lines.push(Line::from(""));
     lines.push(theme::section("RESOURCES"));
-    lines.push(Line::from(Span::styled(
-        resource_summary(details),
-        theme::text(),
-    )));
+    lines.extend(
+        resource_lines(details)
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, theme::text()))),
+    );
     if !applyable {
         let actions = hero_actions(applyable, selected.status);
         if actions
@@ -653,25 +654,79 @@ fn result_lines(state: &TuiState, selected: &StageSummary) -> Vec<Line<'static>>
     vec![Line::from(Span::styled(text, theme::muted()))]
 }
 
-/// Provider-native units in human words. Never normalized across providers
-/// and never presented as cost.
-fn resource_summary(details: &RunDetails) -> String {
+/// Provider-native units in human words, one line per runtime that reported
+/// any. Never summed across runtimes and never presented as cost.
+///
+/// A run routes different roles to different runtimes, and those runtimes do
+/// not report the same quantity under the name "input": one line each is what
+/// the numbers actually support.
+fn resource_lines(details: &RunDetails) -> Vec<String> {
+    if details.usage.is_empty() {
+        return vec!["No usage reported yet".to_owned()];
+    }
+    details
+        .usage
+        .providers()
+        .map(|entry| provider_resources(&entry))
+        .collect()
+}
+
+/// The selected stage's own usage, attributed to the runtime that actually
+/// reported it. Falls back to the configured runtime only while nothing has
+/// started, when there is no reported usage to misattribute anyway.
+fn stage_usage(evidence: &crate::app::StageExecutionEvidence) -> crate::app::ProviderUsage {
+    let provider = evidence
+        .actual_provider
+        .clone()
+        .unwrap_or_else(|| evidence.configured_provider.clone());
+    crate::app::ProviderUsage {
+        accounting: crate::providers::input_accounting(&provider),
+        provider,
+        usage: evidence.usage,
+    }
+}
+
+/// One runtime's reported units, written so no token is counted twice.
+///
+/// A runtime whose input total already contains its cache reads says so in
+/// place, and its cache read is not repeated as if it were a further
+/// quantity. A runtime that keeps them disjoint lists both.
+fn provider_resources(entry: &crate::app::ProviderUsage) -> String {
     use std::fmt::Write as _;
-    let mut summary = format!(
-        "{} input · {} output",
-        format::format_units(details.usage.input_units),
-        format::format_units(details.usage.output_units)
+    let mut line = format!(
+        "{} · {} input",
+        entry.provider,
+        format::format_units(entry.usage.input_units)
+    );
+    let folded_cache_read = entry
+        .input_contains_cache_reads()
+        .then_some(entry.usage.cache_read_units)
+        .flatten();
+    if let Some(cached) = folded_cache_read {
+        let _ = write!(line, " ({} of it cached)", format::format_units(cached));
+    }
+    let _ = write!(
+        line,
+        " · {} output",
+        format::format_units(entry.usage.output_units)
     );
     for (label, value) in [
-        ("cache read", details.usage.cache_read_units),
-        ("cache write", details.usage.cache_write_units),
-        ("reasoning output", details.usage.reasoning_output_units),
+        (
+            "cache read",
+            if folded_cache_read.is_some() {
+                None
+            } else {
+                entry.usage.cache_read_units
+            },
+        ),
+        ("cache write", entry.usage.cache_write_units),
+        ("reasoning output", entry.usage.reasoning_output_units),
     ] {
         if let Some(value) = value {
-            let _ = write!(summary, " · {} {label}", format::format_units(value));
+            let _ = write!(line, " · {} {label}", format::format_units(value));
         }
     }
-    summary
+    line
 }
 
 /// Actions offered by the panel, gated on canonical state: apply and discard
@@ -811,29 +866,18 @@ fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details
         ),
         Line::from(""),
         theme::section("RESOURCE EVIDENCE"),
-        technical_row("Usage", {
-            use std::fmt::Write as _;
-            // Provider-native units; optional dimensions appear only when the
-            // runtime reported them.
-            let mut usage = format!(
-                "{} in / {} out",
-                details.usage.input_units, details.usage.output_units
-            );
-            for (label, value) in [
-                ("cache read", details.usage.cache_read_units),
-                ("cache write", details.usage.cache_write_units),
-                ("reasoning out", details.usage.reasoning_output_units),
-            ] {
-                if let Some(value) = value {
-                    let _ = write!(usage, " / {value} {label}");
-                }
-            }
-            usage
-        }),
     ];
-    // Per-stage execution evidence: provider latency stays here and is never
-    // presented as the stage's wall-clock elapsed time.
+    // Per-stage execution evidence: every row below is scoped to the selected
+    // stage. Usage in particular is the stage's own, not the run's — one
+    // stage runs on one runtime, so the units here need no disclaimer. The
+    // run-wide, per-runtime breakdown belongs to the RESOURCES section.
+    // Provider latency stays here and is never presented as the stage's
+    // wall-clock elapsed time.
     if let Some(evidence) = state.evidence.as_ref() {
+        lines.push(technical_row(
+            "Usage",
+            provider_resources(&stage_usage(evidence)),
+        ));
         lines.push(technical_row(
             "Invocations",
             evidence.invocation_count.to_string(),
@@ -850,6 +894,17 @@ fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details
             evidence.injected_prompt_bytes.map_or_else(
                 || "unavailable".to_owned(),
                 |bytes| format!("{bytes} injected bytes"),
+            ),
+        ));
+        // Requested effort and observed effort are different facts. A
+        // native-default request asks for nothing, so the level the runtime
+        // then chose is visible only here, and only when it recorded one.
+        lines.push(technical_row(
+            "Effort",
+            format!(
+                "{} requested → {} observed",
+                selected.requested_effort.label(),
+                evidence.native_effort.as_deref().unwrap_or("unobserved")
             ),
         ));
         if let Some(version) = evidence.provider_cli_version.as_deref() {
@@ -1836,6 +1891,7 @@ mod tests {
             status,
             configured_provider: "codex".to_owned(),
             requested_effort: EffortSetting::NativeDefault,
+            observed_effort: None,
             configured_model: None,
             actual_provider: Some("codex".to_owned()),
             actual_model: None,
@@ -1870,12 +1926,28 @@ mod tests {
             updated_at: at(12, 5, 0),
             stages,
             attention: Vec::new(),
-            usage: UsageSummary {
-                input_units: 12_288,
-                output_units: 33_154,
-                cache_read_units: Some(2_310_442),
-                ..UsageSummary::default()
-            },
+            usage: crate::app::RunUsage::from_totals([
+                (
+                    "claude".to_owned(),
+                    UsageSummary {
+                        input_units: 128,
+                        output_units: 50_435,
+                        cache_read_units: Some(4_373_955),
+                        cache_write_units: Some(308_947),
+                        reasoning_output_units: None,
+                    },
+                ),
+                (
+                    "codex".to_owned(),
+                    UsageSummary {
+                        input_units: 9_246_322,
+                        output_units: 63_345,
+                        cache_read_units: Some(8_885_760),
+                        cache_write_units: Some(0),
+                        reasoning_output_units: Some(31_932),
+                    },
+                ),
+            ]),
             started_at: None,
             finished_at: None,
         }
@@ -2105,13 +2177,82 @@ mod tests {
         assert!(summary.contains("opus"));
     }
 
+    /// The two runtimes do not report the same quantity under the name
+    /// "input": Claude's excludes what its cache served, Codex's includes it.
+    /// So there is one line per runtime, no total across them, and a cached
+    /// token is never printed twice on the runtime that already folded it in.
     #[test]
-    fn resources_read_in_words_and_stay_provider_native() {
-        let summary = resource_summary(&details(RunStatus::Running, Vec::new()));
-        assert!(summary.contains("12.2k input"), "human label, not `in`");
-        assert!(summary.contains("33.1k output"));
-        assert!(summary.contains("2.3M cache read"));
-        assert!(!summary.contains('$'), "usage never implies cost");
+    fn resources_never_sum_two_runtimes_or_count_a_cached_token_twice() {
+        let lines = resource_lines(&details(RunStatus::Running, Vec::new()));
+        assert_eq!(lines.len(), 2, "one line per reporting runtime");
+        let claude = lines
+            .iter()
+            .find(|line| line.starts_with("claude"))
+            .expect("claude line");
+        let codex = lines
+            .iter()
+            .find(|line| line.starts_with("codex"))
+            .expect("codex line");
+
+        // Claude keeps input and cache read disjoint, so both are quantities
+        // and both are listed.
+        assert!(claude.contains("128 input"), "{claude}");
+        assert!(claude.contains("4.3M cache read"), "{claude}");
+
+        // Codex folds cache reads into its input total. Naming it again as a
+        // separate dimension would show the same 8.9M tokens twice.
+        assert!(codex.contains("9.2M input"), "{codex}");
+        assert!(codex.contains("8.8M of it cached"), "{codex}");
+        assert!(
+            !codex.contains("cache read"),
+            "cached input is already inside the input total: {codex}"
+        );
+        // 8.9M cached tokens must not also appear as their own dimension.
+        assert_eq!(
+            codex.matches("8.8M").count(),
+            1,
+            "a cached token is named once: {codex}"
+        );
+
+        // 128 + 9_246_322 is not a quantity of anything, so no line may
+        // speak for both runtimes at once.
+        for line in &lines {
+            assert!(
+                !(line.contains("claude") && line.contains("codex")),
+                "runtimes are never merged into one figure: {line}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains('$')),
+            "usage never implies cost"
+        );
+    }
+
+    /// The one input figure that means the same thing on both runtimes.
+    #[test]
+    fn uncached_input_is_derived_only_where_the_runtime_declared_how_it_counts() {
+        let usage = details(RunStatus::Running, Vec::new()).usage;
+        let by_provider = usage.providers().collect::<Vec<_>>();
+        let claude = &by_provider[0];
+        let codex = &by_provider[1];
+        assert_eq!(claude.uncached_input_units(), Some(128));
+        assert_eq!(codex.uncached_input_units(), Some(9_246_322 - 8_885_760));
+
+        // An unrecognised runtime declared no convention, so nothing is
+        // derived on its behalf.
+        let unknown = crate::app::RunUsage::from_totals([(
+            "gemini".to_owned(),
+            UsageSummary {
+                input_units: 4_000,
+                output_units: 10,
+                cache_read_units: Some(3_000),
+                cache_write_units: None,
+                reasoning_output_units: None,
+            },
+        )]);
+        let entry = unknown.providers().next().expect("one entry");
+        assert_eq!(entry.uncached_input_units(), None);
+        assert!(!entry.input_contains_cache_reads());
     }
 
     #[test]

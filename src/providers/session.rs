@@ -303,6 +303,25 @@ impl ProviderSessionRecord {
         self.validate()
     }
 
+    /// Records the model the runtime's own evidence says it ran.
+    ///
+    /// Only fills an identity that was never observed. A session that already
+    /// confirmed a different model keeps it, so a disagreement stays a
+    /// disagreement instead of being quietly overwritten by whichever
+    /// observation arrived last.
+    pub(crate) fn confirm_model(
+        &mut self,
+        model_id: ModelId,
+        now: DateTime<Utc>,
+    ) -> Result<(), &'static str> {
+        if self.model_id.is_some() {
+            return Ok(());
+        }
+        self.model_id = Some(model_id);
+        self.updated_at = now.max(self.updated_at);
+        self.validate()
+    }
+
     pub(crate) fn need_user(
         &mut self,
         pending: PendingProviderAttention,

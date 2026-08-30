@@ -775,7 +775,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::app::{RunDetails, StageSummary, UsageSummary};
+    use crate::app::{RunDetails, StageSummary};
     use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
 
     /// A `TuiApp` wired to an empty temporary store: enough to drive intents
@@ -824,6 +824,7 @@ mod tests {
                 status: StageStatus::Running,
                 configured_provider: "codex".to_owned(),
                 requested_effort: EffortSetting::NativeDefault,
+                observed_effort: None,
                 configured_model: None,
                 actual_provider: None,
                 actual_model: None,
@@ -835,7 +836,7 @@ mod tests {
                 finished_at: None,
             }],
             attention: Vec::new(),
-            usage: UsageSummary::default(),
+            usage: crate::app::RunUsage::default(),
             started_at: None,
             finished_at: None,
         }
