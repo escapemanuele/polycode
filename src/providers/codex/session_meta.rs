@@ -233,14 +233,19 @@ mod tests {
         assert_eq!(observed.effort.as_deref(), Some("xhigh"));
     }
 
-    /// The thread ID is another program's output. It reaches the filesystem
-    /// only as a leaf name component, so anything that is not the shape Codex
-    /// emits is refused before a path is built from it.
+    /// The thread ID is another program's output, so two separate things
+    /// keep it harmless, and this proves each of them.
+    ///
+    /// Structurally it never becomes a path component at all: it is matched
+    /// against file names inside `<home>/sessions`, so a traversal string
+    /// cannot reach outside that tree even if the guard were gone. On top of
+    /// that, an ID that is not the shape Codex emits is refused before the
+    /// search starts, so a file that happens to match one is still not read.
     #[test]
-    fn a_thread_id_that_could_traverse_the_filesystem_is_refused() {
+    fn a_thread_id_is_matched_as_a_name_inside_sessions_and_refused_when_implausible() {
         assert!(is_plausible_thread_id(THREAD));
-        // Stage-derived thread identities carry underscores, so the check
-        // has to admit them without admitting a path separator.
+        // Stage-derived thread identities carry underscores, so the check has
+        // to admit them without admitting a path separator.
         assert!(is_plausible_thread_id("codex-thread-quality_review"));
         for hostile in [
             "../../../../etc/passwd",
@@ -257,9 +262,30 @@ mod tests {
                 "{hostile} must be refused"
             );
         }
+
         let home = tempfile::tempdir().unwrap();
         rollout(home.path(), THREAD, &real_shape());
-        assert_eq!(observe(home.path(), "../../../../etc/passwd"), None);
+
+        // A rollout sitting outside the sessions tree is never reached, which
+        // is what makes the ID structurally unable to escape.
+        std::fs::write(
+            home.path()
+                .join("rollout-2026-08-29T18-53-38-escaped.jsonl"),
+            real_shape(),
+        )
+        .unwrap();
+        assert_eq!(observe(home.path(), "escaped"), None);
+
+        // And an implausible ID is refused even when a file inside the tree
+        // would have matched the suffix built from it.
+        let implausible = "id with spaces";
+        let directory = home.path().join("sessions/2026/08/29");
+        std::fs::write(
+            directory.join(format!("rollout-2026-08-29T18-53-38-{implausible}.jsonl")),
+            real_shape(),
+        )
+        .unwrap();
+        assert_eq!(observe(home.path(), implausible), None);
     }
 
     #[test]
