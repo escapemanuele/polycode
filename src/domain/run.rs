@@ -7,8 +7,9 @@ use thiserror::Error;
 use super::{
     AttentionError, AttentionRequest, AttentionRequestId, AttentionStatus, ConfigSnapshotId,
     DependencyKind, DomainEvent, DomainEventKind, EventMetadata, RunId, RunRehydrationData,
-    RunResumeStatus, Stage, StageId, StageRehydrationError, StageStatus, StageTransition,
-    StageTransitionError, WorkflowDefinition, WorkflowDefinitionError, WorkflowKind,
+    RunResumeStatus, Stage, StageId, StageKind, StageRehydrationError, StageStatus,
+    StageTransition, StageTransitionError, WorkflowDefinition, WorkflowDefinitionError,
+    WorkflowKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -413,6 +414,72 @@ impl Run {
             self.id,
             Some(stage_id.clone()),
             kind,
+        ))
+    }
+
+    /// Grows a completed run by one remediation cycle and reopens it.
+    ///
+    /// A run whose decision the operator rejects has everything the fix needs
+    /// already: the workspace with the work in it, the artifacts the reviews
+    /// produced, and the verdict itself. Extending that run keeps all of it
+    /// under one identity that stays a single thing to apply or discard.
+    /// Starting a second run instead would have to adopt this one's workspace,
+    /// which is keyed by run, or begin again from a clean checkout.
+    ///
+    /// This is the second and last place a finished run reopens; the other is
+    /// retrying a stage of a failed one. Both are deliberate operator acts, and
+    /// neither happens on its own.
+    ///
+    /// Nothing here reads the decision. The verdict is prose written for a
+    /// person, and the run has no basis to classify it, so the operator decides
+    /// and this records that they did. The fix stage's context is the verdict
+    /// itself, which it depends on, plus the run's immutable task.
+    ///
+    /// # Errors
+    /// Rejects runs that have not completed, runs already applied or discarded,
+    /// and cycles that would not form a valid DAG.
+    pub fn request_fix(&mut self, metadata: EventMetadata) -> Result<DomainEvent, RunFixError> {
+        if self.status != RunStatus::Completed {
+            return Err(RunFixError::RunNotCompleted(self.status));
+        }
+        let last_decision = self
+            .workflow
+            .stages()
+            .iter()
+            .rev()
+            .find(|stage| stage.kind() == StageKind::Decision)
+            .map(|stage| stage.id().clone())
+            .ok_or(RunFixError::NoDecisionToAnswer)?;
+        let index = u32::try_from(
+            self.workflow
+                .stages()
+                .iter()
+                .filter(|stage| stage.kind() == StageKind::Fix)
+                .count(),
+        )
+        .map_err(|_| RunFixError::TooManyCycles)?
+            + 1;
+        let additional = super::fix_cycle_stages(index, &last_decision);
+        let stage_ids = additional
+            .iter()
+            .map(|stage| stage.id().clone())
+            .collect::<Vec<_>>();
+        let workflow = self.workflow.extended(additional)?;
+        let new_stages = workflow
+            .stages()
+            .iter()
+            .filter(|stage| stage_ids.contains(stage.id()))
+            .map(|definition| Stage::from_definition(self.id, definition))
+            .collect::<Vec<_>>();
+        self.workflow = workflow;
+        self.stages.extend(new_stages);
+        self.status = RunStatus::Running;
+        self.updated_at = metadata.occurred_at();
+        Ok(DomainEvent::new(
+            metadata,
+            self.id,
+            None,
+            DomainEventKind::RunFixRequested { stage_ids },
         ))
     }
 
@@ -968,6 +1035,18 @@ pub enum RunTransitionError {
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RunFixError {
+    #[error("only a completed run can be sent back for a fix; this run is {0:?}")]
+    RunNotCompleted(RunStatus),
+    #[error("run has no decision stage to answer")]
+    NoDecisionToAnswer,
+    #[error("run has grown more remediation cycles than can be numbered")]
+    TooManyCycles,
+    #[error(transparent)]
+    Workflow(#[from] WorkflowDefinitionError),
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RunStageError {
     #[error("run is not active: {0:?}")]
     RunNotActive(RunStatus),
@@ -1134,6 +1213,153 @@ mod tests {
             .unwrap();
         run.transition_stage(stage_id, StageTransition::Complete, metadata(event + 2, 6))
             .unwrap();
+    }
+
+    /// A completed run whose decision the operator rejects.
+    fn decided_run() -> Run {
+        let mut run = new_run(WorkflowDefinition::built_in(WorkflowKind::Standard));
+        start_run(&mut run);
+        let mut event = 10;
+        for stage in [
+            "architecture",
+            "implementation",
+            "quality_review",
+            "spec_review",
+            "decision",
+        ] {
+            complete_stage(&mut run, &id(stage), event);
+            event += 10;
+        }
+        run.transition(RunTransition::Complete, metadata(100, 7))
+            .unwrap();
+        run
+    }
+
+    fn dependency_ids(run: &Run, stage_id: &StageId) -> Vec<String> {
+        run.workflow()
+            .stage(stage_id)
+            .expect("stage exists")
+            .dependencies()
+            .iter()
+            .map(|dependency| dependency.stage_id().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_rejected_run_grows_a_fix_and_a_fresh_decision_over_it_and_reopens() {
+        let mut run = decided_run();
+        assert_eq!(run.stages().len(), 5);
+
+        let event = run.request_fix(metadata(200, 8)).unwrap();
+
+        // The run reopens rather than a second run adopting its workspace.
+        assert_eq!(run.status(), RunStatus::Running);
+        assert_eq!(run.stages().len(), 7);
+        assert!(matches!(
+            event.kind(),
+            DomainEventKind::RunFixRequested { stage_ids }
+                if stage_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
+                    == vec!["fix_1".to_owned(), "decision_1".to_owned()]
+        ));
+
+        // The fix answers the verdict that sent the work back, and the new
+        // decision reads both the fix and that verdict.
+        assert_eq!(dependency_ids(&run, &id("fix_1")), vec!["decision"]);
+        assert_eq!(
+            dependency_ids(&run, &id("decision_1")),
+            vec!["fix_1", "decision"]
+        );
+
+        // Nothing already done is disturbed, and the new work has not started.
+        assert_eq!(
+            run.stage(&id("implementation")).unwrap().status(),
+            StageStatus::Completed
+        );
+        for stage in ["fix_1", "decision_1"] {
+            assert_eq!(
+                run.stage(&id(stage)).unwrap().status(),
+                StageStatus::Pending
+            );
+        }
+        run.validate_invariants().unwrap();
+    }
+
+    /// Reopening is for a run that finished and was judged, not for one that is
+    /// still going, already disposed of, or never decided.
+    #[test]
+    fn only_a_completed_run_can_be_sent_back_for_a_fix() {
+        for (build, expected) in [
+            (
+                (|| {
+                    let mut run = new_run(WorkflowDefinition::built_in(WorkflowKind::Standard));
+                    start_run(&mut run);
+                    run
+                }) as fn() -> Run,
+                RunStatus::Running,
+            ),
+            (
+                || {
+                    let mut run = decided_run();
+                    run.transition(RunTransition::Apply, metadata(150, 8))
+                        .unwrap();
+                    run
+                },
+                RunStatus::Applied,
+            ),
+            (
+                || {
+                    let mut run = decided_run();
+                    run.transition(RunTransition::Discard, metadata(150, 8))
+                        .unwrap();
+                    run
+                },
+                RunStatus::Discarded,
+            ),
+        ] {
+            let mut run = build();
+            let before = run.stages().len();
+            assert_eq!(
+                run.request_fix(metadata(200, 9)).unwrap_err(),
+                RunFixError::RunNotCompleted(expected)
+            );
+            assert_eq!(run.stages().len(), before, "a refusal changes nothing");
+            assert_eq!(run.status(), expected);
+        }
+
+        // A workflow with no decision has no verdict to answer.
+        let mut run = new_run(fast_workflow());
+        start_run(&mut run);
+        complete_stage(&mut run, &id("implementation"), 10);
+        run.transition(RunTransition::Complete, metadata(100, 7))
+            .unwrap();
+        assert_eq!(
+            run.request_fix(metadata(200, 8)).unwrap_err(),
+            RunFixError::NoDecisionToAnswer
+        );
+    }
+
+    /// Pressing fix again answers the verdict that rejected the last fix, not
+    /// the one that rejected the original work.
+    #[test]
+    fn a_second_cycle_answers_the_decision_that_rejected_the_first() {
+        let mut run = decided_run();
+        run.request_fix(metadata(200, 8)).unwrap();
+        let mut event = 210;
+        for stage in ["fix_1", "decision_1"] {
+            complete_stage(&mut run, &id(stage), event);
+            event += 10;
+        }
+        run.transition(RunTransition::Complete, metadata(300, 9))
+            .unwrap();
+
+        run.request_fix(metadata(400, 10)).unwrap();
+        assert_eq!(run.stages().len(), 9);
+        assert_eq!(dependency_ids(&run, &id("fix_2")), vec!["decision_1"]);
+        assert_eq!(
+            dependency_ids(&run, &id("decision_2")),
+            vec!["fix_2", "decision_1"]
+        );
+        run.validate_invariants().unwrap();
     }
 
     #[test]

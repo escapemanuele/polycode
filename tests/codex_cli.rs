@@ -12,6 +12,99 @@ use polycode::domain::{ArtifactKind, Role, RunId, RunStatus};
 use polycode::process::ManagedProcess;
 use polycode::store::SqliteStore;
 
+/// A completed run whose decision the operator rejects is sent back in place.
+///
+/// The run grows a fix and a fresh decision over it, keeps its own workspace
+/// and identity, and leaves the operator's checkout alone throughout — the
+/// remediation is not a second run, and it is not an early apply.
+#[test]
+fn a_rejected_run_is_fixed_in_place_and_the_source_is_untouched_until_apply() {
+    let fixture = Fixture::new();
+    let started = fixture.polycode(
+        &[
+            "standard",
+            "Fix cycle task",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--provider",
+            "codex",
+        ],
+        true,
+        false,
+    );
+    assert_success(&started);
+    let stdout = String::from_utf8(started.stdout).unwrap();
+    let run_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Run        "))
+        .unwrap()
+        .to_owned();
+
+    let before = fixture.status(&run_id);
+    assert!(before.contains("Status     completed"), "{before}");
+    assert!(before.contains("decision"), "{before}");
+    assert!(
+        !before.contains("fix_1"),
+        "a run grows a fix only when asked: {before}"
+    );
+
+    // The operator read the verdict and rejected it. Nothing about the
+    // decision's own wording is consulted.
+    let fixed = fixture.polycode(&["fix", &run_id], true, false);
+    assert_success(&fixed);
+
+    let after = fixture.status(&run_id);
+    assert!(after.contains("fix_1"), "{after}");
+    assert!(after.contains("decision_1"), "{after}");
+    assert!(
+        after.contains("Status     completed"),
+        "the cycle runs to a new verdict: {after}"
+    );
+
+    // The fix produced its own artifact, and it is the fix contract's, not a
+    // second implementation's.
+    let artifact = fixture
+        .data
+        .join("runs")
+        .join(&run_id)
+        .join("artifacts")
+        .join("fix_1.md");
+    assert!(artifact.exists(), "fix artifact missing at {artifact:?}");
+
+    // Everything it changed stayed in the run's own workspace.
+    assert!(
+        !fixture.repo.join("hello.txt").exists(),
+        "a fix is not an apply"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
+        "baseline\n"
+    );
+
+    // Rejecting again answers the newest verdict rather than the first.
+    let again = fixture.polycode(&["fix", &run_id], true, false);
+    assert_success(&again);
+    let after = fixture.status(&run_id);
+    assert!(after.contains("fix_2"), "{after}");
+    assert!(after.contains("decision_2"), "{after}");
+
+    let applied = fixture.polycode(&["apply", &run_id], false, false);
+    assert_success(&applied);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("hello.txt")).unwrap(),
+        "created by fake Codex\n"
+    );
+
+    // A run that has been applied is finished; there is nothing left to send
+    // back.
+    let refused = fixture.polycode(&["fix", &run_id], false, false);
+    assert!(
+        !refused.status.success(),
+        "fix accepted after apply: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+}
+
 #[test]
 fn native_codex_fixture_runs_through_tmux_preserves_source_then_applies() {
     let fixture = Fixture::new();
@@ -542,6 +635,12 @@ impl Fixture {
             capture,
             fake_bin,
         }
+    }
+
+    fn status(&self, run_id: &str) -> String {
+        let output = self.polycode(&["status", run_id], false, false);
+        assert_success(&output);
+        String::from_utf8(output.stdout).unwrap()
     }
 
     fn polycode(&self, args: &[&str], write: bool, logged_out: bool) -> Output {

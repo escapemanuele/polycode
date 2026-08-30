@@ -10,6 +10,7 @@ pub(crate) enum ActionKind {
     Resume,
     Stop,
     Retry,
+    Fix,
     ResolveAttention,
     Apply,
     Discard,
@@ -22,6 +23,7 @@ impl ActionKind {
             Self::Resume => "resuming run",
             Self::Stop => "stopping run",
             Self::Retry => "retrying stage",
+            Self::Fix => "fixing run",
             Self::ResolveAttention => "resolving attention",
             Self::Apply => "applying changes",
             Self::Discard => "discarding run",
@@ -48,6 +50,9 @@ pub(crate) enum WorkerCommand {
         run_id: RunId,
         stage_id: StageId,
     },
+    RequestFix {
+        run_id: RunId,
+    },
     ResolveAttention {
         run_id: RunId,
         attention_id: AttentionRequestId,
@@ -68,6 +73,7 @@ impl WorkerCommand {
             Self::ResumeRun { .. } => ActionKind::Resume,
             Self::StopRun { .. } => ActionKind::Stop,
             Self::RetryStage { .. } => ActionKind::Retry,
+            Self::RequestFix { .. } => ActionKind::Fix,
             Self::ResolveAttention { .. } => ActionKind::ResolveAttention,
             Self::ApplyRun { .. } => ActionKind::Apply,
             Self::DiscardRun { .. } => ActionKind::Discard,
@@ -80,6 +86,7 @@ impl WorkerCommand {
             Self::ResumeRun { run_id }
             | Self::StopRun { run_id }
             | Self::RetryStage { run_id, .. }
+            | Self::RequestFix { run_id }
             | Self::ResolveAttention { run_id, .. }
             | Self::ApplyRun { run_id }
             | Self::DiscardRun { run_id } => Some(*run_id),
@@ -185,6 +192,9 @@ where
         WorkerCommand::RetryStage { run_id, stage_id } => service
             .retry_stage(run_id, &stage_id)
             .map(WorkerSuccess::Execution),
+        WorkerCommand::RequestFix { run_id } => {
+            service.request_fix(run_id).map(WorkerSuccess::Execution)
+        }
         WorkerCommand::ResolveAttention {
             run_id,
             attention_id,

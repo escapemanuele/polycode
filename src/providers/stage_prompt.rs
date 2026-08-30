@@ -30,6 +30,9 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
         }
         (Role::Researcher, _) => "Inspect repository and gather evidence. Do not invent facts.",
         (Role::Architect, _) => "Design smallest coherent change. Name constraints and tradeoffs.",
+        (Role::Implementer, StageKind::Fix) => {
+            "Resolve the blocking findings in the decision that sent this work back, and only those. The implementation already exists in this workspace; correct it rather than rewriting it, and leave findings the decision did not treat as blocking alone. Where you disagree with a finding, say so in the artifact and leave the code as it is rather than silently declining. Run proportionate verification. Return Markdown with # Fix and one section per finding stating what changed or why nothing did."
+        }
         (Role::Implementer, _) => "Implement requested change and run proportionate verification.",
         (Role::CodeQualityReviewer, _) => {
             "Assess implementation quality independently. Inspect actual repository state and do not edit files."
@@ -41,7 +44,7 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
             "Perform legacy/general independent review. Prioritize correctness, regressions, and missing tests. Do not edit files."
         }
         (Role::EngineeringLead, StageKind::Decision) => {
-            "Synthesize direct review evidence across two distinct axes: implementation quality and specification compliance. Do not count findings mechanically or infer approval from reviewer completion. Surface disagreements between reviewers and make an explicit engineering decision."
+            "Synthesize direct review evidence across two distinct axes: implementation quality and specification compliance. Do not count findings mechanically or infer approval from reviewer completion. Surface disagreements between reviewers and make an explicit engineering decision. When a previous decision and a fix answering it are both in evidence, judge whether that fix actually resolves the findings the previous decision called blocking; a fix artifact claiming a finding is resolved is a claim to verify against the code, not a resolution."
         }
         (Role::EngineeringLead, _) => {
             "Integrate direct dependency evidence into one actionable engineering result."
@@ -66,6 +69,32 @@ mod tests {
         assert!(spec.contains("Missing, Wrong, or Unrequested"));
         assert!(spec.contains("tests as evidence rather than product truth"));
         assert_ne!(quality, spec);
+    }
+
+    /// A fix answers a verdict; it is not a second implementation pass.
+    #[test]
+    fn the_fix_contract_is_bounded_by_the_decision_it_answers() {
+        let fix = instruction(Role::Implementer, StageKind::Fix);
+        let implementation = instruction(Role::Implementer, StageKind::Implementation);
+        assert_ne!(fix, implementation);
+        assert!(fix.contains("blocking findings"));
+        assert!(fix.contains("and only those"));
+        assert!(
+            fix.contains("correct it rather than rewriting it"),
+            "the work already exists in the workspace"
+        );
+        // Disagreeing with a finding is allowed; silently ignoring it is not.
+        assert!(fix.contains("say so in the artifact"));
+    }
+
+    #[test]
+    fn a_decision_over_a_fix_verifies_it_against_the_code() {
+        let decision = instruction(Role::EngineeringLead, StageKind::Decision);
+        assert!(decision.contains("previous decision and a fix"));
+        assert!(
+            decision.contains("claim to verify against the code"),
+            "a fix saying it fixed something is not evidence that it did"
+        );
     }
 
     #[test]

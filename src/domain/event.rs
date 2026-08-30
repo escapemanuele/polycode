@@ -159,6 +159,14 @@ pub enum DomainEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// An operator asked a completed run to remediate its own result.
+    ///
+    /// Records which stages the run grew and, when given, the operator's
+    /// instruction. Append-only like every other event: the run's shape at any
+    /// point is the built-in workflow plus the cycles recorded here.
+    RunFixRequested {
+        stage_ids: Vec<StageId>,
+    },
     UsageUpdated,
     /// What the native runtime's own records say it ran for this stage.
     ///

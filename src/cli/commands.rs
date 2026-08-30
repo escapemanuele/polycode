@@ -74,6 +74,10 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             print_report(&report);
             Ok(())
         }
+        Some(Command::Fix { run_id }) => {
+            print_report(&service()?.request_fix(*run_id)?);
+            Ok(())
+        }
         Some(Command::Discard { run_id }) => {
             print_report(&service()?.discard_run(*run_id)?);
             Ok(())
@@ -742,6 +746,7 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
         DomainEventKind::RunFailed => "run failed",
         DomainEventKind::RunApplied => "run applied",
         DomainEventKind::RunDiscarded => "run discarded",
+        DomainEventKind::RunFixRequested { .. } => "fix requested",
         DomainEventKind::StageReady { .. } => "ready",
         DomainEventKind::StageStarted => "started",
         DomainEventKind::StagePaused => "paused",
