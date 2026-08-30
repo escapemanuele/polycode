@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use super::motion::{self, MotionFrame};
 use crate::app::{
     ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails, RunDiffPreview,
     RunListItem, StageExecutionEvidence, UniformProvider,
@@ -322,6 +323,10 @@ pub(crate) struct TuiState {
     /// default only because the prompt appears solely when installing is
     /// possible and nothing more urgent is happening.
     pub update_install_selected: bool,
+    /// Which liveness frame the loop is on. Owned by the loop rather than
+    /// read from the clock here, so a drawn frame stays a pure function of
+    /// state and no test has to wait for one.
+    pub motion_phase: u8,
     pub quit: bool,
 }
 
@@ -354,8 +359,18 @@ impl TuiState {
             update_install: None,
             update_dismissed: false,
             update_install_selected: true,
+            motion_phase: 0,
             quit: false,
         }
+    }
+
+    /// What this frame may do: the surface's ceiling, lowered by whatever
+    /// the user asked for. Nothing that draws gets to decide this itself.
+    pub(crate) fn motion_frame(&self) -> MotionFrame {
+        MotionFrame::new(
+            motion::allowance(self.screen, self.overlay, motion::motion_setting()),
+            self.motion_phase,
+        )
     }
 
     pub(crate) fn replace_runs(&mut self, runs: Vec<RunListItem>) {
@@ -608,5 +623,55 @@ mod tests {
         let form = NewRunForm::new(std::path::Path::new("/repo"));
         assert_eq!(form.workflow, WorkflowKind::Standard);
         assert_eq!(form.execution, ExecutionChoice::Recommended);
+    }
+
+    /// The seam the renderer actually goes through. Rendering a reading
+    /// screen cannot prove this on its own — none of them draws anything
+    /// that moves today, so such a test would pass however the ceiling was
+    /// wired. This asserts the frame those screens hand out, which is the
+    /// thing a future moving element would ask.
+    #[test]
+    fn the_frame_a_reading_surface_hands_out_never_moves() {
+        for screen in [Screen::Artifact, Screen::Logs, Screen::Diff, Screen::NewRun] {
+            let mut state = TuiState::new(std::path::Path::new("/repo"));
+            state.screen = screen;
+            state.motion_phase = 1;
+            assert_eq!(
+                state.motion_frame().liveness_phase(),
+                0,
+                "{screen:?} handed the renderer a moving frame"
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_overlay_hands_out_a_still_frame_over_any_screen() {
+        for overlay in [
+            Overlay::Help,
+            Overlay::Attention,
+            Overlay::ApplyConfirm,
+            Overlay::DiscardConfirm,
+            Overlay::Update,
+        ] {
+            let mut state = TuiState::new(std::path::Path::new("/repo"));
+            state.screen = Screen::RunDetail;
+            state.overlay = Some(overlay);
+            state.motion_phase = 1;
+            assert_eq!(
+                state.motion_frame().liveness_phase(),
+                0,
+                "POD kept breathing behind {overlay:?}"
+            );
+        }
+    }
+
+    /// And the operating surface still moves, so the two tests above are
+    /// about the ceiling rather than about motion never working at all.
+    #[test]
+    fn an_operating_surface_hands_out_the_moving_frame() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.screen = Screen::RunDetail;
+        state.motion_phase = 1;
+        assert_eq!(state.motion_frame().liveness_phase(), 1);
     }
 }

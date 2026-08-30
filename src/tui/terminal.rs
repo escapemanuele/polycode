@@ -22,6 +22,10 @@ impl TerminalSession {
         super::theme::set_palette(super::theme::Palette::for_capability(
             super::theme::ColorCapability::from_environment(),
         ));
+        // Same reasoning for movement: what the user asked for is read once,
+        // and from then on every surface asks the policy rather than the
+        // environment.
+        super::motion::set_motion_setting(super::motion::MotionSetting::from_environment());
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {

@@ -5,6 +5,7 @@ mod format;
 mod input;
 mod markdown;
 mod mascot;
+mod motion;
 mod render;
 mod state;
 mod terminal;

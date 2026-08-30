@@ -7,9 +7,13 @@
 //! nothing is inferred from prose. Every variant occupies exactly
 //! `MASCOT_WIDTH` × `MASCOT_HEIGHT` cells so surrounding layout never
 //! shifts. Art uses only ASCII plus the single-cell block elements
-//! █ ▄ ▀ ▌ ▐ (see `GLYPH_WHITELIST`); no emoji, no ambiguous-width glyphs,
-//! no animation.
+//! █ ▄ ▀ ▌ ▐ (see `GLYPH_WHITELIST`); no emoji, no ambiguous-width glyphs.
+//!
+//! POD may breathe, but only where the surface permits it and only while
+//! work is genuinely running: the caller hands in a [`MotionFrame`], and a
+//! still frame draws exactly the art POD drew before motion existed.
 
+use super::motion::MotionFrame;
 use super::theme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -93,9 +97,9 @@ pub(crate) const fn mascot_activity(role: Role) -> MascotActivity {
     }
 }
 
-/// Expression slots for one state: antenna core (2 chars), left eye,
+/// Expression slots for one state at rest: antenna core (2 chars), left eye,
 /// right eye (2 chars each), mouth (4 chars).
-const fn expression(
+const fn resting_expression(
     state: MascotState,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
     match state {
@@ -106,6 +110,25 @@ const fn expression(
         MascotState::Completed => ("██", "▀▀", "▀▀", "▀▄▄▀"),
         MascotState::Failed => ("xx", "xx", "xx", "▄▀▀▄"),
     }
+}
+
+/// The expression POD wears this frame.
+///
+/// Liveness, and only liveness: while work is running POD blinks, and the
+/// blink borrows the eye `Waiting` already wears one row lower, so motion
+/// introduces no glyph the whitelist has not already accepted. Every other
+/// state is the same in every phase — a face that moves while nothing is
+/// happening would be claiming something untrue.
+const fn expression(
+    state: MascotState,
+    phase: u8,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    let (antenna, eye_left, eye_right, mouth) = resting_expression(state);
+    if matches!(state, MascotState::Running) && phase == 1 {
+        let (_, blink_left, blink_right, _) = resting_expression(MascotState::Waiting);
+        return (antenna, blink_left, blink_right, mouth);
+    }
+    (antenna, eye_left, eye_right, mouth)
 }
 
 /// State label; for Running the activity label takes over (the state is
@@ -173,12 +196,14 @@ fn label(state: MascotState, activity: Option<MascotActivity>) -> &'static str {
 }
 
 /// Renders POD: stable shell + state expression + optional accent + label.
-/// Always `MASCOT_HEIGHT` rows; art rows are exactly `MASCOT_WIDTH` cells.
+/// Always `MASCOT_HEIGHT` rows; art rows are exactly `MASCOT_WIDTH` cells,
+/// in every phase the frame can hand out.
 pub(crate) fn mascot_lines(
     state: MascotState,
     activity: Option<MascotActivity>,
+    motion: MotionFrame,
 ) -> Vec<Line<'static>> {
-    let (antenna, eye_left, eye_right, mouth) = expression(state);
+    let (antenna, eye_left, eye_right, mouth) = expression(state, motion.liveness_phase());
     let accent = match (state, activity) {
         (MascotState::Running, Some(activity)) => Some(activity),
         _ => None,
@@ -220,6 +245,7 @@ pub(crate) fn mascot_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::motion::MotionAllowance;
 
     const ALL_STATES: [MascotState; 6] = [
         MascotState::Idle,
@@ -237,8 +263,22 @@ mod tests {
         MascotActivity::Decision,
     ];
 
+    /// Every liveness phase a frame can hand out.
+    const ALL_PHASES: [MotionFrame; 2] = [
+        MotionFrame::still(),
+        MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1),
+    ];
+
     fn rows(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
-        mascot_lines(state, activity)
+        rows_in(state, activity, MotionFrame::still())
+    }
+
+    fn rows_in(
+        state: MascotState,
+        activity: Option<MascotActivity>,
+        motion: MotionFrame,
+    ) -> Vec<String> {
+        mascot_lines(state, activity, motion)
             .iter()
             .map(|line| {
                 line.spans
@@ -268,16 +308,18 @@ mod tests {
     fn every_variant_keeps_the_same_footprint_and_safe_glyphs() {
         for state in ALL_STATES {
             for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
-                let rows = rows(state, activity);
-                assert_eq!(rows.len(), MASCOT_HEIGHT as usize);
-                for row in &rows[..6] {
-                    assert_eq!(
-                        cell_width(row),
-                        MASCOT_WIDTH as usize,
-                        "unstable footprint for {state:?}/{activity:?}: {row:?}"
-                    );
+                for motion in ALL_PHASES {
+                    let rows = rows_in(state, activity, motion);
+                    assert_eq!(rows.len(), MASCOT_HEIGHT as usize);
+                    for row in &rows[..6] {
+                        assert_eq!(
+                            cell_width(row),
+                            MASCOT_WIDTH as usize,
+                            "unstable footprint for {state:?}/{activity:?}/{motion:?}: {row:?}"
+                        );
+                    }
+                    assert!(cell_width(&rows[6]) <= MASCOT_WIDTH as usize);
                 }
-                assert!(cell_width(&rows[6]) <= MASCOT_WIDTH as usize);
             }
         }
     }
@@ -392,9 +434,9 @@ mod tests {
     /// three stay in one visual language and no glyph is duplicated here.
     #[test]
     fn the_completed_face_reuses_the_running_eyes_and_idle_mouth() {
-        let (_, _, _, idle_mouth) = expression(MascotState::Idle);
-        let (_, running_left, running_right, _) = expression(MascotState::Running);
-        let (_, done_left, done_right, done_mouth) = expression(MascotState::Completed);
+        let (_, _, _, idle_mouth) = resting_expression(MascotState::Idle);
+        let (_, running_left, running_right, _) = resting_expression(MascotState::Running);
+        let (_, done_left, done_right, done_mouth) = resting_expression(MascotState::Completed);
 
         assert_eq!(done_left, running_left, "left eye follows Running");
         assert_eq!(done_right, running_right, "right eye follows Running");
@@ -406,6 +448,64 @@ mod tests {
             !face.contains('^') && !face.contains('\\') && !face.contains('/'),
             "the eyes and mouth must stay block glyphs: {face:?}"
         );
+    }
+
+    /// The guarantee that lets every other surface stay as it was: a frame
+    /// that may not move draws exactly the art POD drew before motion
+    /// existed. Anything that moves has to come through the phase.
+    #[test]
+    fn a_still_frame_draws_the_resting_face_for_every_variant() {
+        for state in ALL_STATES {
+            for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
+                let (antenna, eye_left, eye_right, mouth) = resting_expression(state);
+                let drawn = rows_in(state, activity, MotionFrame::still());
+                assert!(
+                    drawn[0].contains(antenna)
+                        && drawn[2].contains(eye_left)
+                        && drawn[2].contains(eye_right)
+                        && drawn[3].contains(mouth),
+                    "a still frame changed {state:?}/{activity:?}: {drawn:?}"
+                );
+            }
+        }
+    }
+
+    /// Liveness says one thing — this work is alive — so it may appear only
+    /// on the state that is actually working. A face that moved while
+    /// nothing was happening would be claiming progress that is not there.
+    #[test]
+    fn only_running_moves_and_the_blink_stays_inside_the_footprint() {
+        for state in ALL_STATES {
+            let resting = rows_in(state, None, MotionFrame::still());
+            let moving = rows_in(
+                state,
+                None,
+                MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1),
+            );
+            if matches!(state, MascotState::Running) {
+                assert_ne!(resting, moving, "Running work has to look alive");
+            } else {
+                assert_eq!(
+                    resting, moving,
+                    "{state:?} is not working, so it holds still"
+                );
+            }
+        }
+    }
+
+    /// The blink borrows an eye the file already draws, so motion can never
+    /// be the thing that introduces a glyph nobody checked.
+    #[test]
+    fn the_blink_borrows_an_eye_that_already_exists() {
+        let (_, blink_left, blink_right, _) = expression(MascotState::Running, 1);
+        let (_, waiting_left, waiting_right, _) = resting_expression(MascotState::Waiting);
+        assert_eq!(blink_left, waiting_left);
+        assert_eq!(blink_right, waiting_right);
+
+        let (running_antenna, _, _, running_mouth) = resting_expression(MascotState::Running);
+        let (antenna, _, _, mouth) = expression(MascotState::Running, 1);
+        assert_eq!(antenna, running_antenna, "a blink is eyes, not a new face");
+        assert_eq!(mouth, running_mouth, "a blink is eyes, not a new face");
     }
 
     #[test]

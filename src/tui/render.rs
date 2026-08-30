@@ -129,7 +129,11 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         // Decoration yields to content: the mascot appears only when the
         // empty state has room for it.
         if area.width >= 60 && area.height >= 14 {
-            lines.extend(mascot::mascot_lines(mascot::MascotState::Idle, None));
+            lines.extend(mascot::mascot_lines(
+                mascot::MascotState::Idle,
+                None,
+                state.motion_frame(),
+            ));
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
@@ -355,6 +359,7 @@ fn render_pipeline(
         lines.extend(mascot::mascot_lines(
             mascot::mascot_state(Some(details.status), selected.map(|stage| stage.status)),
             selected.map(|stage| mascot::mascot_activity(stage.role)),
+            state.motion_frame(),
         ));
     }
     frame.render_widget(
@@ -1780,6 +1785,21 @@ mod tests {
             .collect()
     }
 
+    /// One symbol per rendered cell, so a test can compare two frames cell by
+    /// cell rather than as a run-together string.
+    fn render_symbols(state: &TuiState, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect()
+    }
+
     /// The footer's contextual half as plain text.
     fn actions_text(state: &TuiState) -> String {
         primary_actions(state.screen, state)
@@ -2389,6 +2409,43 @@ mod tests {
         );
         assert!(text.contains("</>"), "coding accent while running");
         assert!(!render_text(&running, 70, 24).contains(POD_SHELL));
+    }
+
+    /// Motion may repaint a cell; it may never move one. A frame drawn mid
+    /// blink and a frame drawn between blinks differ only where POD's own
+    /// eyes are, so nothing reflows, no width changes, and no line the user
+    /// is reading shifts underneath them.
+    #[test]
+    fn a_blink_repaints_cells_and_never_moves_them() {
+        const WIDTH: u16 = 160;
+        let mut resting = running_state();
+        resting.motion_phase = 0;
+        let mut blinking = running_state();
+        blinking.motion_phase = 1;
+
+        let before = render_symbols(&resting, WIDTH, 40);
+        let after = render_symbols(&blinking, WIDTH, 40);
+        assert_eq!(before.len(), after.len(), "the grid itself must not move");
+
+        let changed: Vec<usize> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter(|(_, (old, new))| old != new)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            !changed.is_empty(),
+            "running work has to look alive on an operating surface"
+        );
+        assert!(
+            changed.len() <= 4,
+            "a blink is four eye cells, not {} cells of the screen",
+            changed.len()
+        );
+        let rows: std::collections::HashSet<usize> =
+            changed.iter().map(|index| index / WIDTH as usize).collect();
+        assert_eq!(rows.len(), 1, "the whole change lives on POD's eye row");
     }
 
     #[test]
