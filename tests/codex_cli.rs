@@ -33,7 +33,16 @@ fn native_codex_fixture_runs_through_tmux_preserves_source_then_applies() {
     assert!(stdout.contains("Status     completed"));
     assert!(stdout.contains("implementer  codex"));
     assert!(stdout.contains("native=codex-thread-implementation"));
-    assert!(stdout.contains("Usage      11 input units · 7 output units"));
+    // Codex folds its cached input into `input_tokens`, so the 3 cached
+    // units are named inside the total and never listed again as a separate
+    // cache-read dimension: that would report 14 units of input for 11.
+    assert!(
+        stdout.contains(
+            "Usage      codex    11 input units (3 of them cached) · 7 output units · 2 reasoning output units"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("cache read units"), "{stdout}");
     let run_id = stdout
         .lines()
         .find_map(|line| line.strip_prefix("Run        "))

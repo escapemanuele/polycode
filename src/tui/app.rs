@@ -775,7 +775,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::app::{RunDetails, StageSummary, UsageSummary};
+    use crate::app::{RunDetails, StageSummary};
     use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
 
     /// A `TuiApp` wired to an empty temporary store: enough to drive intents
@@ -835,7 +835,7 @@ mod tests {
                 finished_at: None,
             }],
             attention: Vec::new(),
-            usage: UsageSummary::default(),
+            usage: crate::app::RunUsage::default(),
             started_at: None,
             finished_at: None,
         }

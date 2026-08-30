@@ -12,6 +12,7 @@ use crate::domain::{
     StageStatus, WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
+use crate::providers::{InputAccounting, input_accounting};
 use crate::store::{RunRevision, SequencedEvent, SqliteStore, StoreError};
 use crate::workspace::WorkspaceStatus;
 
@@ -70,12 +71,13 @@ pub struct AttentionSummary {
     pub summary: String,
 }
 
-/// Aggregated provider-native usage folded from committed usage events.
+/// Provider-native usage folded from committed usage events of ONE runtime.
 ///
-/// Units are provider-native and never normalized across providers; totals
-/// from different providers must not be compared directly. Optional
-/// dimensions stay `None` while no event reported them (`None` = unavailable,
-/// `Some(0)` = explicitly reported zero).
+/// Units are provider-native. Summaries from different providers must never
+/// be added together or compared: see [`InputAccounting`] for why their input
+/// totals are not the same quantity. Optional dimensions stay `None` while no
+/// event reported them (`None` = unavailable, `Some(0)` = explicitly reported
+/// zero).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UsageSummary {
     pub input_units: u64,
@@ -102,6 +104,102 @@ impl UsageSummary {
     }
 }
 
+/// One runtime's folded usage together with the convention it counts by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub provider: String,
+    /// `None` when this runtime never declared a convention.
+    pub accounting: Option<InputAccounting>,
+    pub usage: UsageSummary,
+}
+
+impl ProviderUsage {
+    /// Input units this runtime processed that its own cache did not serve.
+    ///
+    /// This is the only input figure that means the same thing for every
+    /// runtime, so it is the only one worth reading across a mixed run.
+    /// `None` when the runtime declared no convention, or declared a
+    /// cache-inclusive one and then reported no cache read to subtract:
+    /// absence stays absence and is never rendered as zero.
+    #[must_use]
+    pub fn uncached_input_units(&self) -> Option<u64> {
+        match self.accounting? {
+            InputAccounting::CacheExclusive => Some(self.usage.input_units),
+            InputAccounting::CacheInclusive => self
+                .usage
+                .cache_read_units
+                .map(|cached| self.usage.input_units.saturating_sub(cached)),
+        }
+    }
+
+    /// Whether this runtime's reported input total already contains its
+    /// reported cache reads. Presentation must not show both as if they were
+    /// separate quantities when it does.
+    #[must_use]
+    pub const fn input_contains_cache_reads(&self) -> bool {
+        matches!(self.accounting, Some(InputAccounting::CacheInclusive))
+    }
+}
+
+/// Run-level usage, folded per provider and never across providers.
+///
+/// A run routes different roles to different runtimes, and those runtimes do
+/// not report the same quantity under the same name. One total for the run
+/// would therefore be arithmetic without a referent, so this type does not
+/// offer one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    by_provider: BTreeMap<String, UsageSummary>,
+}
+
+impl RunUsage {
+    fn absorb(&mut self, provider: &str, delta: &UsageDelta) {
+        self.by_provider
+            .entry(provider.to_owned())
+            .or_default()
+            .absorb(
+                delta.input_units,
+                delta.output_units,
+                delta.cache_read_units,
+                delta.cache_write_units,
+                delta.reasoning_output_units,
+            );
+    }
+
+    /// Per-runtime usage, ordered by provider name for a stable display.
+    pub fn providers(&self) -> impl Iterator<Item = ProviderUsage> + '_ {
+        self.by_provider
+            .iter()
+            .map(|(provider, usage)| ProviderUsage {
+                provider: provider.clone(),
+                accounting: input_accounting(provider),
+                usage: *usage,
+            })
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_provider.is_empty()
+    }
+
+    /// Builds the view from per-provider totals that were folded elsewhere.
+    #[must_use]
+    pub fn from_totals(totals: impl IntoIterator<Item = (String, UsageSummary)>) -> Self {
+        Self {
+            by_provider: totals.into_iter().collect(),
+        }
+    }
+}
+
+/// One usage event's reported dimensions, before folding.
+struct UsageDelta {
+    input_units: u64,
+    output_units: u64,
+    cache_read_units: Option<u64>,
+    cache_write_units: Option<u64>,
+    reasoning_output_units: Option<u64>,
+}
+
 fn absorb_dimension(total: &mut Option<u64>, delta: Option<u64>) {
     if let Some(delta) = delta {
         *total = Some(total.unwrap_or(0).saturating_add(delta));
@@ -125,7 +223,7 @@ pub struct RunDetails {
     pub updated_at: DateTime<Utc>,
     pub stages: Vec<StageSummary>,
     pub attention: Vec<AttentionSummary>,
-    pub usage: UsageSummary,
+    pub usage: RunUsage,
     /// Semantic wall-clock span of the run, folded from committed
     /// `RunStarted` and terminal run events. Resuming does not restart it.
     pub started_at: Option<DateTime<Utc>>,
@@ -249,7 +347,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
     let resource_plan =
         super::routing::ResourcePlan::from_snapshot(&loaded.config_snapshot, loaded.run.workflow())
             .ok();
-    let usage = usage_summary(&events);
+    let usage = run_usage(&events);
     let run_span = run_span(&events);
     let sessions = store.list_provider_sessions(run_id)?;
     let mut routes = plan
@@ -742,29 +840,36 @@ fn task_summary(task: Option<&str>) -> String {
     }
 }
 
-fn usage_summary(events: &[SequencedEvent]) -> UsageSummary {
-    events
-        .iter()
-        .fold(UsageSummary::default(), |mut usage, event| {
-            if let DomainEventKind::ProviderUsageUpdated {
-                input_units,
-                output_units,
-                cache_read_units,
-                cache_write_units,
-                reasoning_output_units,
-                ..
-            } = event.event.kind()
-            {
-                usage.absorb(
-                    *input_units,
-                    *output_units,
-                    *cache_read_units,
-                    *cache_write_units,
-                    *reasoning_output_units,
-                );
-            }
-            usage
-        })
+/// Folds committed usage events into one summary per reporting runtime.
+///
+/// The provider is taken from the event that reported the numbers, not from
+/// the configured route, so a stage that ran somewhere other than where it
+/// was routed is still counted against the runtime that actually did it.
+fn run_usage(events: &[SequencedEvent]) -> RunUsage {
+    events.iter().fold(RunUsage::default(), |mut usage, event| {
+        if let DomainEventKind::ProviderUsageUpdated {
+            provider_id,
+            input_units,
+            output_units,
+            cache_read_units,
+            cache_write_units,
+            reasoning_output_units,
+            ..
+        } = event.event.kind()
+        {
+            usage.absorb(
+                provider_id.as_str(),
+                &UsageDelta {
+                    input_units: *input_units,
+                    output_units: *output_units,
+                    cache_read_units: *cache_read_units,
+                    cache_write_units: *cache_write_units,
+                    reasoning_output_units: *reasoning_output_units,
+                },
+            );
+        }
+        usage
+    })
 }
 
 #[cfg(test)]
@@ -795,6 +900,76 @@ mod tests {
                 kind,
             ),
         }
+    }
+
+    fn usage_event(
+        sequence: u64,
+        stage: &str,
+        provider: &str,
+        input_units: u64,
+        cache_read_units: Option<u64>,
+    ) -> SequencedEvent {
+        event(
+            sequence,
+            at(12, 0, 0),
+            Some(stage),
+            DomainEventKind::ProviderUsageUpdated {
+                provider_id: crate::domain::ProviderId::new(provider).unwrap(),
+                input_units,
+                output_units: 10,
+                cache_read_units,
+                cache_write_units: None,
+                reasoning_output_units: None,
+                native_models: None,
+            },
+        )
+    }
+
+    /// A deep run splits its roles across both runtimes, and the two do not
+    /// report the same quantity under the name "input". Folding them into one
+    /// total would produce a figure that measures nothing, so the fold keys by
+    /// the runtime that reported the numbers.
+    #[test]
+    fn usage_folds_per_runtime_and_never_into_one_run_total() {
+        let usage = run_usage(&[
+            usage_event(1, "research", "claude", 46, Some(1_619_864)),
+            usage_event(2, "implementation", "codex", 5_783_474, Some(5_606_656)),
+            usage_event(3, "decision", "claude", 32, Some(925_906)),
+        ]);
+        let by_provider = usage.providers().collect::<Vec<_>>();
+        assert_eq!(by_provider.len(), 2, "one entry per reporting runtime");
+
+        let claude = &by_provider[0];
+        assert_eq!(claude.provider, "claude");
+        assert_eq!(claude.usage.input_units, 78, "same-runtime events do add");
+        assert_eq!(claude.usage.cache_read_units, Some(2_545_770));
+        assert_eq!(claude.uncached_input_units(), Some(78));
+
+        let codex = &by_provider[1];
+        assert_eq!(codex.provider, "codex");
+        assert_eq!(codex.usage.input_units, 5_783_474);
+        // Codex already counted its cache reads inside that total.
+        assert!(codex.input_contains_cache_reads());
+        assert_eq!(codex.uncached_input_units(), Some(176_818));
+
+        // Nothing anywhere offers 5_783_552 as the run's input.
+        assert!(
+            !by_provider
+                .iter()
+                .any(|entry| entry.usage.input_units == 5_783_552),
+            "the two runtimes are never summed"
+        );
+    }
+
+    /// A cache-inclusive runtime that reports no cache read leaves the
+    /// uncached figure unavailable rather than claiming its whole input was
+    /// fresh.
+    #[test]
+    fn a_missing_cache_read_leaves_uncached_input_unavailable() {
+        let usage = run_usage(&[usage_event(1, "implementation", "codex", 900, None)]);
+        let codex = usage.providers().next().expect("one entry");
+        assert_eq!(codex.usage.input_units, 900);
+        assert_eq!(codex.uncached_input_units(), None);
     }
 
     #[test]

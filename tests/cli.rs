@@ -34,7 +34,13 @@ fn deep_command_survives_process_restart_and_status_is_read_only() {
     let status_before = fixture.polycode(&["status", run_id]);
     assert_success(&status_before);
     let status_before = String::from_utf8(status_before.stdout).unwrap();
-    assert!(status_before.contains("Usage      60 input units · 30 output units"));
+    // Usage is attributed to the runtime that reported it, never merged into
+    // one run-wide figure. `fake` declares no input-accounting convention, so
+    // its numbers are reported raw with nothing derived from them.
+    assert!(
+        status_before.contains("Usage      fake     60 input units · 30 output units"),
+        "{status_before}"
+    );
     assert!(status_before.contains("quality_review"));
     assert!(status_before.contains("spec_review"));
 
