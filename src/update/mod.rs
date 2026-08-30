@@ -39,9 +39,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Official upstream repository consulted for release metadata.
 pub const OFFICIAL_REPOSITORY: &str = "escapemanuele/polycode";
 
-/// How long a successful check stays authoritative before Polycode asks
-/// GitHub again. One check per day keeps unauthenticated API use well inside
-/// GitHub's limits without ever requiring a token.
+/// How long a successful check is reused before Polycode asks GitHub again.
+/// Reused, not authoritative: a release published inside the window is simply
+/// not known about yet. One check per day keeps unauthenticated API use well
+/// inside GitHub's limits without ever requiring a token.
 pub const CACHE_TTL: TimeDelta = TimeDelta::hours(24);
 
 /// Environment opt-out. Polycode's configuration file is resolved but not yet

@@ -225,6 +225,15 @@ impl RoutedProvider {
         }
     }
 
+    /// A provider whose *runtime* is redirected: process data root and runner
+    /// executable both point somewhere the evaluation harness owns, so an
+    /// eval never touches the user's real process data or their installed
+    /// CLI. It also auto-approves eval permission prompts, which no caller
+    /// should be surprised by after reading the name.
+    ///
+    /// What it does not isolate, and what the name must not be read as
+    /// claiming: the git checkout, the store, or anything else a run touches.
+    /// Those are shared with whatever else is running.
     #[must_use]
     pub(crate) fn isolated(
         plan: RoutingPlan,
