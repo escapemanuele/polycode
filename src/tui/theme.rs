@@ -261,6 +261,14 @@ pub(crate) fn chip_fg() -> Color {
     palette().chip_fg
 }
 
+/// Whether a colour is one Polycode specified rather than one the terminal
+/// theme resolves. Lives here so a test elsewhere can ask the question
+/// without naming a hue, which the palette fence forbids.
+#[cfg(test)]
+pub(crate) const fn is_specified(color: Color) -> bool {
+    matches!(color, Color::Rgb(..))
+}
+
 /// Primary content: the terminal's own foreground.
 pub(crate) fn text() -> Style {
     Style::default()

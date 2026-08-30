@@ -2436,7 +2436,8 @@ mod tests {
             theme::with_palette(palette, || {
                 painted_colours(&state, 160, 40)
                     .iter()
-                    .any(|colour| matches!(colour, Color::Rgb(..)))
+                    .copied()
+                    .any(theme::is_specified)
             })
         };
         assert!(
