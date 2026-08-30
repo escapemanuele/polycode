@@ -2,7 +2,10 @@
 //!
 //! One high-definition pixel companion with a single stable silhouette,
 //! rendered compositionally: fixed shell + state expression (antenna, eyes,
-//! mouth) + optional activity accent + one compact label. State comes from
+//! mouth) + a posture for the work in hand + optional activity accent + one
+//! compact label. One POD in five postures, never five mascots: the
+//! silhouette never changes, so the pipeline keeps representing the roles and
+//! POD keeps representing the product. State comes from
 //! canonical `RunStatus`/`StageStatus` and activity from the typed `Role`;
 //! nothing is inferred from prose. Every variant occupies exactly
 //! `MASCOT_WIDTH` × `MASCOT_HEIGHT` cells so surrounding layout never
@@ -114,32 +117,67 @@ const fn resting_expression(
     }
 }
 
+/// How POD holds its face for the work in hand.
+///
+/// One POD, five postures — not five mascots. The silhouette, the shell and
+/// the footprint never change, so the pipeline keeps representing the roles
+/// and POD keeps representing the product. Every pose is assembled from eyes
+/// another state already wears, so a posture can never be the thing that
+/// introduces a glyph the whitelist has not accepted.
+const fn pose_eyes(activity: MascotActivity) -> (&'static str, &'static str) {
+    let (_, up_left, up_right, _) = resting_expression(MascotState::Running);
+    let (_, down_left, down_right, _) = resting_expression(MascotState::Waiting);
+    let (_, wide_left, wide_right, _) = resting_expression(MascotState::Idle);
+    let (_, stern_left, stern_right, _) = resting_expression(MascotState::NeedsUser);
+    match activity {
+        // Looking up from the page: planning is not typing.
+        MascotActivity::Architecture => (up_left, up_right),
+        // Heads down in the work.
+        MascotActivity::Implementation => (down_left, down_right),
+        // One eye wide, one narrowed: scrutiny, not agreement.
+        MascotActivity::QualityReview => (wide_left, up_right),
+        // Even and unhurried: reading a specification line by line.
+        MascotActivity::SpecReview => (wide_left, wide_right),
+        // Set, and about to say so.
+        MascotActivity::Decision => (stern_left, stern_right),
+    }
+}
+
 /// The expression POD wears this frame.
 ///
-/// The repeating motion, and only that: while work is running POD blinks,
-/// and the blink borrows the eye `Waiting` already wears one row lower, so
-/// motion introduces no glyph the whitelist has not accepted. Every other
-/// state is the same in every phase — a face that moves while nothing is
-/// happening would be claiming something untrue.
+/// Three things can shape it, in strict order. A reaction outranks
+/// everything: something just happened and POD is looking at it. Then the
+/// blink, which is the eyes moving from wherever the pose left them, so a
+/// posture can never be one that cannot blink. Then the pose itself, which
+/// only applies while there is work in hand — everywhere else the state owns
+/// the face exactly as it owns the label.
 const fn expression(
     state: MascotState,
+    activity: Option<MascotActivity>,
     phase: u8,
     reacting: bool,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
-    let (antenna, eye_left, eye_right, mouth) = resting_expression(state);
+    let (antenna, resting_left, resting_right, mouth) = resting_expression(state);
+    let (eye_left, eye_right) = match (state, activity) {
+        (MascotState::Running, Some(activity)) => pose_eyes(activity),
+        _ => (resting_left, resting_right),
+    };
     if reacting {
-        // A reaction outranks a blink: something just happened, and POD is
-        // looking at it rather than breathing. Wide eyes, except where the
-        // state already wears them — then they narrow instead, so a reaction
-        // is always visible without inventing a third eye.
+        // Wide eyes, except where POD already wears them — then they narrow
+        // instead, so a reaction is always visible without inventing a third
+        // eye.
         let (_, wide, _, _) = resting_expression(MascotState::Idle);
         let (_, narrow, _, _) = resting_expression(MascotState::Running);
         let eye = if str_eq(eye_left, wide) { narrow } else { wide };
         return (antenna, eye, eye, mouth);
     }
     if matches!(state, MascotState::Running) && phase == 1 {
-        let (_, blink_left, blink_right, _) = resting_expression(MascotState::Waiting);
-        return (antenna, blink_left, blink_right, mouth);
+        // Measured against the pose rather than against Running's resting
+        // face: a posture that already looks down blinks by looking up.
+        let (_, down, _, _) = resting_expression(MascotState::Waiting);
+        let (_, up, _, _) = resting_expression(MascotState::Running);
+        let eye = if str_eq(eye_left, down) { up } else { down };
+        return (antenna, eye, eye, mouth);
     }
     (antenna, eye_left, eye_right, mouth)
 }
@@ -233,7 +271,7 @@ pub(crate) fn mascot_lines(
     motion: MotionFrame,
 ) -> Vec<Line<'static>> {
     let (antenna, eye_left, eye_right, mouth) =
-        expression(state, motion.active_phase(), motion.is_reacting());
+        expression(state, activity, motion.active_phase(), motion.is_reacting());
     let accent = match (state, activity) {
         (MascotState::Running, Some(activity)) => Some(activity),
         _ => None,
@@ -318,6 +356,13 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// The face proper: antenna, shell, eyes and mouth, without the row
+    /// carrying the tool accent. Comparisons about POD's expression use this,
+    /// because the accent alone would make any two variants look different.
+    fn face(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
+        rows_in(state, activity, MotionFrame::still())[..5].to_vec()
     }
 
     /// Cell width under the whitelist: every permitted glyph is one cell,
@@ -482,13 +527,14 @@ mod tests {
     }
 
     /// The guarantee that lets every other surface stay as it was: a frame
-    /// that may not move draws exactly the art POD drew before motion
-    /// existed. Anything that moves has to come through the phase.
+    /// that may not move draws exactly what POD wears standing still.
+    /// Anything that moves has to come through the phase — a posture is not
+    /// motion, it is what POD looks like while doing that job.
     #[test]
-    fn a_still_frame_draws_the_resting_face_for_every_variant() {
+    fn a_still_frame_draws_the_unmoving_face_for_every_variant() {
         for state in ALL_STATES {
             for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
-                let (antenna, eye_left, eye_right, mouth) = resting_expression(state);
+                let (antenna, eye_left, eye_right, mouth) = expression(state, activity, 0, false);
                 let drawn = rows_in(state, activity, MotionFrame::still());
                 assert!(
                     drawn[0].contains(antenna)
@@ -530,13 +576,13 @@ mod tests {
     /// be the thing that introduces a glyph nobody checked.
     #[test]
     fn the_blink_borrows_an_eye_that_already_exists() {
-        let (_, blink_left, blink_right, _) = expression(MascotState::Running, 1, false);
+        let (_, blink_left, blink_right, _) = expression(MascotState::Running, None, 1, false);
         let (_, waiting_left, waiting_right, _) = resting_expression(MascotState::Waiting);
         assert_eq!(blink_left, waiting_left);
         assert_eq!(blink_right, waiting_right);
 
         let (running_antenna, _, _, running_mouth) = resting_expression(MascotState::Running);
-        let (antenna, _, _, mouth) = expression(MascotState::Running, 1, false);
+        let (antenna, _, _, mouth) = expression(MascotState::Running, None, 1, false);
         assert_eq!(antenna, running_antenna, "a blink is eyes, not a new face");
         assert_eq!(mouth, running_mouth, "a blink is eyes, not a new face");
     }
@@ -559,7 +605,7 @@ mod tests {
                 resting, reacting,
                 "{state:?} showed no sign of having noticed anything"
             );
-            let (_, eye_left, eye_right, _) = expression(state, 0, true);
+            let (_, eye_left, eye_right, _) = expression(state, None, 0, true);
             assert_eq!(eye_left, eye_right, "a reaction keeps POD's face symmetric");
             assert!(
                 eye_left == wide || eye_left == narrow,
@@ -572,10 +618,111 @@ mod tests {
     /// mid-blink shows that it finished.
     #[test]
     fn a_reaction_outranks_a_blink() {
-        let blinking = expression(MascotState::Running, 1, false);
-        let reacting = expression(MascotState::Running, 1, true);
+        let blinking = expression(MascotState::Running, None, 1, false);
+        let reacting = expression(MascotState::Running, None, 1, true);
         assert_ne!(blinking, reacting);
-        assert_eq!(reacting, expression(MascotState::Running, 0, true));
+        assert_eq!(reacting, expression(MascotState::Running, None, 0, true));
+    }
+
+    /// Five postures have to be five *faces*. Compared without the accent
+    /// row on purpose: the tool is always distinct, so including it would
+    /// let every pose be identical and the test would still pass.
+    #[test]
+    fn each_job_has_a_face_of_its_own() {
+        let faces: Vec<Vec<String>> = ALL_ACTIVITIES
+            .iter()
+            .map(|activity| face(MascotState::Running, Some(*activity)))
+            .collect();
+        for (index, face) in faces.iter().enumerate() {
+            for (other_index, other) in faces.iter().enumerate().skip(index + 1) {
+                assert_ne!(
+                    face, other,
+                    "{:?} and {:?} wear the same face",
+                    ALL_ACTIVITIES[index], ALL_ACTIVITIES[other_index]
+                );
+            }
+        }
+    }
+
+    /// A posture is drawn from eyes another state already wears, so the eyes
+    /// alone can coincide with one. The whole face may not: a POD at work
+    /// must never be mistakable for a POD that has stopped, failed, or is
+    /// waiting for you.
+    #[test]
+    fn no_posture_impersonates_another_state() {
+        for activity in ALL_ACTIVITIES {
+            let working = face(MascotState::Running, Some(activity));
+            for state in ALL_STATES {
+                if matches!(state, MascotState::Running) {
+                    continue;
+                }
+                assert_ne!(
+                    working,
+                    face(state, None),
+                    "POD at {activity:?} is indistinguishable from {state:?}"
+                );
+            }
+        }
+    }
+
+    /// The posture is the work in hand, so it appears only where there is
+    /// work in hand — exactly like the label and the tool accent.
+    #[test]
+    fn a_posture_appears_only_while_the_work_is_running() {
+        for state in ALL_STATES {
+            if matches!(state, MascotState::Running) {
+                continue;
+            }
+            for activity in ALL_ACTIVITIES {
+                assert_eq!(
+                    face(state, None),
+                    face(state, Some(activity)),
+                    "{state:?} changed its face for {activity:?}, which it is not doing"
+                );
+            }
+        }
+    }
+
+    /// The blink is measured against the pose rather than against Running's
+    /// resting face, so no posture can be one that cannot blink — including
+    /// the one that already looks where a blink would take it.
+    #[test]
+    fn every_posture_can_still_blink_and_react() {
+        for activity in ALL_ACTIVITIES {
+            let resting = rows_in(MascotState::Running, Some(activity), MotionFrame::still());
+            for moving in [
+                MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
+                MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
+            ] {
+                assert_ne!(
+                    resting,
+                    rows_in(MascotState::Running, Some(activity), moving),
+                    "{activity:?} is a posture that cannot move: {moving:?}"
+                );
+            }
+        }
+    }
+
+    /// Every pose eye is one this file already draws somewhere else, so a
+    /// posture can never be what introduces an unchecked glyph.
+    #[test]
+    fn a_posture_borrows_every_eye_it_wears() {
+        let known: Vec<&str> = ALL_STATES
+            .iter()
+            .flat_map(|state| {
+                let (_, left, right, _) = resting_expression(*state);
+                [left, right]
+            })
+            .collect();
+        for activity in ALL_ACTIVITIES {
+            let (left, right) = pose_eyes(activity);
+            for eye in [left, right] {
+                assert!(
+                    known.contains(&eye),
+                    "{activity:?} invented the eye {eye:?}"
+                );
+            }
+        }
     }
 
     #[test]
