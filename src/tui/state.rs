@@ -2,12 +2,17 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use super::mascot::{self, MascotState};
 use super::motion::{self, MotionFrame};
 use crate::app::{
     ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails, RunDiffPreview,
     RunListItem, StageExecutionEvidence, UniformProvider,
 };
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
+
+/// How long POD reacts to a change before settling into the new state. Long
+/// enough to be seen, short enough that it is over before it is in the way.
+const REACTION: Duration = Duration::from_millis(600);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Screen {
@@ -323,6 +328,16 @@ pub(crate) struct TuiState {
     /// default only because the prompt appears solely when installing is
     /// possible and nothing more urgent is happening.
     pub update_install_selected: bool,
+    /// The state POD last showed, and what it was showing it for. Keyed by
+    /// run and stage so a change in the world can be told apart from the user
+    /// looking somewhere else: arrowing onto a failed stage is not an event.
+    mascot_seen: Option<(RunId, Option<StageId>, MascotState)>,
+    /// When the current reaction ends. Ephemeral by construction — it is a
+    /// deadline, never a durable state, and nothing persists it.
+    reaction_until: Option<Instant>,
+    /// Whether a reaction is playing in the frame being drawn. Owned by the
+    /// loop for the same reason as `motion_phase`.
+    pub reacting: bool,
     /// Which liveness frame the loop is on. Owned by the loop rather than
     /// read from the clock here, so a drawn frame stays a pure function of
     /// state and no test has to wait for one.
@@ -359,6 +374,9 @@ impl TuiState {
             update_install: None,
             update_dismissed: false,
             update_install_selected: true,
+            mascot_seen: None,
+            reaction_until: None,
+            reacting: false,
             motion_phase: 0,
             quit: false,
         }
@@ -370,6 +388,7 @@ impl TuiState {
         MotionFrame::new(
             motion::allowance(self.screen, self.overlay, motion::motion_setting()),
             self.motion_phase,
+            self.reacting,
         )
     }
 
@@ -406,6 +425,46 @@ impl TuiState {
             self.attention_index
                 .min(details.attention.len().saturating_sub(1))
         });
+        self.note_mascot(Instant::now());
+    }
+
+    /// Starts a reaction when the state POD is showing changed underneath it.
+    ///
+    /// The identity is part of the comparison on purpose: POD reacts to the
+    /// world moving, never to the user moving. Selecting a different stage
+    /// shows a different face, and that is not something happening.
+    fn note_mascot(&mut self, now: Instant) {
+        let Some(details) = self.details.as_ref() else {
+            return;
+        };
+        let seen = (
+            details.id,
+            self.selected_stage.clone(),
+            mascot::mascot_state(
+                Some(details.status),
+                details
+                    .stages
+                    .get(self.selected_stage_index)
+                    .map(|stage| stage.status),
+            ),
+        );
+        if let Some(previous) = self.mascot_seen.as_ref()
+            && previous.0 == seen.0
+            && previous.1 == seen.1
+            && previous.2 != seen.2
+        {
+            self.reaction_until = now.checked_add(REACTION);
+        }
+        self.mascot_seen = Some(seen);
+    }
+
+    /// Ends a reaction that has run its course. Called once per frame, next
+    /// to the message expiry, so a reaction can never outlive its window.
+    pub(crate) fn settle_reaction(&mut self, now: Instant) {
+        self.reacting = self.reaction_until.is_some_and(|until| now < until);
+        if !self.reacting {
+            self.reaction_until = None;
+        }
     }
 
     pub(crate) fn move_run(&mut self, forward: bool) {

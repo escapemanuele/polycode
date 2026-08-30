@@ -48,6 +48,10 @@ impl MotionAllowance {
     pub(crate) fn allows_liveness(self) -> bool {
         self == Self::LivenessAndTransitions
     }
+
+    pub(crate) fn allows_transitions(self) -> bool {
+        self >= Self::TransitionsOnly
+    }
 }
 
 /// What the user asked for. Independent of the surface: it can only lower
@@ -166,11 +170,16 @@ pub(crate) fn liveness_phase(elapsed: Duration) -> u8 {
 pub(crate) struct MotionFrame {
     allowance: MotionAllowance,
     phase: u8,
+    reacting: bool,
 }
 
 impl MotionFrame {
-    pub(crate) const fn new(allowance: MotionAllowance, phase: u8) -> Self {
-        Self { allowance, phase }
+    pub(crate) const fn new(allowance: MotionAllowance, phase: u8, reacting: bool) -> Self {
+        Self {
+            allowance,
+            phase,
+            reacting,
+        }
     }
 
     /// A frame that never moves. Production always resolves a real policy
@@ -181,6 +190,7 @@ impl MotionFrame {
         Self {
             allowance: MotionAllowance::Disabled,
             phase: 0,
+            reacting: false,
         }
     }
 
@@ -190,6 +200,14 @@ impl MotionFrame {
         } else {
             0
         }
+    }
+
+    /// Whether POD is in the moment just after something changed. Finite by
+    /// construction — the caller only ever reports a window that ends — and
+    /// permitted one level lower than liveness, because a reaction says
+    /// something happened rather than repeating itself forever.
+    pub(crate) fn is_reacting(self) -> bool {
+        self.reacting && self.allowance.allows_transitions()
     }
 }
 
@@ -311,6 +329,21 @@ mod tests {
 
     /// A blink is brief and rare: most of the time POD's face is the resting
     /// art, which is what keeps a running screen calm to sit in front of.
+    /// Liveness repeats, so it needs the top allowance. A reaction happens
+    /// once and stops, which is exactly what `reduced` keeps.
+    #[test]
+    fn a_reaction_survives_one_level_below_liveness_and_dies_with_the_rest() {
+        let reacting = |allowance| MotionFrame::new(allowance, 0, true).is_reacting();
+        assert!(reacting(MotionAllowance::LivenessAndTransitions));
+        assert!(reacting(MotionAllowance::TransitionsOnly));
+        assert!(!reacting(MotionAllowance::Disabled));
+        assert!(!MotionFrame::still().is_reacting());
+        assert!(
+            !MotionFrame::new(MotionAllowance::LivenessAndTransitions, 0, false).is_reacting(),
+            "a frame nothing happened in must not react"
+        );
+    }
+
     #[test]
     fn a_blink_is_short_rare_and_repeats() {
         assert_eq!(liveness_phase(Duration::ZERO), 0);
@@ -338,14 +371,14 @@ mod tests {
     fn a_frame_that_may_not_move_reports_the_resting_phase_whatever_the_clock_says() {
         for allowance in [MotionAllowance::Disabled, MotionAllowance::TransitionsOnly] {
             assert_eq!(
-                MotionFrame::new(allowance, 1).liveness_phase(),
+                MotionFrame::new(allowance, 1, false).liveness_phase(),
                 0,
                 "{allowance:?} handed out a moving phase"
             );
         }
         assert_eq!(MotionFrame::still().liveness_phase(), 0);
         assert_eq!(
-            MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1).liveness_phase(),
+            MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1, false).liveness_phase(),
             1
         );
     }

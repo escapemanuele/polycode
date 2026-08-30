@@ -122,13 +122,40 @@ const fn resting_expression(
 const fn expression(
     state: MascotState,
     phase: u8,
+    reacting: bool,
 ) -> (&'static str, &'static str, &'static str, &'static str) {
     let (antenna, eye_left, eye_right, mouth) = resting_expression(state);
+    if reacting {
+        // A reaction outranks a blink: something just happened, and POD is
+        // looking at it rather than breathing. Wide eyes, except where the
+        // state already wears them — then they narrow instead, so a reaction
+        // is always visible without inventing a third eye.
+        let (_, wide, _, _) = resting_expression(MascotState::Idle);
+        let (_, narrow, _, _) = resting_expression(MascotState::Running);
+        let eye = if str_eq(eye_left, wide) { narrow } else { wide };
+        return (antenna, eye, eye, mouth);
+    }
     if matches!(state, MascotState::Running) && phase == 1 {
         let (_, blink_left, blink_right, _) = resting_expression(MascotState::Waiting);
         return (antenna, blink_left, blink_right, mouth);
     }
     (antenna, eye_left, eye_right, mouth)
+}
+
+/// `str::eq` is not const, and this comparison has to happen in one.
+const fn str_eq(one: &str, other: &str) -> bool {
+    let (one, other) = (one.as_bytes(), other.as_bytes());
+    if one.len() != other.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < one.len() {
+        if one[index] != other[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 /// State label; for Running the activity label takes over (the state is
@@ -203,7 +230,8 @@ pub(crate) fn mascot_lines(
     activity: Option<MascotActivity>,
     motion: MotionFrame,
 ) -> Vec<Line<'static>> {
-    let (antenna, eye_left, eye_right, mouth) = expression(state, motion.liveness_phase());
+    let (antenna, eye_left, eye_right, mouth) =
+        expression(state, motion.liveness_phase(), motion.is_reacting());
     let accent = match (state, activity) {
         (MascotState::Running, Some(activity)) => Some(activity),
         _ => None,
@@ -264,9 +292,10 @@ mod tests {
     ];
 
     /// Every liveness phase a frame can hand out.
-    const ALL_PHASES: [MotionFrame; 2] = [
+    const ALL_PHASES: [MotionFrame; 3] = [
         MotionFrame::still(),
-        MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1),
+        MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1, false),
+        MotionFrame::new(MotionAllowance::LivenessAndTransitions, 0, true),
     ];
 
     fn rows(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
@@ -480,7 +509,7 @@ mod tests {
             let moving = rows_in(
                 state,
                 None,
-                MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1),
+                MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1, false),
             );
             if matches!(state, MascotState::Running) {
                 assert_ne!(resting, moving, "Running work has to look alive");
@@ -497,15 +526,52 @@ mod tests {
     /// be the thing that introduces a glyph nobody checked.
     #[test]
     fn the_blink_borrows_an_eye_that_already_exists() {
-        let (_, blink_left, blink_right, _) = expression(MascotState::Running, 1);
+        let (_, blink_left, blink_right, _) = expression(MascotState::Running, 1, false);
         let (_, waiting_left, waiting_right, _) = resting_expression(MascotState::Waiting);
         assert_eq!(blink_left, waiting_left);
         assert_eq!(blink_right, waiting_right);
 
         let (running_antenna, _, _, running_mouth) = resting_expression(MascotState::Running);
-        let (antenna, _, _, mouth) = expression(MascotState::Running, 1);
+        let (antenna, _, _, mouth) = expression(MascotState::Running, 1, false);
         assert_eq!(antenna, running_antenna, "a blink is eyes, not a new face");
         assert_eq!(mouth, running_mouth, "a blink is eyes, not a new face");
+    }
+
+    /// A reaction is POD noticing. It has to be visible from every state,
+    /// including the ones whose resting eyes are already wide, and it has to
+    /// borrow eyes the file already draws.
+    #[test]
+    fn a_reaction_is_visible_from_every_state_and_invents_no_eye() {
+        let (_, wide, _, _) = resting_expression(MascotState::Idle);
+        let (_, narrow, _, _) = resting_expression(MascotState::Running);
+        for state in ALL_STATES {
+            let resting = rows_in(state, None, MotionFrame::still());
+            let reacting = rows_in(
+                state,
+                None,
+                MotionFrame::new(MotionAllowance::LivenessAndTransitions, 0, true),
+            );
+            assert_ne!(
+                resting, reacting,
+                "{state:?} showed no sign of having noticed anything"
+            );
+            let (_, eye_left, eye_right, _) = expression(state, 0, true);
+            assert_eq!(eye_left, eye_right, "a reaction keeps POD's face symmetric");
+            assert!(
+                eye_left == wide || eye_left == narrow,
+                "{state:?} reacted with an eye that exists nowhere else: {eye_left:?}"
+            );
+        }
+    }
+
+    /// Something just happened outranks still working: a run that finishes
+    /// mid-blink shows that it finished.
+    #[test]
+    fn a_reaction_outranks_a_blink() {
+        let blinking = expression(MascotState::Running, 1, false);
+        let reacting = expression(MascotState::Running, 1, true);
+        assert_ne!(blinking, reacting);
+        assert_eq!(reacting, expression(MascotState::Running, 0, true));
     }
 
     #[test]

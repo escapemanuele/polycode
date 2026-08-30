@@ -2456,6 +2456,115 @@ mod tests {
         );
     }
 
+    /// A reaction says something happened. So it fires when the world moves
+    /// under POD — and not when the user simply looks somewhere else, which
+    /// also changes the face POD is wearing.
+    #[test]
+    fn pod_reacts_to_the_world_moving_and_not_to_being_looked_away_from() {
+        let stages = |implementation| {
+            vec![
+                // Deliberately not the same face as the stage below it, so
+                // moving the selection genuinely changes what POD shows.
+                stage(
+                    "architecture",
+                    StageKind::Architecture,
+                    Role::Architect,
+                    StageStatus::Failed,
+                ),
+                stage(
+                    "implementation",
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    implementation,
+                ),
+            ]
+        };
+
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.screen = Screen::RunDetail;
+        state.selected_stage_index = 1;
+        state.replace_details(details(RunStatus::Running, stages(StageStatus::Running)));
+        state.settle_reaction(std::time::Instant::now());
+        assert!(
+            !state.reacting,
+            "the first sighting of a run is not something that happened"
+        );
+
+        state.replace_details(details(RunStatus::Running, stages(StageStatus::Completed)));
+        state.settle_reaction(std::time::Instant::now());
+        assert!(state.reacting, "the stage finished and POD did not notice");
+
+        // It ends on its own, without anything else happening.
+        state.settle_reaction(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        assert!(!state.reacting, "the reaction outlived its window");
+
+        // Looking at a different stage shows a different face, which is not
+        // an event. Moved through the real selection path: replace_details
+        // restores the index from the selected stage id, so setting the index
+        // alone would silently move nothing and prove nothing.
+        state.move_stage(false);
+        assert_eq!(state.selected_stage_index, 0, "the selection has to move");
+        state.replace_details(details(RunStatus::Running, stages(StageStatus::Completed)));
+        state.settle_reaction(std::time::Instant::now());
+        assert!(
+            !state.reacting,
+            "POD reacted to the user pressing an arrow key"
+        );
+
+        // ... and the face it now wears really is a different one, so the
+        // assertion above is about identity rather than about nothing having
+        // changed.
+        assert_ne!(
+            mascot::mascot_state(Some(RunStatus::Running), Some(StageStatus::Failed)),
+            mascot::mascot_state(Some(RunStatus::Running), Some(StageStatus::Completed)),
+            "the stage moved to has to look different for this to mean anything"
+        );
+
+        // Nor to a different run: that is a different thing to watch, not
+        // this one changing. Same selected stage name, different run, and a
+        // face that genuinely differs from the one POD was wearing.
+        let mut elsewhere = details(
+            RunStatus::Running,
+            vec![stage(
+                "architecture",
+                StageKind::Architecture,
+                Role::Architect,
+                StageStatus::Running,
+            )],
+        );
+        elsewhere.id = RunId::from_u128(4);
+        state.replace_details(elsewhere);
+        state.settle_reaction(std::time::Instant::now());
+        assert!(!state.reacting, "POD reacted to a different run entirely");
+    }
+
+    /// And the reaction has to reach the screen, inside POD's footprint.
+    #[test]
+    fn a_reaction_reaches_the_screen_without_moving_anything() {
+        const WIDTH: u16 = 160;
+        let mut state = running_state();
+        let resting = render_symbols(&state, WIDTH, 40);
+        state.reacting = true;
+        let reacting = render_symbols(&state, WIDTH, 40);
+
+        assert_ne!(resting, reacting, "the reaction never reached a cell");
+        let changed: Vec<usize> = resting
+            .iter()
+            .zip(&reacting)
+            .enumerate()
+            .filter(|(_, (old, new))| old != new)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            changed.len() <= 4,
+            "a reaction is four eye cells, not {} cells of the screen",
+            changed.len()
+        );
+        let rows: std::collections::HashSet<usize> =
+            changed.iter().map(|index| index / WIDTH as usize).collect();
+        assert_eq!(rows.len(), 1, "the whole change lives on POD's eye row");
+    }
+
     /// Motion may repaint a cell; it may never move one. A frame drawn mid
     /// blink and a frame drawn between blinks differ only where POD's own
     /// eyes are, so nothing reflows, no width changes, and no line the user
