@@ -11,6 +11,10 @@ use ratatui::text::{Line, Span};
 
 /// What the terminal can actually paint. Detected once at startup; the
 /// palette is chosen from it, so nothing downstream has to ask again.
+///
+/// Capability is not taste. It says what is renderable, never what should be
+/// rendered — that is [`ThemeChoice`]. A terminal announcing truecolor has
+/// not asked Polycode to stop using its own theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ColorCapability {
     /// No color at all: `NO_COLOR`, a dumb terminal, or output the user has
@@ -21,6 +25,9 @@ pub(crate) enum ColorCapability {
     /// whatever the user's terminal theme defines, so Polycode sits inside
     /// their palette instead of imposing one.
     Ansi16,
+    /// Twenty-four bit color is available. Only [`ThemeChoice::Vivid`] spends
+    /// it; on its own it changes nothing.
+    TrueColor,
 }
 
 impl ColorCapability {
@@ -29,12 +36,20 @@ impl ColorCapability {
     /// process environment.
     ///
     /// `NO_COLOR` follows the convention at no-color.org: present and
-    /// non-empty disables color regardless of its value.
-    pub(crate) fn resolve(no_color: Option<&str>, term: Option<&str>) -> Self {
+    /// non-empty disables color regardless of its value, and it outranks any
+    /// capability the terminal advertises.
+    pub(crate) fn resolve(
+        no_color: Option<&str>,
+        term: Option<&str>,
+        colorterm: Option<&str>,
+    ) -> Self {
         if no_color.is_some_and(|value| !value.is_empty()) || term == Some("dumb") {
             return Self::Mono;
         }
-        Self::Ansi16
+        match colorterm.map(str::trim) {
+            Some("truecolor" | "24bit") => Self::TrueColor,
+            _ => Self::Ansi16,
+        }
     }
 
     /// Reads the process environment. Kept separate from `resolve` so the
@@ -43,7 +58,38 @@ impl ColorCapability {
         Self::resolve(
             std::env::var("NO_COLOR").ok().as_deref(),
             std::env::var("TERM").ok().as_deref(),
+            std::env::var("COLORTERM").ok().as_deref(),
         )
+    }
+}
+
+/// Which materialisation of the one design system to paint. Both spell the
+/// same eight meanings; they disagree only about who owns the hue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ThemeChoice {
+    /// The default. Named ANSI colors, so every token resolves to whatever
+    /// the user's terminal theme defines and Polycode sits inside their
+    /// aesthetic instead of imposing one. Stays ANSI even where truecolor is
+    /// available: a capability is not permission to take the screen over.
+    #[default]
+    Native,
+    /// Polycode's own colors, specified rather than named. Asked for
+    /// explicitly, and only honoured where the terminal can render them.
+    Vivid,
+}
+
+impl ThemeChoice {
+    pub(crate) fn resolve(theme: Option<&str>) -> Self {
+        match theme.map(str::trim) {
+            Some("vivid") => Self::Vivid,
+            // Anything else — unset, empty, misspelt — is the default. An
+            // unreadable value must not silently restyle the interface.
+            _ => Self::Native,
+        }
+    }
+
+    pub(crate) fn from_environment() -> Self {
+        Self::resolve(std::env::var("POLYCODE_THEME").ok().as_deref())
     }
 }
 
@@ -62,49 +108,91 @@ pub(crate) struct Palette {
 }
 
 impl Palette {
-    pub(crate) const fn for_capability(capability: ColorCapability) -> Self {
-        match capability {
-            ColorCapability::Ansi16 => Self {
-                // Primary Polycode accent: active work, current stage,
-                // product identity.
-                accent: Color::Cyan,
-                // Completion, verified artifacts, apply.
-                success: Color::Green,
-                // The run needs the user. Never used for failure.
-                attention: Color::Yellow,
-                // Failure and destructive actions.
-                danger: Color::Red,
-                // Suspended work: paused and interrupted.
-                suspended: Color::Magenta,
-                // Secondary labels, metadata, structure, inactive connectors.
-                muted: Color::DarkGray,
-                // Structural framing and the architecture role accent. Kept
-                // distinct from the accent so framework reads as structure,
-                // not focus, and never competes with the one active-work
-                // accent per screen.
-                structure: Color::Blue,
-                // Foreground of a reversed chip: black on the chip's own
-                // color keeps its word legible on any accent hue.
-                chip_fg: Color::Black,
-            },
-            // Every token is the terminal's own foreground. Surfaces that
-            // relied on hue alone become indistinguishable here — which is
-            // the point: the monochrome test reads this palette to prove the
-            // interface still tells the truth without color.
-            ColorCapability::Mono => Self {
-                accent: Color::Reset,
-                success: Color::Reset,
-                attention: Color::Reset,
-                danger: Color::Reset,
-                suspended: Color::Reset,
-                muted: Color::Reset,
-                structure: Color::Reset,
-                // A reversed chip still inverts, so its text takes the
-                // background the terminal paints behind it.
-                chip_fg: Color::Reset,
-            },
+    /// The palette to paint with. Capability decides what is renderable and
+    /// the choice decides what to render, and the two only meet here.
+    ///
+    /// Mono outranks everything: a user who asked for no colour does not get
+    /// Polycode's own. Native stays ANSI even on a truecolor terminal, and
+    /// Vivid on a terminal that cannot render it falls back to the same ANSI
+    /// palette rather than to approximated hues — the meanings survive, only
+    /// the specific colours are lost.
+    pub(crate) const fn resolve(capability: ColorCapability, theme: ThemeChoice) -> Self {
+        match (capability, theme) {
+            (ColorCapability::Mono, _) => Self::MONO,
+            (ColorCapability::TrueColor, ThemeChoice::Vivid) => Self::VIVID,
+            (ColorCapability::Ansi16 | ColorCapability::TrueColor, ThemeChoice::Native)
+            | (ColorCapability::Ansi16, ThemeChoice::Vivid) => Self::ANSI16,
         }
     }
+
+    const ANSI16: Self = {
+        Self {
+            // Primary Polycode accent: active work, current stage,
+            // product identity.
+            accent: Color::Cyan,
+            // Completion, verified artifacts, apply.
+            success: Color::Green,
+            // The run needs the user. Never used for failure.
+            attention: Color::Yellow,
+            // Failure and destructive actions.
+            danger: Color::Red,
+            // Suspended work: paused and interrupted.
+            suspended: Color::Magenta,
+            // Secondary labels, metadata, structure, inactive connectors.
+            muted: Color::DarkGray,
+            // Structural framing and the architecture role accent. Kept
+            // distinct from the accent so framework reads as structure,
+            // not focus, and never competes with the one active-work
+            // accent per screen.
+            structure: Color::Blue,
+            // Foreground of a reversed chip: black on the chip's own
+            // color keeps its word legible on any accent hue.
+            chip_fg: Color::Black,
+        }
+    };
+
+    /// Polycode's own colours, specified rather than named.
+    ///
+    /// Every hue is constrained rather than chosen freely: each one holds at
+    /// least a 3:1 contrast ratio against both a black and a white terminal
+    /// background, because a specified colour — unlike a named ANSI one —
+    /// cannot adapt to the user's background and would otherwise vanish on
+    /// half of them. `CHIP_FG` is exempt from that rule and bound by a
+    /// stricter one: it is read *on* the other tokens, so it is measured
+    /// against them instead. Tests enforce both.
+    const VIVID: Self = {
+        Self {
+            accent: Color::Rgb(0x1B, 0x9A, 0xAA),
+            success: Color::Rgb(0x2E, 0x9E, 0x4F),
+            attention: Color::Rgb(0xB5, 0x7E, 0x00),
+            danger: Color::Rgb(0xD1, 0x3A, 0x3F),
+            suspended: Color::Rgb(0xA9, 0x55, 0xC7),
+            // Quieter by saturation rather than by luminance: it has to
+            // recede without becoming unreadable on a light background.
+            muted: Color::Rgb(0x76, 0x7C, 0x84),
+            structure: Color::Rgb(0x3B, 0x7D, 0xD8),
+            chip_fg: Color::Rgb(0x00, 0x00, 0x00),
+        }
+    };
+
+    /// Every token is the terminal's own foreground. Surfaces that relied on
+    /// hue alone become indistinguishable here — which is the point: the
+    /// monochrome test reads this palette to prove the interface still tells
+    /// the truth without color.
+    const MONO: Self = {
+        Self {
+            accent: Color::Reset,
+            success: Color::Reset,
+            attention: Color::Reset,
+            danger: Color::Reset,
+            suspended: Color::Reset,
+            muted: Color::Reset,
+            structure: Color::Reset,
+            // A reversed chip still inverts, so its text takes the
+            // background the terminal paints behind it.
+            chip_fg: Color::Reset,
+        }
+    };
 }
 
 thread_local! {
@@ -112,7 +200,7 @@ thread_local! {
     /// so a test can render one variant monochrome without disturbing the
     /// others; the TUI resolves it once at startup and never changes it.
     static PALETTE: std::cell::Cell<Palette> =
-        const { std::cell::Cell::new(Palette::for_capability(ColorCapability::Ansi16)) };
+        const { std::cell::Cell::new(Palette::resolve(ColorCapability::Ansi16, ThemeChoice::Native)) };
 }
 
 /// Installs the palette for this thread. Called once at TUI startup.
@@ -171,6 +259,14 @@ pub(crate) fn structure() -> Color {
 /// Foreground of a reversed chip.
 pub(crate) fn chip_fg() -> Color {
     palette().chip_fg
+}
+
+/// Whether a colour is one Polycode specified rather than one the terminal
+/// theme resolves. Lives here so a test elsewhere can ask the question
+/// without naming a hue, which the palette fence forbids.
+#[cfg(test)]
+pub(crate) const fn is_specified(color: Color) -> bool {
+    matches!(color, Color::Rgb(..))
 }
 
 /// Primary content: the terminal's own foreground.
@@ -265,34 +361,202 @@ pub(crate) fn spread(
 mod tests {
     use super::*;
 
+    fn named_tokens(palette: Palette) -> [(&'static str, Color); 8] {
+        [
+            ("accent", palette.accent),
+            ("success", palette.success),
+            ("attention", palette.attention),
+            ("danger", palette.danger),
+            ("suspended", palette.suspended),
+            ("muted", palette.muted),
+            ("structure", palette.structure),
+            ("chip_fg", palette.chip_fg),
+        ]
+    }
+
+    fn rgb(color: Color) -> (u8, u8, u8) {
+        match color {
+            Color::Rgb(red, green, blue) => (red, green, blue),
+            other => panic!("{other:?} is not a specified colour"),
+        }
+    }
+
+    /// WCAG relative luminance, and the contrast ratio built from it. The
+    /// floor this enforces is 3:1, the large-text/UI threshold: POD's art and
+    /// the status glyphs are heavy, and holding 4.5:1 against both a black
+    /// and a white background at once leaves almost no usable hues.
+    fn luminance((red, green, blue): (u8, u8, u8)) -> f64 {
+        fn channel(value: u8) -> f64 {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+    }
+
+    fn contrast(one: (u8, u8, u8), other: (u8, u8, u8)) -> f64 {
+        let (first, second) = (luminance(one), luminance(other));
+        (first.max(second) + 0.05) / (first.min(second) + 0.05)
+    }
+
     #[test]
     fn no_color_and_dumb_terminals_resolve_to_monochrome() {
         // The no-color.org convention: present and non-empty, whatever the
         // value. An empty NO_COLOR is explicitly not a request for mono.
         assert_eq!(
-            ColorCapability::resolve(Some("1"), None),
+            ColorCapability::resolve(Some("1"), None, None),
             ColorCapability::Mono
         );
         assert_eq!(
-            ColorCapability::resolve(Some("0"), None),
+            ColorCapability::resolve(Some("0"), None, None),
             ColorCapability::Mono
         );
         assert_eq!(
-            ColorCapability::resolve(Some(""), None),
+            ColorCapability::resolve(Some(""), None, None),
             ColorCapability::Ansi16
         );
         assert_eq!(
-            ColorCapability::resolve(None, None),
+            ColorCapability::resolve(None, None, None),
             ColorCapability::Ansi16
         );
         assert_eq!(
-            ColorCapability::resolve(None, Some("xterm-256color")),
+            ColorCapability::resolve(None, Some("xterm-256color"), None),
             ColorCapability::Ansi16
         );
         assert_eq!(
-            ColorCapability::resolve(None, Some("dumb")),
+            ColorCapability::resolve(None, Some("dumb"), None),
             ColorCapability::Mono
         );
+    }
+
+    #[test]
+    fn truecolor_is_detected_but_never_assumed_to_be_a_request() {
+        assert_eq!(
+            ColorCapability::resolve(None, None, Some("truecolor")),
+            ColorCapability::TrueColor
+        );
+        assert_eq!(
+            ColorCapability::resolve(None, None, Some("24bit")),
+            ColorCapability::TrueColor
+        );
+        assert_eq!(
+            ColorCapability::resolve(None, None, Some("")),
+            ColorCapability::Ansi16
+        );
+
+        // A terminal that can paint anything has still not asked for
+        // anything: on its own, truecolor changes no colour the user sees.
+        assert_eq!(
+            Palette::resolve(ColorCapability::TrueColor, ThemeChoice::Native),
+            Palette::resolve(ColorCapability::Ansi16, ThemeChoice::Native),
+            "a capability became a restyle without anyone asking"
+        );
+
+        // And a user who asked for no colour does not get Polycode's own,
+        // however much the terminal advertises.
+        assert_eq!(
+            ColorCapability::resolve(Some("1"), None, Some("truecolor")),
+            ColorCapability::Mono
+        );
+        assert_eq!(
+            Palette::resolve(ColorCapability::Mono, ThemeChoice::Vivid),
+            Palette::resolve(ColorCapability::Mono, ThemeChoice::Native)
+        );
+    }
+
+    #[test]
+    fn the_theme_understands_vivid_and_ignores_the_rest() {
+        assert_eq!(ThemeChoice::resolve(Some("vivid")), ThemeChoice::Vivid);
+        assert_eq!(ThemeChoice::resolve(Some(" vivid ")), ThemeChoice::Vivid);
+        for value in [
+            None,
+            Some(""),
+            Some("native"),
+            Some("Vivid"),
+            Some("bright"),
+        ] {
+            assert_eq!(
+                ThemeChoice::resolve(value),
+                ThemeChoice::Native,
+                "{value:?} is not a recognised theme, so it must not restyle anything"
+            );
+        }
+    }
+
+    /// Vivid where it can be rendered, and the same meanings in named ANSI
+    /// where it cannot — never approximated hues, which would be Polycode's
+    /// colours badly rather than the terminal's colours well.
+    #[test]
+    fn vivid_is_honoured_only_where_it_can_be_rendered() {
+        assert_eq!(
+            Palette::resolve(ColorCapability::TrueColor, ThemeChoice::Vivid),
+            Palette::VIVID
+        );
+        assert_eq!(
+            Palette::resolve(ColorCapability::Ansi16, ThemeChoice::Vivid),
+            Palette::ANSI16
+        );
+        assert_ne!(
+            Palette::VIVID,
+            Palette::ANSI16,
+            "asking for vivid on a capable terminal has to change something"
+        );
+    }
+
+    /// A named ANSI colour adapts to the user's terminal theme; a specified
+    /// one cannot. So every vivid token has to survive both a black and a
+    /// white background, or Polycode's own palette becomes the reason half
+    /// its users cannot read it.
+    #[test]
+    fn every_vivid_token_stays_legible_on_a_dark_and_a_light_terminal() {
+        for (name, token) in named_tokens(Palette::VIVID) {
+            if name == "chip_fg" {
+                continue;
+            }
+            for (surface, background) in [("black", (0, 0, 0)), ("white", (255, 255, 255))] {
+                let ratio = contrast(rgb(token), background);
+                assert!(
+                    ratio >= 3.0,
+                    "{name} reaches {ratio:.2}:1 on {surface}, which is below the 3:1 floor"
+                );
+            }
+        }
+    }
+
+    /// The chip inverts, so its foreground is read on top of whichever token
+    /// the chip carries. It is exempt from the rule above and bound by this
+    /// one instead.
+    #[test]
+    fn a_chip_word_stays_legible_on_every_token_it_can_sit_on() {
+        let vivid = Palette::VIVID;
+        for (name, token) in named_tokens(vivid) {
+            if name == "chip_fg" {
+                continue;
+            }
+            let ratio = contrast(rgb(vivid.chip_fg), rgb(token));
+            assert!(
+                ratio >= 3.0,
+                "a chip word reaches only {ratio:.2}:1 on {name}"
+            );
+        }
+    }
+
+    /// Otherwise the monochrome collapse below would be measuring nothing.
+    #[test]
+    fn vivid_keeps_its_meanings_apart() {
+        let tokens: Vec<Color> = named_tokens(Palette::VIVID)
+            .into_iter()
+            .filter(|(name, _)| *name != "chip_fg")
+            .map(|(_, token)| token)
+            .collect();
+        for (index, token) in tokens.iter().enumerate() {
+            for other in tokens.iter().skip(index + 1) {
+                assert_ne!(token, other, "two vivid meanings share a colour");
+            }
+        }
     }
 
     /// Under Mono every token is the same colour, so anything that survives
@@ -300,7 +564,7 @@ mod tests {
     /// grow later without the aesthetic layer quietly acquiring meaning.
     #[test]
     fn the_monochrome_palette_leaves_no_token_distinguishable_by_colour() {
-        let mono = Palette::for_capability(ColorCapability::Mono);
+        let mono = Palette::resolve(ColorCapability::Mono, ThemeChoice::Native);
         let tokens = [
             mono.accent,
             mono.success,
@@ -320,7 +584,7 @@ mod tests {
 
         // And the coloured palette must genuinely distinguish them, or the
         // monochrome check above would be vacuous.
-        let ansi = Palette::for_capability(ColorCapability::Ansi16);
+        let ansi = Palette::resolve(ColorCapability::Ansi16, ThemeChoice::Native);
         let coloured = [
             ansi.accent,
             ansi.success,
