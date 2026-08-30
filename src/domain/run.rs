@@ -514,6 +514,7 @@ impl Run {
             | DomainEventKind::ProviderResumed { .. }
             | DomainEventKind::ProviderProgress { .. }
             | DomainEventKind::ProviderUsageUpdated { .. }
+            | DomainEventKind::ProviderRuntimeObserved { .. }
             | DomainEventKind::UsageUpdated => StageStatus::Running,
             DomainEventKind::ProviderNeedsUser { .. } => StageStatus::NeedsUser,
             DomainEventKind::ProviderPaused { .. } => StageStatus::Paused,

@@ -85,6 +85,7 @@ fn current_directory_is_default_repository_and_empty_runs_is_side_effect_free() 
         .args(["review", "Review from cwd", "--provider", "fake"])
         .current_dir(&fixture.repo)
         .env("POLYCODE_DATA_DIR", &fixture.data)
+        .env("CODEX_HOME", fixture.data.join("codex-home"))
         .output()
         .unwrap();
     assert_success(&output);
@@ -157,6 +158,7 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_polycode"))
             .args(args)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .output()
             .unwrap()
     }
@@ -176,6 +178,7 @@ impl Fixture {
             .arg("doctor")
             .env("PATH", &bin)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .output()
             .unwrap()
     }

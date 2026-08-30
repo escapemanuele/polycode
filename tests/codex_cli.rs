@@ -33,6 +33,14 @@ fn native_codex_fixture_runs_through_tmux_preserves_source_then_applies() {
     assert!(stdout.contains("Status     completed"));
     assert!(stdout.contains("implementer  codex"));
     assert!(stdout.contains("native=codex-thread-implementation"));
+    // Codex never names its model or its reasoning effort on stdout. Both come
+    // from the session record it writes for itself, so a run routed with no
+    // pinned model still reports what actually ran instead of "unconfirmed".
+    assert!(stdout.contains("actual=codex/gpt-5.6-luna"), "{stdout}");
+    assert!(
+        stdout.contains("effort=native default requested → xhigh observed"),
+        "{stdout}"
+    );
     // Codex folds its cached input into `input_tokens`, so the 3 cached
     // units are named inside the total and never listed again as a separate
     // cache-read dimension: that would report 14 units of input for 11.
@@ -542,6 +550,7 @@ impl Fixture {
             .args(args)
             .env("PATH", &self.fake_bin)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .env("POLYCODE_FAKE_CODEX_CAPTURE_DIR", &self.capture);
         if write {
             command.env("POLYCODE_FAKE_CODEX_WRITE", "1");
@@ -557,6 +566,7 @@ impl Fixture {
             .args(args)
             .env("PATH", &self.fake_bin)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .env("POLYCODE_FAKE_CODEX_CAPTURE_DIR", &self.capture)
             .env(
                 "POLYCODE_FAKE_CODEX_FAIL_ONCE_DIR",
@@ -571,6 +581,7 @@ impl Fixture {
             .args(args)
             .env("PATH", &self.fake_bin)
             .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
             .env("POLYCODE_FAKE_CODEX_CAPTURE_DIR", &self.capture)
             .env(
                 "POLYCODE_FAKE_CODEX_WAIT_FILE",

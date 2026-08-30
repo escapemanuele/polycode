@@ -896,6 +896,17 @@ fn render_technical(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details
                 |bytes| format!("{bytes} injected bytes"),
             ),
         ));
+        // Requested effort and observed effort are different facts. A
+        // native-default request asks for nothing, so the level the runtime
+        // then chose is visible only here, and only when it recorded one.
+        lines.push(technical_row(
+            "Effort",
+            format!(
+                "{} requested → {} observed",
+                selected.requested_effort.label(),
+                evidence.native_effort.as_deref().unwrap_or("unobserved")
+            ),
+        ));
         if let Some(version) = evidence.provider_cli_version.as_deref() {
             lines.push(technical_row("CLI", version.to_owned()));
         }
@@ -1880,6 +1891,7 @@ mod tests {
             status,
             configured_provider: "codex".to_owned(),
             requested_effort: EffortSetting::NativeDefault,
+            observed_effort: None,
             configured_model: None,
             actual_provider: Some("codex".to_owned()),
             actual_model: None,

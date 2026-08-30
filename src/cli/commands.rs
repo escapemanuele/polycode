@@ -548,6 +548,10 @@ fn print_event(sequence: u64, stage: Option<String>, kind: &DomainEventKind) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one status projection keeps configured and actual columns aligned in source order"
+)]
 fn print_details(details: &RunDetails) {
     println!("Run        {}", details.id);
     println!("Workflow   {}", enum_text(details.workflow));
@@ -614,7 +618,15 @@ fn print_details(details: &RunDetails) {
                 .configured_model
                 .as_deref()
                 .unwrap_or("native default"),
-            stage.requested_effort.label(),
+            stage.observed_effort.as_ref().map_or_else(
+                || format!("{} requested", stage.requested_effort.label()),
+                |observed| {
+                    format!(
+                        "{} requested → {observed} observed",
+                        stage.requested_effort.label()
+                    )
+                }
+            ),
             stage.actual_provider.as_deref().unwrap_or("not started"),
             stage.actual_model.as_deref().unwrap_or("unconfirmed"),
             stage
@@ -744,6 +756,7 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
         DomainEventKind::AttentionResolved { .. } => "attention resolved",
         DomainEventKind::AttentionCancelled { .. } => "attention cancelled",
         DomainEventKind::ProviderStarted { .. } => "provider started",
+        DomainEventKind::ProviderRuntimeObserved { .. } => "provider runtime observed",
         DomainEventKind::ProviderNeedsUser { .. } => "provider awaiting user",
         DomainEventKind::ProviderPaused { .. } => "provider paused",
         DomainEventKind::ProviderInterrupted { .. } => "provider interrupted",

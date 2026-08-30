@@ -824,6 +824,7 @@ mod tests {
                 status: StageStatus::Running,
                 configured_provider: "codex".to_owned(),
                 requested_effort: EffortSetting::NativeDefault,
+                observed_effort: None,
                 configured_model: None,
                 actual_provider: None,
                 actual_model: None,

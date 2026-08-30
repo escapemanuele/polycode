@@ -160,6 +160,19 @@ pub enum DomainEventKind {
         reason: Option<String>,
     },
     UsageUpdated,
+    /// What the native runtime's own records say it ran for this stage.
+    ///
+    /// Distinct from `ProviderStarted`, which carries what the runtime
+    /// announced at launch (nothing, for a runtime that does not announce a
+    /// model). Absent fields mean the runtime never made the fact observable;
+    /// they never mean "as configured".
+    ProviderRuntimeObserved {
+        provider_id: ProviderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_id: Option<ModelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_effort: Option<String>,
+    },
     ProviderUsageUpdated {
         provider_id: ProviderId,
         input_units: u64,

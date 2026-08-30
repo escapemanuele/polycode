@@ -134,7 +134,10 @@ fn controlled_codex_runs_real_boundaries_routes_only_target_role_and_scores_all_
             result.status == EvalStatus::Passed
                 && !result.synthetic
                 && result.target.configured_model.as_deref() == Some("fixture-model")
-                && result.confirmed_model.is_none()
+                // Codex never names its model on stdout, so this is read
+                // from the session record it writes for itself; a pinned
+                // model must come back confirmed, not merely configured.
+                && result.confirmed_model.as_deref() == Some("fixture-model")
                 && result.provider_cli_version.as_deref() == Some("codex-cli fixture-1")
                 && result.usage.input_units == 11
                 && result.usage.output_units == 7
@@ -219,6 +222,9 @@ fn controlled_codex_runs_real_boundaries_routes_only_target_role_and_scores_all_
 struct Fixture {
     temp: TempDir,
     normal_data: PathBuf,
+    /// Codex's own session records. Kept out of `normal_data`, which this
+    /// suite asserts stays untouched by an isolated eval.
+    codex_home: PathBuf,
     capture: PathBuf,
     fake_bin: PathBuf,
 }
@@ -227,6 +233,7 @@ impl Fixture {
     fn new() -> Self {
         let temp = tempdir().unwrap();
         let normal_data = temp.path().join("normal-data");
+        let codex_home = temp.path().join("codex-home");
         let capture = temp.path().join("capture");
         let fake_bin = temp.path().join("fake-bin");
         fs::create_dir_all(&fake_bin).unwrap();
@@ -249,6 +256,7 @@ impl Fixture {
         Self {
             temp,
             normal_data,
+            codex_home,
             capture,
             fake_bin,
         }
@@ -279,6 +287,7 @@ impl Fixture {
             .args(args)
             .env("PATH", std::env::join_paths(paths).unwrap())
             .env("POLYCODE_DATA_DIR", &self.normal_data)
+            .env("CODEX_HOME", &self.codex_home)
             .env("POLYCODE_FAKE_CODEX_CAPTURE_DIR", &self.capture);
         command
     }

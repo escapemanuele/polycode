@@ -319,6 +319,37 @@ fn codex_fixture(arguments: &[OsString]) -> std::io::Result<()> {
                 format!("codex-thread-{stage}")
             }
         });
+    // Real Codex resolves the model from `--model` when given one and from
+    // its own configuration otherwise, then records the result. The fake
+    // mirrors that so a pinned model and a native-default one are
+    // distinguishable in the record, exactly as they are in production.
+    let resolved_model = args
+        .iter()
+        .position(|argument| argument == "--model" || argument == "-m")
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+        .unwrap_or_else(|| "gpt-5.6-luna".to_owned());
+    // Real Codex writes a rollout for its own session and never names the
+    // model on stdout. The fake does the same, so the adapter's only route to
+    // the model identity is the same one it has in production.
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        let directory = std::path::PathBuf::from(home).join("sessions/2026/08/29");
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join(format!("rollout-2026-08-29T18-53-38-{thread_id}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"session_id": thread_id, "cli_version": "0.149.0"}
+                }),
+                serde_json::json!({
+                    "type": "turn_context",
+                    "payload": {"model": resolved_model, "effort": "xhigh", "summary": "auto"}
+                })
+            ),
+        )?;
+    }
     writeln!(
         std::io::stdout(),
         "{}",

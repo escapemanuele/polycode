@@ -627,6 +627,21 @@ where
                     metadata,
                 )?);
             }
+            ProviderSignal::RuntimeObserved {
+                model_id,
+                native_effort,
+            } if stage_status == StageStatus::Running => {
+                let metadata = self.metadata_for(run);
+                events.push(run.record_provider_event(
+                    stage_id,
+                    DomainEventKind::ProviderRuntimeObserved {
+                        provider_id: provider_id.clone(),
+                        model_id,
+                        native_effort,
+                    },
+                    metadata,
+                )?);
+            }
             ProviderSignal::Usage(usage) if stage_status == StageStatus::Running => {
                 let metadata = self.metadata_for(run);
                 events.push(run.record_provider_event(

@@ -39,6 +39,12 @@ pub struct StageSummary {
     /// Persisted requested effort from the immutable resource plan.
     /// `NativeDefault` for every pre-effort-policy snapshot.
     pub requested_effort: EffortSetting,
+    /// The runtime's own effort value for this stage, verbatim.
+    ///
+    /// A `NativeDefault` request asks for nothing, so the level the runtime
+    /// then chose is knowable only from what it recorded. `None` means it
+    /// recorded nothing; it never means "the same as requested".
+    pub observed_effort: Option<String>,
     pub configured_model: Option<String>,
     pub actual_provider: Option<String>,
     pub actual_model: Option<String>,
@@ -296,6 +302,13 @@ pub struct StageExecutionEvidence {
     pub configured_model: Option<String>,
     pub actual_provider: Option<String>,
     pub confirmed_model: Option<String>,
+    /// The runtime's own reasoning-effort value for this stage, verbatim.
+    ///
+    /// Distinct from [`StageSummary::requested_effort`], which is what
+    /// Polycode asked for. A native-default request asks for nothing, so this
+    /// is the only place the resulting level is visible at all. `None` means
+    /// the runtime never made it observable.
+    pub native_effort: Option<String>,
     pub provider_cli_version: Option<String>,
     pub usage: UsageSummary,
     pub native_model_usage: Option<Vec<NativeModelUsage>>,
@@ -376,6 +389,22 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
                 _ => None,
             }
         });
+        let observed = events.iter().rev().find_map(|event| {
+            if event.event.stage_id() != Some(stage.id()) {
+                return None;
+            }
+            match event.event.kind() {
+                DomainEventKind::ProviderRuntimeObserved {
+                    model_id,
+                    native_effort,
+                    ..
+                } => Some((
+                    model_id.as_ref().map(ToString::to_string),
+                    native_effort.clone(),
+                )),
+                _ => None,
+            }
+        });
         let process_status = session
             .and_then(crate::providers::ProviderSessionRecord::current_process_id)
             .map(|process_id| store.load_managed_process(process_id))
@@ -400,9 +429,14 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             actual_provider: session
                 .map(|session| session.provider_id().to_string())
                 .or_else(|| started.as_ref().map(|(provider, _)| provider.clone())),
-            actual_model: session
-                .and_then(crate::providers::ProviderSessionRecord::model_id)
-                .map(ToString::to_string)
+            observed_effort: observed.as_ref().and_then(|(_, effort)| effort.clone()),
+            actual_model: observed
+                .and_then(|(model, _)| model)
+                .or_else(|| {
+                    session
+                        .and_then(crate::providers::ProviderSessionRecord::model_id)
+                        .map(ToString::to_string)
+                })
                 .or_else(|| started.and_then(|(_, model)| model)),
             provider_session_record: session.map(|session| session.id().to_string()),
             native_session: session
@@ -659,6 +693,10 @@ fn invocation_telemetry(
     Ok((invocation_count, injected_prompt_bytes))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fold keeps every per-stage evidence dimension read from the same event pass"
+)]
 pub(crate) fn stage_execution_evidence(
     store: &mut SqliteStore,
     run_id: RunId,
@@ -677,6 +715,8 @@ pub(crate) fn stage_execution_evidence(
         .route(stage.role())
         .ok_or(super::RoutingError::MissingRoleRoute(stage.role()))?;
     let events = store.load_events(run_id)?;
+    let mut observed_model: Option<String> = None;
+    let mut native_effort: Option<String> = None;
     let mut usage = UsageSummary::default();
     let mut native_models: BTreeMap<String, NativeModelUsage> = BTreeMap::new();
     let mut started_at = None;
@@ -716,6 +756,17 @@ pub(crate) fn stage_execution_evidence(
                 );
                 merge_native_models(&mut native_models, event_models.iter().flatten());
             }
+            DomainEventKind::ProviderRuntimeObserved {
+                model_id,
+                native_effort: effort,
+                ..
+            } => {
+                observed_model = model_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .or(observed_model);
+                native_effort = effort.clone().or(native_effort);
+            }
             DomainEventKind::ProviderCompleted { .. } | DomainEventKind::ProviderFailed { .. } => {
                 finished_at = Some(*event.event.occurred_at());
             }
@@ -741,11 +792,18 @@ pub(crate) fn stage_execution_evidence(
                     .as_ref()
                     .map(|(provider, _)| provider.clone())
             }),
-        confirmed_model: session
-            .as_ref()
-            .and_then(crate::providers::ProviderSessionRecord::model_id)
-            .map(ToString::to_string)
+        // What the runtime's own records said it ran outranks what it
+        // announced at launch, and both outrank silence. Nothing here ever
+        // falls back to the configured model.
+        confirmed_model: observed_model
+            .or_else(|| {
+                session
+                    .as_ref()
+                    .and_then(crate::providers::ProviderSessionRecord::model_id)
+                    .map(ToString::to_string)
+            })
             .or_else(|| started_target.and_then(|(_, model)| model)),
+        native_effort,
         provider_cli_version: session
             .as_ref()
             .and_then(crate::providers::ProviderSessionRecord::cli_version)

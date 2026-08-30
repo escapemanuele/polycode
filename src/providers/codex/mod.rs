@@ -6,6 +6,9 @@ mod detection;
 mod error;
 mod prompt;
 mod protocol;
+mod session_meta;
+
+use session_meta::ObservedRuntime;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,6 +41,10 @@ pub struct CodexProvider<B = TmuxBackend> {
     effort: EffortSetting,
     manager: ProcessManager<B>,
     artifact_root: PathBuf,
+    /// Where this process reads Codex's own session records, resolved once at
+    /// construction. `None` disables the lookup entirely, which leaves the
+    /// runtime unobserved rather than guessed.
+    codex_home: Option<PathBuf>,
 }
 
 impl CodexProvider<TmuxBackend> {
@@ -57,6 +64,7 @@ impl CodexProvider<TmuxBackend> {
             effort: EffortSetting::NativeDefault,
             manager: ProcessManager::from_environment()?,
             artifact_root: root,
+            codex_home: session_meta::home_from_environment(),
         })
     }
 
@@ -75,6 +83,7 @@ impl CodexProvider<TmuxBackend> {
             effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
             artifact_root: root,
+            codex_home: session_meta::home_from_environment(),
         })
     }
 }
@@ -98,6 +107,18 @@ impl<B: ProcessBackend> CodexProvider<B> {
 
     fn now() -> DateTime<Utc> {
         std::time::SystemTime::now().into()
+    }
+
+    /// What Codex's own session record says this thread ran.
+    ///
+    /// Returns `None` when no home is configured, no rollout matches the
+    /// thread, or the record names neither fact. An unobserved runtime stays
+    /// unobserved: nothing here falls back to the configured model, because
+    /// "what we asked for" is not evidence of "what ran".
+    fn observe_runtime(&self, session: &ProviderSessionRecord) -> Option<ObservedRuntime> {
+        let home = self.codex_home.as_deref()?;
+        let thread = session.native_session_id()?;
+        session_meta::observe(home, thread.as_str())
     }
 
     fn final_message_path(
@@ -277,6 +298,14 @@ impl<B: ProcessBackend> CodexProvider<B> {
         clippy::too_many_arguments,
         reason = "mapping needs exact raw checkpoint plus reconciled process evidence"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match keeps every native record's session, artifact and signal effects together"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match keeps every native record's session, artifact and signal effects together"
+    )]
     fn map_record(
         &mut self,
         store: &mut SqliteStore,
@@ -340,6 +369,16 @@ impl<B: ProcessBackend> CodexProvider<B> {
                         "Codex emitted turn.completed but process ended as {process_status:?} without successful exit evidence"
                     )));
                 }
+                // Codex's stream never names the model or the reasoning
+                // effort it resolved. Its own session record does, and by the
+                // time `turn.completed` arrives that record is written, so
+                // this is the first moment the fact is observable at all.
+                let observed = self.observe_runtime(&session);
+                if let Some(model) = observed.as_ref().and_then(|it| it.model.clone()) {
+                    session
+                        .confirm_model(model, Self::now())
+                        .map_err(|error| CodexProviderError::Protocol(error.to_owned()))?;
+                }
                 let final_path = self.final_message_path(request, &session, session.invocation());
                 let workspace = store.load_workspace(request.run_id())?.ok_or_else(|| {
                     CodexProviderError::Protocol("run workspace disappeared".to_owned())
@@ -359,7 +398,16 @@ impl<B: ProcessBackend> CodexProvider<B> {
                 commit = commit
                     .with_session(ProviderSessionMutation::new(session, expected))
                     .with_artifact(artifact);
-                vec![ProviderSignal::Usage(usage), ProviderSignal::Completed]
+                let mut signals = Vec::new();
+                if let Some(observed) = observed {
+                    signals.push(ProviderSignal::RuntimeObserved {
+                        model_id: observed.model,
+                        native_effort: observed.effort,
+                    });
+                }
+                signals.push(ProviderSignal::Usage(usage));
+                signals.push(ProviderSignal::Completed);
+                signals
             }
             CodexRecord::Failed(message) => {
                 if session.native_session_id().is_none() {
@@ -1072,6 +1120,9 @@ mod tests {
             effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&process_root, backend),
             artifact_root: process_root,
+            // Inside the test's own temp directory: the lookup runs for real
+            // and finds nothing, and no test can reach a real Codex home.
+            codex_home: Some(temp.path().join("codex-home")),
         };
         let mut engine = WorkflowEngine::new(provider, "recover task");
         loop {
@@ -1160,6 +1211,10 @@ mod tests {
             effort: EffortSetting::NativeDefault,
             manager: ProcessManager::new(&process_root, FixtureBackend::new(output)),
             artifact_root: process_root,
+            // Inside the test's own temp directory: the lookup runs for real
+            // and finds nothing unless the test writes a rollout there, and
+            // no test can reach a real Codex home.
+            codex_home: Some(temp.path().join("codex-home")),
         };
         (temp, database, run_id, store, provider)
     }
