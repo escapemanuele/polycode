@@ -878,6 +878,126 @@ mod tests {
         }
     }
 
+    /// Everything the operator can see of their own checkout: every file in
+    /// the working tree with its bytes, the branch they are standing on, and
+    /// the commit it points at. `.git` is walked past deliberately — a run
+    /// legitimately writes worktree metadata and a branch ref in there, and
+    /// neither is something the operator is looking at.
+    fn source_snapshot(source: &Path) -> (Vec<(PathBuf, Vec<u8>)>, String, String) {
+        fn walk(directory: &Path, base: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in fs::read_dir(directory).unwrap().flatten() {
+                let path = entry.path();
+                if path.file_name() == Some(OsStr::new(".git")) {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    out.push((
+                        path.strip_prefix(base).unwrap().to_path_buf(),
+                        fs::read(&path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(source, source, &mut files);
+        files.sort();
+        (
+            files,
+            git_text(source, ["rev-parse", "HEAD"]),
+            git_text(source, ["rev-parse", "--abbrev-ref", "HEAD"]),
+        )
+    }
+
+    /// The invariant that entitles the word "isolated": a run owns its
+    /// worktree and touches nothing the operator is working in. Asserted
+    /// across the whole lifecycle rather than at creation, because the
+    /// hazard is a long-running run beside someone editing the same
+    /// checkout — the operator is left mid-edit here on purpose, with both
+    /// an untracked file and a modified tracked one.
+    #[test]
+    fn a_run_leaves_the_operators_checkout_exactly_as_it_found_it() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        fs::write(fixture.source.join("local-only.txt"), "mine\n").unwrap();
+        fs::write(fixture.source.join("README.md"), "mine too\n").unwrap();
+        let before = source_snapshot(&fixture.source);
+
+        let workspace = fixture.prepare();
+        fs::write(
+            workspace.worktree_path().join("README.md"),
+            "changed by the run\n",
+        )
+        .unwrap();
+        fs::write(workspace.worktree_path().join("added.txt"), "new\n").unwrap();
+        git(workspace.worktree_path(), ["add", "."]);
+        git(workspace.worktree_path(), ["commit", "-m", "run work"]);
+        fixture.complete();
+        assert_eq!(
+            source_snapshot(&fixture.source),
+            before,
+            "a run changed the checkout its operator is working in"
+        );
+
+        fixture
+            .manager()
+            .discard(&mut fixture.store, fixture.run_id)
+            .unwrap();
+        fixture
+            .manager()
+            .cleanup(&mut fixture.store, fixture.run_id)
+            .unwrap();
+        assert_eq!(
+            source_snapshot(&fixture.source),
+            before,
+            "cleaning up after a run changed the operator's checkout"
+        );
+    }
+
+    /// And the one exception, stated so the invariant above is not merely a
+    /// test that nothing anywhere ever writes to the source. Apply is the
+    /// single path that does, it is invoked deliberately, and it refuses a
+    /// checkout that is not clean.
+    #[test]
+    fn apply_is_the_only_thing_that_writes_to_the_operators_checkout() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let before = source_snapshot(&fixture.source);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(
+            workspace.worktree_path().join("README.md"),
+            "changed by the run\n",
+        )
+        .unwrap();
+
+        // Not while the operator has work in progress. Two guards enforce
+        // this — one before the apply intent is recorded and one immediately
+        // before the write, so a checkout that goes dirty in between is
+        // caught too. This asserts the behaviour, not either guard: removing
+        // the first leaves the second, and the run still refuses.
+        fs::write(fixture.source.join("mid-edit.txt"), "mine\n").unwrap();
+        assert!(matches!(
+            fixture.manager().apply(&mut fixture.store, fixture.run_id),
+            Err(WorkspaceError::SourceCheckoutDirty(_))
+        ));
+        fs::remove_file(fixture.source.join("mid-edit.txt")).unwrap();
+
+        fixture
+            .manager()
+            .apply(&mut fixture.store, fixture.run_id)
+            .unwrap();
+        let after = source_snapshot(&fixture.source);
+        assert_ne!(
+            after, before,
+            "apply is supposed to be the one thing that changes the source"
+        );
+        assert_eq!(after.1, before.1, "apply does not move the operator's HEAD");
+        assert_eq!(
+            after.2, before.2,
+            "apply does not move the operator's branch"
+        );
+    }
+
     #[test]
     fn branch_workspace_is_isolated_and_source_may_be_dirty_at_creation() {
         let mut fixture = Fixture::new(WorkflowKind::Standard);
