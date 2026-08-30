@@ -69,6 +69,7 @@ impl TuiApp {
                 self.refresh();
             }
             self.state.motion_phase = motion::liveness_phase(self.started.elapsed());
+            self.state.settle_reaction(Instant::now());
             terminal
                 .terminal_mut()
                 .draw(|frame| render::render(frame, &self.state))?;
