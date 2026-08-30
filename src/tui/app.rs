@@ -35,7 +35,7 @@ pub(crate) struct TuiApp {
     /// Present only while an installation this session started is running.
     installing: Option<Receiver<InstallOutcome>>,
     last_refresh: Instant,
-    /// When this session started drawing. Only the liveness phase reads it,
+    /// When this session started drawing. Only the blink phase reads it,
     /// so POD's breathing is tied to the session rather than to whichever
     /// redraw happened to come first.
     started: Instant,
@@ -68,7 +68,7 @@ impl TuiApp {
             if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
                 self.refresh();
             }
-            self.state.motion_phase = motion::liveness_phase(self.started.elapsed());
+            self.state.motion_phase = motion::active_phase(self.started.elapsed());
             self.state.settle_reaction(Instant::now());
             terminal
                 .terminal_mut()

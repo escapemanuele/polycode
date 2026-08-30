@@ -9,9 +9,11 @@
 //! shifts. Art uses only ASCII plus the single-cell block elements
 //! █ ▄ ▀ ▌ ▐ (see `GLYPH_WHITELIST`); no emoji, no ambiguous-width glyphs.
 //!
-//! POD may breathe, but only where the surface permits it and only while
-//! work is genuinely running: the caller hands in a [`MotionFrame`], and a
-//! still frame draws exactly the art POD drew before motion existed.
+//! POD may breathe, but only where the surface permits it and only while the
+//! domain considers the work active: the caller hands in a [`MotionFrame`],
+//! and a still frame draws exactly the art POD drew before motion existed.
+//! The breathing reinforces a state written elsewhere in words and glyphs —
+//! it is never the evidence for it.
 
 use super::motion::MotionFrame;
 use super::theme;
@@ -114,9 +116,9 @@ const fn resting_expression(
 
 /// The expression POD wears this frame.
 ///
-/// Liveness, and only liveness: while work is running POD blinks, and the
-/// blink borrows the eye `Waiting` already wears one row lower, so motion
-/// introduces no glyph the whitelist has not already accepted. Every other
+/// The repeating motion, and only that: while work is running POD blinks,
+/// and the blink borrows the eye `Waiting` already wears one row lower, so
+/// motion introduces no glyph the whitelist has not accepted. Every other
 /// state is the same in every phase — a face that moves while nothing is
 /// happening would be claiming something untrue.
 const fn expression(
@@ -231,7 +233,7 @@ pub(crate) fn mascot_lines(
     motion: MotionFrame,
 ) -> Vec<Line<'static>> {
     let (antenna, eye_left, eye_right, mouth) =
-        expression(state, motion.liveness_phase(), motion.is_reacting());
+        expression(state, motion.active_phase(), motion.is_reacting());
     let accent = match (state, activity) {
         (MascotState::Running, Some(activity)) => Some(activity),
         _ => None,
@@ -291,11 +293,11 @@ mod tests {
         MascotActivity::Decision,
     ];
 
-    /// Every liveness phase a frame can hand out.
+    /// Every phase a frame can hand out.
     const ALL_PHASES: [MotionFrame; 3] = [
         MotionFrame::still(),
-        MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1, false),
-        MotionFrame::new(MotionAllowance::LivenessAndTransitions, 0, true),
+        MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
+        MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
     ];
 
     fn rows(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
@@ -499,9 +501,11 @@ mod tests {
         }
     }
 
-    /// Liveness says one thing — this work is alive — so it may appear only
-    /// on the state that is actually working. A face that moved while
-    /// nothing was happening would be claiming progress that is not there.
+    /// The repeating motion says one thing — Polycode considers this work
+    /// active — so it may appear only on the state that carries that meaning.
+    /// A face that moved while nothing was happening would be claiming
+    /// progress that is not there. It is never evidence that the process
+    /// behind the run is alive; see the contract in `motion`.
     #[test]
     fn only_running_moves_and_the_blink_stays_inside_the_footprint() {
         for state in ALL_STATES {
@@ -509,7 +513,7 @@ mod tests {
             let moving = rows_in(
                 state,
                 None,
-                MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1, false),
+                MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
             );
             if matches!(state, MascotState::Running) {
                 assert_ne!(resting, moving, "Running work has to look alive");
@@ -549,7 +553,7 @@ mod tests {
             let reacting = rows_in(
                 state,
                 None,
-                MotionFrame::new(MotionAllowance::LivenessAndTransitions, 0, true),
+                MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
             );
             assert_ne!(
                 resting, reacting,

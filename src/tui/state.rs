@@ -338,7 +338,7 @@ pub(crate) struct TuiState {
     /// Whether a reaction is playing in the frame being drawn. Owned by the
     /// loop for the same reason as `motion_phase`.
     pub reacting: bool,
-    /// Which liveness frame the loop is on. Owned by the loop rather than
+    /// Which blink frame the loop is on. Owned by the loop rather than
     /// read from the clock here, so a drawn frame stays a pure function of
     /// state and no test has to wait for one.
     pub motion_phase: u8,
@@ -696,7 +696,7 @@ mod tests {
             state.screen = screen;
             state.motion_phase = 1;
             assert_eq!(
-                state.motion_frame().liveness_phase(),
+                state.motion_frame().active_phase(),
                 0,
                 "{screen:?} handed the renderer a moving frame"
             );
@@ -717,7 +717,7 @@ mod tests {
             state.overlay = Some(overlay);
             state.motion_phase = 1;
             assert_eq!(
-                state.motion_frame().liveness_phase(),
+                state.motion_frame().active_phase(),
                 0,
                 "POD kept breathing behind {overlay:?}"
             );
@@ -731,6 +731,6 @@ mod tests {
         let mut state = TuiState::new(std::path::Path::new("/repo"));
         state.screen = Screen::RunDetail;
         state.motion_phase = 1;
-        assert_eq!(state.motion_frame().liveness_phase(), 1);
+        assert_eq!(state.motion_frame().active_phase(), 1);
     }
 }
