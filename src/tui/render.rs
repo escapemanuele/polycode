@@ -2565,6 +2565,26 @@ mod tests {
         assert_eq!(rows.len(), 1, "the whole change lives on POD's eye row");
     }
 
+    /// The property that makes the repeating motion safe to have at all: it
+    /// is redundant. A frame with every kind of movement switched off still
+    /// names the state in words, so `POLYCODE_MOTION=off` costs the user
+    /// nothing, and nobody has to read a blink as evidence of anything.
+    #[test]
+    fn a_frame_that_never_moves_still_names_the_state() {
+        let mut state = running_state();
+        state.motion_phase = 0;
+        state.reacting = false;
+        let text = render_text(&state, 160, 40);
+        assert!(
+            text.contains("RUNNING"),
+            "the run state is not written down"
+        );
+        assert!(
+            text.contains("BUILDING"),
+            "the stage's work is not written down"
+        );
+    }
+
     /// Motion may repaint a cell; it may never move one. A frame drawn mid
     /// blink and a frame drawn between blinks differ only where POD's own
     /// eyes are, so nothing reflows, no width changes, and no line the user

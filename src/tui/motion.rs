@@ -1,8 +1,24 @@
 //! When the interface is allowed to move.
 //!
-//! Motion is honest only when time is part of what it says: this work is
-//! still alive, or something just happened. Everything else competes with
-//! the text the user is reading, and Polycode runs for hours.
+//! Motion is honest only when time is part of what it says: Polycode
+//! considers this work active, or something just changed. Everything else
+//! competes with the text the user is reading, and Polycode runs for hours.
+//!
+//! One contract governs the repeating half, and it is a claim about what
+//! movement is *allowed to mean*:
+//!
+//! > Active-state motion is redundant, sparse and non-authoritative. It may
+//! > reinforce an active semantic state; it must never be the evidence that
+//! > work is actually alive.
+//!
+//! The distinction is not pedantry. `RUNNING`, the advancing elapsed, the
+//! pipeline and POD's blink all report the same thing — the domain's view of
+//! the run — and there is a window in which that view says Running while
+//! every process behind it is already dead (see the abandoned-run grace in
+//! `run_service`). A user who read the blink as proof of a live process
+//! would be reading a guarantee nothing here can make. Because the movement
+//! is redundant, it can be switched off entirely without losing one bit of
+//! information, which is exactly the property that makes it safe to add.
 //!
 //! Two independent inputs decide it, and they meet as a minimum:
 //!
@@ -20,11 +36,14 @@ use super::state::{Overlay, Screen};
 
 /// How often POD blinks, and for how long.
 ///
+/// Redundant by design: everything it reinforces is already written in words
+/// and glyphs elsewhere on the screen. That is what lets it be this rare.
+///
 /// Deliberately sparse and lopsided. An even alternation — half a second
 /// open, half a second shut — reads as a pulsing glitch rather than as a
 /// creature, and over the hours a run takes it becomes something to look
 /// away from. A short blink every few seconds says the same thing (this work
-/// is alive) and then gets out of the way. The blink is comfortably longer
+/// is active) and then gets out of the way. The blink is comfortably longer
 /// than the 100ms event poll, so it never falls between two redraws.
 const BLINK_PERIOD: Duration = Duration::from_secs(3);
 const BLINK_LENGTH: Duration = Duration::from_millis(200);
@@ -40,13 +59,14 @@ pub(crate) enum MotionAllowance {
     /// A finite reaction may play when state changes, but nothing repeats on
     /// its own.
     TransitionsOnly,
-    /// Work that is genuinely running may also show that it is alive.
-    LivenessAndTransitions,
+    /// Work the domain considers active may also carry the repeating,
+    /// non-authoritative motion described in this module's contract.
+    ActiveStateAndTransitions,
 }
 
 impl MotionAllowance {
-    pub(crate) fn allows_liveness(self) -> bool {
-        self == Self::LivenessAndTransitions
+    pub(crate) fn allows_active_state(self) -> bool {
+        self == Self::ActiveStateAndTransitions
     }
 
     pub(crate) fn allows_transitions(self) -> bool {
@@ -71,7 +91,7 @@ impl MotionSetting {
         match self {
             Self::Off => MotionAllowance::Disabled,
             Self::Reduced => MotionAllowance::TransitionsOnly,
-            Self::Full => MotionAllowance::LivenessAndTransitions,
+            Self::Full => MotionAllowance::ActiveStateAndTransitions,
         }
     }
 
@@ -135,7 +155,7 @@ pub(crate) const fn surface_ceiling(screen: Screen, overlay: Option<Overlay>) ->
     match screen {
         // Operating surfaces: what they show is work in progress, so time is
         // part of the information.
-        Screen::Runs | Screen::RunDetail => MotionAllowance::LivenessAndTransitions,
+        Screen::Runs | Screen::RunDetail => MotionAllowance::ActiveStateAndTransitions,
         // Reading surfaces: prose, logs, a diff, a form being filled in.
         Screen::Artifact | Screen::Logs | Screen::Diff | Screen::NewRun => {
             MotionAllowance::Disabled
@@ -153,10 +173,10 @@ pub(crate) fn allowance(
     surface_ceiling(screen, overlay).min(setting.ceiling())
 }
 
-/// Which liveness frame the clock is on: 1 during a blink, 0 the rest of the
+/// Which frame the clock is on: 1 during a blink, 0 the rest of the
 /// time. Phase 0 is the resting art, so a surface that never asks the clock
 /// and a surface between blinks draw exactly the same thing.
-pub(crate) fn liveness_phase(elapsed: Duration) -> u8 {
+pub(crate) fn active_phase(elapsed: Duration) -> u8 {
     let within = elapsed.as_millis() % BLINK_PERIOD.as_millis();
     u8::from(within >= BLINK_PERIOD.as_millis() - BLINK_LENGTH.as_millis())
 }
@@ -164,7 +184,7 @@ pub(crate) fn liveness_phase(elapsed: Duration) -> u8 {
 /// One frame's permission to move, handed to whatever draws it.
 ///
 /// The phase is private on purpose. A renderer cannot read the clock around
-/// the allowance: it asks for `liveness_phase`, which is zero — the resting
+/// the allowance: it asks for `active_phase`, which is zero — the resting
 /// frame — whenever motion is not permitted here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MotionFrame {
@@ -194,8 +214,8 @@ impl MotionFrame {
         }
     }
 
-    pub(crate) fn liveness_phase(self) -> u8 {
-        if self.allowance.allows_liveness() {
+    pub(crate) fn active_phase(self) -> u8 {
+        if self.allowance.allows_active_state() {
             self.phase
         } else {
             0
@@ -204,8 +224,8 @@ impl MotionFrame {
 
     /// Whether POD is in the moment just after something changed. Finite by
     /// construction — the caller only ever reports a window that ends — and
-    /// permitted one level lower than liveness, because a reaction says
-    /// something happened rather than repeating itself forever.
+    /// permitted one level lower than the repeating kind, because a reaction
+    /// says something happened rather than repeating itself forever.
     pub(crate) fn is_reacting(self) -> bool {
         self.reacting && self.allowance.allows_transitions()
     }
@@ -285,9 +305,9 @@ mod tests {
     }
 
     #[test]
-    fn an_operating_surface_is_the_only_one_that_may_show_liveness() {
+    fn an_operating_surface_is_the_only_one_that_may_repeat() {
         for screen in ALL_SCREENS {
-            let allows = allowance(screen, None, MotionSetting::Full).allows_liveness();
+            let allows = allowance(screen, None, MotionSetting::Full).allows_active_state();
             assert_eq!(
                 allows,
                 matches!(screen, Screen::Runs | Screen::RunDetail),
@@ -329,37 +349,37 @@ mod tests {
 
     /// A blink is brief and rare: most of the time POD's face is the resting
     /// art, which is what keeps a running screen calm to sit in front of.
-    /// Liveness repeats, so it needs the top allowance. A reaction happens
-    /// once and stops, which is exactly what `reduced` keeps.
+    /// Repeating motion needs the top allowance. A reaction happens once and
+    /// stops, which is exactly what `reduced` keeps.
     #[test]
-    fn a_reaction_survives_one_level_below_liveness_and_dies_with_the_rest() {
+    fn a_reaction_survives_one_level_below_the_repeating_kind() {
         let reacting = |allowance| MotionFrame::new(allowance, 0, true).is_reacting();
-        assert!(reacting(MotionAllowance::LivenessAndTransitions));
+        assert!(reacting(MotionAllowance::ActiveStateAndTransitions));
         assert!(reacting(MotionAllowance::TransitionsOnly));
         assert!(!reacting(MotionAllowance::Disabled));
         assert!(!MotionFrame::still().is_reacting());
         assert!(
-            !MotionFrame::new(MotionAllowance::LivenessAndTransitions, 0, false).is_reacting(),
+            !MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, false).is_reacting(),
             "a frame nothing happened in must not react"
         );
     }
 
     #[test]
     fn a_blink_is_short_rare_and_repeats() {
-        assert_eq!(liveness_phase(Duration::ZERO), 0);
-        assert_eq!(liveness_phase(Duration::from_millis(2799)), 0);
-        assert_eq!(liveness_phase(Duration::from_millis(2800)), 1);
-        assert_eq!(liveness_phase(Duration::from_millis(2999)), 1);
-        assert_eq!(liveness_phase(Duration::from_secs(3)), 0);
+        assert_eq!(active_phase(Duration::ZERO), 0);
+        assert_eq!(active_phase(Duration::from_millis(2799)), 0);
+        assert_eq!(active_phase(Duration::from_millis(2800)), 1);
+        assert_eq!(active_phase(Duration::from_millis(2999)), 1);
+        assert_eq!(active_phase(Duration::from_secs(3)), 0);
         // And again on the next cycle, hours in, without overflowing.
-        assert_eq!(liveness_phase(Duration::from_millis(5800)), 1);
-        assert_eq!(liveness_phase(Duration::from_secs(36_000)), 0);
+        assert_eq!(active_phase(Duration::from_millis(5800)), 1);
+        assert_eq!(active_phase(Duration::from_secs(36_000)), 0);
 
         // Overwhelmingly still: at 100ms redraws, at most a couple of frames
         // in every thirty show a blink at all.
         let moving = (0..30_000)
             .step_by(100)
-            .filter(|ms| liveness_phase(Duration::from_millis(*ms)) == 1)
+            .filter(|ms| active_phase(Duration::from_millis(*ms)) == 1)
             .count();
         assert!(
             moving * 10 < 30_000 / 100,
@@ -371,14 +391,14 @@ mod tests {
     fn a_frame_that_may_not_move_reports_the_resting_phase_whatever_the_clock_says() {
         for allowance in [MotionAllowance::Disabled, MotionAllowance::TransitionsOnly] {
             assert_eq!(
-                MotionFrame::new(allowance, 1, false).liveness_phase(),
+                MotionFrame::new(allowance, 1, false).active_phase(),
                 0,
                 "{allowance:?} handed out a moving phase"
             );
         }
-        assert_eq!(MotionFrame::still().liveness_phase(), 0);
+        assert_eq!(MotionFrame::still().active_phase(), 0);
         assert_eq!(
-            MotionFrame::new(MotionAllowance::LivenessAndTransitions, 1, false).liveness_phase(),
+            MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false).active_phase(),
             1
         );
     }
