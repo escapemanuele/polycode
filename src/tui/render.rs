@@ -77,7 +77,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::styled(" ▌ ", theme::muted()),
         Span::styled(screen, Style::default().add_modifier(Modifier::BOLD)),
     ];
-    if let Some(busy) = state.worker_busy.as_deref() {
+    if let Some(busy) = state.busy_label() {
         left.push(Span::styled(
             format!("  {busy}…"),
             Style::default().fg(theme::accent()),
@@ -3103,9 +3103,15 @@ mod tests {
         assert!(!state.update_prompt_is_due(), "never over another overlay");
         state.overlay = None;
 
-        state.worker_busy = Some("applying changes".to_owned());
+        state.begin_action(
+            crate::tui::worker::ActionKind::Apply,
+            Some(RunId::from_u128(1)),
+        );
         assert!(!state.update_prompt_is_due(), "never during an action");
-        state.worker_busy = None;
+        state.settle_action(
+            crate::tui::worker::ActionKind::Apply,
+            Some(RunId::from_u128(1)),
+        );
 
         state.replace_runs(vec![RunListItem {
             id: RunId::from_u128(1),

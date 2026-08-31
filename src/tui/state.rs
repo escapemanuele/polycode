@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::mascot::{self, MascotState};
 use super::motion::{self, MotionFrame};
+use super::worker::{ActionKind, WorkerCommand};
 use crate::app::{
     ArtifactSummary, ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails,
     RunDiffPreview, RunListItem, StageExecutionEvidence, UniformProvider,
@@ -34,6 +35,49 @@ pub(crate) enum Overlay {
     /// Application-level software update. Deliberately the lowest-priority
     /// overlay: run attention always outranks it.
     Update,
+}
+
+/// How many agents this interface will have working at one time.
+///
+/// Each one holds a managed worktree, a terminal session and a provider
+/// process for as long as it runs, so the ceiling is about the machine, not
+/// about the domain: enough to keep several pieces of work moving at once,
+/// short of handing the whole machine over to a fleet nobody is watching. The
+/// command line is unaffected — a separate process has its own ceiling.
+pub(crate) const CONCURRENT_AGENTS: usize = 4;
+
+/// Why a dispatched action was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Another action is already working on the same run.
+    RunIsHeld(ActionKind),
+    /// This interface already has as many agents at work as it will run.
+    AtCapacity,
+}
+
+impl Refusal {
+    /// What the user is told, in terms of what they can do about it.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::RunIsHeld(holder) => {
+                format!("Already {} — wait for it to finish", holder.label())
+            }
+            Self::AtCapacity => format!(
+                "{CONCURRENT_AGENTS} agents are already working — wait for one to finish, or stop one"
+            ),
+        }
+    }
+}
+
+/// One action this session dispatched and has not yet heard back about.
+///
+/// The run it targets is what makes it a claim rather than a global lock: an
+/// action holds the run it is working on and nothing else. A start holds no
+/// run at all, because the run it creates does not exist until it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InFlightAction {
+    pub action: ActionKind,
+    pub run_id: Option<RunId>,
 }
 
 /// Presentation-level notification severity. TUI-only; durable state that
@@ -345,7 +389,10 @@ pub(crate) struct TuiState {
     pub attention_index: usize,
     pub attention_response: TextField,
     pub new_run: NewRunForm,
-    pub worker_busy: Option<String>,
+    /// Every dispatched action still waiting on its outcome. A list rather
+    /// than a single slot: this interface can be working on several runs at
+    /// once, and one run's action is no reason to refuse another's.
+    pub in_flight: Vec<InFlightAction>,
     pub message: Option<UiMessage>,
     pub quiescent: Option<QuiescentState>,
     /// Newer official release, once a background check has concluded. Absent
@@ -400,7 +447,7 @@ impl TuiState {
             attention_index: 0,
             attention_response: TextField::default(),
             new_run: NewRunForm::new(repository),
-            worker_busy: None,
+            in_flight: Vec::new(),
             message: None,
             quiescent: None,
             update: None,
@@ -539,6 +586,74 @@ impl TuiState {
             .map(|attention| attention.id)
     }
 
+    /// Records that an action has been dispatched and is now working.
+    pub(crate) fn begin_action(&mut self, action: ActionKind, run_id: Option<RunId>) {
+        self.in_flight.push(InFlightAction { action, run_id });
+    }
+
+    /// Drops one finished action from the in-flight set.
+    ///
+    /// Exactly one entry, never every match: two stops on the same run are two
+    /// separate pieces of work, and the second is still running when the first
+    /// reports back.
+    pub(crate) fn settle_action(&mut self, action: ActionKind, run_id: Option<RunId>) {
+        if let Some(index) = self
+            .in_flight
+            .iter()
+            .position(|entry| entry.action == action && entry.run_id == run_id)
+        {
+            self.in_flight.remove(index);
+        }
+    }
+
+    /// Why `command` cannot start right now, if it cannot.
+    ///
+    /// Actions are held against the run they target, so work on one run never
+    /// refuses work on another. Stop is the deliberate exception to every rule
+    /// here: it is the only way out of a run that has stopped making progress,
+    /// so it is always allowed, including against the very action it is
+    /// interrupting. The application layer is built for exactly that, retrying
+    /// the stop until it wins the concurrency race with whoever is still
+    /// driving the run.
+    pub(crate) fn action_refusal(&self, command: &WorkerCommand) -> Option<Refusal> {
+        let kind = command.kind();
+        if kind == ActionKind::Stop {
+            return None;
+        }
+        if let Some(target) = command.run_id()
+            && let Some(holder) = self
+                .in_flight
+                .iter()
+                .find(|entry| entry.run_id == Some(target))
+        {
+            return Some(Refusal::RunIsHeld(holder.action));
+        }
+        if kind.drives_a_provider() && self.agents_at_work() >= CONCURRENT_AGENTS {
+            return Some(Refusal::AtCapacity);
+        }
+        None
+    }
+
+    /// How many in-flight actions currently have an agent working.
+    pub(crate) fn agents_at_work(&self) -> usize {
+        self.in_flight
+            .iter()
+            .filter(|entry| entry.action.drives_a_provider())
+            .count()
+    }
+
+    /// What the header says about work in flight, if anything is.
+    ///
+    /// One action names itself; several are counted, because listing them
+    /// would crowd out the run identity the header exists to show.
+    pub(crate) fn busy_label(&self) -> Option<String> {
+        match self.in_flight.as_slice() {
+            [] => None,
+            [only] => Some(only.action.label().to_owned()),
+            many => Some(format!("{} actions in flight", many.len())),
+        }
+    }
+
     /// Whether apply/discard review actions are offered for the selected run.
     ///
     /// Mirrors the workspace invariant (`WorkspaceManager::apply`): only a
@@ -555,7 +670,7 @@ impl TuiState {
             && !self.update_dismissed
             && self.overlay.is_none()
             && self.screen == Screen::Runs
-            && self.worker_busy.is_none()
+            && self.in_flight.is_empty()
             && !self.runs.iter().any(|run| {
                 matches!(
                     run.status,
