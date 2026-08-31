@@ -715,7 +715,21 @@ impl TuiApp {
         };
         match self.reader.inspect_run(run_id) {
             Ok(details) => self.state.replace_details(details),
-            Err(error) => self.state.set_error(error.to_string()),
+            Err(error) => {
+                // The panel must never keep narrating a different run than the
+                // one selected. When the selected run cannot be inspected, its
+                // own last details may stand, but another run's are dropped —
+                // otherwise two list rows appear to share one run.
+                if self
+                    .state
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.id != run_id)
+                {
+                    self.state.details = None;
+                }
+                self.state.set_error(error.to_string());
+            }
         }
         if let Ok(artifacts) = self.reader.list_artifacts(run_id) {
             let complete: Vec<_> = artifacts
@@ -1043,6 +1057,32 @@ mod tests {
             .routes
             .retain(|route| route.role != Role::Implementer);
         details
+    }
+
+    /// A panel narrating run A while run B is selected makes two list rows
+    /// appear to share one run. When the selected run cannot be inspected,
+    /// another run's details are dropped rather than left standing.
+    #[test]
+    fn anothers_details_are_dropped_when_the_selected_run_cannot_be_inspected() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Review));
+        app.state.selected_run = Some(RunId::from_u128(8));
+        app.refresh_selected();
+        assert!(
+            app.state.details.is_none(),
+            "run 7's details must not stand in for unreadable run 8"
+        );
+        assert!(app.state.message.is_some());
+    }
+
+    /// The selected run's own last details may stand while it is unreadable:
+    /// they are stale, but they are its own story, and dropping them would
+    /// blank the panel on every transient read failure.
+    #[test]
+    fn a_runs_own_details_survive_its_inspect_failure() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Review));
+        app.refresh_selected();
+        assert!(app.state.details.is_some());
+        assert_eq!(app.state.details.as_ref().unwrap().id, RunId::from_u128(7));
     }
 
     /// "Fix it" answers a decision, so it is offered exactly where one exists
