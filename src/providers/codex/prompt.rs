@@ -9,6 +9,12 @@ use super::CodexProviderError;
 
 const MAX_DEPENDENCY_BYTES: u64 = 1024 * 1024;
 
+/// Codex rejects a turn whose input exceeds 1,048,576 characters
+/// (`input_too_large`, code -32602). The margin leaves room for whatever the
+/// runtime wraps around stdin. Bytes bound characters from above, so budgeting
+/// in bytes can only undershoot the character limit.
+const MAX_INPUT_BYTES: usize = 1024 * 1024 - 16 * 1024;
+
 pub(crate) fn compose(
     request: &ProviderRequest,
     artifacts: &[ArtifactRecord],
@@ -71,7 +77,11 @@ pub(crate) fn compose(
         .expect("String writes cannot fail");
     }
     if let Some(handoff) = handoff {
-        prompt.push_str(&change_handoff::render(handoff));
+        // The change map is the one part that may legitimately dwarf the
+        // input limit, and it is navigation aid, not source of truth — so it
+        // is the part that yields whatever room the rest of the prompt left.
+        let room = MAX_INPUT_BYTES.saturating_sub(prompt.len());
+        prompt.push_str(&change_handoff::render_within(handoff, room));
     }
     Ok(prompt)
 }
@@ -145,6 +155,33 @@ mod tests {
         assert_eq!(with.len(), without.len() + section.len());
         // Same shared render() as the Claude adapter: semantic identity is the
         // single provider-neutral section, byte-for-byte.
+    }
+
+    /// Codex rejects any turn over its input limit outright, so a change map
+    /// bigger than the limit must arrive shortened, never verbatim — the run
+    /// died on `input_too_large` in the wild.
+    #[test]
+    fn a_change_map_larger_than_the_input_limit_is_shortened_to_fit() {
+        let diff_text = "+padding line of diff text to overflow the input\n".repeat(25_000);
+        let total = diff_text.len() as u64;
+        let giant = ChangeHandoff::for_tests(
+            &"b".repeat(40),
+            vec![ChangedFileRecord {
+                kind: ChangeKind::Modified,
+                path: "src/lib.rs".to_owned(),
+                previous_path: None,
+                binary: false,
+            }],
+            &diff_text,
+            total,
+            true,
+        );
+        assert!(change_handoff::render(&giant).len() > MAX_INPUT_BYTES);
+        let request = request(Role::SpecReviewer, StageKind::SpecReview);
+        let prompt = compose(&request, &[], Some(&giant)).unwrap();
+
+        assert!(prompt.len() <= MAX_INPUT_BYTES);
+        assert!(prompt.contains("Completeness: INCOMPLETE"));
     }
 
     #[test]
