@@ -638,7 +638,11 @@ fn seat_mascot(
     let seat = mascot::MASCOT_HEIGHT as usize + 3;
     let wrapped_rows: usize = lines
         .iter()
-        .map(|line| span_width(&line.spans).div_ceil((width as usize).max(1)).max(1))
+        .map(|line| {
+            span_width(&line.spans)
+                .div_ceil((width as usize).max(1))
+                .max(1)
+        })
         .sum();
     let inner_height = area.height.saturating_sub(1) as usize;
     if area.width >= mascot::MASCOT_WIDTH + 20 && inner_height > wrapped_rows + seat {
@@ -2683,10 +2687,7 @@ mod tests {
 
         // Running with its driver in flight needs no second one.
         let mut driven = running_state();
-        driven.begin_action(
-            crate::tui::worker::ActionKind::Resume,
-            driven.selected_run,
-        );
+        driven.begin_action(crate::tui::worker::ActionKind::Resume, driven.selected_run);
         assert!(!actions_text(&driven).contains("[r] Resume"));
 
         let mut paused = running_state();

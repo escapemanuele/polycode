@@ -1800,10 +1800,9 @@ mod tests {
     }
 
     fn holds_resume_for(app: &TuiApp, id: u128) -> bool {
-        app.state
-            .in_flight
-            .iter()
-            .any(|entry| entry.action == ActionKind::Resume && entry.run_id == Some(RunId::from_u128(id)))
+        app.state.in_flight.iter().any(|entry| {
+            entry.action == ActionKind::Resume && entry.run_id == Some(RunId::from_u128(id))
+        })
     }
 
     #[test]
