@@ -638,7 +638,11 @@ fn seat_mascot(
     let seat = mascot::MASCOT_HEIGHT as usize + 3;
     let wrapped_rows: usize = lines
         .iter()
-        .map(|line| span_width(&line.spans).div_ceil((width as usize).max(1)).max(1))
+        .map(|line| {
+            span_width(&line.spans)
+                .div_ceil((width as usize).max(1))
+                .max(1)
+        })
         .sum();
     let inner_height = area.height.saturating_sub(1) as usize;
     if area.width >= mascot::MASCOT_WIDTH + 20 && inner_height > wrapped_rows + seat {
@@ -647,7 +651,7 @@ fn seat_mascot(
         lines.push(Line::from(""));
         lines.extend(mascot::mascot_lines(
             mascot::mascot_state(Some(details.status), Some(selected.status)),
-            Some(mascot::mascot_activity(selected.role)),
+            Some(mascot::mascot_activity(selected.kind)),
             state.motion_frame(),
         ));
     }
@@ -3119,7 +3123,9 @@ mod tests {
         let mut resting = running_state();
         resting.motion_phase = 0;
         let mut blinking = running_state();
-        blinking.motion_phase = 1;
+        // The blink tick of the loop in `motion`, which the prop cycle rests
+        // on — so the only cells this frame may repaint are POD's eyes.
+        blinking.motion_phase = 5;
 
         let before = render_symbols(&resting, WIDTH, 40);
         let after = render_symbols(&blinking, WIDTH, 40);
