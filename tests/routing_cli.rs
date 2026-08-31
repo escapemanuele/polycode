@@ -94,6 +94,50 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     );
 }
 
+/// Omitting both selection flags is the same request as `--profile
+/// recommended`, and says so in the report rather than routing silently.
+#[test]
+fn omitting_the_selection_flags_starts_the_recommended_profile() {
+    let fixture = Fixture::new();
+    let started = fixture.polycode_write(&[
+        "standard",
+        "Build default routing fixture",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+    ]);
+    assert_success(&started);
+    let stdout = String::from_utf8(started.stdout).unwrap();
+    assert!(stdout.contains("Status     completed"), "{stdout}");
+    assert!(
+        stdout.contains("Profile    recommended (recommended_v2)"),
+        "the resolved profile is named, not assumed: {stdout}"
+    );
+
+    // The same per-role split the explicit flag produces, not one uniform
+    // provider standing in for a profile.
+    let run_id: RunId = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Run        "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
+    let by_stage = store
+        .list_provider_sessions(run_id)
+        .unwrap()
+        .iter()
+        .map(|session| {
+            (
+                session.stage_id().as_str().to_owned(),
+                session.provider_id().as_str().to_owned(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(by_stage["architecture"], "claude");
+    assert_eq!(by_stage["implementation"], "codex");
+    assert_eq!(by_stage["spec_review"], "codex");
+}
+
 #[test]
 fn provider_and_profile_flags_conflict_before_state_creation() {
     let fixture = Fixture::new();
