@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 5;
+pub const DATABASE_SCHEMA_VERSION: u32 = 6;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -14,24 +14,32 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
             migrate_v4(connection)?;
-            migrate_v5(connection)
+            migrate_v5(connection)?;
+            migrate_v6(connection)
         }
         1 => {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
             migrate_v4(connection)?;
-            migrate_v5(connection)
+            migrate_v5(connection)?;
+            migrate_v6(connection)
         }
         2 => {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
-            migrate_v5(connection)
+            migrate_v5(connection)?;
+            migrate_v6(connection)
         }
         3 => {
             migrate_v4(connection)?;
-            migrate_v5(connection)
+            migrate_v5(connection)?;
+            migrate_v6(connection)
         }
-        4 => migrate_v5(connection),
+        4 => {
+            migrate_v5(connection)?;
+            migrate_v6(connection)
+        }
+        5 => migrate_v6(connection),
         unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
     }
 }
@@ -409,6 +417,19 @@ fn migrate_v5(connection: &Connection) -> Result<(), StoreError> {
              SELECT RAISE(ABORT, 'artifacts are immutable');
          END;
          PRAGMA user_version = 5;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Operator-facing visibility: a hidden run stays fully intact and
+/// queryable, it is only left out of the default Runs list. Not a run
+/// lifecycle state, so it lives beside the snapshot rather than in it.
+fn migrate_v6(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE runs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1));
+         PRAGMA user_version = 6;
          COMMIT;",
     )?;
     Ok(())

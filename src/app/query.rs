@@ -27,6 +27,8 @@ pub struct RunListItem {
     pub task_summary: String,
     pub repository: Option<PathBuf>,
     pub updated_at: DateTime<Utc>,
+    /// Hidden runs are left out of the default Runs list.
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,6 +332,7 @@ pub(crate) fn list(store: &SqliteStore) -> Result<Vec<RunListItem>, AppError> {
             task_summary: task_summary(run.task.as_deref()),
             repository: run.repository_path.map(PathBuf::from),
             updated_at: run.updated_at,
+            hidden: run.hidden,
         })
         .collect())
 }

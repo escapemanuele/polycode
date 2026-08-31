@@ -171,6 +171,11 @@ impl TuiApp {
             Intent::Apply => self.open_apply_confirmation(),
             Intent::Fix => self.request_fix(),
             Intent::Discard => self.state.overlay = Some(Overlay::DiscardConfirm),
+            Intent::Hide if self.state.screen == Screen::Runs => self.toggle_selected_hidden(),
+            Intent::ShowHidden if self.state.screen == Screen::Runs => {
+                self.state.show_hidden = !self.state.show_hidden;
+                self.refresh();
+            }
             Intent::DismissMessage => self.state.dismiss_message(),
             Intent::ToggleRaw if self.state.screen == Screen::Artifact => {
                 self.state.artifact_raw = !self.state.artifact_raw;
@@ -613,10 +618,33 @@ impl TuiApp {
         self.refresh();
     }
 
+    /// Hides the selected run from the default list, or unhides it when the
+    /// list is showing hidden runs. Synchronous on purpose: it is a single
+    /// metadata update with no processes or workspaces involved, exactly like
+    /// the settling writes `list_runs` already performs on this thread.
+    fn toggle_selected_hidden(&mut self) {
+        let Some(run) = self.state.runs.get(self.state.selected_run_index) else {
+            return;
+        };
+        let (run_id, hidden) = (run.id, run.hidden);
+        if let Err(error) = self.reader.set_run_hidden(run_id, !hidden) {
+            self.state.set_error(error.to_string());
+            return;
+        }
+        self.refresh();
+    }
+
     fn refresh(&mut self) {
         match self.reader.list_runs() {
             Ok(runs) => {
-                self.state.replace_runs(runs);
+                let (visible, hidden_count) = if self.state.show_hidden {
+                    (runs, 0)
+                } else {
+                    let hidden = runs.iter().filter(|run| run.hidden).count();
+                    (runs.into_iter().filter(|run| !run.hidden).collect(), hidden)
+                };
+                self.state.hidden_count = hidden_count;
+                self.state.replace_runs(visible);
                 self.refresh_selected();
             }
             Err(error) => self.state.set_error(error.to_string()),
