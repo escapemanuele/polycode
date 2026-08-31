@@ -137,7 +137,7 @@ pub(crate) fn render_within(handoff: &ChangeHandoff, max_bytes: usize) -> String
     // INCOMPLETE completeness line can push the result past the budget.
     let overhead = {
         let mut probe = bounded.clone();
-        probe.diff_text = "\n".to_owned();
+        "\n".clone_into(&mut probe.diff_text);
         render(&probe).len()
     };
     // A few spare bytes absorb the count digits the INCOMPLETE line grows by.
