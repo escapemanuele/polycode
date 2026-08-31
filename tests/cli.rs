@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
@@ -60,16 +60,26 @@ fn deep_command_survives_process_restart_and_status_is_read_only() {
 }
 
 #[test]
-fn fake_provider_must_be_selected_explicitly() {
+fn the_default_profile_never_falls_back_to_the_development_provider() {
+    // Neither native CLI is on this fixture's PATH. Omitting the selection
+    // flags therefore has to fail, and fail saying what is missing: the
+    // development provider produces artifacts that look like work, so a
+    // default that quietly reached for it would be worse than no default.
     let fixture = Fixture::new();
-    let output = fixture.polycode(&["fast", "task", "--repo", fixture.repo.to_str().unwrap()]);
+    let output = fixture.polycode_without_native_providers(&[
+        "fast",
+        "task",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+    ]);
 
     assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("use --provider claude|codex|fake or --profile recommended")
+        stderr.contains("recommended profile requires authenticated Claude Code or Codex CLI"),
+        "{stderr}"
     );
+    assert!(!stderr.contains("fake"), "{stderr}");
     assert!(!fixture.data.join("polycode.db").exists());
 }
 
@@ -163,20 +173,40 @@ impl Fixture {
             .unwrap()
     }
 
-    fn doctor_without_native_providers(&self) -> Output {
-        let bin = self.temp.path().join("doctor-bin");
+    /// A PATH carrying only the runtime prerequisites, with both native
+    /// provider CLIs deliberately absent.
+    ///
+    /// Tests that turn on a provider being unavailable must say so themselves
+    /// rather than inheriting whatever the machine running them happens to
+    /// have installed and authenticated.
+    fn bin_without_native_providers(&self, name: &str) -> PathBuf {
+        let bin = self.temp.path().join(name);
         fs::create_dir_all(&bin).unwrap();
-        // Only the runtime prerequisites are present; the native provider CLIs
-        // are deliberately absent, which must stay diagnostic rather than fatal.
         for tool in ["tmux", "git"] {
             let found =
                 find_on_path(tool).unwrap_or_else(|| panic!("{tool} is required for CLI tests"));
             #[cfg(unix)]
             std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
         }
+        bin
+    }
+
+    fn polycode_without_native_providers(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_polycode"))
+            .args(args)
+            .env("PATH", self.bin_without_native_providers("bare-bin"))
+            .env("POLYCODE_DATA_DIR", &self.data)
+            .env("CODEX_HOME", self.data.join("codex-home"))
+            .output()
+            .unwrap()
+    }
+
+    fn doctor_without_native_providers(&self) -> Output {
+        // The native provider CLIs being absent must stay diagnostic rather
+        // than fatal.
         Command::new(env!("CARGO_BIN_EXE_polycode"))
             .arg("doctor")
-            .env("PATH", &bin)
+            .env("PATH", self.bin_without_native_providers("doctor-bin"))
             .env("POLYCODE_DATA_DIR", &self.data)
             .env("CODEX_HOME", self.data.join("codex-home"))
             .output()
@@ -184,7 +214,7 @@ impl Fixture {
     }
 }
 
-fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())

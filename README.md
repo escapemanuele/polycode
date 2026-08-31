@@ -221,6 +221,7 @@ polycode standard "Add export support" --repo /path/to/repo --provider codex
 polycode deep "Redesign authentication" --provider codex
 polycode review "Review the error boundary" --provider codex
 polycode deep "Refactor authentication" --profile recommended
+polycode standard "Fix the parser"
 polycode fast "Fix the parser" --provider fake
 polycode runs
 polycode status <run-id>
@@ -232,7 +233,7 @@ polycode apply <run-id>
 polycode discard <run-id>
 ```
 
-Workflow commands use current directory unless `--repo` is supplied. Execution selection remains explicit and flags are mutually exclusive:
+Workflow commands use current directory unless `--repo` is supplied. Omitting both selection flags starts the `recommended` profile, the same default the TUI's new-run composer opens on; the resolved profile is named in the report rather than assumed. Recommended never falls back to the development FakeProvider, so the default can refuse to start — `recommended profile requires authenticated Claude Code or Codex CLI` — but can never quietly run a task against something that only looks like work. Fake stays something you ask for by name. Flags are mutually exclusive:
 
 - `--provider claude|codex|fake` creates uniform routing for every role used by workflow.
 - `--profile recommended` resolves the current versioned profile (`recommended_v2`) once, persists explicit routes, and never re-resolves them on restart. Runs persisted under `recommended_v1` keep resolving their original routes unchanged.

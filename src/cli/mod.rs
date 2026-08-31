@@ -133,10 +133,12 @@ pub struct RunArgs {
     /// Git repository; defaults to current directory.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
-    /// Native provider (`claude` or `codex`) or deterministic development provider (`fake`).
+    /// Native provider (`claude` or `codex`) or deterministic development
+    /// provider (`fake`). Overrides the default routing profile.
     #[arg(long, conflicts_with = "profile")]
     pub provider: Option<String>,
-    /// Versioned routing profile (`recommended`).
+    /// Versioned routing profile (`recommended`). Used by default when neither
+    /// selection flag is given.
     #[arg(long, conflicts_with = "provider")]
     pub profile: Option<String>,
     /// Requested native-runtime effort (`native`, `low`, `medium`, `high`).

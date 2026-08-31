@@ -95,20 +95,28 @@ fn service() -> Result<RunService<RuntimeProviderFactory>> {
 }
 
 fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
+    // Omitting both flags means Recommended, the same default the TUI's new-run
+    // composer already starts on. It is a routing profile, not a provider: it
+    // resolves to authenticated Claude Code or Codex and refuses to fall back
+    // to the development FakeProvider, so the default can fail to start but
+    // can never quietly run a task against something that only looks like
+    // work. Fake stays something you ask for by name.
     let selection = match (args.provider.as_deref(), args.profile.as_deref()) {
-        (Some(provider), None) => Some(ExecutionSelection::Uniform(UniformProvider::try_from(
-            provider,
-        )?)),
-        (None, Some("recommended")) => Some(ExecutionSelection::Recommended),
+        (Some(provider), None) => ExecutionSelection::Uniform(UniformProvider::try_from(provider)?),
+        (None, Some("recommended") | None) => ExecutionSelection::Recommended,
         (None, Some(other)) => {
             anyhow::bail!("unsupported profile {other:?}; supported profiles: recommended")
         }
-        (None, None) => None,
         (Some(_), Some(_)) => unreachable!("clap rejects conflicting selection flags"),
     };
     let effort = parse_effort(args.effort.as_deref())?;
-    let report =
-        service()?.start_run(workflow, args.task.clone(), &args.repo, selection, effort)?;
+    let report = service()?.start_run(
+        workflow,
+        args.task.clone(),
+        &args.repo,
+        Some(selection),
+        effort,
+    )?;
     print_report(&report);
     Ok(())
 }
