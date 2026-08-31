@@ -62,6 +62,9 @@ pub struct RunSummary {
     pub repository_path: Option<String>,
     pub revision: RunRevision,
     pub updated_at: DateTime<Utc>,
+    /// Operator-facing visibility; a hidden run is left out of the default
+    /// Runs list but stays fully intact.
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,7 +312,8 @@ impl SqliteStore {
     pub fn list_runs(&self) -> Result<Vec<RunSummary>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT runs.id, runs.status, runs.workflow, run_inputs.task,
-                    run_workspaces.source_repo_path, runs.revision, runs.updated_at
+                    run_workspaces.source_repo_path, runs.revision, runs.updated_at,
+                    runs.hidden
              FROM runs
              LEFT JOIN run_inputs ON run_inputs.run_id = runs.id
              LEFT JOIN run_workspaces ON run_workspaces.run_id = runs.id
@@ -324,11 +328,12 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         })?;
         let mut summaries = Vec::new();
         for row in rows {
-            let (id, status, workflow, task, repository_path, revision, updated_at) = row?;
+            let (id, status, workflow, task, repository_path, revision, updated_at, hidden) = row?;
             summaries.push(RunSummary {
                 id: id
                     .parse()
@@ -339,9 +344,28 @@ impl SqliteStore {
                 repository_path,
                 revision: RunRevision(i64_to_u64(revision, "run revision")?),
                 updated_at: parse_timestamp(&updated_at)?,
+                hidden,
             });
         }
         Ok(summaries)
+    }
+
+    /// Sets the operator-facing visibility flag. Deliberately outside the
+    /// CAS revision protocol: hiding is list metadata, not a run mutation,
+    /// so it must neither bump the revision nor touch `updated_at`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::RunNotFound`] for an unknown run, or `SQLite`
+    /// errors.
+    pub fn set_run_hidden(&mut self, run_id: RunId, hidden: bool) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE runs SET hidden = ?1 WHERE id = ?2",
+            rusqlite::params![hidden, run_id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::RunNotFound(run_id));
+        }
+        Ok(())
     }
 
     /// Atomically updates snapshot and appends semantic events using CAS revision.
@@ -1362,6 +1386,43 @@ mod tests {
         assert_eq!(store.load_events(second.id()).unwrap()[0].sequence, 1);
         assert_eq!(store.load_run(first.id()).unwrap().run, first);
         assert_eq!(store.load_run(second.id()).unwrap().run, second);
+    }
+
+    /// Hiding is list metadata, not a run mutation: the flag round-trips
+    /// through `list_runs`, while the run's revision, snapshot and
+    /// `updated_at` stay exactly as they were.
+    #[test]
+    fn hiding_a_run_flags_the_summary_without_mutating_the_run() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 210, "hide-config", 4_000);
+        let before = store
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == run.id())
+            .unwrap();
+        assert!(!before.hidden);
+
+        store.set_run_hidden(run.id(), true).unwrap();
+        let after = store
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == run.id())
+            .unwrap();
+        assert!(after.hidden);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(store.load_run(run.id()).unwrap().run, run);
+
+        store.set_run_hidden(run.id(), false).unwrap();
+        assert!(!store.list_runs().unwrap()[0].hidden);
+
+        let missing = crate::domain::RunId::from_u128(999_999);
+        assert!(matches!(
+            store.set_run_hidden(missing, false),
+            Err(StoreError::RunNotFound(id)) if id == missing
+        ));
     }
 
     #[test]

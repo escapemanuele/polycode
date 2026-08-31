@@ -460,6 +460,18 @@ where
         Self::report(&mut store, run_id, before, None)
     }
 
+    /// Sets whether a run is hidden from the default Runs list. Pure list
+    /// metadata: no lifecycle transition, no revision bump, no process or
+    /// workspace side effects.
+    ///
+    /// # Errors
+    /// Returns store or path errors; unknown runs surface as `RunNotFound`.
+    pub fn set_run_hidden(&self, run_id: RunId, hidden: bool) -> Result<(), AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        store.set_run_hidden(run_id, hidden)?;
+        Ok(())
+    }
+
     /// Returns indexed summaries without creating a missing database.
     ///
     /// # Errors

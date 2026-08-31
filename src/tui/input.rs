@@ -29,6 +29,8 @@ pub(crate) enum Intent {
     Apply,
     Fix,
     Discard,
+    Hide,
+    ShowHidden,
     DismissMessage,
     ToggleRaw,
     TechnicalDetails,
@@ -68,6 +70,8 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('a') => Intent::Apply,
         KeyCode::Char('f') => Intent::Fix,
         KeyCode::Char('X') => Intent::Discard,
+        KeyCode::Char('h') => Intent::Hide,
+        KeyCode::Char('H') => Intent::ShowHidden,
         KeyCode::Char('x') => Intent::DismissMessage,
         KeyCode::Char('m') => Intent::ToggleRaw,
         KeyCode::Char('i') => Intent::TechnicalDetails,
@@ -141,6 +145,18 @@ mod tests {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
             Intent::ToggleRaw
+        );
+    }
+
+    #[test]
+    fn lowercase_h_hides_and_stays_distinct_from_uppercase_show_hidden() {
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Intent::Hide
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Intent::ShowHidden
         );
     }
 }

@@ -136,16 +136,36 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ));
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(Span::styled(
-            "No runs yet.",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(theme::action(
-            "n",
-            "Start your first run",
-            theme::accent(),
-        )));
+        if state.hidden_count > 0 {
+            // Not actually empty — everything is hidden; say so instead of
+            // pretending the operator never ran anything.
+            let plural = if state.hidden_count == 1 {
+                "run"
+            } else {
+                "runs"
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{} hidden {plural}.", state.hidden_count),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(theme::action(
+                "H",
+                "Show hidden runs",
+                theme::accent(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "No runs yet.",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(theme::action(
+                "n",
+                "Start your first run",
+                theme::accent(),
+            )));
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .alignment(Alignment::Center)
@@ -200,7 +220,9 @@ fn run_row(
     let age = format::elapsed(Some(run.updated_at), None, now)
         .map(|span| format!("{} ago", format::format_duration(span)))
         .unwrap_or_default();
-    let meta = format!("{}  {age}", enum_text(run.workflow));
+    // Only ever visible while the list is showing hidden runs.
+    let hidden_mark = if run.hidden { "hidden  " } else { "" };
+    let meta = format!("{hidden_mark}{}  {age}", enum_text(run.workflow));
     // Budget: cursor, glyph, the meta column, and a gap wide enough that the
     // ellipsis can never push the row past the rail.
     let task_width = (width as usize).saturating_sub(meta.chars().count() + 7);
@@ -1412,6 +1434,18 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
         Screen::Runs => {
             push("Enter", "Open", theme::accent());
             push("n", "New run", theme::accent());
+            if let Some(run) = state.runs.get(state.selected_run_index) {
+                push(
+                    "h",
+                    if run.hidden { "Unhide" } else { "Hide" },
+                    theme::muted_color(),
+                );
+            }
+            if state.show_hidden {
+                push("H", "Hide hidden", theme::muted_color());
+            } else if state.hidden_count > 0 {
+                push("H", "Show hidden", theme::muted_color());
+            }
         }
         Screen::RunDetail => {
             let needs_user = state
@@ -1563,7 +1597,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -2271,6 +2305,7 @@ mod tests {
             task_summary: "OAuth provider".to_owned(),
             repository: Some(std::path::PathBuf::from("/repo")),
             updated_at: at(12, 0, 0),
+            hidden: false,
         }]);
         state.details = Some(details(RunStatus::NeedsUser, Vec::new()));
         let text = render_text(&state, 120, 30);
@@ -2279,6 +2314,48 @@ mod tests {
         assert!(text.contains("▸ "), "the selected run carries a cursor");
         state.overlay = Some(Overlay::Help);
         assert!(render_text(&state, 120, 30).contains("Help · Esc closes"));
+    }
+
+    /// Hiding has three visible surfaces: the footer offers the keys, a run
+    /// shown by the all-runs view carries a "hidden" mark, and a list where
+    /// everything is hidden says so instead of claiming there are no runs.
+    #[test]
+    fn hidden_runs_are_advertised_marked_and_counted() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.replace_runs(vec![RunListItem {
+            id: RunId::from_u128(7),
+            workflow: WorkflowKind::Standard,
+            status: RunStatus::Completed,
+            task_summary: "Ship the widget".to_owned(),
+            repository: None,
+            updated_at: at(12, 0, 0),
+            hidden: false,
+        }]);
+        state.details = Some(details(RunStatus::Completed, Vec::new()));
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("[h] Hide"), "footer offers hiding");
+        assert!(!text.contains("Show hidden"), "nothing is hidden yet");
+
+        // Something hidden exists: the footer says how to see it.
+        state.hidden_count = 1;
+        assert!(render_text(&state, 120, 30).contains("[H] Show hidden"));
+
+        // The all-runs view marks the hidden run and offers to re-hide.
+        state.show_hidden = true;
+        state.runs[0].hidden = true;
+        let showing = render_text(&state, 120, 30);
+        assert!(showing.contains("hidden  "), "hidden run carries its mark");
+        assert!(showing.contains("[h] Unhide"));
+        assert!(showing.contains("[H] Hide hidden"));
+
+        // Everything hidden: the empty state tells the truth.
+        state.show_hidden = false;
+        state.replace_runs(Vec::new());
+        state.hidden_count = 2;
+        let empty = render_text(&state, 120, 30);
+        assert!(empty.contains("2 hidden runs."), "{empty}");
+        assert!(empty.contains("Show hidden runs"));
+        assert!(!empty.contains("No runs yet"));
     }
 
     #[test]
@@ -3347,6 +3424,7 @@ mod tests {
             task_summary: "OAuth".to_owned(),
             repository: None,
             updated_at: at(12, 0, 0),
+            hidden: false,
         }]);
         assert!(
             !state.update_prompt_is_due(),
