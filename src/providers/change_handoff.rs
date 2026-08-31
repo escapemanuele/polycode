@@ -119,6 +119,42 @@ impl ChangeHandoff {
     }
 }
 
+/// Renders the section so it fits inside `max_bytes`, shedding diff lines
+/// first. The inventory and the completeness verdict always survive: a
+/// provider with a hard input limit loses navigation detail, never the
+/// knowledge that detail is missing. Bytes bound characters from above, so a
+/// byte budget is safe against a character-counted limit.
+#[must_use]
+pub(crate) fn render_within(handoff: &ChangeHandoff, max_bytes: usize) -> String {
+    let section = render(handoff);
+    if section.len() <= max_bytes {
+        return section;
+    }
+    let mut bounded = handoff.clone();
+    bounded.diff_complete = false;
+    // Overhead is measured on the truncated shape itself — including the diff
+    // header a non-empty diff brings back — so neither it nor the longer
+    // INCOMPLETE completeness line can push the result past the budget.
+    let overhead = {
+        let mut probe = bounded.clone();
+        probe.diff_text = "\n".to_owned();
+        render(&probe).len()
+    };
+    // A few spare bytes absorb the count digits the INCOMPLETE line grows by.
+    let mut room = max_bytes
+        .saturating_sub(overhead + 32)
+        .min(bounded.diff_text.len());
+    while room > 0 && !bounded.diff_text.is_char_boundary(room) {
+        room -= 1;
+    }
+    let keep = bounded.diff_text[..room]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    bounded.diff_text.truncate(keep);
+    bounded.diff_complete = false;
+    render(&bounded)
+}
+
 /// Renders the provider-neutral prompt section. Byte-identical across
 /// adapters for the same handoff.
 #[must_use]
@@ -197,6 +233,36 @@ mod tests {
             previous_path: None,
             binary,
         }
+    }
+
+    /// A budget below the section's size sheds diff lines but keeps the
+    /// inventory and turns the completeness verdict INCOMPLETE; an ample
+    /// budget changes nothing.
+    #[test]
+    fn render_within_sheds_diff_lines_and_keeps_the_verdict_honest() {
+        let diff_text = "diff --git a/x b/x\n".repeat(400);
+        let preview = PatchPreview {
+            bytes: diff_text.clone().into_bytes(),
+            total_bytes: diff_text.len() as u64,
+            truncated: false,
+        };
+        let full = handoff(vec![file(ChangeKind::Modified, "x", false)], &preview);
+        let complete = render(&full);
+        assert_eq!(render_within(&full, complete.len()), complete);
+
+        let bounded = render_within(&full, 2000);
+        assert!(bounded.len() <= 2000);
+        assert!(bounded.contains("Changed files (1 total):"));
+        assert!(bounded.contains("Completeness: INCOMPLETE"));
+        // What diff survives ends on a whole line, never mid-hunk.
+        let diff_part = bounded
+            .split("differ\"):\n")
+            .nth(1)
+            .unwrap_or("")
+            .split("\nCompleteness")
+            .next()
+            .unwrap_or("");
+        assert!(diff_part.is_empty() || diff_part.ends_with('\n'));
     }
 
     #[test]
