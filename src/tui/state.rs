@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use super::mascot::{self, MascotState};
 use super::motion::{self, MotionFrame};
 use crate::app::{
-    ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails, RunDiffPreview,
-    RunListItem, StageExecutionEvidence, UniformProvider,
+    ArtifactSummary, ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails,
+    RunDiffPreview, RunListItem, StageExecutionEvidence, UniformProvider,
 };
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
 
@@ -287,6 +287,35 @@ const fn cycle(index: usize, length: usize, forward: bool) -> usize {
     }
 }
 
+/// One artifact's opening line, and the artifact it was read from.
+///
+/// The source identity is what keeps a half-second refresh cheap: the file is
+/// reread only when the stage, its attempt, or its size changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StageHeadline {
+    pub stage_id: StageId,
+    pub attempt: u32,
+    pub content_size: u64,
+    /// The quoted line, or `None` for an artifact that carries no prose to
+    /// quote — remembered rather than forgotten, so an artifact with nothing
+    /// to say is not reread twice a second for as long as it stays selected.
+    pub text: Option<String>,
+    /// Whether the artifact stated this as its own bottom line, or whether it
+    /// is the artifact's opening paragraph standing in for one.
+    pub contracted: bool,
+}
+
+impl StageHeadline {
+    /// Whether this quote still belongs to the artifact in front of the
+    /// operator. A new attempt, a rewritten file, or a different stage all
+    /// mean the panel is holding someone else's words.
+    pub(crate) fn describes(&self, stage_id: &StageId, artifact: &ArtifactSummary) -> bool {
+        self.stage_id == *stage_id
+            && self.attempt == artifact.attempt
+            && self.content_size == artifact.content_size
+    }
+}
+
 #[derive(Debug)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -307,6 +336,9 @@ pub(crate) struct TuiState {
     pub technical: bool,
     pub evidence: Option<StageExecutionEvidence>,
     pub stages_with_artifacts: HashSet<StageId>,
+    /// What the selected stage's artifact says about itself, in one line.
+    /// Absent until a stage with a verified artifact is selected.
+    pub headline: Option<StageHeadline>,
     pub logs: Option<ProcessLogView>,
     pub diff: Option<RunDiffPreview>,
     pub scroll: u16,
@@ -361,6 +393,7 @@ impl TuiState {
             technical: false,
             evidence: None,
             stages_with_artifacts: HashSet::new(),
+            headline: None,
             logs: None,
             diff: None,
             scroll: 0,
@@ -747,5 +780,54 @@ mod tests {
         state.screen = Screen::RunDetail;
         state.motion_phase = 1;
         assert_eq!(state.motion_frame().active_phase(), 1);
+    }
+
+    /// The panel refreshes twice a second and an artifact is up to a megabyte
+    /// of Markdown that has to be read and rehashed to be trusted. So the
+    /// quote is kept until the artifact behind it is genuinely a different
+    /// one — and a retry, which rewrites the same stage, counts as different.
+    #[test]
+    fn a_quote_is_kept_for_its_own_artifact_and_dropped_for_any_other() {
+        let stage_id = StageId::new("quality_review").unwrap();
+        let artifact = ArtifactSummary {
+            stage_id: stage_id.clone(),
+            kind: crate::domain::ArtifactKind::CodeQualityReview,
+            status: crate::domain::ArtifactStatus::Complete,
+            attempt: 1,
+            provider: Some("claude".to_owned()),
+            model: None,
+            content_size: 4_096,
+            created_at: Utc.timestamp_opt(0, 0).single().unwrap(),
+        };
+        let headline = StageHeadline {
+            stage_id: stage_id.clone(),
+            attempt: 1,
+            content_size: 4_096,
+            text: Some("Two screens, one mechanism, two endings.".to_owned()),
+            contracted: true,
+        };
+
+        assert!(headline.describes(&stage_id, &artifact));
+
+        let retried = ArtifactSummary {
+            attempt: 2,
+            ..artifact.clone()
+        };
+        assert!(
+            !headline.describes(&stage_id, &retried),
+            "a retry rewrote it"
+        );
+
+        let rewritten = ArtifactSummary {
+            content_size: 5_000,
+            ..artifact.clone()
+        };
+        assert!(!headline.describes(&stage_id, &rewritten));
+
+        let elsewhere = StageId::new("spec_review").unwrap();
+        assert!(
+            !headline.describes(&elsewhere, &artifact),
+            "another stage's artifact never inherits this quote"
+        );
     }
 }

@@ -36,6 +36,7 @@ pub(crate) fn compose(
         "You are executing one Polycode stage. Work only inside current managed worktree. Respect repository instructions, AGENTS.md, rules, skills, MCP configuration, and native Codex configuration discovered normally. Do not apply changes to another checkout. Do not invoke Polycode apply. Do not commit or push. Return concise Markdown describing result, evidence, and unresolved risks."
     )
     .expect("String writes cannot fail");
+    writeln!(prompt, "{}", stage_prompt::BOTTOM_LINE).expect("String writes cannot fail");
     match request.stage_kind() {
         StageKind::Implementation | StageKind::Fix => writeln!(
             prompt,
@@ -122,6 +123,13 @@ mod tests {
             46,
             true,
         )
+    }
+
+    #[test]
+    fn every_stage_prompt_asks_for_the_bottom_line_section() {
+        let prompt = compose(&request(Role::Researcher, StageKind::Research), &[], None).unwrap();
+
+        assert!(prompt.contains(stage_prompt::BOTTOM_LINE));
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub(crate) fn compose(
         "Work only inside current worktree. Respect repository instructions and native Claude Code configuration. Return concise Markdown describing result, evidence, and unresolved risks."
     )
     .expect("String writes cannot fail");
+    writeln!(prompt, "{}", stage_prompt::BOTTOM_LINE).expect("String writes cannot fail");
 
     let dependencies = stage_prompt::direct_dependency_artifacts(request, artifacts);
     if !dependencies.is_empty() {
@@ -85,6 +86,15 @@ mod tests {
             Option::<ProviderSessionId>::None,
             vec![],
         )
+    }
+
+    /// Both adapters carry the same opening contract: the panel that quotes
+    /// the artifact must not care which runtime produced it.
+    #[test]
+    fn every_stage_prompt_asks_for_the_bottom_line_section() {
+        let prompt = compose(&request(Role::Researcher, StageKind::Research), &[], None).unwrap();
+
+        assert!(prompt.contains(stage_prompt::BOTTOM_LINE));
     }
 
     #[test]

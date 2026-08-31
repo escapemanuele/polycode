@@ -1,6 +1,7 @@
 //! Local Ratatui projection and control surface over application use cases.
 
 mod app;
+mod bottom_line;
 mod format;
 mod input;
 mod markdown;

@@ -4,14 +4,15 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use crate::app::{AppError, RunService, RuntimeProviderFactory};
+use crate::app::{AppError, ArtifactSummary, RunService, RuntimeProviderFactory};
 use crate::domain::{StageId, StageStatus};
 use crate::update::{InstallSource, UpdateInfo};
 
+use super::bottom_line;
 use super::input::{Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
-use super::state::{Overlay, Screen, TuiState, UiMessageKind};
+use super::state::{Overlay, Screen, StageHeadline, TuiState, UiMessageKind};
 use super::terminal::TerminalSession;
 use super::worker::{Worker, WorkerCommand, WorkerResult, WorkerSuccess};
 
@@ -635,13 +636,59 @@ impl TuiApp {
             Err(error) => self.state.set_error(error.to_string()),
         }
         if let Ok(artifacts) = self.reader.list_artifacts(run_id) {
-            self.state.stages_with_artifacts = artifacts
+            let complete: Vec<_> = artifacts
                 .into_iter()
                 .filter(|artifact| artifact.status == crate::domain::ArtifactStatus::Complete)
-                .map(|artifact| artifact.stage_id)
                 .collect();
+            self.state.stages_with_artifacts = complete
+                .iter()
+                .map(|artifact| artifact.stage_id.clone())
+                .collect();
+            self.refresh_headline(run_id, &complete);
         }
         self.refresh_evidence();
+    }
+
+    /// The selected stage's own opening line, for the panel that shows it
+    /// before the artifact is opened.
+    ///
+    /// The artifact is read only when the selection lands on a different
+    /// artifact than the one already quoted, so the half-second refresh does
+    /// not reread and rehash the same file forever. An artifact that fails
+    /// its integrity check quotes nothing; opening it is what reports that.
+    fn refresh_headline(&mut self, run_id: crate::domain::RunId, artifacts: &[ArtifactSummary]) {
+        let Some((_, stage_id)) = self.selected_stage_identity() else {
+            self.state.headline = None;
+            return;
+        };
+        let Some(source) = artifacts
+            .iter()
+            .filter(|artifact| artifact.stage_id == stage_id)
+            .max_by_key(|artifact| artifact.attempt)
+        else {
+            self.state.headline = None;
+            return;
+        };
+        if self
+            .state
+            .headline
+            .as_ref()
+            .is_some_and(|headline| headline.describes(&stage_id, source))
+        {
+            return;
+        }
+        let Ok(artifact) = self.reader.read_artifact(run_id, &stage_id) else {
+            self.state.headline = None;
+            return;
+        };
+        let opening = bottom_line::extract(&artifact.text);
+        self.state.headline = Some(StageHeadline {
+            stage_id,
+            attempt: source.attempt,
+            content_size: source.content_size,
+            contracted: opening.as_ref().is_some_and(|opening| opening.contracted),
+            text: opening.map(|opening| opening.text),
+        });
     }
 
     /// Per-stage diagnostic evidence is only needed by the technical view, so

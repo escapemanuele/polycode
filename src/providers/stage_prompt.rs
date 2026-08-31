@@ -18,6 +18,13 @@ pub(crate) fn direct_dependency_artifacts<'a>(
         .collect()
 }
 
+/// Provider-neutral opening contract, identical for every role.
+///
+/// The control room shows one line of a finished stage before anyone opens
+/// the artifact. That line is quoted, never inferred: the agent that did the
+/// work is the only party that may state what the work concluded.
+pub(crate) const BOTTOM_LINE: &str = "Open the returned Markdown with a `## Bottom line` section, before every other section including any title-adjacent scope note. Write at most two sentences, at most forty words total, in plain conversational language a tired reviewer reads in one glance: the verdict, and the single thing that matters most. No file paths, no symbol names, no counts, no hedging, and nothing the rest of the artifact does not already justify. Every other required section follows it, unchanged.";
+
 /// Provider-neutral semantic contract for one engineering responsibility.
 /// Native adapters add transport and safety framing around this text.
 pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
@@ -94,6 +101,21 @@ mod tests {
         assert!(
             decision.contains("claim to verify against the code"),
             "a fix saying it fixed something is not evidence that it did"
+        );
+    }
+
+    /// The control room quotes this section instead of summarizing prose it
+    /// cannot judge, so the contract has to name the heading it will look for
+    /// and bound what may be written under it.
+    #[test]
+    fn bottom_line_contract_names_the_section_and_bounds_it() {
+        assert!(BOTTOM_LINE.contains("## Bottom line"));
+        assert!(BOTTOM_LINE.contains("two sentences"));
+        assert!(BOTTOM_LINE.contains("forty words"));
+        assert!(BOTTOM_LINE.contains("plain conversational language"));
+        assert!(
+            BOTTOM_LINE.contains("nothing the rest of the artifact does not already justify"),
+            "a headline is a quote of the work, never an addition to it"
         );
     }
 
