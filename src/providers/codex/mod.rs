@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use crate::domain::{EffortSetting, ModelId, ProviderId, ProviderSessionId, Role, StageStatus};
 use crate::engine::{Provider, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal};
 use crate::process::{
-    ExitResult, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend, ProcessManager,
-    TmuxBackend,
+    ExitResult, ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend,
+    ProcessManager, TmuxBackend,
 };
 use crate::providers::{
     ProviderCommit, ProviderSessionMutation, ProviderSessionRecord, ProviderSessionRecordId,
@@ -33,6 +33,9 @@ use protocol::{CodexRecord, first_record};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Ceiling for one record. A single line larger than this fails the poll
+/// rather than growing the read without bound.
+const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct CodexProvider<B = TmuxBackend> {
     id: ProviderId,
@@ -249,9 +252,7 @@ impl<B: ProcessBackend> CodexProvider<B> {
             self.manager.start(store, process_id)?;
         }
         let inspection = self.manager.inspect(store, process_id)?;
-        let chunk =
-            self.manager
-                .read_output(store, process_id, OutputStream::Stdout, MAX_OUTPUT_BYTES)?;
+        let chunk = self.read_record_chunk(store, process_id)?;
         if let Some((record, consumed)) = first_record(chunk.bytes())? {
             let consumed = u64::try_from(consumed)
                 .map_err(|_| CodexProviderError::Protocol("record size overflow".to_owned()))?;
@@ -292,6 +293,30 @@ impl<B: ProcessBackend> CodexProvider<B> {
             chunk,
             inspection.process.status(),
         )
+    }
+
+    /// Reads unacknowledged stdout, widening the window whenever it fills
+    /// without containing a newline. A record only completes at a newline, so
+    /// a saturated window without one can never yield a record no matter how
+    /// often the same-sized read is retried — a single Codex `item.completed`
+    /// carrying a full typecheck log has exceeded one window in practice,
+    /// which stalled the run for good.
+    fn read_record_chunk(
+        &self,
+        store: &SqliteStore,
+        process_id: ManagedProcessId,
+    ) -> Result<OutputChunk, CodexProviderError> {
+        let mut max_bytes = MAX_OUTPUT_BYTES;
+        loop {
+            let chunk =
+                self.manager
+                    .read_output(store, process_id, OutputStream::Stdout, max_bytes)?;
+            let saturated = chunk.bytes().len() == max_bytes;
+            if !saturated || chunk.bytes().contains(&b'\n') || max_bytes >= MAX_RECORD_BYTES {
+                return Ok(chunk);
+            }
+            max_bytes = MAX_RECORD_BYTES.min(max_bytes.saturating_mul(2));
+        }
     }
 
     #[allow(
@@ -996,6 +1021,44 @@ mod tests {
         engine
             .drive_observing(&mut store, run_id)
             .expect("observing a process that died mid-record must not fail the stop");
+    }
+
+    /// One record can outgrow a whole read window — Codex has emitted an
+    /// `item.completed` carrying a full typecheck log past the 1 MiB window
+    /// in practice. The read must widen until the record's newline fits, or
+    /// the run stalls on a poll that can never see a complete record.
+    #[test]
+    fn a_record_larger_than_one_read_window_still_completes_the_run() {
+        let log = "line of build output\\n".repeat(MAX_OUTPUT_BYTES / 16);
+        let output = format!(
+            concat!(
+                "{{\"type\":\"thread.started\",\"thread_id\":\"codex-thread-1\"}}\n",
+                "{{\"type\":\"turn.started\"}}\n",
+                "{{\"type\":\"item.completed\",\"item\":{{\"id\":\"c1\",",
+                "\"type\":\"command_execution\",\"command\":\"yarn typecheck\",",
+                "\"aggregated_output\":\"{}\"}}}}\n",
+                "{{\"type\":\"item.completed\",\"item\":{{\"id\":\"m1\",",
+                "\"type\":\"agent_message\",\"text\":\"Fixture progress\"}}}}\n",
+                "{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":100,",
+                "\"cached_input_tokens\":50,\"output_tokens\":20,",
+                "\"reasoning_output_tokens\":5}}}}\n"
+            ),
+            log
+        );
+        assert!(output.lines().any(|line| line.len() > MAX_OUTPUT_BYTES));
+        let (_temp, _database, run_id, mut store, provider) = fixture(&output);
+        let mut engine = WorkflowEngine::new(provider, "fixture task");
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+        assert_eq!(session.status(), ProviderSessionStatus::Completed);
     }
 
     #[test]
