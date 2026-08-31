@@ -1769,7 +1769,9 @@ mod tests {
     use crate::domain::{EffortSetting, Role, RunId, StageId, StageKind, WorkflowKind};
     use crate::tui::state::StageHeadline;
 
-    const POD_SHELL: &str = "▄██████████▄";
+    // POD's legs, folded to half-blocks: the one art fragment every scene
+    // keeps, so it marks "POD is on screen" regardless of costume or prop.
+    const POD_SHELL: &str = "██    ██";
 
     /// The contract guarded where it can actually be reopened.
     ///
@@ -2673,7 +2675,10 @@ mod tests {
             text.contains("BUILDING"),
             "implementer running reads BUILDING"
         );
-        assert!(text.contains("</>"), "coding accent while running");
+        assert!(
+            text.contains("█▀▀▀█▀▀▀█"),
+            "the builder's brick wall stands beside POD"
+        );
         assert!(!render_text(&running, 70, 24).contains(POD_SHELL));
     }
 
@@ -2911,6 +2916,12 @@ mod tests {
         let rail = 160_u16 * 38 / 100;
         for y in 2..38 {
             for x in 0..rail {
+                // POD's sprite is the one legitimate surface: a `▀` cell
+                // carries its bottom pixel in the background. Everything
+                // else in the rail stays unpainted.
+                if buffer[(x, y)].symbol() == "▀" {
+                    continue;
+                }
                 assert_eq!(
                     buffer[(x, y)].bg,
                     ratatui::style::Color::Reset,

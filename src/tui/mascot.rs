@@ -1,41 +1,49 @@
 //! POD — the Polycode Operator Droid.
 //!
-//! One high-definition pixel companion with a single stable silhouette,
-//! rendered compositionally: fixed shell + state expression (antenna, eyes,
-//! mouth) + a posture for the work in hand + optional activity accent + one
-//! compact label. One POD in five postures, never five mascots: the
-//! silhouette never changes, so the pipeline keeps representing the roles and
-//! POD keeps representing the product. State comes from
-//! canonical `RunStatus`/`StageStatus` and activity from the typed `Role`;
-//! nothing is inferred from prose. Every variant occupies exactly
-//! `MASCOT_WIDTH` × `MASCOT_HEIGHT` cells so surrounding layout never
-//! shifts. Art uses only ASCII plus the single-cell block elements
-//! █ ▄ ▀ ▌ ▐ (see `GLYPH_WHITELIST`); no emoji, no ambiguous-width glyphs.
+//! One pixel companion, drawn as a real sprite. Every variant is a 26×14
+//! pixel image rendered at double vertical resolution with half-block
+//! glyphs: each terminal cell carries two pixels (`▀` with a foreground for
+//! the top pixel and a background for the bottom one), which is what lets
+//! POD read as a picture instead of a pile of box-drawing characters.
 //!
-//! POD may breathe, but only where the surface permits it and only while the
-//! domain considers the work active: the caller hands in a [`MotionFrame`],
-//! and a still frame draws exactly the art POD drew before motion existed.
-//! The breathing reinforces a state written elsewhere in words and glyphs —
-//! it is never the evidence for it.
+//! Each pipeline role is a scene: the researcher wears reading glasses next
+//! to a stack of books, the architect draws with a pencil, the builder wears
+//! a hard hat beside a brick wall, the quality reviewer holds a magnifying
+//! glass, the spec reviewer works through a checklist, the lead wears the
+//! crown beside the gavel. The scene follows the *selected stage* in every
+//! state, while the state owns the expression (eyes, brow, mouth), the body
+//! color and the label. State comes from canonical `RunStatus`/`StageStatus`
+//! and the scene from the typed `Role`; nothing is inferred from prose.
+//!
+//! Sprites are painted only with semantic theme tokens — body takes the
+//! state color, props take `structure`, materials take `attention`, `paper`
+//! and `muted` — so Mono collapses the art to a silhouette whose features
+//! survive as punched-through holes, and Vivid/ANSI recolor it without the
+//! art knowing a hue. Every variant occupies exactly `MASCOT_WIDTH` ×
+//! `MASCOT_HEIGHT` cells so surrounding layout never shifts.
+//!
+//! POD may breathe, but only where the surface permits it and only while
+//! the domain considers the work active: the caller hands in a
+//! [`MotionFrame`], and a still frame draws exactly the art POD drew before
+//! motion existed. The breathing reinforces a state written elsewhere in
+//! words and glyphs — it is never the evidence for it.
 
 use super::motion::MotionFrame;
 use super::theme;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::domain::{Role, RunStatus, StageStatus};
 
-/// Every variant renders exactly this many terminal cells per art row.
-pub(crate) const MASCOT_WIDTH: u16 = 16;
+/// Every variant renders exactly this many terminal cells per art row:
+/// a 17-pixel body column plus a 9-pixel prop panel.
+pub(crate) const MASCOT_WIDTH: u16 = 26;
 
-/// Six art rows plus one label row, for every variant.
-pub(crate) const MASCOT_HEIGHT: u16 = 7;
+/// Seven art rows (14 pixel rows at two pixels per cell) plus one label row.
+pub(crate) const MASCOT_HEIGHT: u16 = 8;
 
-/// The only non-ASCII glyphs POD may use: single-cell block elements with
-/// predictable width in the terminals Ratatui targets. Enforced by the
-/// footprint test, which rejects anything outside ASCII plus this set.
-#[cfg(test)]
-const GLYPH_WHITELIST: [char; 5] = ['█', '▄', '▀', '▌', '▐'];
+/// Pixel rows in a sprite; always twice the art rows.
+const SPRITE_ROWS: usize = 14;
 
 /// Overall mood, projected from canonical run/stage state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +59,7 @@ pub(crate) enum MascotState {
 /// Current responsibility, projected from the typed stage role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MascotActivity {
+    Research,
     Architecture,
     Implementation,
     QualityReview,
@@ -89,12 +98,12 @@ pub(crate) const fn mascot_state(
     }
 }
 
-/// Maps the semantic responsibility to POD's activity. Researcher maps to
-/// Architecture (both are planning/thinking work; no separate taxonomy for
-/// one role) and legacy Reviewer to `QualityReview`.
+/// Maps the semantic responsibility to POD's scene. Legacy Reviewer maps to
+/// `QualityReview`.
 pub(crate) const fn mascot_activity(role: Role) -> MascotActivity {
     match role {
-        Role::Architect | Role::Researcher => MascotActivity::Architecture,
+        Role::Researcher => MascotActivity::Research,
+        Role::Architect => MascotActivity::Architecture,
         Role::Implementer => MascotActivity::Implementation,
         Role::CodeQualityReviewer | Role::Reviewer => MascotActivity::QualityReview,
         Role::SpecReviewer => MascotActivity::SpecReview,
@@ -102,100 +111,100 @@ pub(crate) const fn mascot_activity(role: Role) -> MascotActivity {
     }
 }
 
-/// Expression slots for one state at rest: antenna core (2 chars), left eye,
-/// right eye (2 chars each), mouth (4 chars).
-const fn resting_expression(
-    state: MascotState,
-) -> (&'static str, &'static str, &'static str, &'static str) {
-    match state {
-        MascotState::Idle => ("██", "██", "██", "▀▄▄▀"),
-        MascotState::Running => ("██", "▀▀", "▀▀", " ▄▄ "),
-        MascotState::Waiting => ("zz", "▄▄", "▄▄", " .. "),
-        MascotState::NeedsUser => ("!!", "▐█", "█▌", " ██ "),
-        MascotState::Completed => ("██", "▀▀", "▀▀", "▀▄▄▀"),
-        MascotState::Failed => ("xx", "xx", "xx", "▄▀▀▄"),
-    }
+/// One state's face at rest, in pixel slots: the brow above the eyes
+/// (2 pixels, `K` = raised), the eye's top and bottom pixel rows (2 each),
+/// and the mouth's upper and lower rows (6 each). `G` pixels are body,
+/// `K` pixels are punched through to the terminal background.
+struct Expression {
+    brow: &'static str,
+    eye_top: &'static str,
+    eye_bottom: &'static str,
+    mouth_upper: &'static str,
+    mouth_lower: &'static str,
 }
 
-/// How POD holds its face for the work in hand.
-///
-/// One POD, five postures — not five mascots. The silhouette, the shell and
-/// the footprint never change, so the pipeline keeps representing the roles
-/// and POD keeps representing the product. Every pose is assembled from eyes
-/// another state already wears, so a posture can never be the thing that
-/// introduces a glyph the whitelist has not accepted.
-const fn pose_eyes(activity: MascotActivity) -> (&'static str, &'static str) {
-    let (_, up_left, up_right, _) = resting_expression(MascotState::Running);
-    let (_, down_left, down_right, _) = resting_expression(MascotState::Waiting);
-    let (_, wide_left, wide_right, _) = resting_expression(MascotState::Idle);
-    let (_, stern_left, stern_right, _) = resting_expression(MascotState::NeedsUser);
-    match activity {
-        // Looking up from the page: planning is not typing.
-        MascotActivity::Architecture => (up_left, up_right),
-        // Heads down in the work.
-        MascotActivity::Implementation => (down_left, down_right),
-        // One eye wide, one narrowed: scrutiny, not agreement.
-        MascotActivity::QualityReview => (wide_left, up_right),
-        // Even and unhurried: reading a specification line by line.
-        MascotActivity::SpecReview => (wide_left, wide_right),
-        // Set, and about to say so.
-        MascotActivity::Decision => (stern_left, stern_right),
+const fn resting_expression(state: MascotState) -> Expression {
+    match state {
+        // Open square eyes, an even mouth.
+        MascotState::Idle => Expression {
+            brow: "GG",
+            eye_top: "KK",
+            eye_bottom: "KK",
+            mouth_upper: "GKKKKG",
+            mouth_lower: "GGGGGG",
+        },
+        // Eyes lowered into the work, mouth set small.
+        MascotState::Running => Expression {
+            brow: "GG",
+            eye_top: "GG",
+            eye_bottom: "KK",
+            mouth_upper: "GGKKGG",
+            mouth_lower: "GGGGGG",
+        },
+        // Eyes lowered and the mouth slack: dozing, not working.
+        MascotState::Waiting => Expression {
+            brow: "GG",
+            eye_top: "GG",
+            eye_bottom: "KK",
+            mouth_upper: "GGGGGG",
+            mouth_lower: "GGKKGG",
+        },
+        // Raised brows, wide eyes, mouth open: POD is asking.
+        MascotState::NeedsUser => Expression {
+            brow: "KK",
+            eye_top: "KK",
+            eye_bottom: "KK",
+            mouth_upper: "GGKKGG",
+            mouth_lower: "GGKKGG",
+        },
+        // Smiling eyes and a smile.
+        MascotState::Completed => Expression {
+            brow: "GG",
+            eye_top: "KK",
+            eye_bottom: "GG",
+            mouth_upper: "KGGGGK",
+            mouth_lower: "GKKKKG",
+        },
+        // Open eyes over a frown.
+        MascotState::Failed => Expression {
+            brow: "GG",
+            eye_top: "KK",
+            eye_bottom: "KK",
+            mouth_upper: "GKKKKG",
+            mouth_lower: "KGGGGK",
+        },
     }
 }
 
 /// The expression POD wears this frame.
 ///
-/// Three things can shape it, in strict order. A reaction outranks
-/// everything: something just happened and POD is looking at it. Then the
-/// blink, which is the eyes moving from wherever the pose left them, so a
-/// posture can never be one that cannot blink. Then the pose itself, which
-/// only applies while there is work in hand — everywhere else the state owns
-/// the face exactly as it owns the label.
-const fn expression(
-    state: MascotState,
-    activity: Option<MascotActivity>,
-    phase: u8,
-    reacting: bool,
-) -> (&'static str, &'static str, &'static str, &'static str) {
-    let (antenna, resting_left, resting_right, mouth) = resting_expression(state);
-    let (eye_left, eye_right) = match (state, activity) {
-        (MascotState::Running, Some(activity)) => pose_eyes(activity),
-        _ => (resting_left, resting_right),
-    };
+/// A reaction outranks everything: something just happened and POD's eyes
+/// go wide (or, where they already are wide, narrow — a reaction must be
+/// visible from every face without inventing a third eye shape). Then the
+/// blink, which is the eyes flipping between their two pixel rows and
+/// exists only while Running — the one state whose motion means anything.
+/// Everywhere else the state's resting face stands.
+const fn expression(state: MascotState, phase: u8, reacting: bool) -> Expression {
+    let resting = resting_expression(state);
     if reacting {
-        // Wide eyes, except where POD already wears them — then they narrow
-        // instead, so a reaction is always visible without inventing a third
-        // eye.
-        let (_, wide, _, _) = resting_expression(MascotState::Idle);
-        let (_, narrow, _, _) = resting_expression(MascotState::Running);
-        let eye = if str_eq(eye_left, wide) { narrow } else { wide };
-        return (antenna, eye, eye, mouth);
+        let already_wide =
+            resting.eye_top.as_bytes()[0] == b'K' && resting.eye_bottom.as_bytes()[0] == b'K';
+        return Expression {
+            eye_top: if already_wide { "GG" } else { "KK" },
+            eye_bottom: "KK",
+            ..resting
+        };
     }
     if matches!(state, MascotState::Running) && phase == 1 {
-        // Measured against the pose rather than against Running's resting
-        // face: a posture that already looks down blinks by looking up.
-        let (_, down, _, _) = resting_expression(MascotState::Waiting);
-        let (_, up, _, _) = resting_expression(MascotState::Running);
-        let eye = if str_eq(eye_left, down) { up } else { down };
-        return (antenna, eye, eye, mouth);
+        // The blink flips the eye between its two pixel rows: lowered eyes
+        // look up, and the face stays the face.
+        return Expression {
+            eye_top: resting.eye_bottom,
+            eye_bottom: resting.eye_top,
+            ..resting
+        };
     }
-    (antenna, eye_left, eye_right, mouth)
-}
-
-/// `str::eq` is not const, and this comparison has to happen in one.
-const fn str_eq(one: &str, other: &str) -> bool {
-    let (one, other) = (one.as_bytes(), other.as_bytes());
-    if one.len() != other.len() {
-        return false;
-    }
-    let mut index = 0;
-    while index < one.len() {
-        if one[index] != other[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
+    resting
 }
 
 /// State label; for Running the activity label takes over (the state is
@@ -213,23 +222,12 @@ const fn state_label(state: MascotState) -> &'static str {
 
 pub(crate) const fn activity_label(activity: MascotActivity) -> &'static str {
     match activity {
-        MascotActivity::Architecture => "THINKING",
+        MascotActivity::Research => "READING",
+        MascotActivity::Architecture => "DESIGNING",
         MascotActivity::Implementation => "BUILDING",
         MascotActivity::QualityReview => "INSPECTING",
         MascotActivity::SpecReview => "CHECKING",
         MascotActivity::Decision => "DECIDING",
-    }
-}
-
-/// 3-char tool held at the base; shown only while Running (state overrides
-/// activity everywhere else).
-const fn activity_accent(activity: MascotActivity) -> &'static str {
-    match activity {
-        MascotActivity::Architecture => "[#]",
-        MascotActivity::Implementation => "</>",
-        MascotActivity::QualityReview => "(o)",
-        MascotActivity::SpecReview => "[=]",
-        MascotActivity::Decision => "[!]",
     }
 }
 
@@ -243,16 +241,6 @@ fn state_style(state: MascotState) -> Style {
     }
 }
 
-fn accent_style(activity: MascotActivity) -> Style {
-    match activity {
-        MascotActivity::Architecture => Style::new().fg(theme::structure()),
-        MascotActivity::Implementation
-        | MascotActivity::QualityReview
-        | MascotActivity::SpecReview
-        | MascotActivity::Decision => Style::new().fg(theme::muted_color()),
-    }
-}
-
 /// The label POD wears: state wins outright; only Running yields the line
 /// to the current activity.
 fn label(state: MascotState, activity: Option<MascotActivity>) -> &'static str {
@@ -262,50 +250,249 @@ fn label(state: MascotState, activity: Option<MascotActivity>) -> &'static str {
     }
 }
 
-/// Renders POD: stable shell + state expression + optional accent + label.
-/// Always `MASCOT_HEIGHT` rows; art rows are exactly `MASCOT_WIDTH` cells,
-/// in every phase the frame can hand out.
+/// What sits on POD's head, five pixel rows over the 17-pixel body column.
+/// The plain antenna for most jobs; the builder's hard hat and the lead's
+/// crown replace it.
+const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
+    match activity {
+        Some(MascotActivity::Implementation) => [
+            ".................",
+            ".....YYYYYYYY....",
+            "....YYYYYYYYYY...",
+            "...YYYYYYYYYYYY..",
+            "..WWWWWWWWWWWWWW.",
+        ],
+        Some(MascotActivity::Decision) => [
+            "...Y....Y....Y...",
+            "...YY..YYY..YY...",
+            "...YYYYYYYYYYY...",
+            "...YYYYYYYYYYY...",
+            ".................",
+        ],
+        _ => [
+            "........GG.......",
+            "........GG.......",
+            "........GG.......",
+            ".......GGGG......",
+            ".................",
+        ],
+    }
+}
+
+/// The prop drawn beside POD, nine pixel rows of nine pixels.
+///
+/// - Research: a stack of three books, page edges out.
+/// - Architecture: a pencil drawing its line.
+/// - Implementation: a half-laid brick wall.
+/// - `QualityReview`: a magnifying glass, lens and handle.
+/// - `SpecReview`: a checklist with ticked boxes.
+/// - Decision: the gavel resting on its block.
+const fn prop_rows(activity: MascotActivity) -> [&'static str; 9] {
+    match activity {
+        MascotActivity::Research => [
+            ".........",
+            ".........",
+            ".YYYYYYW.",
+            ".YYYYYYW.",
+            "BBBBBBBW.",
+            "BBBBBBBW.",
+            ".DDDDDDW.",
+            ".DDDDDDW.",
+            ".........",
+        ],
+        MascotActivity::Architecture => [
+            "......WW.",
+            ".....WYYW",
+            "....YYYY.",
+            "...YYYY..",
+            "..YYYY...",
+            ".DYYY....",
+            ".DD......",
+            "D........",
+            "DDDD.....",
+        ],
+        MascotActivity::Implementation => [
+            "DDDDDDDDD",
+            "DBBBDBBBD",
+            "DDDDDDDDD",
+            "DBDBBBDBB",
+            "DDDDDDDDD",
+            "DBBBDBBBD",
+            "DDDDDDDDD",
+            "DBDBBBDBB",
+            "DDDDDDDDD",
+        ],
+        MascotActivity::QualityReview => [
+            ".BBBBB...",
+            "BBWWWBB..",
+            "BWWWWWB..",
+            "BWWWWWB..",
+            "BBWWWBB..",
+            ".BBBBB...",
+            "....BBB..",
+            ".....BBB.",
+            "......BBB",
+        ],
+        MascotActivity::SpecReview => [
+            "WWWWWWWWW",
+            "WYYWDDDDW",
+            "WWWWWWWWW",
+            "WYYWDDDDW",
+            "WWWWWWWWW",
+            "WYYWDDDDW",
+            "WWWWWWWWW",
+            "WWWWWWWWW",
+            ".........",
+        ],
+        MascotActivity::Decision => [
+            ".........",
+            ".YYYYYYY.",
+            ".YYYYYYY.",
+            ".YYYYYYY.",
+            "...DDD...",
+            "...DDD...",
+            "...DDD...",
+            "DDDDDDDDD",
+            "DDDDDDDDD",
+        ],
+    }
+}
+
+/// The nine face pixel rows of the 17-pixel body column, with the state
+/// expression slotted in. Research wears its reading glasses — frames drawn
+/// in `paper` around the same eye pixels, so the eyes (and the blink) stay
+/// exactly where every other face keeps them.
+fn face_rows(activity: Option<MascotActivity>, expr: &Expression) -> [String; 9] {
+    let Expression {
+        brow,
+        eye_top,
+        eye_bottom,
+        mouth_upper,
+        mouth_lower,
+    } = expr;
+    let glasses = matches!(activity, Some(MascotActivity::Research));
+    let crown_row = format!("...GGG{brow}GGG{brow}GG..");
+    let (top, eyes_top, eyes_bottom, under) = if glasses {
+        (
+            "...GGWWWWGWWWWG..".to_owned(),
+            format!("...GGW{eye_top}WWW{eye_top}WG.."),
+            format!("...GGW{eye_bottom}WWW{eye_bottom}WG.."),
+            "...GGWWWWGWWWWG..".to_owned(),
+        )
+    } else {
+        (
+            crown_row,
+            format!("...GGG{eye_top}GGG{eye_top}GG.."),
+            format!("...GGG{eye_bottom}GGG{eye_bottom}GG.."),
+            "...GGGGGGGGGGGG..".to_owned(),
+        )
+    };
+    [
+        top,
+        eyes_top,
+        eyes_bottom,
+        under,
+        format!("...GGG{mouth_upper}GGG.."),
+        format!("...GGG{mouth_lower}GGG.."),
+        "....GGGGGGGGGG...".to_owned(),
+        ".....GG....GG....".to_owned(),
+        ".....GG....GG....".to_owned(),
+    ]
+}
+
+/// The full 26×14 pixel grid for one frame. With a stage in hand the body
+/// stands left with the prop beside it; without one the plain body stands
+/// centered in the same footprint.
+fn sprite_grid(
+    state: MascotState,
+    activity: Option<MascotActivity>,
+    motion: MotionFrame,
+) -> Vec<String> {
+    let expr = expression(state, motion.active_phase(), motion.is_reacting());
+    let hat = hat_rows(activity);
+    let face = face_rows(activity, &expr);
+    let mut grid = Vec::with_capacity(SPRITE_ROWS);
+    match activity {
+        Some(activity) => {
+            let prop = prop_rows(activity);
+            for row in hat {
+                grid.push(format!("{row}........."));
+            }
+            for (face_row, prop_row) in face.iter().zip(prop) {
+                grid.push(format!("{face_row}{prop_row}"));
+            }
+        }
+        None => {
+            for row in hat.iter().map(|row| (*row).to_owned()).chain(face) {
+                grid.push(format!("....{row}....."));
+            }
+        }
+    }
+    grid
+}
+
+/// The color a pixel token resolves to; `None` is punched through to the
+/// terminal background ('.' outside the sprite, 'K' for facial features).
+fn pixel_color(token: u8, body: Color) -> Option<Color> {
+    match token {
+        b'G' => Some(body),
+        b'B' => Some(theme::structure()),
+        b'Y' => Some(theme::attention()),
+        b'W' => Some(theme::paper()),
+        b'D' => Some(theme::muted_color()),
+        _ => None,
+    }
+}
+
+/// Folds two pixel rows into one row of half-block cells, merging adjacent
+/// cells of equal style into single spans.
+fn render_pixel_pair(top_row: &str, bottom_row: &str, body: Color) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = Style::new();
+    for (top, bottom) in top_row.bytes().zip(bottom_row.bytes()) {
+        let (glyph, style) = match (pixel_color(top, body), pixel_color(bottom, body)) {
+            (None, None) => (' ', Style::new()),
+            (Some(color), None) => ('▀', Style::new().fg(color)),
+            (None, Some(color)) => ('▄', Style::new().fg(color)),
+            (Some(upper), Some(lower)) if upper == lower => ('█', Style::new().fg(upper)),
+            (Some(upper), Some(lower)) => ('▀', Style::new().fg(upper).bg(lower)),
+        };
+        if style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = style;
+        run.push(glyph);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
+    }
+    Line::from(spans).alignment(ratatui::layout::Alignment::Center)
+}
+
+/// Renders POD: the sprite for the selected stage's scene wearing the
+/// state's expression and body color, plus one label. Always
+/// `MASCOT_HEIGHT` rows; art rows are exactly `MASCOT_WIDTH` cells, in
+/// every phase the frame can hand out.
 pub(crate) fn mascot_lines(
     state: MascotState,
     activity: Option<MascotActivity>,
     motion: MotionFrame,
 ) -> Vec<Line<'static>> {
-    let (antenna, eye_left, eye_right, mouth) =
-        expression(state, activity, motion.active_phase(), motion.is_reacting());
-    let accent = match (state, activity) {
-        (MascotState::Running, Some(activity)) => Some(activity),
-        _ => None,
-    };
-    let style = state_style(state);
-    let center = ratatui::layout::Alignment::Center;
-    let art = [
-        format!("      ▄{antenna}▄      "),
-        "   ▄██████████▄ ".to_owned(),
-        format!("  ██  {eye_left}  {eye_right}  ██"),
-        format!("  ██   {mouth}   ██"),
-        "   ▀██████████▀ ".to_owned(),
-    ];
-    let mut lines: Vec<Line<'static>> = art
-        .into_iter()
-        .map(|row| Line::from(Span::styled(row, style)).alignment(center))
+    let grid = sprite_grid(state, activity, motion);
+    // Every state style sets a foreground; paper is an inert fallback that
+    // keeps the sprite visible if one ever stopped.
+    let body = state_style(state).fg.unwrap_or_else(theme::paper);
+    let mut lines: Vec<Line<'static>> = grid
+        .chunks(2)
+        .map(|pair| render_pixel_pair(&pair[0], &pair[1], body))
         .collect();
-    // Feet row carries the tool accent inside the fixed footprint.
-    lines.push(
-        Line::from(vec![
-            Span::styled("    ▐██  ██▌ ", style),
-            accent.map_or_else(
-                || Span::styled("   ", style),
-                |activity| Span::styled(activity_accent(activity), accent_style(activity)),
-            ),
-        ])
-        .alignment(center),
-    );
     lines.push(
         Line::from(Span::styled(
             label(state, activity),
             state_style(state).add_modifier(Modifier::BOLD),
         ))
-        .alignment(center),
+        .alignment(ratatui::layout::Alignment::Center),
     );
     lines
 }
@@ -323,7 +510,8 @@ mod tests {
         MascotState::Completed,
         MascotState::Failed,
     ];
-    const ALL_ACTIVITIES: [MascotActivity; 5] = [
+    const ALL_ACTIVITIES: [MascotActivity; 6] = [
+        MascotActivity::Research,
         MascotActivity::Architecture,
         MascotActivity::Implementation,
         MascotActivity::QualityReview,
@@ -337,6 +525,10 @@ mod tests {
         MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
         MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
     ];
+
+    /// The half-block alphabet: the only glyphs a sprite row may render,
+    /// all single-cell in the terminals Ratatui targets.
+    const HALF_BLOCKS: [char; 4] = [' ', '▀', '▄', '█'];
 
     fn rows(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
         rows_in(state, activity, MotionFrame::still())
@@ -358,26 +550,11 @@ mod tests {
             .collect()
     }
 
-    /// The face proper: antenna, shell, eyes and mouth, without the row
-    /// carrying the tool accent. Comparisons about POD's expression use this,
-    /// because the accent alone would make any two variants look different.
-    fn face(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
-        rows_in(state, activity, MotionFrame::still())[..5].to_vec()
-    }
-
-    /// Cell width under the whitelist: every permitted glyph is one cell,
-    /// so char count equals rendered width. Panics on any glyph outside
-    /// ASCII + the block whitelist.
-    fn cell_width(row: &str) -> usize {
-        row.chars()
-            .map(|character| {
-                assert!(
-                    character.is_ascii() || GLYPH_WHITELIST.contains(&character),
-                    "glyph {character:?} is outside the safe single-cell set"
-                );
-                1
-            })
-            .sum()
+    /// The rendered scene without the label. Glyphs alone under-report the
+    /// art (two colors can share a glyph), so scene comparisons also read
+    /// the pixel grid.
+    fn scene(state: MascotState, activity: Option<MascotActivity>) -> Vec<String> {
+        sprite_grid(state, activity, MotionFrame::still())
     }
 
     #[test]
@@ -387,14 +564,50 @@ mod tests {
                 for motion in ALL_PHASES {
                     let rows = rows_in(state, activity, motion);
                     assert_eq!(rows.len(), MASCOT_HEIGHT as usize);
-                    for row in &rows[..6] {
+                    for row in &rows[..7] {
                         assert_eq!(
-                            cell_width(row),
+                            row.chars().count(),
                             MASCOT_WIDTH as usize,
                             "unstable footprint for {state:?}/{activity:?}/{motion:?}: {row:?}"
                         );
+                        for glyph in row.chars() {
+                            assert!(
+                                HALF_BLOCKS.contains(&glyph),
+                                "glyph {glyph:?} is outside the half-block set: {row:?}"
+                            );
+                        }
                     }
-                    assert!(cell_width(&rows[6]) <= MASCOT_WIDTH as usize);
+                    assert!(rows[7].is_ascii());
+                    assert!(rows[7].chars().count() <= MASCOT_WIDTH as usize);
+                }
+            }
+        }
+    }
+
+    /// The grid is the ground truth the renderer folds: every pixel row must
+    /// hold exactly `MASCOT_WIDTH` pixels of known tokens, in every state,
+    /// scene and motion phase.
+    #[test]
+    fn every_sprite_grid_is_rectangular_with_known_tokens() {
+        for state in ALL_STATES {
+            for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
+                for motion in ALL_PHASES {
+                    let grid = sprite_grid(state, activity, motion);
+                    assert_eq!(grid.len(), SPRITE_ROWS);
+                    for row in &grid {
+                        assert_eq!(
+                            row.len(),
+                            MASCOT_WIDTH as usize,
+                            "ragged pixel row for {state:?}/{activity:?}: {row:?}"
+                        );
+                        for token in row.bytes() {
+                            assert!(
+                                matches!(token, b'.' | b'K' | b'G' | b'B' | b'Y' | b'W' | b'D'),
+                                "unknown pixel token {:?} in {row:?}",
+                                token as char
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -435,6 +648,7 @@ mod tests {
 
     #[test]
     fn role_mapping_is_semantic() {
+        assert_eq!(mascot_activity(Role::Researcher), MascotActivity::Research);
         assert_eq!(
             mascot_activity(Role::Architect),
             MascotActivity::Architecture
@@ -456,102 +670,133 @@ mod tests {
             MascotActivity::Decision
         );
         assert_eq!(
-            mascot_activity(Role::Researcher),
-            MascotActivity::Architecture
-        );
-        assert_eq!(
             mascot_activity(Role::Reviewer),
             MascotActivity::QualityReview
         );
     }
 
     #[test]
-    fn state_overrides_activity_in_label_and_accent() {
+    fn state_overrides_activity_in_the_label() {
         let needs = rows(MascotState::NeedsUser, Some(MascotActivity::Implementation));
-        assert_eq!(needs[6], "NEEDS YOU");
-        assert!(!needs.join("\n").contains("</>"), "no accent when alert");
+        assert_eq!(needs[7], "NEEDS YOU");
 
         let failed = rows(MascotState::Failed, Some(MascotActivity::Implementation));
-        assert_eq!(failed[6], "FAILED");
-        assert!(!failed.join("\n").contains("</>"));
+        assert_eq!(failed[7], "FAILED");
 
-        let done = rows(MascotState::Completed, Some(MascotActivity::QualityReview));
-        assert_eq!(done[6], "DONE");
-        assert!(!done.join("\n").contains("(o)"));
+        let done = rows(MascotState::Completed, Some(MascotActivity::Decision));
+        assert_eq!(done[7], "DONE");
 
         let running = rows(MascotState::Running, Some(MascotActivity::Implementation));
-        assert_eq!(running[6], "BUILDING");
-        assert!(running.join("\n").contains("</>"), "accent while running");
+        assert_eq!(running[7], "BUILDING");
 
-        assert_eq!(rows(MascotState::Running, None)[6], "RUNNING");
-        assert_eq!(rows(MascotState::Idle, None)[6], "READY");
-        assert_eq!(rows(MascotState::Waiting, None)[6], "WAITING");
+        assert_eq!(rows(MascotState::Running, None)[7], "RUNNING");
+        assert_eq!(rows(MascotState::Idle, None)[7], "READY");
+        assert_eq!(rows(MascotState::Waiting, None)[7], "WAITING");
     }
 
     #[test]
-    fn activity_labels_and_accents_are_distinct_and_compact() {
+    fn activity_labels_are_distinct_and_compact() {
         let labels: Vec<_> = ALL_ACTIVITIES.iter().map(|a| activity_label(*a)).collect();
-        let accents: Vec<_> = ALL_ACTIVITIES.iter().map(|a| activity_accent(*a)).collect();
-        for (index, (label, accent)) in labels.iter().zip(&accents).enumerate() {
+        for (index, label) in labels.iter().enumerate() {
             assert!(label.len() <= 10);
-            assert_eq!(accent.len(), 3);
-            for (other_label, other_accent) in labels.iter().zip(&accents).skip(index + 1) {
-                assert_ne!(label, other_label);
-                assert_ne!(accent, other_accent);
+            for other in labels.iter().skip(index + 1) {
+                assert_ne!(label, other);
             }
         }
     }
 
-    /// Completed once used caret eyes and a slash mouth. Both kept the
-    /// footprint the generic test checks, while rendering as detached marks
-    /// above a mouth whose lower half merged into the filled shell below.
-    /// Pinned as a relationship rather than as literal art: Completed borrows
-    /// the eyes Running already uses and the mouth Idle already uses, so the
-    /// three stay in one visual language and no glyph is duplicated here.
+    /// Six jobs have to be six *scenes*: whatever stage the operator
+    /// selects, the hat, the glasses or the prop must say which job this is
+    /// at a glance — and the prop panel alone must already tell them apart.
     #[test]
-    fn the_completed_face_reuses_the_running_eyes_and_idle_mouth() {
-        let (_, _, _, idle_mouth) = resting_expression(MascotState::Idle);
-        let (_, running_left, running_right, _) = resting_expression(MascotState::Running);
-        let (_, done_left, done_right, done_mouth) = resting_expression(MascotState::Completed);
+    fn each_job_has_a_scene_of_its_own_in_every_state() {
+        for (index, activity) in ALL_ACTIVITIES.iter().enumerate() {
+            for other in ALL_ACTIVITIES.iter().skip(index + 1) {
+                assert_ne!(
+                    prop_rows(*activity),
+                    prop_rows(*other),
+                    "{activity:?} and {other:?} share a prop"
+                );
+            }
+        }
+        for state in ALL_STATES {
+            let scenes: Vec<Vec<String>> = ALL_ACTIVITIES
+                .iter()
+                .map(|activity| scene(state, Some(*activity)))
+                .collect();
+            for (index, this) in scenes.iter().enumerate() {
+                for (other_index, other) in scenes.iter().enumerate().skip(index + 1) {
+                    assert_ne!(
+                        this, other,
+                        "{:?} and {:?} wear the same scene in {state:?}",
+                        ALL_ACTIVITIES[index], ALL_ACTIVITIES[other_index]
+                    );
+                }
+            }
+        }
+    }
 
-        assert_eq!(done_left, running_left, "left eye follows Running");
-        assert_eq!(done_right, running_right, "right eye follows Running");
-        assert_eq!(done_mouth, idle_mouth, "mouth follows Idle");
+    /// The scene is the job, so it follows the selected stage in every
+    /// state: a finished Decision stage is a crowned POD with the gavel
+    /// saying DONE, never the generic shell. This is the whole point of
+    /// dressing POD.
+    #[test]
+    fn the_scene_follows_the_selected_stage_in_every_state() {
+        for state in ALL_STATES {
+            for activity in ALL_ACTIVITIES {
+                assert_ne!(
+                    scene(state, Some(activity)),
+                    scene(state, None),
+                    "{activity:?} looks generic in {state:?}"
+                );
+            }
+        }
+    }
 
-        // The shapes that broke it, named so they cannot come back quietly.
-        let face = [done_left, done_right, done_mouth].concat();
-        assert!(
-            !face.contains('^') && !face.contains('\\') && !face.contains('/'),
-            "the eyes and mouth must stay block glyphs: {face:?}"
-        );
+    /// The state still owns the expression inside every costume: the same
+    /// job in two different states may never render identically, or DONE
+    /// would be indistinguishable from FAILED under the same crown. Pinned
+    /// on the pixel grid, so it holds even where two states share a body
+    /// color.
+    #[test]
+    fn no_state_hides_behind_a_costume() {
+        for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
+            for (index, state) in ALL_STATES.iter().enumerate() {
+                for other in ALL_STATES.iter().skip(index + 1) {
+                    assert_ne!(
+                        scene(*state, activity),
+                        scene(*other, activity),
+                        "{state:?} and {other:?} look the same while {activity:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The guarantee that lets every other surface stay as it was: a frame
     /// that may not move draws exactly what POD wears standing still.
-    /// Anything that moves has to come through the phase — a posture is not
-    /// motion, it is what POD looks like while doing that job.
     #[test]
-    fn a_still_frame_draws_the_unmoving_face_for_every_variant() {
+    fn a_still_frame_draws_the_resting_face_for_every_variant() {
         for state in ALL_STATES {
             for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
-                let (antenna, eye_left, eye_right, mouth) = expression(state, activity, 0, false);
-                let drawn = rows_in(state, activity, MotionFrame::still());
-                assert!(
-                    drawn[0].contains(antenna)
-                        && drawn[2].contains(eye_left)
-                        && drawn[2].contains(eye_right)
-                        && drawn[3].contains(mouth),
-                    "a still frame changed {state:?}/{activity:?}: {drawn:?}"
+                assert_eq!(
+                    rows_in(state, activity, MotionFrame::still()),
+                    rows_in(
+                        state,
+                        activity,
+                        MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, false)
+                    ),
+                    "a still frame changed {state:?}/{activity:?}"
                 );
             }
         }
     }
 
     /// The repeating motion says one thing — Polycode considers this work
-    /// active — so it may appear only on the state that carries that meaning.
-    /// A face that moved while nothing was happening would be claiming
-    /// progress that is not there. It is never evidence that the process
-    /// behind the run is alive; see the contract in `motion`.
+    /// active — so it may appear only on the state that carries that
+    /// meaning. A face that moved while nothing was happening would be
+    /// claiming progress that is not there. It is never evidence that the
+    /// process behind the run is alive; see the contract in `motion`.
     #[test]
     fn only_running_moves_and_the_blink_stays_inside_the_footprint() {
         for state in ALL_STATES {
@@ -572,28 +817,10 @@ mod tests {
         }
     }
 
-    /// The blink borrows an eye the file already draws, so motion can never
-    /// be the thing that introduces a glyph nobody checked.
-    #[test]
-    fn the_blink_borrows_an_eye_that_already_exists() {
-        let (_, blink_left, blink_right, _) = expression(MascotState::Running, None, 1, false);
-        let (_, waiting_left, waiting_right, _) = resting_expression(MascotState::Waiting);
-        assert_eq!(blink_left, waiting_left);
-        assert_eq!(blink_right, waiting_right);
-
-        let (running_antenna, _, _, running_mouth) = resting_expression(MascotState::Running);
-        let (antenna, _, _, mouth) = expression(MascotState::Running, None, 1, false);
-        assert_eq!(antenna, running_antenna, "a blink is eyes, not a new face");
-        assert_eq!(mouth, running_mouth, "a blink is eyes, not a new face");
-    }
-
     /// A reaction is POD noticing. It has to be visible from every state,
-    /// including the ones whose resting eyes are already wide, and it has to
-    /// borrow eyes the file already draws.
+    /// including the ones whose resting eyes are already wide.
     #[test]
-    fn a_reaction_is_visible_from_every_state_and_invents_no_eye() {
-        let (_, wide, _, _) = resting_expression(MascotState::Idle);
-        let (_, narrow, _, _) = resting_expression(MascotState::Running);
+    fn a_reaction_is_visible_from_every_state() {
         for state in ALL_STATES {
             let resting = rows_in(state, None, MotionFrame::still());
             let reacting = rows_in(
@@ -605,12 +832,6 @@ mod tests {
                 resting, reacting,
                 "{state:?} showed no sign of having noticed anything"
             );
-            let (_, eye_left, eye_right, _) = expression(state, None, 0, true);
-            assert_eq!(eye_left, eye_right, "a reaction keeps POD's face symmetric");
-            assert!(
-                eye_left == wide || eye_left == narrow,
-                "{state:?} reacted with an eye that exists nowhere else: {eye_left:?}"
-            );
         }
     }
 
@@ -618,76 +839,32 @@ mod tests {
     /// mid-blink shows that it finished.
     #[test]
     fn a_reaction_outranks_a_blink() {
-        let blinking = expression(MascotState::Running, None, 1, false);
-        let reacting = expression(MascotState::Running, None, 1, true);
+        let blinking = rows_in(
+            MascotState::Running,
+            None,
+            MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
+        );
+        let reacting = rows_in(
+            MascotState::Running,
+            None,
+            MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, true),
+        );
         assert_ne!(blinking, reacting);
-        assert_eq!(reacting, expression(MascotState::Running, None, 0, true));
+        assert_eq!(
+            reacting,
+            rows_in(
+                MascotState::Running,
+                None,
+                MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
+            )
+        );
     }
 
-    /// Five postures have to be five *faces*. Compared without the accent
-    /// row on purpose: the tool is always distinct, so including it would
-    /// let every pose be identical and the test would still pass.
+    /// Every scene keeps a face that can blink and react — the glasses wrap
+    /// the same eye pixels every other face uses, so no costume can be the
+    /// one that cannot move.
     #[test]
-    fn each_job_has_a_face_of_its_own() {
-        let faces: Vec<Vec<String>> = ALL_ACTIVITIES
-            .iter()
-            .map(|activity| face(MascotState::Running, Some(*activity)))
-            .collect();
-        for (index, face) in faces.iter().enumerate() {
-            for (other_index, other) in faces.iter().enumerate().skip(index + 1) {
-                assert_ne!(
-                    face, other,
-                    "{:?} and {:?} wear the same face",
-                    ALL_ACTIVITIES[index], ALL_ACTIVITIES[other_index]
-                );
-            }
-        }
-    }
-
-    /// A posture is drawn from eyes another state already wears, so the eyes
-    /// alone can coincide with one. The whole face may not: a POD at work
-    /// must never be mistakable for a POD that has stopped, failed, or is
-    /// waiting for you.
-    #[test]
-    fn no_posture_impersonates_another_state() {
-        for activity in ALL_ACTIVITIES {
-            let working = face(MascotState::Running, Some(activity));
-            for state in ALL_STATES {
-                if matches!(state, MascotState::Running) {
-                    continue;
-                }
-                assert_ne!(
-                    working,
-                    face(state, None),
-                    "POD at {activity:?} is indistinguishable from {state:?}"
-                );
-            }
-        }
-    }
-
-    /// The posture is the work in hand, so it appears only where there is
-    /// work in hand — exactly like the label and the tool accent.
-    #[test]
-    fn a_posture_appears_only_while_the_work_is_running() {
-        for state in ALL_STATES {
-            if matches!(state, MascotState::Running) {
-                continue;
-            }
-            for activity in ALL_ACTIVITIES {
-                assert_eq!(
-                    face(state, None),
-                    face(state, Some(activity)),
-                    "{state:?} changed its face for {activity:?}, which it is not doing"
-                );
-            }
-        }
-    }
-
-    /// The blink is measured against the pose rather than against Running's
-    /// resting face, so no posture can be one that cannot blink — including
-    /// the one that already looks where a blink would take it.
-    #[test]
-    fn every_posture_can_still_blink_and_react() {
+    fn every_scene_can_still_blink_and_react() {
         for activity in ALL_ACTIVITIES {
             let resting = rows_in(MascotState::Running, Some(activity), MotionFrame::still());
             for moving in [
@@ -697,43 +874,8 @@ mod tests {
                 assert_ne!(
                     resting,
                     rows_in(MascotState::Running, Some(activity), moving),
-                    "{activity:?} is a posture that cannot move: {moving:?}"
+                    "{activity:?} is a scene that cannot move: {moving:?}"
                 );
-            }
-        }
-    }
-
-    /// Every pose eye is one this file already draws somewhere else, so a
-    /// posture can never be what introduces an unchecked glyph.
-    #[test]
-    fn a_posture_borrows_every_eye_it_wears() {
-        let known: Vec<&str> = ALL_STATES
-            .iter()
-            .flat_map(|state| {
-                let (_, left, right, _) = resting_expression(*state);
-                [left, right]
-            })
-            .collect();
-        for activity in ALL_ACTIVITIES {
-            let (left, right) = pose_eyes(activity);
-            for eye in [left, right] {
-                assert!(
-                    known.contains(&eye),
-                    "{activity:?} invented the eye {eye:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn faces_differ_between_states_beyond_the_label() {
-        let faces: Vec<Vec<String>> = ALL_STATES
-            .iter()
-            .map(|state| rows(*state, None)[..6].to_vec())
-            .collect();
-        for (index, face) in faces.iter().enumerate() {
-            for other in faces.iter().skip(index + 1) {
-                assert_ne!(face, other, "each state needs a distinct face");
             }
         }
     }
