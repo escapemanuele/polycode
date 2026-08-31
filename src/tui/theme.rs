@@ -104,6 +104,7 @@ pub(crate) struct Palette {
     suspended: Color,
     muted: Color,
     structure: Color,
+    paper: Color,
     chip_fg: Color,
 }
 
@@ -145,6 +146,10 @@ impl Palette {
             // not focus, and never competes with the one active-work
             // accent per screen.
             structure: Color::Blue,
+            // Light material detail in sprite art: paper, page edges,
+            // the brim of a hard hat. Brighter than muted, quieter than
+            // the terminal's own foreground.
+            paper: Color::Gray,
             // Foreground of a reversed chip: black on the chip's own
             // color keeps its word legible on any accent hue.
             chip_fg: Color::Black,
@@ -171,6 +176,9 @@ impl Palette {
             // recede without becoming unreadable on a light background.
             muted: Color::Rgb(0x76, 0x7C, 0x84),
             structure: Color::Rgb(0x3B, 0x7D, 0xD8),
+            // Neutral gray held inside the 3:1 band against both black
+            // and white, so paper stays paper on either background.
+            paper: Color::Rgb(0x8F, 0x8F, 0x8F),
             chip_fg: Color::Rgb(0x00, 0x00, 0x00),
         }
     };
@@ -188,6 +196,7 @@ impl Palette {
             suspended: Color::Reset,
             muted: Color::Reset,
             structure: Color::Reset,
+            paper: Color::Reset,
             // A reversed chip still inverts, so its text takes the
             // background the terminal paints behind it.
             chip_fg: Color::Reset,
@@ -255,6 +264,10 @@ pub(crate) fn muted_color() -> Color {
 /// Structural framing and the architecture role accent.
 pub(crate) fn structure() -> Color {
     palette().structure
+}
+/// Light material detail in sprite art: paper, pages, a hat brim.
+pub(crate) fn paper() -> Color {
+    palette().paper
 }
 /// Foreground of a reversed chip.
 pub(crate) fn chip_fg() -> Color {
@@ -361,7 +374,7 @@ pub(crate) fn spread(
 mod tests {
     use super::*;
 
-    fn named_tokens(palette: Palette) -> [(&'static str, Color); 8] {
+    fn named_tokens(palette: Palette) -> [(&'static str, Color); 9] {
         [
             ("accent", palette.accent),
             ("success", palette.success),
@@ -370,6 +383,7 @@ mod tests {
             ("suspended", palette.suspended),
             ("muted", palette.muted),
             ("structure", palette.structure),
+            ("paper", palette.paper),
             ("chip_fg", palette.chip_fg),
         ]
     }
