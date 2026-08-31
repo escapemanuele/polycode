@@ -6,14 +6,15 @@
 //! the top pixel and a background for the bottom one), which is what lets
 //! POD read as a picture instead of a pile of box-drawing characters.
 //!
-//! Each pipeline role is a scene: the researcher wears reading glasses next
+//! Each pipeline job is a scene: the researcher wears reading glasses next
 //! to a stack of books, the architect draws with a pencil, the builder wears
 //! a hard hat beside a brick wall, the quality reviewer holds a magnifying
-//! glass, the spec reviewer works through a checklist, the lead wears the
-//! crown beside the gavel. The scene follows the *selected stage* in every
-//! state, while the state owns the expression (eyes, brow, mouth), the body
-//! color and the label. State comes from canonical `RunStatus`/`StageStatus`
-//! and the scene from the typed `Role`; nothing is inferred from prose.
+//! glass, the spec reviewer works through a checklist, the crowned lead
+//! weighs the balance scales in Synthesis and sits at the gavel in Decision.
+//! The scene follows the *selected stage* in every state, while the state
+//! owns the expression (eyes, brow, mouth), the body color and the label.
+//! State comes from canonical `RunStatus`/`StageStatus` and the scene from
+//! the typed `StageKind`; nothing is inferred from prose.
 //!
 //! Sprites are painted only with semantic theme tokens — body takes the
 //! state color, props take `structure`, materials take `attention`, `paper`
@@ -22,18 +23,20 @@
 //! art knowing a hue. Every variant occupies exactly `MASCOT_WIDTH` ×
 //! `MASCOT_HEIGHT` cells so surrounding layout never shifts.
 //!
-//! POD may breathe, but only where the surface permits it and only while
-//! the domain considers the work active: the caller hands in a
-//! [`MotionFrame`], and a still frame draws exactly the art POD drew before
-//! motion existed. The breathing reinforces a state written elsewhere in
-//! words and glyphs — it is never the evidence for it.
+//! POD may move, but only where the surface permits it and only while the
+//! domain considers the work active: the caller hands in a [`MotionFrame`],
+//! and a still frame draws exactly the resting art. While a stage Runs, POD
+//! works: the prop plays its two-frame cycle — the lens sweeps, the pencil
+//! draws, the scales tilt, the gavel lifts — and the eyes blink on their own
+//! tick of the same loop. The movement reinforces a state written elsewhere
+//! in words and glyphs — it is never the evidence for it.
 
 use super::motion::MotionFrame;
 use super::theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::domain::{Role, RunStatus, StageStatus};
+use crate::domain::{RunStatus, StageKind, StageStatus};
 
 /// Every variant renders exactly this many terminal cells per art row:
 /// a 17-pixel body column plus a 9-pixel prop panel.
@@ -64,6 +67,7 @@ pub(crate) enum MascotActivity {
     Implementation,
     QualityReview,
     SpecReview,
+    Synthesis,
     Decision,
 }
 
@@ -98,16 +102,21 @@ pub(crate) const fn mascot_state(
     }
 }
 
-/// Maps the semantic responsibility to POD's scene. Legacy Reviewer maps to
-/// `QualityReview`.
-pub(crate) const fn mascot_activity(role: Role) -> MascotActivity {
-    match role {
-        Role::Researcher => MascotActivity::Research,
-        Role::Architect => MascotActivity::Architecture,
-        Role::Implementer => MascotActivity::Implementation,
-        Role::CodeQualityReviewer | Role::Reviewer => MascotActivity::QualityReview,
-        Role::SpecReviewer => MascotActivity::SpecReview,
-        Role::EngineeringLead => MascotActivity::Decision,
+/// Maps the stage's kind to POD's scene. The kind, not the role, names the
+/// job: the lead runs both Synthesis and Decision, and each deserves its own
+/// scene. Legacy and independent reviews map to `QualityReview`; a fix is
+/// implementation work; deep analysis is reading.
+pub(crate) const fn mascot_activity(kind: StageKind) -> MascotActivity {
+    match kind {
+        StageKind::Research | StageKind::DeepAnalysis => MascotActivity::Research,
+        StageKind::Architecture => MascotActivity::Architecture,
+        StageKind::Implementation | StageKind::Fix => MascotActivity::Implementation,
+        StageKind::CodeQualityReview | StageKind::Review | StageKind::IndependentReview => {
+            MascotActivity::QualityReview
+        }
+        StageKind::SpecReview => MascotActivity::SpecReview,
+        StageKind::Synthesis => MascotActivity::Synthesis,
+        StageKind::Decision => MascotActivity::Decision,
     }
 }
 
@@ -184,7 +193,7 @@ const fn resting_expression(state: MascotState) -> Expression {
 /// blink, which is the eyes flipping between their two pixel rows and
 /// exists only while Running — the one state whose motion means anything.
 /// Everywhere else the state's resting face stands.
-const fn expression(state: MascotState, phase: u8, reacting: bool) -> Expression {
+const fn expression(state: MascotState, blinking: bool, reacting: bool) -> Expression {
     let resting = resting_expression(state);
     if reacting {
         let already_wide =
@@ -195,7 +204,7 @@ const fn expression(state: MascotState, phase: u8, reacting: bool) -> Expression
             ..resting
         };
     }
-    if matches!(state, MascotState::Running) && phase == 1 {
+    if matches!(state, MascotState::Running) && blinking {
         // The blink flips the eye between its two pixel rows: lowered eyes
         // look up, and the face stays the face.
         return Expression {
@@ -227,6 +236,7 @@ pub(crate) const fn activity_label(activity: MascotActivity) -> &'static str {
         MascotActivity::Implementation => "BUILDING",
         MascotActivity::QualityReview => "INSPECTING",
         MascotActivity::SpecReview => "CHECKING",
+        MascotActivity::Synthesis => "WEIGHING",
         MascotActivity::Decision => "DECIDING",
     }
 }
@@ -262,7 +272,7 @@ const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
             "...YYYYYYYYYYYY..",
             "..WWWWWWWWWWWWWW.",
         ],
-        Some(MascotActivity::Decision) => [
+        Some(MascotActivity::Synthesis | MascotActivity::Decision) => [
             "...Y....Y....Y...",
             "...YY..YYY..YY...",
             "...YYYYYYYYYYY...",
@@ -279,15 +289,28 @@ const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
     }
 }
 
-/// The prop drawn beside POD, nine pixel rows of nine pixels.
+/// The prop drawn beside POD, nine pixel rows of nine pixels, in two
+/// frames: frame 0 is the prop at rest, frame 1 is the prop being worked —
+/// the pair the running loop alternates so the job looks *done*, not just
+/// named.
 ///
-/// - Research: a stack of three books, page edges out.
-/// - Architecture: a pencil drawing its line.
-/// - Implementation: a half-laid brick wall.
-/// - `QualityReview`: a magnifying glass, lens and handle.
-/// - `SpecReview`: a checklist with ticked boxes.
-/// - Decision: the gavel resting on its block.
-const fn prop_rows(activity: MascotActivity) -> [&'static str; 9] {
+/// - Research: a stack of three books; the top book slides out.
+/// - Architecture: a pencil drawing its line; it lifts and the line grows.
+/// - Implementation: a half-laid brick wall; fresh mortar lands on top.
+/// - `QualityReview`: a magnifying glass, lens and handle; it sweeps.
+/// - `SpecReview`: a checklist with ticked boxes; the next box gets ticked.
+/// - Synthesis: the balance scales; the pans tilt as they weigh.
+/// - Decision: the gavel resting on its block; it lifts to strike.
+const fn prop_rows(activity: MascotActivity, frame: u8) -> [&'static str; 9] {
+    if frame == 1 {
+        working_prop_rows(activity)
+    } else {
+        resting_prop_rows(activity)
+    }
+}
+
+/// Frame 0: every tool at rest.
+const fn resting_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
     match activity {
         MascotActivity::Research => [
             ".........",
@@ -344,11 +367,106 @@ const fn prop_rows(activity: MascotActivity) -> [&'static str; 9] {
             "WWWWWWWWW",
             ".........",
         ],
+        MascotActivity::Synthesis => [
+            "....Y....",
+            ".YYYYYYY.",
+            ".Y..Y..Y.",
+            ".Y..Y..Y.",
+            "YYY.Y.YYY",
+            "....Y....",
+            "....Y....",
+            "...YYY...",
+            ".DDDDDDD.",
+        ],
         MascotActivity::Decision => [
             ".........",
             ".YYYYYYY.",
             ".YYYYYYY.",
             ".YYYYYYY.",
+            "...DDD...",
+            "...DDD...",
+            "...DDD...",
+            "DDDDDDDDD",
+            "DDDDDDDDD",
+        ],
+    }
+}
+
+/// Frame 1: the same tool mid-use — same footprint, same materials, only
+/// the movement differs from the resting frame.
+const fn working_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
+    match activity {
+        MascotActivity::Research => [
+            ".........",
+            ".........",
+            "..YYYYYYW",
+            "..YYYYYYW",
+            "BBBBBBBW.",
+            "BBBBBBBW.",
+            ".DDDDDDW.",
+            ".DDDDDDW.",
+            ".........",
+        ],
+        MascotActivity::Architecture => [
+            ".....WYYW",
+            "....YYYY.",
+            "...YYYY..",
+            "..YYYY...",
+            ".DYYY....",
+            ".DD......",
+            "D........",
+            ".........",
+            "DDDDDD...",
+        ],
+        MascotActivity::Implementation => [
+            "DDDWWWDDD",
+            "DBBBDBBBD",
+            "DDDDDDDDD",
+            "DBDBBBDBB",
+            "DDDDDDDDD",
+            "DBBBDBBBD",
+            "DDDDDDDDD",
+            "DBDBBBDBB",
+            "DDDDDDDDD",
+        ],
+        MascotActivity::QualityReview => [
+            "..BBBBB..",
+            ".BBWWWBB.",
+            ".BWWWWWB.",
+            ".BWWWWWB.",
+            ".BBWWWBB.",
+            "..BBBBB..",
+            ".....BBB.",
+            "......BBB",
+            ".......BB",
+        ],
+        MascotActivity::SpecReview => [
+            "WWWWWWWWW",
+            "WYYWDDDDW",
+            "WWWWWWWWW",
+            "WYYWDDDDW",
+            "WWWWWWWWW",
+            "WYYWDDDDW",
+            "WWWWWWWWW",
+            "WYYWWWWWW",
+            ".........",
+        ],
+        MascotActivity::Synthesis => [
+            "....Y....",
+            ".YYYYYYY.",
+            ".Y..Y..Y.",
+            "YYY.Y..Y.",
+            "....Y..Y.",
+            "....Y.YYY",
+            "....Y....",
+            "...YYY...",
+            ".DDDDDDD.",
+        ],
+        MascotActivity::Decision => [
+            ".YYYYYYY.",
+            ".YYYYYYY.",
+            ".YYYYYYY.",
+            ".........",
             "...DDD...",
             "...DDD...",
             "...DDD...",
@@ -408,13 +526,20 @@ fn sprite_grid(
     activity: Option<MascotActivity>,
     motion: MotionFrame,
 ) -> Vec<String> {
-    let expr = expression(state, motion.active_phase(), motion.is_reacting());
+    let expr = expression(state, motion.is_blinking(), motion.is_reacting());
+    // The prop is worked, not just worn: its two frames alternate only while
+    // the stage is actually Running — every other state rests the tools.
+    let prop_frame = if matches!(state, MascotState::Running) {
+        motion.prop_frame()
+    } else {
+        0
+    };
     let hat = hat_rows(activity);
     let face = face_rows(activity, &expr);
     let mut grid = Vec::with_capacity(SPRITE_ROWS);
     match activity {
         Some(activity) => {
-            let prop = prop_rows(activity);
+            let prop = prop_rows(activity, prop_frame);
             for row in hat {
                 grid.push(format!("{row}........."));
             }
@@ -510,21 +635,45 @@ mod tests {
         MascotState::Completed,
         MascotState::Failed,
     ];
-    const ALL_ACTIVITIES: [MascotActivity; 6] = [
+    const ALL_ACTIVITIES: [MascotActivity; 7] = [
         MascotActivity::Research,
         MascotActivity::Architecture,
         MascotActivity::Implementation,
         MascotActivity::QualityReview,
         MascotActivity::SpecReview,
+        MascotActivity::Synthesis,
         MascotActivity::Decision,
     ];
 
-    /// Every phase a frame can hand out.
-    const ALL_PHASES: [MotionFrame; 3] = [
-        MotionFrame::still(),
-        MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
-        MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
-    ];
+    /// A moving frame on the given tick of the animation loop.
+    fn moving(phase: u8) -> MotionFrame {
+        MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, phase, false)
+    }
+
+    /// The tick the eyes blink on, found rather than hardcoded so these
+    /// tests follow the clock in `motion` wherever it puts the blink.
+    fn blink_frame() -> MotionFrame {
+        (0..8).map(moving).find(|f| f.is_blinking()).unwrap()
+    }
+
+    /// A tick that swaps the prop and nothing else.
+    fn work_frame() -> MotionFrame {
+        (0..8)
+            .map(moving)
+            .find(|f| f.prop_frame() == 1 && !f.is_blinking())
+            .unwrap()
+    }
+
+    /// Every kind of frame a surface can hand out: still, mid-blink, prop
+    /// mid-swing, and reacting.
+    fn all_phases() -> [MotionFrame; 4] {
+        [
+            MotionFrame::still(),
+            blink_frame(),
+            work_frame(),
+            MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
+        ]
+    }
 
     /// The half-block alphabet: the only glyphs a sprite row may render,
     /// all single-cell in the terminals Ratatui targets.
@@ -561,7 +710,7 @@ mod tests {
     fn every_variant_keeps_the_same_footprint_and_safe_glyphs() {
         for state in ALL_STATES {
             for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
-                for motion in ALL_PHASES {
+                for motion in all_phases() {
                     let rows = rows_in(state, activity, motion);
                     assert_eq!(rows.len(), MASCOT_HEIGHT as usize);
                     for row in &rows[..7] {
@@ -591,7 +740,7 @@ mod tests {
     fn every_sprite_grid_is_rectangular_with_known_tokens() {
         for state in ALL_STATES {
             for activity in std::iter::once(None).chain(ALL_ACTIVITIES.map(Some)) {
-                for motion in ALL_PHASES {
+                for motion in all_phases() {
                     let grid = sprite_grid(state, activity, motion);
                     assert_eq!(grid.len(), SPRITE_ROWS);
                     for row in &grid {
@@ -647,31 +796,50 @@ mod tests {
     }
 
     #[test]
-    fn role_mapping_is_semantic() {
-        assert_eq!(mascot_activity(Role::Researcher), MascotActivity::Research);
+    fn kind_mapping_is_semantic() {
         assert_eq!(
-            mascot_activity(Role::Architect),
+            mascot_activity(StageKind::Research),
+            MascotActivity::Research
+        );
+        assert_eq!(
+            mascot_activity(StageKind::DeepAnalysis),
+            MascotActivity::Research
+        );
+        assert_eq!(
+            mascot_activity(StageKind::Architecture),
             MascotActivity::Architecture
         );
         assert_eq!(
-            mascot_activity(Role::Implementer),
+            mascot_activity(StageKind::Implementation),
             MascotActivity::Implementation
         );
         assert_eq!(
-            mascot_activity(Role::CodeQualityReviewer),
+            mascot_activity(StageKind::Fix),
+            MascotActivity::Implementation
+        );
+        assert_eq!(
+            mascot_activity(StageKind::CodeQualityReview),
             MascotActivity::QualityReview
         );
         assert_eq!(
-            mascot_activity(Role::SpecReviewer),
+            mascot_activity(StageKind::Review),
+            MascotActivity::QualityReview
+        );
+        assert_eq!(
+            mascot_activity(StageKind::IndependentReview),
+            MascotActivity::QualityReview
+        );
+        assert_eq!(
+            mascot_activity(StageKind::SpecReview),
             MascotActivity::SpecReview
         );
         assert_eq!(
-            mascot_activity(Role::EngineeringLead),
-            MascotActivity::Decision
+            mascot_activity(StageKind::Synthesis),
+            MascotActivity::Synthesis
         );
         assert_eq!(
-            mascot_activity(Role::Reviewer),
-            MascotActivity::QualityReview
+            mascot_activity(StageKind::Decision),
+            MascotActivity::Decision
         );
     }
 
@@ -705,18 +873,20 @@ mod tests {
         }
     }
 
-    /// Six jobs have to be six *scenes*: whatever stage the operator
+    /// Seven jobs have to be seven *scenes*: whatever stage the operator
     /// selects, the hat, the glasses or the prop must say which job this is
     /// at a glance — and the prop panel alone must already tell them apart.
     #[test]
     fn each_job_has_a_scene_of_its_own_in_every_state() {
         for (index, activity) in ALL_ACTIVITIES.iter().enumerate() {
             for other in ALL_ACTIVITIES.iter().skip(index + 1) {
-                assert_ne!(
-                    prop_rows(*activity),
-                    prop_rows(*other),
-                    "{activity:?} and {other:?} share a prop"
-                );
+                for frame in [0, 1] {
+                    assert_ne!(
+                        prop_rows(*activity, frame),
+                        prop_rows(*other, frame),
+                        "{activity:?} and {other:?} share a prop in frame {frame}"
+                    );
+                }
             }
         }
         for state in ALL_STATES {
@@ -801,18 +971,41 @@ mod tests {
     fn only_running_moves_and_the_blink_stays_inside_the_footprint() {
         for state in ALL_STATES {
             let resting = rows_in(state, None, MotionFrame::still());
-            let moving = rows_in(
-                state,
-                None,
-                MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
-            );
+            let blinking = rows_in(state, None, blink_frame());
             if matches!(state, MascotState::Running) {
-                assert_ne!(resting, moving, "Running work has to look alive");
+                assert_ne!(resting, blinking, "Running work has to look alive");
             } else {
                 assert_eq!(
-                    resting, moving,
+                    resting, blinking,
                     "{state:?} is not working, so it holds still"
                 );
+            }
+        }
+    }
+
+    /// While a stage Runs, POD works its prop: every scene has a second
+    /// frame and it differs from the resting one. Any other state rests the
+    /// tools — a prop swinging beside finished or failed work would claim
+    /// activity that is not there.
+    #[test]
+    fn a_running_scene_works_its_prop_and_every_other_state_rests_it() {
+        for activity in ALL_ACTIVITIES {
+            assert_ne!(
+                prop_rows(activity, 0),
+                prop_rows(activity, 1),
+                "{activity:?}'s prop has no working frame"
+            );
+            for state in ALL_STATES {
+                let resting = scene(state, Some(activity));
+                let working = sprite_grid(state, Some(activity), work_frame());
+                if matches!(state, MascotState::Running) {
+                    assert_ne!(resting, working, "{activity:?}'s prop never moves");
+                } else {
+                    assert_eq!(
+                        resting, working,
+                        "{state:?} is not working, yet {activity:?}'s prop moved"
+                    );
+                }
             }
         }
     }
@@ -839,15 +1032,16 @@ mod tests {
     /// mid-blink shows that it finished.
     #[test]
     fn a_reaction_outranks_a_blink() {
-        let blinking = rows_in(
-            MascotState::Running,
-            None,
-            MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
-        );
+        let blink_tick = blink_frame();
+        let blinking = rows_in(MascotState::Running, None, blink_tick);
         let reacting = rows_in(
             MascotState::Running,
             None,
-            MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, true),
+            MotionFrame::new(
+                MotionAllowance::ActiveStateAndTransitions,
+                blink_tick.active_phase(),
+                true,
+            ),
         );
         assert_ne!(blinking, reacting);
         assert_eq!(
@@ -868,7 +1062,7 @@ mod tests {
         for activity in ALL_ACTIVITIES {
             let resting = rows_in(MascotState::Running, Some(activity), MotionFrame::still());
             for moving in [
-                MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 1, false),
+                blink_frame(),
                 MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, 0, true),
             ] {
                 assert_ne!(

@@ -34,19 +34,22 @@ use std::time::Duration;
 
 use super::state::{Overlay, Screen};
 
-/// How often POD blinks, and for how long.
+/// The animation clock: a quarter-second tick over a two-second loop.
 ///
 /// Redundant by design: everything it reinforces is already written in words
-/// and glyphs elsewhere on the screen. That is what lets it be this rare.
+/// and glyphs elsewhere on the screen. That is what lets it stay decorative.
 ///
-/// Deliberately sparse and lopsided. An even alternation — half a second
-/// open, half a second shut — reads as a pulsing glitch rather than as a
-/// creature, and over the hours a run takes it becomes something to look
-/// away from. A short blink every few seconds says the same thing (this work
-/// is active) and then gets out of the way. The blink is comfortably longer
-/// than the 100ms event poll, so it never falls between two redraws.
-const BLINK_PERIOD: Duration = Duration::from_secs(3);
-const BLINK_LENGTH: Duration = Duration::from_millis(200);
+/// The loop carries two movements, offset so they never land on the same
+/// tick. POD's prop plays its two-frame work cycle on ticks 2–3 and 6–7 —
+/// the lens sweeps, the gavel lifts — which is what makes a running stage
+/// look worked on rather than merely labelled. The blink is a single tick
+/// (250ms, comfortably longer than the 100ms event poll) on tick 5, a
+/// prop-resting tick, so a blink changes POD's eyes and nothing else. Tick 0
+/// is the resting art: a surface that never asks the clock and a surface at
+/// the top of the loop draw exactly the same thing.
+const TICK: Duration = Duration::from_millis(250);
+const CYCLE_TICKS: u128 = 8;
+const BLINK_TICK: u8 = 5;
 
 /// How much movement is permitted, ordered from most to least restrictive so
 /// the two inputs combine with `min`. An allowance rather than a policy: a
@@ -173,12 +176,11 @@ pub(crate) fn allowance(
     surface_ceiling(screen, overlay).min(setting.ceiling())
 }
 
-/// Which frame the clock is on: 1 during a blink, 0 the rest of the
-/// time. Phase 0 is the resting art, so a surface that never asks the clock
-/// and a surface between blinks draw exactly the same thing.
+/// Which tick of the animation loop the clock is on (0..8). Tick 0 is the
+/// resting art; what each tick means is decided here, in one place, by the
+/// accessors on [`MotionFrame`].
 pub(crate) fn active_phase(elapsed: Duration) -> u8 {
-    let within = elapsed.as_millis() % BLINK_PERIOD.as_millis();
-    u8::from(within >= BLINK_PERIOD.as_millis() - BLINK_LENGTH.as_millis())
+    ((elapsed.as_millis() / TICK.as_millis()) % CYCLE_TICKS) as u8
 }
 
 /// One frame's permission to move, handed to whatever draws it.
@@ -220,6 +222,19 @@ impl MotionFrame {
         } else {
             0
         }
+    }
+
+    /// Whether this tick is the blink. False whenever motion is not
+    /// permitted, because the resting phase is never the blink tick.
+    pub(crate) fn is_blinking(self) -> bool {
+        self.active_phase() == BLINK_TICK
+    }
+
+    /// Which of a prop's two work frames this tick shows: the loop holds
+    /// each frame for two ticks, and a frame that may not move holds
+    /// frame 0.
+    pub(crate) fn prop_frame(self) -> u8 {
+        (self.active_phase() / 2) % 2
     }
 
     /// Whether POD is in the moment just after something changed. Finite by
@@ -365,26 +380,58 @@ mod tests {
     }
 
     #[test]
-    fn a_blink_is_short_rare_and_repeats() {
+    fn the_clock_ticks_through_the_loop_and_repeats() {
         assert_eq!(active_phase(Duration::ZERO), 0);
-        assert_eq!(active_phase(Duration::from_millis(2799)), 0);
-        assert_eq!(active_phase(Duration::from_millis(2800)), 1);
-        assert_eq!(active_phase(Duration::from_millis(2999)), 1);
-        assert_eq!(active_phase(Duration::from_secs(3)), 0);
+        assert_eq!(active_phase(Duration::from_millis(249)), 0);
+        assert_eq!(active_phase(Duration::from_millis(250)), 1);
+        assert_eq!(active_phase(Duration::from_millis(1999)), 7);
+        assert_eq!(active_phase(Duration::from_secs(2)), 0);
         // And again on the next cycle, hours in, without overflowing.
-        assert_eq!(active_phase(Duration::from_millis(5800)), 1);
+        assert_eq!(active_phase(Duration::from_millis(3250)), 5);
         assert_eq!(active_phase(Duration::from_secs(36_000)), 0);
+    }
 
-        // Overwhelmingly still: at 100ms redraws, at most a couple of frames
-        // in every thirty show a blink at all.
-        let moving = (0..30_000)
-            .step_by(100)
-            .filter(|ms| active_phase(Duration::from_millis(*ms)) == 1)
-            .count();
-        assert!(
-            moving * 10 < 30_000 / 100,
-            "POD blinked on {moving} of 300 frames, which is a twitch, not a blink"
+    /// The blink is one tick of the loop, and it lands on a tick whose prop
+    /// frame is the resting one — so a blink changes POD's eyes and nothing
+    /// else, and the eyes are still only briefly shut.
+    #[test]
+    fn a_blink_is_one_tick_and_props_hold_still_for_it() {
+        let frame =
+            |phase| MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, phase, false);
+        let blinks: Vec<u8> = (0..8).filter(|tick| frame(*tick).is_blinking()).collect();
+        assert_eq!(blinks, vec![BLINK_TICK], "the blink is exactly one tick");
+        assert_eq!(
+            frame(BLINK_TICK).prop_frame(),
+            0,
+            "a blink must not coincide with a prop swap"
         );
+    }
+
+    /// The prop's two work frames alternate through the loop, holding each
+    /// frame long enough (two ticks, half a second) to read as movement
+    /// rather than flicker — and tick 0 shows the resting frame, so a still
+    /// surface and the top of the loop agree.
+    #[test]
+    fn the_prop_cycle_alternates_and_rests_on_tick_zero() {
+        let frame =
+            |phase| MotionFrame::new(MotionAllowance::ActiveStateAndTransitions, phase, false);
+        let cycle: Vec<u8> = (0..8).map(|tick| frame(tick).prop_frame()).collect();
+        assert_eq!(cycle, vec![0, 0, 1, 1, 0, 0, 1, 1]);
+    }
+
+    /// Movement that is not permitted does not leak through the richer
+    /// accessors either.
+    #[test]
+    fn a_still_frame_neither_blinks_nor_swaps_the_prop() {
+        for allowance in [MotionAllowance::Disabled, MotionAllowance::TransitionsOnly] {
+            let frame = MotionFrame::new(allowance, BLINK_TICK, false);
+            assert!(!frame.is_blinking(), "{allowance:?} blinked");
+            assert_eq!(
+                MotionFrame::new(allowance, 2, false).prop_frame(),
+                0,
+                "{allowance:?} swapped the prop"
+            );
+        }
     }
 
     #[test]
