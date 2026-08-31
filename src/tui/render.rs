@@ -299,8 +299,19 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(area);
-    // Technical mode spends POD's rows on diagnostics instead.
-    render_pipeline(frame, columns[0], state, details, !state.technical);
+    // The status strip yields before the pipeline does: a rail too short for
+    // both spends every row on the stages themselves.
+    let rail = if columns[0].height > STATUS_HEIGHT + 10 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(STATUS_HEIGHT)])
+            .split(columns[0]);
+        render_status(frame, rows[1], details);
+        rows[0]
+    } else {
+        columns[0]
+    };
+    render_pipeline(frame, rail, state, details);
     if state.technical {
         render_technical(frame, columns[1], state, details);
     } else {
@@ -308,16 +319,89 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
 }
 
-/// Left rail: the run's task, its stages in workflow order with their
-/// semantic durations, and POD seated under a short rule when room remains.
-/// One vertical rule separates the rail from the hero — no boxes.
-fn render_pipeline(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &TuiState,
-    details: &RunDetails,
-    show_mascot: bool,
-) {
+/// Rows the status strip needs: a rule, its section label, and two sentences.
+const STATUS_HEIGHT: u16 = 5;
+
+/// Bottom of the rail: the run's actual state in one or two plain sentences.
+/// Typed and state-driven like `activity_message` — never model prose.
+fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
+    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+    let width = area.width.saturating_sub(3);
+    let mut lines = vec![theme::centered_rule(width), theme::section("STATUS")];
+    lines.extend(
+        status_sentences(details, now)
+            .into_iter()
+            .map(|sentence| Line::from(Span::styled(sentence, theme::text()))),
+    );
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(theme::muted())
+                .padding(Padding::new(1, 1, 0, 0)),
+        ),
+        area,
+    );
+}
+
+/// What the run is doing right now, then how far along it is. The first
+/// sentence follows the run's canonical status; the second counts stages, so
+/// both stay facts the domain already asserted.
+fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
+    let running = details
+        .stages
+        .iter()
+        .find(|stage| stage.status == StageStatus::Running);
+    let first = match details.status {
+        RunStatus::Running => running.map_or_else(
+            || "Run is moving between stages.".to_owned(),
+            |stage| {
+                format::elapsed(stage.started_at, None, now).map_or_else(
+                    || format!("{} is running.", stage_title(stage.kind)),
+                    |span| {
+                        format!(
+                            "{} has been running for {}.",
+                            stage_title(stage.kind),
+                            format::format_duration(span)
+                        )
+                    },
+                )
+            },
+        ),
+        RunStatus::NeedsUser => "Waiting on you to resolve a request.".to_owned(),
+        RunStatus::Completed => "Run complete — the result is ready to review.".to_owned(),
+        RunStatus::Applied => "Changes applied to the repository.".to_owned(),
+        RunStatus::Discarded => "Run discarded.".to_owned(),
+        RunStatus::Failed => details
+            .stages
+            .iter()
+            .find(|stage| stage.status == StageStatus::Failed)
+            .map_or_else(
+                || "Run failed.".to_owned(),
+                |stage| format!("{} failed — its logs say why.", stage_title(stage.kind)),
+            ),
+        RunStatus::Paused | RunStatus::Interrupted => {
+            "Run suspended — resume when ready.".to_owned()
+        }
+        RunStatus::Created | RunStatus::Preparing | RunStatus::Ready => {
+            "Run has not started yet.".to_owned()
+        }
+    };
+    let completed = details
+        .stages
+        .iter()
+        .filter(|stage| stage.status == StageStatus::Completed)
+        .count();
+    vec![
+        first,
+        format!("{completed} of {} stages complete.", details.stages.len()),
+    ]
+}
+
+/// Left rail: the run's task and its stages in workflow order with their
+/// semantic durations. One vertical rule separates the rail from the hero —
+/// no boxes.
+fn render_pipeline(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &RunDetails) {
     let now: DateTime<Utc> = std::time::SystemTime::now().into();
     let width = area.width.saturating_sub(3);
     let mut lines = vec![
@@ -358,22 +442,6 @@ fn render_pipeline(
             Span::styled("◇ ", theme::muted()),
             Span::styled("Fix (booked)", theme::muted()),
         ]));
-    }
-    let inner_height = area.height.saturating_sub(1) as usize;
-    // POD's seat: one blank row, a short rule, another blank row, then POD —
-    // attached to the pipeline it belongs to rather than pinned to the bottom
-    // edge with a dead zone above it.
-    let seat = mascot::MASCOT_HEIGHT as usize + 3;
-    if show_mascot && area.width >= mascot::MASCOT_WIDTH + 20 && inner_height > lines.len() + seat {
-        lines.push(Line::from(""));
-        lines.push(theme::centered_rule(width));
-        lines.push(Line::from(""));
-        let selected = details.stages.get(state.selected_stage_index);
-        lines.extend(mascot::mascot_lines(
-            mascot::mascot_state(Some(details.status), selected.map(|stage| stage.status)),
-            selected.map(|stage| mascot::mascot_activity(stage.role)),
-            state.motion_frame(),
-        ));
     }
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -485,11 +553,11 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         runtime_summary(selected),
         theme::muted(),
     )));
-    if details.attention.is_empty() && !applyable {
-        lines.push(Line::from(Span::styled(
-            activity_message(selected.status),
-            theme::text(),
-        )));
+    if details.attention.is_empty()
+        && !applyable
+        && let Some(activity) = activity_message(selected.status)
+    {
+        lines.push(Line::from(Span::styled(activity, theme::text())));
     }
     lines.push(Line::from(""));
     // After the pivot the panel speaks for the run, so the result section
@@ -520,12 +588,44 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
             lines.extend(actions);
         }
     }
+    seat_mascot(&mut lines, area, width, state, details, selected);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(Block::default().padding(Padding::new(2, 1, 1, 0))),
         area,
     );
+}
+
+/// POD's seat: one blank row, a short rule, another blank row, then POD —
+/// under the panel that narrates the stage POD is acting out. Decoration
+/// yields first: any doubt about the room, and the seat stays empty. Rows
+/// are counted post-wrap, since the hero wraps and a quoted headline can
+/// spend more rows than it has lines.
+fn seat_mascot(
+    lines: &mut Vec<Line<'static>>,
+    area: Rect,
+    width: u16,
+    state: &TuiState,
+    details: &RunDetails,
+    selected: &StageSummary,
+) {
+    let seat = mascot::MASCOT_HEIGHT as usize + 3;
+    let wrapped_rows: usize = lines
+        .iter()
+        .map(|line| span_width(&line.spans).div_ceil((width as usize).max(1)).max(1))
+        .sum();
+    let inner_height = area.height.saturating_sub(1) as usize;
+    if area.width >= mascot::MASCOT_WIDTH + 20 && inner_height > wrapped_rows + seat {
+        lines.push(Line::from(""));
+        lines.push(theme::centered_rule(width));
+        lines.push(Line::from(""));
+        lines.extend(mascot::mascot_lines(
+            mascot::mascot_state(Some(details.status), Some(selected.status)),
+            Some(mascot::mascot_activity(selected.role)),
+            state.motion_frame(),
+        ));
+    }
 }
 
 /// The hero's opening statement: which stage, in what state, for how long.
@@ -592,16 +692,18 @@ fn hero_clock(span: chrono::TimeDelta) -> String {
 }
 
 /// Typed, state-driven activity text. Never inferred from logs or model prose,
-/// and never repeating an action the actions row already offers.
-const fn activity_message(status: StageStatus) -> &'static str {
+/// and never repeating an action the actions row already offers. A completed
+/// stage says nothing: its badge already reads COMPLETED, and the result
+/// section below speaks for what it produced.
+const fn activity_message(status: StageStatus) -> Option<&'static str> {
     match status {
-        StageStatus::Running => "Agent is working…",
-        StageStatus::Pending | StageStatus::Ready => "Waiting for the previous stage",
-        StageStatus::Completed => "Stage finished",
-        StageStatus::Failed => "The provider ended this stage before it completed",
-        StageStatus::Paused | StageStatus::Interrupted => "Stage suspended",
-        StageStatus::NeedsUser => "Waiting on you",
-        StageStatus::Skipped => "Stage skipped by the workflow",
+        StageStatus::Running => Some("Agent is working…"),
+        StageStatus::Pending | StageStatus::Ready => Some("Waiting for the previous stage"),
+        StageStatus::Completed => None,
+        StageStatus::Failed => Some("The provider ended this stage before it completed"),
+        StageStatus::Paused | StageStatus::Interrupted => Some("Stage suspended"),
+        StageStatus::NeedsUser => Some("Waiting on you"),
+        StageStatus::Skipped => Some("Stage skipped by the workflow"),
     }
 }
 
@@ -653,7 +755,7 @@ const HEADLINE_ROWS: usize = 2;
 fn result_lines(state: &TuiState, selected: &StageSummary, width: u16) -> Vec<Line<'static>> {
     if state.stages_with_artifacts.contains(&selected.id) {
         let mut lines = vec![Line::from(Span::styled(
-            "✓ Verified artifact available",
+            format!("✓ {}", result_statement(selected.kind)),
             Style::default()
                 .fg(theme::success())
                 .add_modifier(Modifier::BOLD),
@@ -675,6 +777,25 @@ fn result_lines(state: &TuiState, selected: &StageSummary, width: u16) -> Vec<Li
         _ => "No verified artifact",
     };
     vec![Line::from(Span::styled(text, theme::muted()))]
+}
+
+/// The result line in the stage's own terms: what kind of outcome arrived,
+/// in a few words. It names the shape of the result — a verdict, a plan, a
+/// change — and leaves the judgment itself to the quoted bottom line below,
+/// because the panel never states a verdict the artifact did not state.
+const fn result_statement(kind: StageKind) -> &'static str {
+    match kind {
+        StageKind::Research => "Research findings ready",
+        StageKind::Architecture => "Architecture plan ready",
+        StageKind::Implementation => "Implementation ready",
+        StageKind::CodeQualityReview => "Quality review verdict in",
+        StageKind::SpecReview => "Spec review verdict in",
+        StageKind::Review | StageKind::IndependentReview => "Review verdict in",
+        StageKind::DeepAnalysis => "Analysis ready",
+        StageKind::Synthesis => "Synthesis ready",
+        StageKind::Decision => "Decision reached",
+        StageKind::Fix => "Fix ready",
+    }
 }
 
 /// The artifact's opening line, quoted. Never a summary this panel wrote:
@@ -2485,7 +2606,7 @@ mod tests {
             .stages_with_artifacts
             .insert(StageId::new("implementation").unwrap());
         let text = render_text(&completed, 160, 40);
-        assert!(text.contains("✓ Verified artifact available"));
+        assert!(text.contains("✓ Implementation ready"));
         assert!(text.contains("[Enter/o] Open result"));
     }
 
@@ -2519,7 +2640,7 @@ mod tests {
         let text = render_text(&state, 160, 40);
         assert!(!text.contains("It does what the task asked"));
         assert!(
-            text.contains("✓ Verified artifact available"),
+            text.contains("✓ Implementation ready"),
             "a stale quote hides itself without hiding the artifact"
         );
     }
@@ -2940,13 +3061,48 @@ mod tests {
     }
 
     #[test]
-    fn pod_is_seated_under_the_pipeline_rather_than_floating() {
+    fn pod_is_seated_under_the_hero_rather_than_floating() {
         let text = render_text(&running_state(), 160, 40);
-        let last_stage = text.find("Quality review").unwrap();
-        let tail = &text[last_stage..];
+        let resources = text.find("RESOURCES").unwrap();
+        let tail = &text[resources..];
         let rule = tail.find("──────────").expect("POD sits under a rule");
         let pod = tail.find(POD_SHELL).unwrap();
-        assert!(rule < pod, "the rule separates the rail from its operator");
+        assert!(rule < pod, "the rule separates the hero from its operator");
+    }
+
+    /// The rail's bottom strip narrates the run in plain sentences, and the
+    /// sentence follows the run's canonical status rather than the selection.
+    #[test]
+    fn status_strip_speaks_the_runs_actual_state_in_sentences() {
+        let running = render_text(&running_state(), 160, 40);
+        assert!(running.contains("STATUS"));
+        assert!(
+            running.contains("Implementation has been running for"),
+            "the live stage is named with its elapsed"
+        );
+        assert!(running.contains("1 of 3 stages complete."));
+
+        let completed = render_text(&completed_state(), 160, 40);
+        assert!(completed.contains("Run complete — the result is ready to review."));
+        assert!(completed.contains("1 of 1 stages complete."));
+
+        // A rail too short for the strip spends its rows on the stages.
+        assert!(!render_text(&running_state(), 70, 15).contains("STATUS"));
+    }
+
+    /// A completed stage's badge already reads COMPLETED; the hero does not
+    /// repeat it as prose while the run works on.
+    #[test]
+    fn a_completed_stage_is_not_narrated_as_finished() {
+        let mut state = running_state();
+        state.selected_stage_index = 0;
+        state.selected_stage = Some(StageId::new("architecture").unwrap());
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("COMPLETED"), "the badge carries the state");
+        assert!(
+            !text.contains("Stage finished"),
+            "the badge is not repeated as prose"
+        );
     }
 
     #[test]
