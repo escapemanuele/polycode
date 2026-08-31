@@ -2244,6 +2244,7 @@ mod tests {
                 configured_provider: "codex".to_owned(),
                 configured_model: None,
                 reason: "recommended_role_assignment".to_owned(),
+                requested_effort: Some(crate::domain::EffortSetting::NativeDefault),
             }],
             revision: crate::store::RunRevision::initial(),
             created_at: at(12, 0, 0),

@@ -69,6 +69,11 @@ pub struct RouteSummary {
     pub configured_provider: String,
     pub configured_model: Option<String>,
     pub reason: String,
+    /// Requested effort from the immutable resource plan, when the sealed
+    /// configuration states one for this role. `None` on a v3 snapshot sealed
+    /// before fix-cycle routing, whose plan stops at the roles the workflow
+    /// started with — a route without an effort cannot be driven.
+    pub requested_effort: Option<EffortSetting>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,6 +374,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             configured_provider: route.target().provider_id().to_string(),
             configured_model: route.target().model_id().map(ToString::to_string),
             reason: route.reason().to_owned(),
+            requested_effort: resource_plan.as_ref().and_then(|plan| plan.effort(role)),
         })
         .collect::<Vec<_>>();
     routes.sort_by_key(|route| role_order(route.role));

@@ -342,10 +342,12 @@ impl ResourcePlan {
     /// Reconstructs the immutable resource plan from a persisted snapshot.
     ///
     /// Schema v1 and v2 predate effort policy and always decode to
-    /// `NativeDefault` for every workflow role — never `Medium` — so no old
-    /// run changes native runtime behavior. Schema v3 requires an explicit
-    /// setting for exactly the workflow's required roles; anything malformed
-    /// fails closed.
+    /// `NativeDefault` for every routable role — never `Medium` — so no old
+    /// run changes native runtime behavior. Routable, not just required: a
+    /// completed run can grow a fix cycle, and driving those stages asks for
+    /// their effort exactly like it asks for their route. Schema v3 requires
+    /// an explicit setting for at least the workflow's required roles and
+    /// nothing beyond its routable ones; anything malformed fails closed.
     ///
     /// # Errors
     /// Rejects malformed payloads, unknown settings, or incomplete coverage.
@@ -353,10 +355,9 @@ impl ResourcePlan {
         snapshot: &ResolvedConfigSnapshot,
         workflow: &WorkflowDefinition,
     ) -> Result<Self, RoutingError> {
-        let required = required_roles(workflow);
         match snapshot.schema_version() {
             1 | 2 => Ok(Self {
-                role_efforts: required
+                role_efforts: routable_roles(workflow)
                     .into_iter()
                     .map(|role| (role, EffortSetting::NativeDefault))
                     .collect(),
@@ -375,7 +376,14 @@ impl ResourcePlan {
 }
 
 /// Structural effort rules shared by routing and resource decoding: v2 must
-/// not smuggle a resource plan; v3 must cover exactly the workflow roles.
+/// not smuggle a resource plan; v3 must cover every required role and stay
+/// within the routable ones.
+///
+/// A window between the two bounds exists because v3 payloads sealed before
+/// fix-cycle routing cover only the roles their workflow starts with. Those
+/// snapshots are never rewritten, so they must keep decoding; what they
+/// cannot do is execute a fix cycle, which [`unroutable_fix_role`] refuses
+/// before one is committed.
 fn validate_resource_plan_shape(
     payload: &RoutingPayloadV2,
     workflow: &WorkflowDefinition,
@@ -387,10 +395,13 @@ fn validate_resource_plan_shape(
         )),
         (3, Some(plan)) => {
             let required = required_roles(workflow);
-            if plan.len() != required.len() || !required.iter().all(|role| plan.contains_key(role))
+            let routable = routable_roles(workflow);
+            if !required.iter().all(|role| plan.contains_key(role))
+                || !plan.keys().all(|role| routable.contains(role))
             {
                 return Err(RoutingError::InvalidConfig(
-                    "resource plan must cover exactly the workflow's required roles".to_owned(),
+                    "resource plan must cover the workflow's required roles and stay within its routable roles"
+                        .to_owned(),
                 ));
             }
             Ok(())
@@ -710,24 +721,30 @@ fn routable_roles(workflow: &WorkflowDefinition) -> HashSet<Role> {
     roles
 }
 
-/// The first fix-cycle role this sealed configuration cannot route, if any.
+/// The first fix-cycle role this sealed configuration cannot execute, if any:
+/// a role it cannot route, or one it states no requested effort for.
 ///
 /// Asked before a fix is committed rather than discovered while driving one.
 /// The request appends stages and gives the workspace a branch, so a run whose
 /// configuration predates fix-cycle routing would otherwise be left carrying
 /// stages nothing can execute — and unreadable, because reading a run resolves
-/// its routes.
+/// its routes. Effort is held to the same bar as the route: a v3 snapshot
+/// sealed before fix-cycle routing states effort only for the roles its
+/// workflow started with, and inventing a level for the fix would re-resolve
+/// what was sealed.
 ///
 /// # Errors
-/// Returns the decoding failures of [`RoutingPlan::from_snapshot`].
+/// Returns the decoding failures of [`RoutingPlan::from_snapshot`] and
+/// [`ResourcePlan::from_snapshot`].
 pub fn unroutable_fix_role(
     snapshot: &ResolvedConfigSnapshot,
     workflow: &WorkflowDefinition,
 ) -> Result<Option<Role>, RoutingError> {
     let plan = RoutingPlan::from_snapshot(snapshot, workflow)?;
+    let efforts = ResourcePlan::from_snapshot(snapshot, workflow)?;
     let mut missing = fix_cycle_roles(workflow)
         .into_iter()
-        .filter(|role| plan.route(*role).is_none())
+        .filter(|role| plan.route(*role).is_none() || efforts.effort(*role).is_none())
         .collect::<Vec<_>>();
     missing.sort_by_key(|role| format!("{role:?}"));
     Ok(missing.into_iter().next())
@@ -1413,6 +1430,128 @@ mod tests {
             unroutable_fix_role(&legacy, &workflow).unwrap(),
             Some(Role::Implementer)
         );
+    }
+
+    /// The route alone is not enough to drive a fix stage: the provider also
+    /// asks the resource plan for the role's requested effort. A v2 review
+    /// snapshot predates effort policy entirely, so its plan must cover the
+    /// fix-cycle roles with `NativeDefault` — this is the exact gap behind
+    /// "configured effort missing for Implementer".
+    #[test]
+    fn a_review_states_native_default_effort_for_the_fix_it_may_be_asked_for() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        let snapshot = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("review-effort").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.schema_version(), 2);
+        let plan = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(
+            plan.effort(Role::Implementer),
+            Some(EffortSetting::NativeDefault),
+            "the fix cycle's roles need effort exactly like they need routes"
+        );
+        assert_eq!(unroutable_fix_role(&snapshot, &workflow).unwrap(), None);
+    }
+
+    /// Explicit effort on a review seals a v3 plan over every routable role,
+    /// Implementer included, and the seal-time round-trip must accept it.
+    #[test]
+    fn explicit_effort_on_a_review_seals_and_covers_the_fix_cycle() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        let snapshot = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::HIGH,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("review-explicit").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.schema_version(), 3);
+        let plan = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(plan.effort(Role::Implementer), Some(EffortSetting::HIGH));
+        assert_eq!(unroutable_fix_role(&snapshot, &workflow).unwrap(), None);
+    }
+
+    /// A v3 snapshot sealed before fix-cycle routing states effort only for
+    /// the roles its workflow started with. It must keep decoding — the run
+    /// is still readable — but a fix request has to be refused by name, not
+    /// discovered mid-drive as a missing effort.
+    #[test]
+    fn a_v3_plan_sealed_without_fix_effort_decodes_but_names_the_refused_role() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        let sealed = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::HIGH,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("pre-fix-v3").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        let mut payload = sealed.payload().clone();
+        payload["resource_plan"]
+            .as_object_mut()
+            .unwrap()
+            .remove("implementer");
+        let legacy = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("pre-fix-v3-trimmed").unwrap(),
+            sealed.schema_version(),
+            payload,
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+
+        let plan = ResourcePlan::from_snapshot(&legacy, &workflow).unwrap();
+        assert_eq!(plan.effort(Role::Implementer), None);
+        assert_eq!(
+            unroutable_fix_role(&legacy, &workflow).unwrap(),
+            Some(Role::Implementer)
+        );
+    }
+
+    /// The widened coverage rule is a window, not an open door: a role no
+    /// run of this workflow could ever grow still fails closed.
+    #[test]
+    fn a_v3_plan_with_a_role_outside_the_routable_set_fails_closed() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        let sealed = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::HIGH,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("alien-role").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        let mut payload = sealed.payload().clone();
+        payload["resource_plan"]["architect"] = json!("high");
+        let widened = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("alien-role-widened").unwrap(),
+            sealed.schema_version(),
+            payload,
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert!(ResourcePlan::from_snapshot(&widened, &workflow).is_err());
     }
 
     #[test]

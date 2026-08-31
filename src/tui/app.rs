@@ -1001,7 +1001,7 @@ mod tests {
             profile: "recommended".to_owned(),
             profile_version: "recommended_v2".to_owned(),
             // A run can only be fixed if its configuration routes the roles a
-            // fix adds, so the fixture carries those routes.
+            // fix adds and states their effort, so the fixture carries both.
             routes: [Role::Implementer, Role::EngineeringLead]
                 .into_iter()
                 .map(|role| crate::app::RouteSummary {
@@ -1009,6 +1009,7 @@ mod tests {
                     configured_provider: "codex".to_owned(),
                     configured_model: None,
                     reason: "test".to_owned(),
+                    requested_effort: Some(EffortSetting::NativeDefault),
                 })
                 .collect(),
             revision: crate::store::RunRevision::initial(),
