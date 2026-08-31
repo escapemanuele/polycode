@@ -358,14 +358,13 @@ impl TuiApp {
             self.state.set_error("Repository cannot be empty");
             return;
         }
-        self.dispatch(WorkerCommand::StartRun {
+        if self.dispatch(WorkerCommand::StartRun {
             workflow: self.state.new_run.workflow,
             task,
             repository: PathBuf::from(repository),
             selection: self.state.new_run.execution.selection(),
             effort: self.state.new_run.effort.setting(),
-        });
-        if self.state.worker_busy.is_some() {
+        }) {
             self.state.screen = Screen::Runs;
         }
     }
@@ -552,48 +551,53 @@ impl TuiApp {
         Some((self.state.selected_run?, self.state.selected_stage.clone()?))
     }
 
-    fn dispatch(&mut self, command: WorkerCommand) {
-        if self.state.worker_busy.is_some() {
-            self.state
-                .set_error("Another application action is already running");
-            return;
+    /// Starts one action, unless another action already holds its run.
+    ///
+    /// Returns whether the command was dispatched, so a caller that navigates
+    /// on success can tell a started action from a refused one.
+    fn dispatch(&mut self, command: WorkerCommand) -> bool {
+        if let Some(refusal) = self.state.action_refusal(&command) {
+            self.state.set_error(refusal.reason());
+            return false;
         }
-        let label = command.kind().label().to_owned();
-        match self.worker.send(command) {
-            Ok(()) => {
-                self.state.worker_busy = Some(label);
-                self.state.message = None;
-            }
-            Err(error) => self.state.set_error(error),
-        }
+        self.state.begin_action(command.kind(), command.run_id());
+        self.worker.send(command);
+        self.state.message = None;
+        true
     }
 
     fn receive_worker_results(&mut self) {
-        loop {
-            match self.worker.try_recv() {
-                Ok(Some(result)) => self.handle_worker_result(result),
-                Ok(None) => break,
-                Err(error) => {
-                    self.state.worker_busy = None;
-                    self.state.set_error(error);
-                    break;
-                }
-            }
+        while let Some(result) = self.worker.try_recv() {
+            self.handle_worker_result(result);
         }
     }
 
     fn handle_worker_result(&mut self, result: WorkerResult) {
-        self.state.worker_busy = None;
+        self.state.settle_action(result.action, result.run_id);
         match result.result {
             Ok(success) => {
                 let run_id = success.report().details.id;
-                self.state.selected_run = Some(run_id);
-                self.state.replace_details(success.report().details.clone());
-                self.state.quiescent = Some(success.report().outcome.clone());
-                self.state.screen = Screen::RunDetail;
+                // An action finishing is not a reason to move the user. Only
+                // the run they are already looking at — or the first run this
+                // session has, when they are looking at nothing — opens on its
+                // own; anything else running in the background reports through
+                // the message line and the refreshed list, leaving the screen
+                // where the user put it.
+                if self
+                    .state
+                    .selected_run
+                    .is_none_or(|selected| selected == run_id)
+                {
+                    self.state.selected_run = Some(run_id);
+                    self.state.replace_details(success.report().details.clone());
+                    self.state.quiescent = Some(success.report().outcome.clone());
+                    self.state.screen = Screen::RunDetail;
+                }
                 let message = match success {
                     WorkerSuccess::Applied(outcome, _) => format!("Apply finished: {outcome:?}"),
-                    WorkerSuccess::Execution(_) => format!("{} finished", result.action.label()),
+                    WorkerSuccess::Execution(_) => {
+                        format!("{} finished for {run_id}", result.action.label())
+                    }
                 };
                 self.state.set_message(message);
             }
@@ -814,6 +818,8 @@ mod tests {
     use super::*;
     use crate::app::{RunDetails, StageSummary};
     use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
+    use crate::tui::state::CONCURRENT_AGENTS;
+    use crate::tui::worker::ActionKind;
 
     /// A `TuiApp` wired to an empty temporary store: enough to drive intents
     /// without touching the user's data directory or any provider.
@@ -900,7 +906,7 @@ mod tests {
         )));
         app.handle_intent(Intent::Fix);
         assert_eq!(
-            app.state.worker_busy.as_deref(),
+            app.state.busy_label().as_deref(),
             Some("fixing run"),
             "a rejected standard run is exactly what fix is for"
         );
@@ -925,7 +931,7 @@ mod tests {
         ] {
             let (mut app, _fixture) = app_with(run);
             app.handle_intent(Intent::Fix);
-            assert_eq!(app.state.worker_busy, None, "fix dispatched for {label}");
+            assert!(app.state.in_flight.is_empty(), "fix dispatched for {label}");
             // A refusal explains itself rather than doing nothing visible.
             assert!(
                 app.state.message.is_some(),
@@ -955,7 +961,7 @@ mod tests {
                 "apply confirmation must not open for {status:?}/{workflow:?}"
             );
             assert!(
-                app.state.worker_busy.is_none(),
+                app.state.in_flight.is_empty(),
                 "no worker command dispatched for {status:?}/{workflow:?}"
             );
             let message = app.state.message.as_ref().expect("user is told why");
@@ -1035,7 +1041,7 @@ mod tests {
         app.handle_intent(Intent::Apply);
         assert_eq!(app.state.overlay, Some(Overlay::ApplyConfirm));
         assert!(
-            app.state.worker_busy.is_none(),
+            app.state.in_flight.is_empty(),
             "opening the confirmation still dispatches nothing"
         );
     }
@@ -1133,7 +1139,7 @@ mod tests {
         // Run actions are inert while the prompt owns the keyboard.
         app.handle_intent(Intent::Apply);
         assert_eq!(app.state.overlay, Some(Overlay::Update));
-        assert!(app.state.worker_busy.is_none());
+        assert!(app.state.in_flight.is_empty());
     }
 
     #[test]
@@ -1142,7 +1148,7 @@ mod tests {
             let (mut app, _fixture) = app_with(details(status, WorkflowKind::Standard));
             app.handle_intent(Intent::Stop);
             assert!(
-                app.state.worker_busy.is_some(),
+                !app.state.in_flight.is_empty(),
                 "{status:?} is stoppable, so the action dispatches"
             );
             assert_eq!(
@@ -1162,7 +1168,7 @@ mod tests {
             let (mut app, _fixture) = app_with(details(status, WorkflowKind::Standard));
             app.handle_intent(Intent::Stop);
             assert!(
-                app.state.worker_busy.is_none(),
+                app.state.in_flight.is_empty(),
                 "{status:?} must not dispatch a stop"
             );
             assert!(
@@ -1173,13 +1179,228 @@ mod tests {
         }
     }
 
+    /// The same run under a different identity, for the cases that need two.
+    fn other_run(mut details: RunDetails, id: RunId) -> RunDetails {
+        details.id = id;
+        details
+    }
+
+    fn start_command() -> WorkerCommand {
+        WorkerCommand::StartRun {
+            workflow: WorkflowKind::Standard,
+            task: "a second piece of work".to_owned(),
+            repository: std::path::PathBuf::from("/repo"),
+            selection: crate::app::ExecutionSelection::Uniform(crate::app::UniformProvider::Fake),
+            effort: EffortSetting::NativeDefault,
+        }
+    }
+
+    /// The regression this gate was rebuilt around: one busy run used to lock
+    /// the whole interface, so starting a second run — the thing the command
+    /// line could always do — was refused for as long as the first one ran.
+    #[test]
+    fn work_on_one_run_never_holds_back_another_run_or_a_new_one() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        let first = RunId::from_u128(7);
+        let second = RunId::from_u128(8);
+
+        assert!(app.dispatch(WorkerCommand::ResumeRun { run_id: first }));
+        assert!(
+            app.dispatch(WorkerCommand::ResumeRun { run_id: second }),
+            "another run's work is none of the first run's business"
+        );
+        assert!(
+            app.dispatch(start_command()),
+            "a new run holds no existing run, so nothing can hold it back"
+        );
+        assert_eq!(app.state.in_flight.len(), 3, "all three are working");
+    }
+
+    /// Two actions on one run would race each other over the same durable
+    /// state, so that pairing — and only that pairing — is still refused.
+    #[test]
+    fn a_second_action_on_the_same_run_is_refused_and_names_the_holder() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        let run_id = RunId::from_u128(7);
+
+        assert!(app.dispatch(WorkerCommand::ResumeRun { run_id }));
+        assert!(!app.dispatch(WorkerCommand::ApplyRun { run_id }));
+        let message = app
+            .state
+            .message
+            .as_ref()
+            .expect("the refusal explains itself");
+        assert!(
+            message.text.contains("resuming run"),
+            "the refusal names what is holding the run: {:?}",
+            message.text
+        );
+        assert_eq!(app.state.in_flight.len(), 1, "nothing extra was started");
+    }
+
+    /// Concurrency is not unlimited. Each agent at work holds a worktree, a
+    /// terminal session and a provider process, so the interface stops handing
+    /// out more of them than it means to run at once.
+    #[test]
+    fn agents_stop_being_started_at_the_ceiling() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        for index in 0..CONCURRENT_AGENTS {
+            let run_id = RunId::from_u128(100 + index as u128);
+            assert!(
+                app.dispatch(WorkerCommand::ResumeRun { run_id }),
+                "agent {index} is within the ceiling"
+            );
+        }
+
+        assert!(
+            !app.dispatch(start_command()),
+            "one more agent than the ceiling is refused"
+        );
+        let message = app
+            .state
+            .message
+            .as_ref()
+            .expect("the refusal explains itself");
+        assert!(
+            message.text.contains("already working"),
+            "the refusal says why: {:?}",
+            message.text
+        );
+
+        // The ceiling counts agents, not actions: the work that only touches
+        // the store and the checkout still goes out, and stop most of all —
+        // it is how the user gets back under the ceiling.
+        assert!(app.dispatch(WorkerCommand::StopRun {
+            run_id: RunId::from_u128(100)
+        }));
+        assert!(app.dispatch(WorkerCommand::DiscardRun {
+            run_id: RunId::from_u128(200)
+        }));
+    }
+
+    /// Stop is the way out of a run that has stopped making progress, so the
+    /// action it is interrupting must never be the reason it cannot run.
+    #[test]
+    fn stop_is_never_held_back_by_the_action_it_interrupts() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        let run_id = RunId::from_u128(7);
+        assert!(app.dispatch(WorkerCommand::ResumeRun { run_id }));
+
+        app.handle_intent(Intent::Stop);
+
+        assert_eq!(
+            app.state.in_flight.len(),
+            2,
+            "the stop went out alongside the resume holding the run"
+        );
+        assert!(
+            app.state
+                .in_flight
+                .iter()
+                .any(|entry| entry.action == ActionKind::Stop),
+            "the stop is one of them"
+        );
+    }
+
+    /// Several runs at once means results arrive while the user is reading
+    /// something else. A finished background run reports; it does not grab
+    /// the screen the user chose.
+    #[test]
+    fn a_background_run_finishing_never_moves_the_user() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::Logs;
+        let finished = other_run(
+            details(RunStatus::Completed, WorkflowKind::Standard),
+            RunId::from_u128(8),
+        );
+
+        app.handle_worker_result(WorkerResult {
+            action: ActionKind::Start,
+            run_id: None,
+            result: Ok(WorkerSuccess::Execution(crate::app::ExecutionReport {
+                details: finished,
+                committed_events: Vec::new(),
+                outcome: crate::app::QuiescentState::Completed,
+            })),
+        });
+
+        assert_eq!(
+            app.state.screen,
+            Screen::Logs,
+            "the user stays where it was"
+        );
+        // The fixture store holds no runs, so the refresh that follows every
+        // result clears the selection here. What matters is that the finished
+        // run did not take it.
+        assert_ne!(
+            app.state.selected_run,
+            Some(RunId::from_u128(8)),
+            "a background run never selects itself"
+        );
+        let message = app.state.message.as_ref().expect("but it is announced");
+        assert!(
+            message.text.contains(&RunId::from_u128(8).to_string()),
+            "the announcement says which run finished: {:?}",
+            message.text
+        );
+    }
+
+    /// The run on screen is the one the user is waiting on, so its result
+    /// still opens by itself.
+    #[test]
+    fn the_selected_run_finishing_still_opens_its_result() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::Runs;
+
+        app.handle_worker_result(WorkerResult {
+            action: ActionKind::Resume,
+            run_id: Some(RunId::from_u128(7)),
+            result: Ok(WorkerSuccess::Execution(crate::app::ExecutionReport {
+                details: details(RunStatus::Completed, WorkflowKind::Standard),
+                committed_events: Vec::new(),
+                outcome: crate::app::QuiescentState::Completed,
+            })),
+        });
+
+        assert_eq!(app.state.screen, Screen::RunDetail);
+        assert_eq!(
+            app.state.quiescent,
+            Some(crate::app::QuiescentState::Completed)
+        );
+        assert!(
+            app.state.in_flight.is_empty(),
+            "the finished action stopped holding its run"
+        );
+    }
+
+    /// One label reads as itself; several would crowd out the run identity
+    /// the header exists to show, so they are counted instead.
+    #[test]
+    fn the_header_names_one_action_and_counts_more() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        assert_eq!(app.state.busy_label(), None, "nothing to say when idle");
+
+        assert!(app.dispatch(WorkerCommand::ResumeRun {
+            run_id: RunId::from_u128(7)
+        }));
+        assert_eq!(app.state.busy_label().as_deref(), Some("resuming run"));
+
+        assert!(app.dispatch(WorkerCommand::ResumeRun {
+            run_id: RunId::from_u128(8)
+        }));
+        assert_eq!(
+            app.state.busy_label().as_deref(),
+            Some("2 actions in flight")
+        );
+    }
+
     #[test]
     fn quit_still_detaches_without_stopping_the_run() {
         let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
         app.handle_intent(Intent::Quit);
         assert!(app.state.quit, "q still leaves the frontend");
         assert!(
-            app.state.worker_busy.is_none(),
+            app.state.in_flight.is_empty(),
             "detaching never interrupts the run"
         );
     }

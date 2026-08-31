@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::{ApplyOutcome, ExecutionReport, ExecutionSelection, ProviderFactory, RunService};
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
@@ -27,6 +28,19 @@ impl ActionKind {
             Self::ResolveAttention => "resolving attention",
             Self::Apply => "applying changes",
             Self::Discard => "discarding run",
+        }
+    }
+
+    /// Whether this action puts an agent to work.
+    ///
+    /// The ones that do each hold a managed worktree, a terminal session and a
+    /// provider process for as long as they run, so they are the actions worth
+    /// counting against a ceiling. Stopping, applying and discarding touch
+    /// only the store and the checkout, and cost nothing to have several of.
+    pub(crate) const fn drives_a_provider(self) -> bool {
+        match self {
+            Self::Start | Self::Resume | Self::Retry | Self::Fix | Self::ResolveAttention => true,
+            Self::Stop | Self::Apply | Self::Discard => false,
         }
     }
 }
@@ -115,56 +129,108 @@ pub(crate) struct WorkerResult {
     pub result: Result<WorkerSuccess, String>,
 }
 
+/// Starts one command, given somewhere to report its outcome.
+type Start = Box<dyn Fn(WorkerCommand, Sender<WorkerResult>)>;
+
 pub(crate) struct Worker {
-    sender: Sender<WorkerCommand>,
+    /// Starts one command on a thread of its own. Boxed so `Worker` carries
+    /// none of the service's provider-factory type parameter.
+    start: Start,
+    /// Held for the life of the interface so the result channel can never
+    /// disconnect: every action reports into a receiver that still exists.
+    results: Sender<WorkerResult>,
     receiver: Receiver<WorkerResult>,
+}
+
+/// Guarantees the interface hears back about every command it started.
+///
+/// A thread that panicked would otherwise never report, and the action it was
+/// running would stay in flight for the rest of the session — holding its run
+/// against every later action and lighting the header for work nobody is
+/// doing. Reporting from `Drop` closes that gap: the outcome is sent exactly
+/// once, whether the action returned or unwound.
+struct Report {
+    action: ActionKind,
+    run_id: Option<RunId>,
+    results: Sender<WorkerResult>,
+    reported: bool,
+}
+
+impl Report {
+    const fn new(action: ActionKind, run_id: Option<RunId>, results: Sender<WorkerResult>) -> Self {
+        Self {
+            action,
+            run_id,
+            results,
+            reported: false,
+        }
+    }
+
+    fn settle(&mut self, result: Result<WorkerSuccess, String>) {
+        self.reported = true;
+        self.send(result);
+    }
+
+    fn send(&self, result: Result<WorkerSuccess, String>) {
+        // A closed receiver means the interface is already gone, and there is
+        // nobody left to tell.
+        let _ = self.results.send(WorkerResult {
+            action: self.action,
+            run_id: self.run_id,
+            result,
+        });
+    }
+}
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        if !self.reported {
+            self.send(Err("the action ended unexpectedly".to_owned()));
+        }
+    }
 }
 
 impl Worker {
     pub(crate) fn spawn<F>(service: RunService<F>) -> Self
     where
-        F: ProviderFactory + Send + 'static,
+        F: ProviderFactory + Send + Sync + 'static,
         F::Provider: Send + 'static,
     {
-        let (command_sender, command_receiver) = mpsc::channel::<WorkerCommand>();
-        let (result_sender, result_receiver) = mpsc::channel::<WorkerResult>();
-        std::thread::spawn(move || {
-            while let Ok(command) = command_receiver.recv() {
-                let action = command.kind();
-                let run_id = command.run_id();
-                let result = execute(&service, command).map_err(|error| error.to_string());
-                if result_sender
-                    .send(WorkerResult {
-                        action,
-                        run_id,
-                        result,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
+        // Shared rather than owned by one thread: every action gets the same
+        // service, and they no longer take turns holding it.
+        let service = Arc::new(service);
+        let (results, receiver) = mpsc::channel::<WorkerResult>();
+        let start: Start = Box::new(move |command, results| {
+            let service = Arc::clone(&service);
+            std::thread::spawn(move || {
+                let mut report = Report::new(command.kind(), command.run_id(), results);
+                let outcome = execute(&service, command).map_err(|error| error.to_string());
+                report.settle(outcome);
+            });
         });
         Self {
-            sender: command_sender,
-            receiver: result_receiver,
+            start,
+            results,
+            receiver,
         }
     }
 
-    pub(crate) fn send(&self, command: WorkerCommand) -> Result<(), String> {
-        self.sender
-            .send(command)
-            .map_err(|_| "application action worker is unavailable".to_owned())
+    /// Sets one action going on its own thread.
+    ///
+    /// Actions run concurrently by construction. Which of them may overlap is
+    /// the caller's judgement, not this one's: the worker starts what it is
+    /// handed and nothing here queues behind anything else.
+    pub(crate) fn send(&self, command: WorkerCommand) {
+        (self.start)(command, self.results.clone());
     }
 
-    pub(crate) fn try_recv(&self) -> Result<Option<WorkerResult>, String> {
-        match self.receiver.try_recv() {
-            Ok(result) => Ok(Some(result)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => {
-                Err("application action worker disconnected".to_owned())
-            }
-        }
+    /// Takes the next action that has finished, if one has reported back.
+    ///
+    /// Never fails: the sender lives in this struct, so the channel cannot
+    /// disconnect while the worker is alive, and the only other outcome is an
+    /// empty queue.
+    pub(crate) fn try_recv(&self) -> Option<WorkerResult> {
+        self.receiver.try_recv().ok()
     }
 }
 
@@ -239,19 +305,17 @@ mod tests {
             fixture.path().join("worktrees"),
             DevelopmentFakeProviderFactory,
         ));
-        worker
-            .send(WorkerCommand::StartRun {
-                workflow: WorkflowKind::Standard,
-                task: "worker integration".to_owned(),
-                repository: repo,
-                selection: ExecutionSelection::Uniform(UniformProvider::Fake),
-                effort: EffortSetting::NativeDefault,
-            })
-            .unwrap();
+        worker.send(WorkerCommand::StartRun {
+            workflow: WorkflowKind::Standard,
+            task: "worker integration".to_owned(),
+            repository: repo,
+            selection: ExecutionSelection::Uniform(UniformProvider::Fake),
+            effort: EffortSetting::NativeDefault,
+        });
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = loop {
-            if let Some(result) = worker.try_recv().unwrap() {
+            if let Some(result) = worker.try_recv() {
                 break result;
             }
             assert!(Instant::now() < deadline, "worker result timed out");
@@ -270,18 +334,16 @@ mod tests {
             fixture.path().join("worktrees"),
             DevelopmentFakeProviderFactory,
         ));
-        worker
-            .send(WorkerCommand::StartRun {
-                workflow: WorkflowKind::Fast,
-                task: "invalid repository".to_owned(),
-                repository: fixture.path().join("missing"),
-                selection: ExecutionSelection::Uniform(UniformProvider::Fake),
-                effort: EffortSetting::NativeDefault,
-            })
-            .unwrap();
+        worker.send(WorkerCommand::StartRun {
+            workflow: WorkflowKind::Fast,
+            task: "invalid repository".to_owned(),
+            repository: fixture.path().join("missing"),
+            selection: ExecutionSelection::Uniform(UniformProvider::Fake),
+            effort: EffortSetting::NativeDefault,
+        });
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Some(result) = worker.try_recv().unwrap() {
+            if let Some(result) = worker.try_recv() {
                 assert!(
                     result
                         .result
@@ -291,6 +353,53 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "worker error timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// An action whose thread dies without reporting would otherwise hold its
+    /// run against every later action, with nothing left running to release
+    /// it. The guard reports the failure on the dying thread's behalf.
+    #[test]
+    fn an_action_that_never_reports_still_settles() {
+        let (results, receiver) = mpsc::channel();
+        let run_id = Some(RunId::from_u128(3));
+        drop(Report::new(ActionKind::Apply, run_id, results));
+
+        let result = receiver.try_recv().expect("the guard reported for it");
+        assert_eq!(result.action, ActionKind::Apply);
+        assert_eq!(result.run_id, run_id, "settling the run it was holding");
+        assert!(result.result.is_err(), "and says it did not succeed");
+    }
+
+    /// Two actions dispatched together both report: nothing queues behind
+    /// anything else, and no result is lost to the other one running.
+    #[test]
+    fn two_actions_started_together_both_report_back() {
+        let fixture = TempDir::new().unwrap();
+        let worker = Worker::spawn(RunService::new(
+            fixture.path().join("polycode.db"),
+            fixture.path().join("worktrees"),
+            DevelopmentFakeProviderFactory,
+        ));
+        for task in ["first", "second"] {
+            worker.send(WorkerCommand::StartRun {
+                workflow: WorkflowKind::Fast,
+                task: task.to_owned(),
+                repository: fixture.path().join("missing"),
+                selection: ExecutionSelection::Uniform(UniformProvider::Fake),
+                effort: EffortSetting::NativeDefault,
+            });
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reported = 0;
+        while reported < 2 {
+            if worker.try_recv().is_some() {
+                reported += 1;
+                continue;
+            }
+            assert!(Instant::now() < deadline, "only {reported} of 2 reported");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
