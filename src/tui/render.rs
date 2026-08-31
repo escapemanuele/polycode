@@ -98,14 +98,17 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
-/// Run identity for the header: workflow and repository first, then the
-/// canonical run state and its wall-clock elapsed. Narrow terminals keep the
-/// state and drop the identity.
+/// Run identity for the header: the run id itself first — the handle every
+/// CLI command takes — then workflow and repository, then the canonical run
+/// state and its wall-clock elapsed. Narrow terminals keep the state and drop
+/// the identity.
 fn header_identity(details: &RunDetails, width: u16) -> Vec<Span<'static>> {
     let now: DateTime<Utc> = std::time::SystemTime::now().into();
     let mut spans = Vec::new();
     if width >= HEADER_IDENTITY_WIDTH {
-        let mut identity = enum_text(details.workflow);
+        let mut identity = details.id.to_string();
+        identity.push_str(" · ");
+        identity.push_str(&enum_text(details.workflow));
         if let Some(path) = details.repository.as_deref() {
             identity.push_str(" · ");
             identity.push_str(&format::repository_name(path));
@@ -2287,6 +2290,12 @@ mod tests {
         assert!(
             !text.contains("/Users/e/Code/wp-calypso-2"),
             "the full path stays in technical mode"
+        );
+        // The run id is the handle every CLI command takes, so entering a run
+        // shows it without hunting for technical mode.
+        assert!(
+            text.contains(&RunId::from_u128(3).to_string()),
+            "header names the run id"
         );
         // Narrow terminals keep the state and drop the identity.
         let narrow = render_text(&running_state(), 70, 24);
