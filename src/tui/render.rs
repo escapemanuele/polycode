@@ -489,7 +489,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
     } else {
         theme::section("RESULT")
     });
-    lines.extend(result_lines(state, selected));
+    lines.extend(result_lines(state, selected, width));
     lines.push(Line::from(""));
     lines.push(theme::section("RESOURCES"));
     lines.extend(
@@ -632,17 +632,26 @@ fn runtime_summary(stage: &StageSummary) -> String {
     }
 }
 
-fn result_lines(state: &TuiState, selected: &StageSummary) -> Vec<Line<'static>> {
+/// How much of the artifact's opening line the panel quotes: two wrapped
+/// rows. Past that the line stops being a glance and starts being reading,
+/// which is what opening the artifact is for.
+const HEADLINE_ROWS: usize = 2;
+
+fn result_lines(state: &TuiState, selected: &StageSummary, width: u16) -> Vec<Line<'static>> {
     if state.stages_with_artifacts.contains(&selected.id) {
-        return vec![
-            Line::from(Span::styled(
-                "✓ Verified artifact available",
-                Style::default()
-                    .fg(theme::success())
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(theme::action("Enter/o", "Open result", theme::success())),
-        ];
+        let mut lines = vec![Line::from(Span::styled(
+            "✓ Verified artifact available",
+            Style::default()
+                .fg(theme::success())
+                .add_modifier(Modifier::BOLD),
+        ))];
+        lines.extend(headline_lines(state, selected, width));
+        lines.push(Line::from(theme::action(
+            "Enter/o",
+            "Open result",
+            theme::success(),
+        )));
+        return lines;
     }
     // Expected absence stays informational; only a completed stage without an
     // artifact is a real problem, and opening it reports that as an error.
@@ -653,6 +662,33 @@ fn result_lines(state: &TuiState, selected: &StageSummary) -> Vec<Line<'static>>
         _ => "No verified artifact",
     };
     vec![Line::from(Span::styled(text, theme::muted()))]
+}
+
+/// The artifact's opening line, quoted. Never a summary this panel wrote:
+/// the words are the agent's, either from the `## Bottom line` the stage
+/// contract asks for, or — for an artifact that predates the contract or
+/// ignored it — from its first paragraph, which reads as the excerpt it is.
+fn headline_lines(state: &TuiState, selected: &StageSummary, width: u16) -> Vec<Line<'static>> {
+    let Some(headline) = state
+        .headline
+        .as_ref()
+        .filter(|headline| headline.stage_id == selected.id)
+    else {
+        return Vec::new();
+    };
+    let Some(quoted) = headline.text.as_ref() else {
+        return Vec::new();
+    };
+    let budget = (width as usize).max(24) * HEADLINE_ROWS;
+    let style = if headline.contracted {
+        theme::text()
+    } else {
+        theme::muted().add_modifier(Modifier::ITALIC)
+    };
+    vec![Line::from(Span::styled(
+        format::truncate_title(quoted, budget),
+        style,
+    ))]
 }
 
 /// Provider-native units in human words, one line per runtime that reported
@@ -1731,6 +1767,7 @@ mod tests {
     use super::*;
     use crate::app::{RouteSummary, RunListItem, StageSummary, UsageSummary};
     use crate::domain::{EffortSetting, Role, RunId, StageId, StageKind, WorkflowKind};
+    use crate::tui::state::StageHeadline;
 
     const POD_SHELL: &str = "▄██████████▄";
 
@@ -2388,6 +2425,72 @@ mod tests {
         let text = render_text(&completed, 160, 40);
         assert!(text.contains("✓ Verified artifact available"));
         assert!(text.contains("[Enter/o] Open result"));
+    }
+
+    /// The panel quotes the artifact of the stage the operator is looking at,
+    /// and of no other. A headline outlives a keypress; the selection it was
+    /// read for does not.
+    #[test]
+    fn the_result_section_quotes_the_selected_stage_and_only_that_one() {
+        let mut state = completed_state();
+        let implementation = StageId::new("implementation").unwrap();
+        state.stages_with_artifacts.insert(implementation.clone());
+        state.headline = Some(StageHeadline {
+            stage_id: implementation,
+            attempt: 1,
+            content_size: 512,
+            text: Some("It does what the task asked, but the retry path is untested.".to_owned()),
+            contracted: true,
+        });
+
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("It does what the task asked, but the retry path is untested."));
+        assert!(
+            text.contains("[Enter/o] Open result"),
+            "the quote is a lead-in, not a replacement"
+        );
+
+        state.headline = state.headline.take().map(|headline| StageHeadline {
+            stage_id: StageId::new("research").unwrap(),
+            ..headline
+        });
+        let text = render_text(&state, 160, 40);
+        assert!(!text.contains("It does what the task asked"));
+        assert!(
+            text.contains("✓ Verified artifact available"),
+            "a stale quote hides itself without hiding the artifact"
+        );
+    }
+
+    /// A glance is two rows. An agent that ignored the word limit is cut off
+    /// with an ellipsis rather than pushing Resources off the panel.
+    #[test]
+    fn a_long_opening_line_is_cut_to_two_rows() {
+        let mut state = completed_state();
+        let implementation = StageId::new("implementation").unwrap();
+        state.stages_with_artifacts.insert(implementation.clone());
+        state.headline = Some(StageHeadline {
+            stage_id: implementation.clone(),
+            attempt: 1,
+            content_size: 4096,
+            text: Some("word ".repeat(400)),
+            contracted: false,
+        });
+        let selected = state.details.as_ref().unwrap().stages[0].clone();
+
+        let lines = headline_lines(&state, &selected, 40);
+        let quoted: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(quoted.ends_with('…'), "the cut is visible");
+        assert!(
+            quoted.chars().count() <= 40 * HEADLINE_ROWS + 1,
+            "two rows at most: {}",
+            quoted.chars().count()
+        );
     }
 
     #[test]
