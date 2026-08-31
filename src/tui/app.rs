@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use crate::app::{AppError, ArtifactSummary, RunService, RuntimeProviderFactory};
-use crate::domain::{StageId, StageStatus};
+use crate::app::{AppError, ArtifactSummary, RunListItem, RunService, RuntimeProviderFactory};
+use crate::domain::{RunId, RunStatus, StageId, StageStatus};
 use crate::update::{InstallSource, UpdateInfo};
 
 use super::bottom_line;
@@ -40,6 +40,10 @@ pub(crate) struct TuiApp {
     /// so POD's breathing is tied to the session rather than to whichever
     /// redraw happened to come first.
     started: Instant,
+    /// Runs the store said were `Running` on this session's first refresh.
+    /// Their drivers died with the instance that started them, so this one
+    /// resumes each of them; `None` until that first look is taken.
+    orphaned: Option<Vec<RunId>>,
 }
 
 impl TuiApp {
@@ -56,6 +60,7 @@ impl TuiApp {
                 .checked_sub(REFRESH_INTERVAL)
                 .unwrap_or_else(Instant::now),
             started: Instant::now(),
+            orphaned: None,
         })
     }
 
@@ -512,6 +517,56 @@ impl TuiApp {
         }
     }
 
+    /// Resumes runs a dead instance left behind.
+    ///
+    /// A running run normally has the action driving it in this process, and
+    /// nothing else ever reads its provider processes. A row that is already
+    /// `Running` on this session's first refresh therefore has no driver
+    /// anywhere — its instance died mid-run — and would sit "running" forever,
+    /// even after its processes finish. Resuming reconciles what those
+    /// processes wrote and drives the run on. Only runs from that first look
+    /// are ever swept: anything that turns `Running` later was started here.
+    /// Later sweeps retry an orphan the agent ceiling deferred, and drop one
+    /// that moved on without us — resolved from the CLI, or finished.
+    fn recover_orphaned_runs(&mut self, runs: &[RunListItem]) {
+        let pending = if let Some(pending) = self.orphaned.as_mut() {
+            pending.retain(|id| {
+                runs.iter()
+                    .any(|run| run.id == *id && run.status == RunStatus::Running)
+            });
+            pending.clone()
+        } else {
+            let found: Vec<RunId> = runs
+                .iter()
+                .filter(|run| run.status == RunStatus::Running)
+                .map(|run| run.id)
+                .collect();
+            self.orphaned = Some(found.clone());
+            found
+        };
+        let mut reconnected = 0_usize;
+        for run_id in pending {
+            let command = WorkerCommand::ResumeRun { run_id };
+            if self.state.action_refusal(&command).is_some() {
+                continue;
+            }
+            if let Some(pending) = self.orphaned.as_mut() {
+                pending.retain(|id| *id != run_id);
+            }
+            if self.dispatch(command) {
+                reconnected += 1;
+            }
+        }
+        // After the dispatches: starting an action clears the message line.
+        if reconnected > 0 {
+            let noun = if reconnected == 1 { "run" } else { "runs" };
+            self.state.notify(
+                UiMessageKind::Info,
+                format!("Resuming {reconnected} {noun} left running by a previous session"),
+            );
+        }
+    }
+
     fn open_attention(&mut self) {
         if self
             .state
@@ -686,6 +741,7 @@ impl TuiApp {
     fn refresh(&mut self) {
         match self.reader.list_runs() {
             Ok(runs) => {
+                self.recover_orphaned_runs(&runs);
                 let (visible, hidden_count) = if self.state.show_hidden {
                     (runs, 0)
                 } else {
@@ -977,6 +1033,7 @@ mod tests {
             installing: None,
             last_refresh: Instant::now(),
             started: Instant::now(),
+            orphaned: None,
         };
         (app, fixture)
     }
@@ -1270,6 +1327,7 @@ mod tests {
             installing: None,
             last_refresh: Instant::now(),
             started: Instant::now(),
+            orphaned: None,
         };
         assert!(app.state.run_is_applyable());
         app.handle_intent(Intent::Apply);
@@ -1727,5 +1785,89 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         );
         assert_eq!(map_text_key(key), Intent::Character('q'));
+    }
+
+    fn listed(id: u128, status: RunStatus) -> RunListItem {
+        RunListItem {
+            id: RunId::from_u128(id),
+            workflow: WorkflowKind::Standard,
+            status,
+            task_summary: "task".to_owned(),
+            repository: None,
+            updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            hidden: false,
+        }
+    }
+
+    fn holds_resume_for(app: &TuiApp, id: u128) -> bool {
+        app.state
+            .in_flight
+            .iter()
+            .any(|entry| entry.action == ActionKind::Resume && entry.run_id == Some(RunId::from_u128(id)))
+    }
+
+    #[test]
+    fn first_refresh_resumes_runs_left_running_by_a_dead_instance() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        let runs = vec![
+            listed(1, RunStatus::Running),
+            listed(2, RunStatus::Completed),
+            listed(3, RunStatus::Paused),
+        ];
+
+        app.recover_orphaned_runs(&runs);
+
+        assert!(holds_resume_for(&app, 1), "the orphan gets a driver");
+        assert!(!holds_resume_for(&app, 2), "finished runs are left alone");
+        assert!(!holds_resume_for(&app, 3), "paused is the user's decision");
+        assert!(
+            app.state
+                .message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("previous session")),
+            "the user hears why an agent started on its own"
+        );
+    }
+
+    #[test]
+    fn runs_turning_running_after_the_first_look_are_never_swept() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.recover_orphaned_runs(&[]);
+
+        // A run started by this session shows up Running on a later refresh
+        // while its own start action still has no run id to hold it with.
+        app.recover_orphaned_runs(&[listed(4, RunStatus::Running)]);
+
+        assert!(
+            !holds_resume_for(&app, 4),
+            "its driver lives here; a second one would race it"
+        );
+    }
+
+    #[test]
+    fn an_orphan_deferred_by_the_agent_ceiling_is_retried_until_it_starts() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        for _ in 0..CONCURRENT_AGENTS {
+            app.state.begin_action(ActionKind::Start, None);
+        }
+        let runs = vec![listed(5, RunStatus::Running)];
+
+        app.recover_orphaned_runs(&runs);
+        assert!(!holds_resume_for(&app, 5), "no capacity yet");
+
+        app.state.settle_action(ActionKind::Start, None);
+        app.recover_orphaned_runs(&runs);
+        assert!(holds_resume_for(&app, 5), "resumed once capacity frees up");
+
+        app.recover_orphaned_runs(&runs);
+        assert_eq!(
+            app.state
+                .in_flight
+                .iter()
+                .filter(|entry| entry.run_id == Some(RunId::from_u128(5)))
+                .count(),
+            1,
+            "an orphan is resumed exactly once"
+        );
     }
 }

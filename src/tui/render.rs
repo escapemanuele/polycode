@@ -1482,10 +1482,18 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
                 if let Some(label) = FixOffer::of(state).label() {
                     push("f", label, theme::attention());
                 }
+                // A running run normally has its driver in this process and
+                // needs no key; one nobody holds was left behind by a dead
+                // instance, and resume is how it gets a driver again.
+                let orphaned = run_status == Some(RunStatus::Running)
+                    && state
+                        .selected_run
+                        .is_some_and(|run_id| !state.run_is_held(run_id));
                 if matches!(
                     run_status,
                     Some(RunStatus::Paused | RunStatus::Interrupted | RunStatus::Ready)
-                ) {
+                ) || orphaned
+                {
                     push("r", "Resume", theme::attention());
                 }
                 if state.run_is_stoppable() {
@@ -2668,9 +2676,18 @@ mod tests {
     }
 
     #[test]
-    fn footer_offers_resume_only_for_a_suspended_run() {
-        let running = running_state();
-        assert!(!actions_text(&running).contains("[r] Resume"));
+    fn footer_offers_resume_for_suspended_and_orphaned_runs() {
+        // Running with nobody driving it: left behind by a dead instance.
+        let orphaned = running_state();
+        assert!(actions_text(&orphaned).contains("[r] Resume"));
+
+        // Running with its driver in flight needs no second one.
+        let mut driven = running_state();
+        driven.begin_action(
+            crate::tui::worker::ActionKind::Resume,
+            driven.selected_run,
+        );
+        assert!(!actions_text(&driven).contains("[r] Resume"));
 
         let mut paused = running_state();
         paused.details.as_mut().unwrap().status = RunStatus::Paused;

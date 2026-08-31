@@ -679,6 +679,18 @@ impl TuiState {
         None
     }
 
+    /// Whether some in-flight action currently holds this run.
+    ///
+    /// A start in flight has no run id until it reports back, so while one is
+    /// running any run may be the one it is bringing up; those are treated as
+    /// held rather than offered a second driver.
+    pub(crate) fn run_is_held(&self, run_id: RunId) -> bool {
+        self.in_flight.iter().any(|entry| {
+            entry.run_id == Some(run_id)
+                || (entry.action == ActionKind::Start && entry.run_id.is_none())
+        })
+    }
+
     /// How many in-flight actions currently have an agent working.
     pub(crate) fn agents_at_work(&self) -> usize {
         self.in_flight
