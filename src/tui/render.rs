@@ -394,7 +394,7 @@ fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
             },
         ),
         RunStatus::NeedsUser => "Waiting on you to resolve a request.".to_owned(),
-        RunStatus::Completed => "Run complete — the result is ready to review.".to_owned(),
+        RunStatus::Completed => completed_sentence(details),
         RunStatus::Applied => "Changes applied to the repository.".to_owned(),
         RunStatus::Discarded => "Run discarded.".to_owned(),
         RunStatus::Failed => details
@@ -417,10 +417,53 @@ fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
         .iter()
         .filter(|stage| stage.status == StageStatus::Completed)
         .count();
+    let failed = failed_stage_titles(details).len();
     vec![
         first,
-        format!("{completed} of {} stages complete.", details.stages.len()),
+        if failed == 0 {
+            format!("{completed} of {} stages complete.", details.stages.len())
+        } else {
+            format!(
+                "{completed} of {} stages complete, {failed} failed.",
+                details.stages.len()
+            )
+        },
     ]
+}
+
+/// The titles of every failed stage, in workflow order.
+fn failed_stage_titles(details: &RunDetails) -> Vec<&'static str> {
+    details
+        .stages
+        .iter()
+        .filter(|stage| stage.status == StageStatus::Failed)
+        .map(|stage| stage_title(stage.kind))
+        .collect()
+}
+
+/// A run can complete with an optional stage failed on the way — the
+/// workflow allows it, and the decision may well have ruled over the gap.
+/// Saying only "run complete" would hide that, so the sentence names the
+/// failure and the fact that the decision still concluded. What the decision
+/// *ruled* stays out of it: the verdict is prose the result panel quotes
+/// from the decision's own artifact, never something this strip restates.
+fn completed_sentence(details: &RunDetails) -> String {
+    let failed = failed_stage_titles(details);
+    if failed.is_empty() {
+        return "Run complete — the result is ready to review.".to_owned();
+    }
+    let failed = failed.join(" and ");
+    let decided = details
+        .stages
+        .iter()
+        .any(|stage| stage.kind == StageKind::Decision && stage.status == StageStatus::Completed);
+    if decided {
+        format!(
+            "Run complete — {failed} failed, but the decision was still reached. Its verdict is ready to review."
+        )
+    } else {
+        format!("Run complete — the result is ready to review, though {failed} failed on the way.")
+    }
 }
 
 /// Left rail: the run's task and its stages in workflow order with their
@@ -701,12 +744,24 @@ fn completed_hero(details: &RunDetails, width: u16, now: DateTime<Utc>) -> Vec<L
             )],
             width,
         ),
-        Line::from(Span::styled(
-            format!("✓ {completed} of {} stages completed", details.stages.len()),
-            Style::default()
-                .fg(theme::success())
-                .add_modifier(Modifier::BOLD),
-        )),
+        Line::from({
+            let mut spans = vec![Span::styled(
+                format!("✓ {completed} of {} stages completed", details.stages.len()),
+                Style::default()
+                    .fg(theme::success())
+                    .add_modifier(Modifier::BOLD),
+            )];
+            let failed = failed_stage_titles(details);
+            if !failed.is_empty() {
+                spans.push(Span::styled(
+                    format!(" · {} failed", failed.join(" and ")),
+                    Style::default()
+                        .fg(theme::danger())
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans
+        }),
     ]
 }
 
@@ -2278,6 +2333,55 @@ mod tests {
         state
     }
 
+    /// The review workflow's real shape when an optional review fails and
+    /// the run still completes: the decision ruled over the gap.
+    fn completed_with_failure_details() -> RunDetails {
+        let stages = vec![
+            stage(
+                "research",
+                StageKind::Research,
+                Role::Researcher,
+                StageStatus::Completed,
+            ),
+            stage(
+                "quality_review",
+                StageKind::CodeQualityReview,
+                Role::CodeQualityReviewer,
+                StageStatus::Completed,
+            ),
+            stage(
+                "spec_review",
+                StageKind::SpecReview,
+                Role::SpecReviewer,
+                StageStatus::Failed,
+            ),
+            stage(
+                "synthesis",
+                StageKind::Synthesis,
+                Role::EngineeringLead,
+                StageStatus::Completed,
+            ),
+            stage(
+                "decision",
+                StageKind::Decision,
+                Role::EngineeringLead,
+                StageStatus::Completed,
+            ),
+        ];
+        let mut run = details(RunStatus::Completed, stages);
+        run.started_at = Some(at(12, 0, 0));
+        run.finished_at = Some(at(12, 12, 48));
+        run
+    }
+
+    fn completed_with_failure_state() -> TuiState {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.screen = Screen::RunDetail;
+        state.selected_run = Some(RunId::from_u128(3));
+        state.replace_details(completed_with_failure_details());
+        state
+    }
+
     #[test]
     fn empty_runs_and_small_terminal_render_without_panicking() {
         let state = TuiState::new(std::path::Path::new("/repo"));
@@ -3180,6 +3284,31 @@ mod tests {
 
         // A rail too short for the strip spends its rows on the stages.
         assert!(!render_text(&running_state(), 70, 15).contains("STATUS"));
+    }
+
+    /// A workflow may complete over an optional stage's failure — the
+    /// decision ruled with one review missing. "Run complete" alone would
+    /// hide that, so every completed surface names the failure: the strip's
+    /// sentence, its stage count, and the hero's tally. What the decision
+    /// ruled stays a quote from its own artifact, never this strip's claim.
+    #[test]
+    fn a_run_completed_over_a_failure_says_so_everywhere_it_counts() {
+        // The sentences are asserted at the seam — the rendered rail wraps
+        // long lines, so `contains` on the screen text cannot see them whole.
+        let sentences = status_sentences(&completed_with_failure_details(), at(12, 13, 0));
+        assert_eq!(
+            sentences[0],
+            "Run complete — Spec review failed, but the decision was still reached. \
+             Its verdict is ready to review."
+        );
+        assert_eq!(sentences[1], "4 of 5 stages complete, 1 failed.");
+
+        let text = render_text(&completed_with_failure_state(), 160, 40);
+        assert!(text.contains("✓ 4 of 5 stages completed · Spec review failed"));
+        assert!(
+            !text.contains("the result is ready to review."),
+            "the plain sentence would hide the failure"
+        );
     }
 
     /// A completed stage's badge already reads COMPLETED; the hero does not
