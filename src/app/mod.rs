@@ -22,6 +22,6 @@ pub use routing::{
     RECOMMENDED_PROFILE_VERSION, RECOMMENDED_PROFILE_VERSION_V1,
     RECOMMENDED_V2_EVIDENCE_FINGERPRINT, RECOMMENDED_V2_EVIDENCE_SUITE, RecommendedAvailability,
     RecommendedDecision, RecommendedProvenance, ResourcePlan, RoleRoute, RoutingError, RoutingPlan,
-    UniformProvider, recommended_provenance,
+    UniformProvider, recommended_provenance, unroutable_fix_role,
 };
 pub use run_service::{ApplyOutcome, ExecutionReport, QuiescentState, RunService};

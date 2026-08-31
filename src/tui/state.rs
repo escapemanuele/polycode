@@ -360,12 +360,33 @@ impl StageHeadline {
     }
 }
 
-/// Whether a run's workflow reaches a verdict a fix could answer.
-fn has_decision(details: &RunDetails) -> bool {
-    details
+/// Whether this run could actually carry out a fix: it reaches a verdict for
+/// one to answer, and its sealed configuration can route the stages one adds.
+///
+/// The second half matters because configuration is written once, at creation.
+/// A run created before fix-cycle routing existed has no route for the role
+/// that would do the fixing, and offering a key that can only fail — after it
+/// has already appended the stages — is worse than not offering it.
+///
+/// The roles come from [`fix_cycle_stages`] itself rather than being named
+/// here, so this cannot drift from what a fix cycle is actually made of.
+fn can_be_fixed(details: &RunDetails) -> bool {
+    let Some(decision) = details
         .stages
         .iter()
-        .any(|stage| stage.kind == crate::domain::StageKind::Decision)
+        .rev()
+        .find(|stage| stage.kind == crate::domain::StageKind::Decision)
+    else {
+        return false;
+    };
+    crate::domain::fix_cycle_stages(1, &decision.id)
+        .iter()
+        .all(|added| {
+            details
+                .routes
+                .iter()
+                .any(|route| route.role == added.role())
+        })
 }
 
 #[derive(Debug)]
@@ -735,7 +756,7 @@ impl TuiState {
     /// the branch apply will later want.
     pub(crate) fn run_can_be_fixed(&self) -> bool {
         self.details.as_ref().is_some_and(|details| {
-            details.status == crate::domain::RunStatus::Completed && has_decision(details)
+            details.status == crate::domain::RunStatus::Completed && can_be_fixed(details)
         })
     }
 
@@ -749,7 +770,7 @@ impl TuiState {
             matches!(
                 details.status,
                 crate::domain::RunStatus::Running | crate::domain::RunStatus::NeedsUser
-            ) && has_decision(details)
+            ) && can_be_fixed(details)
         })
     }
 

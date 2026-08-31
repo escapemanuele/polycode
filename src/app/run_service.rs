@@ -295,6 +295,16 @@ where
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
         self.reconcile(&mut store, run_id)?;
+        // Ask before committing to anything. Requesting a fix appends stages
+        // and gives the workspace a branch, and a configuration sealed before
+        // fix-cycle routing existed cannot execute those stages — nor can the
+        // run be read afterwards, because reading it resolves its routes.
+        let loaded = store.load_run(run_id)?;
+        if let Some(role) =
+            crate::app::unroutable_fix_role(&loaded.config_snapshot, loaded.run.workflow())?
+        {
+            return Err(AppError::UnroutableFixCycle { run_id, role });
+        }
         // A review's workspace is detached, because a review is not meant to
         // produce changes. This is the request that changes that, so the
         // workspace earns its branch here rather than leaving the fix to write

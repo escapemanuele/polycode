@@ -958,7 +958,17 @@ mod tests {
             base_commit: Some("abc1234".to_owned()),
             profile: "recommended".to_owned(),
             profile_version: "recommended_v2".to_owned(),
-            routes: Vec::new(),
+            // A run can only be fixed if its configuration routes the roles a
+            // fix adds, so the fixture carries those routes.
+            routes: [Role::Implementer, Role::EngineeringLead]
+                .into_iter()
+                .map(|role| crate::app::RouteSummary {
+                    role,
+                    configured_provider: "codex".to_owned(),
+                    configured_model: None,
+                    reason: "test".to_owned(),
+                })
+                .collect(),
             revision: crate::store::RunRevision::initial(),
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
             updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
@@ -998,6 +1008,15 @@ mod tests {
         details
     }
 
+    /// The same run as configuration sealed before fix-cycle routing wrote it:
+    /// a verdict to answer, and no route for the role that would answer it.
+    fn unroutable(mut details: RunDetails) -> RunDetails {
+        details
+            .routes
+            .retain(|route| route.role != Role::Implementer);
+        details
+    }
+
     /// "Fix it" answers a decision, so it is offered exactly where one exists
     /// and the run has finished reaching it.
     #[test]
@@ -1029,6 +1048,10 @@ mod tests {
             (
                 "no decision stage to answer",
                 details(RunStatus::Completed, WorkflowKind::Fast),
+            ),
+            (
+                "configuration sealed before fix-cycle routing",
+                unroutable(decided(details(RunStatus::Completed, WorkflowKind::Review))),
             ),
         ] {
             let (mut app, _fixture) = app_with(run);

@@ -55,6 +55,14 @@ pub enum AppError {
         "run {0} cannot be resumed because its execution configuration predates the executable schema"
     )]
     LegacyExecutionConfig(RunId),
+    #[error(
+        "run {run_id} cannot be fixed: its execution configuration was sealed before \
+fix-cycle routing existed and has no route for {role:?}. Start a new run to act on this one's findings."
+    )]
+    UnroutableFixCycle {
+        run_id: RunId,
+        role: crate::domain::Role,
+    },
     #[error("run {0} was discarded and cannot continue")]
     DiscardedRun(RunId),
     #[error("run {run_id} stage {stage_id} has no verified artifact")]

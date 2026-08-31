@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::domain::{
-    ConfigSnapshotId, EffortSetting, ModelId, ProviderId, Role, WorkflowDefinition,
+    ConfigSnapshotId, EffortSetting, ModelId, ProviderId, Role, StageDefinition, StageKind,
+    WorkflowDefinition, fix_cycle_stages,
 };
 use crate::store::ResolvedConfigSnapshot;
 
@@ -488,7 +489,7 @@ pub fn resolve_config(
     id: ConfigSnapshotId,
     created_at: DateTime<Utc>,
 ) -> Result<ResolvedConfigSnapshot, RoutingError> {
-    let roles = required_roles(workflow);
+    let roles = routable_roles(workflow);
     let (profile, profile_version, routes) = match selection {
         ExecutionSelection::Uniform(provider) => {
             let routes = roles
@@ -670,6 +671,66 @@ fn required_roles(workflow: &WorkflowDefinition) -> HashSet<Role> {
         .iter()
         .map(crate::domain::StageDefinition::role)
         .collect()
+}
+
+/// The roles a fix cycle would add to this workflow, if it can grow one.
+///
+/// Derived from [`fix_cycle_stages`] rather than named here, so the two cannot
+/// drift: whatever the cycle is made of is what has to be routable.
+fn fix_cycle_roles(workflow: &WorkflowDefinition) -> HashSet<Role> {
+    workflow
+        .stages()
+        .iter()
+        .rev()
+        .find(|stage| stage.kind() == StageKind::Decision)
+        .map(|decision| {
+            fix_cycle_stages(1, decision.id())
+                .iter()
+                .map(StageDefinition::role)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every role this run's configuration has to answer for, including the ones
+/// it does not use yet.
+///
+/// Configuration is sealed at creation and never re-resolved, but a completed
+/// run that reached a verdict can still grow a fix cycle, and those stages
+/// arrive long after the sealing. Resolving only the roles a workflow starts
+/// with left a review — the one workflow whose entire output is a list of
+/// things to fix — with no route for the role that would fix them.
+///
+/// Deliberately not what [`validate_required_routes`] checks. That question is
+/// about the stages a run actually has, and widening it would reject every
+/// configuration written before this one.
+fn routable_roles(workflow: &WorkflowDefinition) -> HashSet<Role> {
+    let mut roles = required_roles(workflow);
+    roles.extend(fix_cycle_roles(workflow));
+    roles
+}
+
+/// The first fix-cycle role this sealed configuration cannot route, if any.
+///
+/// Asked before a fix is committed rather than discovered while driving one.
+/// The request appends stages and gives the workspace a branch, so a run whose
+/// configuration predates fix-cycle routing would otherwise be left carrying
+/// stages nothing can execute — and unreadable, because reading a run resolves
+/// its routes.
+///
+/// # Errors
+/// Returns the decoding failures of [`RoutingPlan::from_snapshot`].
+pub fn unroutable_fix_role(
+    snapshot: &ResolvedConfigSnapshot,
+    workflow: &WorkflowDefinition,
+) -> Result<Option<Role>, RoutingError> {
+    let plan = RoutingPlan::from_snapshot(snapshot, workflow)?;
+    let mut missing = fix_cycle_roles(workflow)
+        .into_iter()
+        .filter(|role| plan.route(*role).is_none())
+        .collect::<Vec<_>>();
+    missing.sort_by_key(|role| format!("{role:?}"));
+    Ok(missing.into_iter().next())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1276,6 +1337,82 @@ mod tests {
         );
         assert_ne!(plain, modeled);
         assert_eq!(HashSet::from([plain, modeled]).len(), 2);
+    }
+
+    /// A review's stages never mention the Implementer, but a completed review
+    /// can be sent back to fix what it found — and configuration is sealed at
+    /// creation, so the route has to be there before anyone asks.
+    #[test]
+    fn a_review_is_configured_to_route_the_fix_it_may_later_be_asked_for() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        assert!(
+            !workflow
+                .stages()
+                .iter()
+                .any(|stage| stage.role() == Role::Implementer),
+            "no review stage implements anything; the route is for the cycle it can grow"
+        );
+
+        let snapshot = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("review-fixable").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            unroutable_fix_role(&snapshot, &workflow).unwrap(),
+            None,
+            "every role a fix cycle adds is routable"
+        );
+        let plan = RoutingPlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert!(plan.route(Role::Implementer).is_some());
+    }
+
+    /// Configurations written before fix-cycle routing carry no such route, and
+    /// they are never rewritten. Asking has to say so *before* a fix appends
+    /// stages the run could then never execute — or be read past.
+    #[test]
+    fn a_configuration_sealed_without_fix_routing_names_what_it_cannot_route() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Review);
+        let sealed = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::NativeDefault,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("legacy-review").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        // Exactly what a pre-fix-cycle snapshot looks like: the workflow's own
+        // roles and nothing more.
+        let mut payload = sealed.payload().clone();
+        let routes = payload
+            .get_mut("routes")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        routes.remove("implementer");
+        let legacy = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("legacy-review-trimmed").unwrap(),
+            sealed.schema_version(),
+            payload,
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            unroutable_fix_role(&legacy, &workflow).unwrap(),
+            Some(Role::Implementer)
+        );
     }
 
     #[test]
