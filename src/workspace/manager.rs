@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::domain::{EventId, EventMetadata, Run, RunId, RunStatus, RunTransition};
 use crate::git::{
     GitRepository, apply_patch, branch_exists, branch_tip, check_patch, create_worktree,
-    delete_owned_branch, generate_patch, generate_patch_preview, inspect_worktree, remove_worktree,
-    source_is_clean,
+    delete_owned_branch, detach_worktree, generate_patch, generate_patch_preview,
+    inspect_worktree, remove_worktree, source_is_clean, tree_is_clean,
 };
 use crate::store::{RunRevision, SqliteStore, worktree_root};
 
@@ -144,22 +144,97 @@ impl WorkspaceManager {
             .ok_or(WorkspaceError::WorkspaceMissing(run_id))?;
         match workspace.status() {
             WorkspaceStatus::Preparing => self.reconcile_preparing(store, workspace),
-            WorkspaceStatus::Ready => {
-                if let Err(error) = self.validate_source(&workspace) {
-                    return Self::break_workspace(store, workspace, error.to_string());
-                }
-                if !workspace.worktree_path().exists() {
-                    return Self::break_workspace(store, workspace, "ready worktree is missing");
-                }
-                if let Err(error) = self.validate_workspace(&workspace, false) {
-                    return Self::break_workspace(store, workspace, error.to_string());
-                }
-                Ok(ReconciliationOutcome::Unchanged(workspace))
-            }
+            WorkspaceStatus::Ready => match self.observe(&workspace) {
+                Ok(()) => Ok(ReconciliationOutcome::Unchanged(workspace)),
+                Err(reason) => Self::break_workspace(store, workspace, reason),
+            },
             WorkspaceStatus::Removing => self.finish_removal(store, workspace),
             WorkspaceStatus::Removed => Ok(ReconciliationOutcome::Unchanged(workspace)),
-            WorkspaceStatus::Broken => Ok(ReconciliationOutcome::Broken(workspace)),
+            WorkspaceStatus::Broken => self.reconcile_broken(store, workspace),
         }
+    }
+
+    /// Re-observes a workspace that persisted state calls usable, healing what
+    /// is safely healable before reporting anything wrong.
+    ///
+    /// Returns the reason the workspace is unusable, in the words that reach
+    /// the operator through `last_error`.
+    fn observe(&self, workspace: &RunWorkspace) -> Result<(), String> {
+        if let Err(error) = self.validate_source(workspace) {
+            return Err(error.to_string());
+        }
+        if !workspace.worktree_path().exists() {
+            return Err("ready worktree is missing".to_owned());
+        }
+        if let Err(error) = self.restore_detached_head(workspace) {
+            return Err(error.to_string());
+        }
+        self.validate_workspace(workspace, false)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Returns a detached worktree to its base commit after an agent moved HEAD.
+    ///
+    /// An agent told to review a pull request will reach for `gh pr checkout`,
+    /// and inside a worktree Polycode owns exclusively that is reasonable work,
+    /// not a loss of ownership — which the worktree's path and Git common
+    /// directory still prove, and which this does not touch. Treating the moved
+    /// HEAD as a mismatch broke the run permanently on the next reconcile, with
+    /// no route back that did not edit the store by hand.
+    ///
+    /// Uncommitted work is the one case this refuses to resolve alone.
+    /// Re-detaching would discard changes no event ever recorded, so a dirty
+    /// tree under a moved HEAD stays broken for an operator to judge.
+    fn restore_detached_head(&self, workspace: &RunWorkspace) -> Result<(), WorkspaceError> {
+        if workspace.mode() != WorkspaceMode::Detached {
+            return Ok(());
+        }
+        let identity = inspect_worktree(&self.git, workspace.worktree_path())?;
+        if identity.branch.is_none() && identity.head_commit == workspace.base_commit() {
+            return Ok(());
+        }
+        if !tree_is_clean(&self.git, workspace.worktree_path())? {
+            return Err(WorkspaceError::WorkspaceOwnershipMismatch {
+                run_id: workspace.run_id(),
+                reason: format!(
+                    "detached worktree carries uncommitted work at {}, away from base {}",
+                    identity.head_commit,
+                    workspace.base_commit()
+                ),
+            });
+        }
+        detach_worktree(
+            &self.git,
+            workspace.worktree_path(),
+            workspace.base_commit(),
+        )?;
+        Ok(())
+    }
+
+    /// Re-observes a broken workspace instead of treating the verdict as final.
+    ///
+    /// What breaks a workspace is usually a condition outside it — a source
+    /// checkout that moved, a worktree not yet on disk, an agent that walked
+    /// HEAD off its base — and once the condition is gone the run is
+    /// recoverable. Broken is what was observed, not a property the workspace
+    /// acquired, so it is observed again; a workspace that still fails stays
+    /// broken and reports the current reason rather than the original one.
+    fn reconcile_broken(
+        &self,
+        store: &mut SqliteStore,
+        mut workspace: RunWorkspace,
+    ) -> Result<ReconciliationOutcome, WorkspaceError> {
+        if let Err(reason) = self.observe(&workspace) {
+            if workspace.last_error() != Some(reason.as_str()) {
+                Self::persist_broken(store, &mut workspace, reason)?;
+            }
+            return Ok(ReconciliationOutcome::Broken(workspace));
+        }
+        let prior_revision = workspace.revision();
+        workspace.mark_ready(now());
+        store.update_workspace(&workspace, prior_revision)?;
+        Ok(ReconciliationOutcome::Ready(workspace))
     }
 
     /// Applies exact workspace delta to clean source checkout without staging or committing.
@@ -1518,6 +1593,108 @@ mod tests {
                 .load_workspace(branch_fixture.run_id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// An agent told to review a pull request reaches for `gh pr checkout`.
+    /// That is reasonable work inside a worktree Polycode owns exclusively,
+    /// and it used to end the run: the next reconcile read the branch as an
+    /// ownership mismatch and condemned a workspace nothing else could revive.
+    #[test]
+    fn a_review_worktree_that_walked_off_its_base_is_returned_to_it() {
+        let mut fixture = Fixture::new(WorkflowKind::Review);
+        let workspace = fixture.prepare();
+        let base = workspace.base_commit().to_owned();
+        git(&fixture.source, ["branch", "pull-request"]);
+        git(workspace.worktree_path(), ["checkout", "pull-request"]);
+
+        let outcome = fixture
+            .manager()
+            .reconcile(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert!(matches!(outcome, ReconciliationOutcome::Unchanged(_)));
+        assert_eq!(
+            fixture
+                .store
+                .load_workspace(fixture.run_id)
+                .unwrap()
+                .unwrap()
+                .status(),
+            WorkspaceStatus::Ready
+        );
+        assert_eq!(
+            git_text(workspace.worktree_path(), ["rev-parse", "HEAD"]),
+            base,
+            "the worktree is back on the commit the run was prepared from"
+        );
+        assert_eq!(
+            git_text(workspace.worktree_path(), ["rev-parse", "--abbrev-ref", "HEAD"]),
+            "HEAD",
+            "and detached again, the way a review workspace is owned"
+        );
+    }
+
+    /// Healing stops where evidence begins. Re-detaching a dirty tree would
+    /// destroy work no event ever recorded, so that stays an operator's call.
+    #[test]
+    fn uncommitted_work_under_a_moved_head_is_never_silently_discarded() {
+        let mut fixture = Fixture::new(WorkflowKind::Review);
+        let workspace = fixture.prepare();
+        git(&fixture.source, ["branch", "pull-request"]);
+        git(workspace.worktree_path(), ["checkout", "pull-request"]);
+        let stray = workspace.worktree_path().join("NOTES.md");
+        fs::write(&stray, "work nobody recorded\n").unwrap();
+
+        let outcome = fixture
+            .manager()
+            .reconcile(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert!(matches!(outcome, ReconciliationOutcome::Broken(_)));
+        assert_eq!(
+            fs::read_to_string(&stray).unwrap(),
+            "work nobody recorded\n",
+            "the run is refused, and the work survives the refusal"
+        );
+    }
+
+    /// Broken records what was observed, not something the workspace became.
+    /// Once the condition is gone the run is recoverable, and recovering it
+    /// must not require editing the store by hand.
+    #[test]
+    fn a_broken_workspace_is_observed_again_rather_than_condemned() {
+        let mut fixture = Fixture::new(WorkflowKind::Review);
+        let workspace = fixture.prepare();
+        git(&fixture.source, ["branch", "pull-request"]);
+        git(workspace.worktree_path(), ["checkout", "pull-request"]);
+        let stray = workspace.worktree_path().join("NOTES.md");
+        fs::write(&stray, "work nobody recorded\n").unwrap();
+        assert!(matches!(
+            fixture
+                .manager()
+                .reconcile(&mut fixture.store, fixture.run_id)
+                .unwrap(),
+            ReconciliationOutcome::Broken(_)
+        ));
+
+        fs::remove_file(&stray).unwrap();
+
+        let outcome = fixture
+            .manager()
+            .reconcile(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert!(matches!(outcome, ReconciliationOutcome::Ready(_)));
+        let healed = fixture
+            .store
+            .load_workspace(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(healed.status(), WorkspaceStatus::Ready);
+        assert!(
+            healed.last_error().is_none(),
+            "a recovered workspace stops reporting the failure it recovered from"
         );
     }
 

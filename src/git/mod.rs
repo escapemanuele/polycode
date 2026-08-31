@@ -14,9 +14,9 @@ pub(crate) use command::{Git, git_version};
 pub(crate) use patch::ChangeKind;
 pub(crate) use patch::{
     ChangedFileRecord, PatchPreview, apply_patch, check_patch, generate_change_evidence,
-    generate_patch, generate_patch_preview, source_is_clean,
+    generate_patch, generate_patch_preview, source_is_clean, tree_is_clean,
 };
 pub(crate) use worktree::{
     WorktreeIdentity, branch_exists, branch_tip, create_worktree, delete_owned_branch,
-    inspect_worktree, remove_worktree,
+    detach_worktree, inspect_worktree, remove_worktree,
 };

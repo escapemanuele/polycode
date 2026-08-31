@@ -8,8 +8,17 @@ use super::command::{Git, os};
 use super::{GitError, GitRepository};
 
 pub(crate) fn source_is_clean(git: &Git, repository: &GitRepository) -> Result<bool, GitError> {
+    tree_is_clean(git, repository.source_path())
+}
+
+/// Whether one working tree carries no change of any kind, tracked or not.
+///
+/// Written against a path rather than a [`GitRepository`] because the callers
+/// that matter ask it about a managed worktree, which is a working tree
+/// Polycode owns but never discovered as a repository of its own.
+pub(crate) fn tree_is_clean(git: &Git, path: &Path) -> Result<bool, GitError> {
     let output = git.checked(
-        repository.source_path(),
+        path,
         &[
             os("status"),
             os("--porcelain=v1"),

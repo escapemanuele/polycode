@@ -57,6 +57,16 @@ pub(crate) fn inspect_worktree(git: &Git, path: &Path) -> Result<WorktreeIdentit
     })
 }
 
+/// Returns one worktree to a detached HEAD at `commit`.
+///
+/// Refuses nothing on its own: the caller decides whether losing the current
+/// HEAD is safe, because only the caller knows whether the tree is clean.
+pub(crate) fn detach_worktree(git: &Git, path: &Path, commit: &str) -> Result<(), GitError> {
+    validate_commit(commit)?;
+    git.checked(path, &[os("checkout"), os("--detach"), os(commit)])?;
+    Ok(())
+}
+
 pub(crate) fn remove_worktree(
     git: &Git,
     repository: &GitRepository,
