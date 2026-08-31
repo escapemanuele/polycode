@@ -346,6 +346,19 @@ fn render_pipeline(
             now,
         ));
     }
+    // A booked fix is work the operator has already decided on, so the rail
+    // shows it where that work will appear. Muted and unselectable: it is an
+    // intention about this run, not yet a stage of it.
+    if state.fix_is_booked() {
+        if connectors {
+            lines.push(Line::from(Span::styled("  ┆", theme::muted())));
+        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("◇ ", theme::muted()),
+            Span::styled("Fix (booked)", theme::muted()),
+        ]));
+    }
     let inner_height = area.height.saturating_sub(1) as usize;
     // POD's seat: one blank row, a short rule, another blank row, then POD —
     // attached to the pipeline it belongs to rather than pinned to the bottom
@@ -436,7 +449,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         return;
     };
     let applyable = state.run_is_applyable();
-    let fixable = state.run_can_be_fixed();
+    let fix = FixOffer::of(state);
     let mut lines = if applyable {
         completed_hero(details, width, now)
     } else {
@@ -465,7 +478,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         lines.push(Line::from(""));
         lines.push(Line::from(theme::chip("READY TO REVIEW", theme::success())));
         lines.push(Line::from(""));
-        lines.extend(hero_actions(applyable, fixable, selected.status));
+        lines.extend(hero_actions(applyable, fix, selected.status));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -498,7 +511,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
             .map(|line| Line::from(Span::styled(line, theme::text()))),
     );
     if !applyable {
-        let actions = hero_actions(applyable, fixable, selected.status);
+        let actions = hero_actions(applyable, fix, selected.status);
         if actions
             .iter()
             .all(|line| span_width(&line.spans) <= width as usize)
@@ -768,15 +781,52 @@ fn provider_resources(entry: &crate::app::ProviderUsage) -> String {
 
 /// Actions offered by the panel, gated on canonical state: apply and discard
 /// appear only for a run the workspace layer would accept.
-fn hero_actions(applyable: bool, fixable: bool, status: StageStatus) -> Vec<Line<'static>> {
+/// What the interface may offer about a fix, resolved once so the panel and
+/// the footer cannot disagree about it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixOffer {
+    /// No verdict to answer, or no way to answer one yet.
+    Unavailable,
+    /// The run has reached its verdict; the key starts the fix now.
+    Now,
+    /// The run is still working; the key books the fix against its verdict.
+    Book,
+    /// Already booked. The key cancels it.
+    Booked,
+}
+
+impl FixOffer {
+    fn of(state: &TuiState) -> Self {
+        if state.run_can_be_fixed() {
+            Self::Now
+        } else if !state.run_can_book_a_fix() {
+            Self::Unavailable
+        } else if state.fix_is_booked() {
+            Self::Booked
+        } else {
+            Self::Book
+        }
+    }
+
+    const fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Unavailable => None,
+            Self::Now => Some("Fix it"),
+            Self::Book => Some("Fix when done"),
+            Self::Booked => Some("Fix booked — cancel"),
+        }
+    }
+}
+
+fn hero_actions(applyable: bool, fix: FixOffer, status: StageStatus) -> Vec<Line<'static>> {
     let mut spans = Vec::new();
     if applyable {
         spans.extend(theme::action("d", "Review diff", theme::accent()));
         spans.push(Span::raw("   "));
         spans.extend(theme::action("a", "Apply changes", theme::success()));
-        if fixable {
+        if let Some(label) = fix.label() {
             spans.push(Span::raw("   "));
-            spans.extend(theme::action("f", "Fix it", theme::attention()));
+            spans.extend(theme::action("f", label, theme::attention()));
         }
         spans.push(Span::raw("   "));
         spans.extend(theme::action("X", "Discard", theme::danger()));
@@ -792,6 +842,12 @@ fn hero_actions(applyable: bool, fixable: bool, status: StageStatus) -> Vec<Line
         spans.extend(theme::action("l", "Logs", theme::accent()));
         spans.push(Span::raw("   "));
         spans.extend(theme::action("d", "Diff", theme::accent()));
+        // A review reaches a verdict without ever becoming applyable, so this
+        // is the only place its fix is ever offered.
+        if let Some(label) = fix.label() {
+            spans.push(Span::raw("   "));
+            spans.extend(theme::action("f", label, theme::attention()));
+        }
     }
     spans.push(Span::raw("   "));
     spans.extend(theme::action("i", "Details", theme::muted_color()));
@@ -1254,8 +1310,8 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
             } else if state.run_is_applyable() {
                 push("d", "Review diff", theme::accent());
                 push("a", "Apply", theme::success());
-                if state.run_can_be_fixed() {
-                    push("f", "Fix it", theme::attention());
+                if let Some(label) = FixOffer::of(state).label() {
+                    push("f", label, theme::attention());
                 }
                 push("X", "Discard", theme::danger());
             } else {
@@ -1264,6 +1320,9 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
                 push("d", "Diff", theme::accent());
                 if stage_status == Some(StageStatus::Failed) {
                     push("t", "Retry", theme::attention());
+                }
+                if let Some(label) = FixOffer::of(state).label() {
+                    push("f", label, theme::attention());
                 }
                 if matches!(
                     run_status,
@@ -1958,6 +2017,7 @@ mod tests {
             workflow: WorkflowKind::Standard,
             status,
             repository: Some(std::path::PathBuf::from("/Users/e/Code/wp-calypso-2")),
+            workspace_mode: Some(crate::workspace::WorkspaceMode::Branch),
             workspace_status: Some(crate::workspace::WorkspaceStatus::Ready),
             base_commit: Some("abc1234".to_owned()),
             profile: "recommended".to_owned(),

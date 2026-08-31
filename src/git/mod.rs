@@ -17,6 +17,6 @@ pub(crate) use patch::{
     generate_patch, generate_patch_preview, source_is_clean, tree_is_clean,
 };
 pub(crate) use worktree::{
-    WorktreeIdentity, branch_exists, branch_tip, create_worktree, delete_owned_branch,
-    detach_worktree, inspect_worktree, remove_worktree,
+    WorktreeIdentity, branch_exists, branch_tip, create_branch_in_worktree, create_worktree,
+    delete_owned_branch, detach_worktree, inspect_worktree, remove_worktree,
 };

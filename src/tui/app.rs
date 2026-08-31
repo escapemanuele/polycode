@@ -450,12 +450,61 @@ impl TuiApp {
         let Some(run_id) = self.state.selected_run else {
             return;
         };
-        if !self.state.run_can_be_fixed() {
-            self.state
-                .notify(UiMessageKind::Info, fix_unavailable_reason(&self.state));
+        if self.state.run_can_be_fixed() {
+            self.state.fix_when_finished.remove(&run_id);
+            self.dispatch(WorkerCommand::RequestFix { run_id });
             return;
         }
-        self.dispatch(WorkerCommand::RequestFix { run_id });
+        if self.state.run_can_book_a_fix() {
+            if self.state.fix_when_finished.remove(&run_id) {
+                self.state.notify(
+                    UiMessageKind::Info,
+                    "Fix cancelled — this run will rest when it finishes.",
+                );
+            } else {
+                self.state.fix_when_finished.insert(run_id);
+                self.state.notify(
+                    UiMessageKind::Info,
+                    "Fix booked — it starts on its own once this run reaches its verdict.",
+                );
+            }
+            return;
+        }
+        self.state
+            .notify(UiMessageKind::Info, fix_unavailable_reason(&self.state));
+    }
+
+    /// Starts the fixes the operator booked while their runs were still working.
+    ///
+    /// Driven from the listing rather than the detail panel, because a booked
+    /// run is usually not the one being watched and waiting for the operator to
+    /// select it would defeat the point of booking it. A booking the interface
+    /// cannot honour yet — the run is held by another action, or this many
+    /// agents are already at work — stays booked and says nothing; the next
+    /// refresh is half a second away, and an explanation twice a second is not
+    /// worth reading.
+    fn start_booked_fixes(&mut self) {
+        if self.state.fix_when_finished.is_empty() {
+            return;
+        }
+        let ready = self
+            .state
+            .runs
+            .iter()
+            .filter(|item| {
+                item.status == crate::domain::RunStatus::Completed
+                    && self.state.fix_when_finished.contains(&item.id)
+            })
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        for run_id in ready {
+            let command = WorkerCommand::RequestFix { run_id };
+            if self.state.action_refusal(&command).is_some() {
+                continue;
+            }
+            self.state.fix_when_finished.remove(&run_id);
+            self.dispatch(command);
+        }
     }
 
     fn open_attention(&mut self) {
@@ -617,6 +666,7 @@ impl TuiApp {
         match self.reader.list_runs() {
             Ok(runs) => {
                 self.state.replace_runs(runs);
+                self.start_booked_fixes();
                 self.refresh_selected();
             }
             Err(error) => self.state.set_error(error.to_string()),
@@ -715,9 +765,6 @@ fn fix_unavailable_reason(state: &TuiState) -> String {
     let Some(details) = state.details.as_ref() else {
         return "Select a run before asking for a fix.".to_owned();
     };
-    if details.workflow == crate::domain::WorkflowKind::Review {
-        return "Review runs change nothing, so there is nothing to fix.".to_owned();
-    }
     if details.status != crate::domain::RunStatus::Completed {
         return format!(
             "{} A fix answers a decision, so the run has to reach one first.",
@@ -863,7 +910,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::app::{RunDetails, StageSummary};
+    use crate::app::{RunDetails, RunListItem, StageSummary};
     use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
     use crate::tui::state::CONCURRENT_AGENTS;
     use crate::tui::worker::ActionKind;
@@ -899,6 +946,14 @@ mod tests {
             workflow,
             status,
             repository: Some(std::path::PathBuf::from("/repo")),
+            // A review is prepared detached, and adopts a branch only when it
+            // is sent back to fix what it found. The fixture says so, because
+            // that is what decides whether apply is offered.
+            workspace_mode: Some(if workflow == WorkflowKind::Review {
+                crate::workspace::WorkspaceMode::Detached
+            } else {
+                crate::workspace::WorkspaceMode::Branch
+            }),
             workspace_status: Some(crate::workspace::WorkspaceStatus::Ready),
             base_commit: Some("abc1234".to_owned()),
             profile: "recommended".to_owned(),
@@ -947,29 +1002,29 @@ mod tests {
     /// and the run has finished reaching it.
     #[test]
     fn fix_is_dispatched_only_for_a_completed_run_that_reached_a_decision() {
-        let (mut app, _fixture) = app_with(decided(details(
-            RunStatus::Completed,
-            WorkflowKind::Standard,
-        )));
-        app.handle_intent(Intent::Fix);
-        assert_eq!(
-            app.state.busy_label().as_deref(),
-            Some("fixing run"),
-            "a rejected standard run is exactly what fix is for"
-        );
+        for (label, run) in [
+            (
+                "a rejected standard run is exactly what fix is for",
+                decided(details(RunStatus::Completed, WorkflowKind::Standard)),
+            ),
+            (
+                "a review reaches a verdict too, and may be sent back to act on it",
+                decided(details(RunStatus::Completed, WorkflowKind::Review)),
+            ),
+        ] {
+            let (mut app, _fixture) = app_with(run);
+            app.handle_intent(Intent::Fix);
+            assert_eq!(
+                app.state.busy_label().as_deref(),
+                Some("fixing run"),
+                "{label}"
+            );
+        }
 
         for (label, run) in [
             (
-                "still running",
-                decided(details(RunStatus::Running, WorkflowKind::Standard)),
-            ),
-            (
                 "already applied",
                 decided(details(RunStatus::Applied, WorkflowKind::Standard)),
-            ),
-            (
-                "a review run changes nothing",
-                decided(details(RunStatus::Completed, WorkflowKind::Review)),
             ),
             (
                 "no decision stage to answer",
@@ -985,6 +1040,46 @@ mod tests {
                 "no explanation offered for {label}"
             );
         }
+    }
+
+    /// The operator usually knows they want a fix long before the verdict
+    /// lands. Booking it means they say so once, and stop watching for the run
+    /// to end.
+    #[test]
+    fn a_fix_booked_while_a_run_works_starts_itself_when_the_run_finishes() {
+        let run_id = RunId::from_u128(7);
+        let (mut app, _fixture) =
+            app_with(decided(details(RunStatus::Running, WorkflowKind::Review)));
+
+        app.handle_intent(Intent::Fix);
+        assert!(
+            app.state.in_flight.is_empty(),
+            "booking starts nothing while the run is still working"
+        );
+        assert!(app.state.fix_when_finished.contains(&run_id));
+
+        app.handle_intent(Intent::Fix);
+        assert!(
+            !app.state.fix_when_finished.contains(&run_id),
+            "the same key cancels a booking the operator changed their mind about"
+        );
+
+        app.handle_intent(Intent::Fix);
+        app.state.runs = vec![RunListItem {
+            id: run_id,
+            workflow: WorkflowKind::Review,
+            status: RunStatus::Completed,
+            task_summary: "Add OAuth provider support".to_owned(),
+            repository: Some(std::path::PathBuf::from("/repo")),
+            updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        }];
+        app.start_booked_fixes();
+
+        assert_eq!(app.state.busy_label().as_deref(), Some("fixing run"));
+        assert!(
+            app.state.fix_when_finished.is_empty(),
+            "a booking is spent once it is honoured, not replayed every refresh"
+        );
     }
 
     #[test]

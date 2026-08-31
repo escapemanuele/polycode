@@ -295,6 +295,11 @@ where
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
         self.reconcile(&mut store, run_id)?;
+        // A review's workspace is detached, because a review is not meant to
+        // produce changes. This is the request that changes that, so the
+        // workspace earns its branch here rather than leaving the fix to write
+        // into a tree apply would later refuse to transfer.
+        WorkspaceManager::new(&self.worktrees).adopt_branch_for_fix(&mut store, run_id)?;
         let mut engine = self.engine(&mut store, run_id)?;
         engine.request_fix(&mut store, run_id)?;
         let status = drive_attached(&mut engine, &mut store, run_id)?;

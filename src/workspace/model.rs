@@ -243,6 +243,19 @@ impl RunWorkspace {
         self.updated_at = now.max(self.updated_at);
     }
 
+    /// Gives a read-only workspace a branch of its own to write on.
+    ///
+    /// A review is prepared detached because it is not meant to produce
+    /// changes. Asking it to fix what it found changes that, and apply will
+    /// only transfer a branch Polycode owns, so the mode and the branch move
+    /// together — the store rejects one without the other.
+    pub(crate) fn adopt_branch(&mut self, branch: String, now: DateTime<Utc>) {
+        self.branch_name = Some(branch);
+        self.mode = WorkspaceMode::Branch;
+        self.branch_owned = true;
+        self.updated_at = now.max(self.updated_at);
+    }
+
     pub(crate) fn confirm_branch_ownership(&mut self) {
         if self.mode == WorkspaceMode::Branch {
             self.branch_owned = true;

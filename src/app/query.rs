@@ -14,7 +14,7 @@ use crate::domain::{
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
 use crate::providers::{InputAccounting, input_accounting};
 use crate::store::{RunRevision, SequencedEvent, SqliteStore, StoreError};
-use crate::workspace::WorkspaceStatus;
+use crate::workspace::{WorkspaceMode, WorkspaceStatus};
 
 use super::AppError;
 use super::RoutingPlan;
@@ -211,6 +211,10 @@ pub struct RunDetails {
     pub status: RunStatus,
     pub repository: Option<PathBuf>,
     pub workspace_status: Option<WorkspaceStatus>,
+    /// Whether this run's workspace can carry changes back to the operator's
+    /// checkout. A review is prepared detached and adopts a branch only if it
+    /// is later asked to fix what it found.
+    pub workspace_mode: Option<WorkspaceMode>,
     pub base_commit: Option<String>,
     pub profile: String,
     pub profile_version: String,
@@ -456,6 +460,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         repository: workspace
             .as_ref()
             .map(|workspace| workspace.source_repo_path().to_path_buf()),
+        workspace_mode: workspace.as_ref().map(crate::workspace::RunWorkspace::mode),
         workspace_status: workspace
             .as_ref()
             .map(crate::workspace::RunWorkspace::status),

@@ -67,6 +67,20 @@ pub(crate) fn detach_worktree(git: &Git, path: &Path, commit: &str) -> Result<()
     Ok(())
 }
 
+/// Creates `branch` at one worktree's current HEAD and checks it out there.
+///
+/// The branch starts where the worktree already stands rather than at any
+/// named commit: the caller is adopting the tree as it is, not moving it.
+pub(crate) fn create_branch_in_worktree(
+    git: &Git,
+    path: &Path,
+    branch: &str,
+) -> Result<(), GitError> {
+    git.checked(path, &[os("check-ref-format"), os("--branch"), os(branch)])?;
+    git.checked(path, &[os("checkout"), os("-b"), os(branch)])?;
+    Ok(())
+}
+
 pub(crate) fn remove_worktree(
     git: &Git,
     repository: &GitRepository,

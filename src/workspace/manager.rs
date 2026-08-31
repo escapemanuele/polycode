@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::{EventId, EventMetadata, Run, RunId, RunStatus, RunTransition};
 use crate::git::{
-    GitRepository, apply_patch, branch_exists, branch_tip, check_patch, create_worktree,
-    delete_owned_branch, detach_worktree, generate_patch, generate_patch_preview,
+    GitRepository, apply_patch, branch_exists, branch_tip, check_patch, create_branch_in_worktree,
+    create_worktree, delete_owned_branch, detach_worktree, generate_patch, generate_patch_preview,
     inspect_worktree, remove_worktree, source_is_clean, tree_is_clean,
 };
 use crate::store::{RunRevision, SqliteStore, worktree_root};
@@ -235,6 +235,45 @@ impl WorkspaceManager {
         workspace.mark_ready(now());
         store.update_workspace(&workspace, prior_revision)?;
         Ok(ReconciliationOutcome::Ready(workspace))
+    }
+
+    /// Gives a review's workspace a branch, so a fix cycle can reach the
+    /// operator's checkout.
+    ///
+    /// A review is prepared detached: it produces findings, not changes, and
+    /// apply refuses anything but a branch Polycode owns. Sending that run back
+    /// to fix what it found is the moment the run starts producing changes, so
+    /// it is the moment the workspace earns a branch — created at the
+    /// worktree's current HEAD, which is the tree the fix will edit.
+    ///
+    /// Idempotent by construction: a run already on a branch, including one on
+    /// its second fix cycle, is returned unchanged.
+    ///
+    /// # Errors
+    /// Returns ownership, branch-conflict, Git, or persistence errors. A
+    /// workspace that is not Ready is refused without being modified.
+    pub fn adopt_branch_for_fix(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<RunWorkspace, WorkspaceError> {
+        let mut workspace = Self::ready_workspace(store, run_id)?;
+        if workspace.mode() == WorkspaceMode::Branch {
+            return Ok(workspace);
+        }
+        let repository = self.validate_source(&workspace)?;
+        self.validate_workspace(&workspace, false)?;
+        let branch = format!("polycode/run-{run_id}");
+        if branch_exists(&self.git, &repository, &branch)? {
+            return Err(WorkspaceError::BranchConflict(branch));
+        }
+        create_branch_in_worktree(&self.git, workspace.worktree_path(), &branch)?;
+        let prior_revision = workspace.revision();
+        workspace.adopt_branch(branch, now());
+        store.adopt_workspace_branch(&workspace, prior_revision)?;
+        store
+            .load_workspace(run_id)?
+            .ok_or(WorkspaceError::WorkspaceMissing(run_id))
     }
 
     /// Applies exact workspace delta to clean source checkout without staging or committing.
@@ -1560,6 +1599,80 @@ mod tests {
         );
     }
 
+    /// A review is detached because it is not meant to produce changes.
+    /// Sending it back to fix what it found is the moment that stops being
+    /// true, so it is the moment the workspace earns a branch — and, with it,
+    /// a route back into the operator's checkout that apply will accept.
+    #[test]
+    fn a_review_workspace_earns_a_branch_when_asked_to_fix_what_it_found() {
+        let mut fixture = Fixture::new(WorkflowKind::Review);
+        let workspace = fixture.prepare();
+        assert_eq!(workspace.mode(), WorkspaceMode::Detached);
+        fixture.complete();
+
+        let adopted = fixture
+            .manager()
+            .adopt_branch_for_fix(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert_eq!(adopted.mode(), WorkspaceMode::Branch);
+        assert!(adopted.branch_owned());
+        let branch = adopted.branch_name().unwrap().to_owned();
+        assert_eq!(
+            git_text(
+                workspace.worktree_path(),
+                ["rev-parse", "--abbrev-ref", "HEAD"]
+            ),
+            branch,
+            "the worktree stands on the branch the store now claims"
+        );
+        assert!(
+            matches!(
+                fixture
+                    .manager()
+                    .reconcile(&mut fixture.store, fixture.run_id)
+                    .unwrap(),
+                ReconciliationOutcome::Unchanged(_)
+            ),
+            "and reconcile recognises the workspace it just became"
+        );
+
+        let again = fixture
+            .manager()
+            .adopt_branch_for_fix(&mut fixture.store, fixture.run_id)
+            .unwrap();
+        assert_eq!(
+            again.branch_name(),
+            Some(branch.as_str()),
+            "a second fix cycle adopts nothing new"
+        );
+    }
+
+    /// The point of the branch: what the fix writes can reach the checkout.
+    /// Before adoption this same run is refused, which
+    /// `review_workspace_rejects_apply_even_when_logically_completed` pins.
+    #[test]
+    fn a_fixed_review_can_finally_transfer_what_it_changed() {
+        let mut fixture = Fixture::new(WorkflowKind::Review);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fixture
+            .manager()
+            .adopt_branch_for_fix(&mut fixture.store, fixture.run_id)
+            .unwrap();
+        fs::write(workspace.worktree_path().join("README.md"), "fixed\n").unwrap();
+
+        fixture
+            .manager()
+            .apply(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(fixture.source.join("README.md")).unwrap(),
+            "fixed\n"
+        );
+    }
+
     #[test]
     fn deterministic_paths_reject_collisions_and_existing_branches() {
         let mut fixture = Fixture::new(WorkflowKind::Standard);
@@ -1629,7 +1742,10 @@ mod tests {
             "the worktree is back on the commit the run was prepared from"
         );
         assert_eq!(
-            git_text(workspace.worktree_path(), ["rev-parse", "--abbrev-ref", "HEAD"]),
+            git_text(
+                workspace.worktree_path(),
+                ["rev-parse", "--abbrev-ref", "HEAD"]
+            ),
             "HEAD",
             "and detached again, the way a review workspace is owned"
         );

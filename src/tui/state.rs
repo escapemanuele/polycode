@@ -360,6 +360,14 @@ impl StageHeadline {
     }
 }
 
+/// Whether a run's workflow reaches a verdict a fix could answer.
+fn has_decision(details: &RunDetails) -> bool {
+    details
+        .stages
+        .iter()
+        .any(|stage| stage.kind == crate::domain::StageKind::Decision)
+}
+
 #[derive(Debug)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -393,6 +401,13 @@ pub(crate) struct TuiState {
     /// than a single slot: this interface can be working on several runs at
     /// once, and one run's action is no reason to refuse another's.
     pub in_flight: Vec<InFlightAction>,
+    /// Runs the operator has already decided to send back for a fix, chosen
+    /// while the run was still working. Held here rather than in the store
+    /// because nothing has happened yet: this is an intention about a run, not
+    /// a fact about one, and the interface is the only thing that can act on
+    /// it. A run that finishes while Polycode is closed simply waits to be
+    /// asked again.
+    pub fix_when_finished: HashSet<RunId>,
     pub message: Option<UiMessage>,
     pub quiescent: Option<QuiescentState>,
     /// Newer official release, once a background check has concluded. Absent
@@ -454,6 +469,7 @@ impl TuiState {
             update_install: None,
             update_dismissed: false,
             update_install_selected: true,
+            fix_when_finished: HashSet::new(),
             mascot_seen: None,
             reaction_until: None,
             reacting: false,
@@ -703,23 +719,44 @@ impl TuiState {
     pub(crate) fn run_is_applyable(&self) -> bool {
         self.details.as_ref().is_some_and(|details| {
             details.status == crate::domain::RunStatus::Completed
-                && details.workflow != WorkflowKind::Review
+                && details.workspace_mode == Some(crate::workspace::WorkspaceMode::Branch)
         })
     }
 
     /// Whether this run can be sent back to fix its own result.
     ///
-    /// The same completed branch-run state apply needs, plus a decision for
-    /// the fix to answer. A workflow that never decides has no verdict to
-    /// remediate, so offering the action there would only produce a refusal.
+    /// A completed run and a decision for the fix to answer. A workflow that
+    /// never decides has no verdict to remediate, so offering the action there
+    /// would only produce a refusal.
+    ///
+    /// Deliberately not apply's answer any more. A review reaches a verdict
+    /// like any other workflow, and being unable to *transfer* changes is not
+    /// the same as having nothing to fix — asking is what gives its workspace
+    /// the branch apply will later want.
     pub(crate) fn run_can_be_fixed(&self) -> bool {
-        self.run_is_applyable()
-            && self.details.as_ref().is_some_and(|details| {
-                details
-                    .stages
-                    .iter()
-                    .any(|stage| stage.kind == crate::domain::StageKind::Decision)
-            })
+        self.details.as_ref().is_some_and(|details| {
+            details.status == crate::domain::RunStatus::Completed && has_decision(details)
+        })
+    }
+
+    /// Whether a fix can be *booked* on the selected run: it is still working,
+    /// and its workflow will reach a decision for that fix to answer.
+    ///
+    /// Booking exists because the operator already knows what they want while
+    /// the run is still going, and the alternative is watching for it to end.
+    pub(crate) fn run_can_book_a_fix(&self) -> bool {
+        self.details.as_ref().is_some_and(|details| {
+            matches!(
+                details.status,
+                crate::domain::RunStatus::Running | crate::domain::RunStatus::NeedsUser
+            ) && has_decision(details)
+        })
+    }
+
+    /// Whether the selected run is already booked for a fix.
+    pub(crate) fn fix_is_booked(&self) -> bool {
+        self.selected_run
+            .is_some_and(|run_id| self.fix_when_finished.contains(&run_id))
     }
 
     pub(crate) fn notify(&mut self, kind: UiMessageKind, text: impl Into<String>) {

@@ -91,6 +91,56 @@ impl SqliteStore {
         Ok(revision)
     }
 
+    /// Records a detached workspace adopting a branch of its own.
+    ///
+    /// Mode and branch name are otherwise creation-time identity, and
+    /// [`Self::update_workspace`] refuses to move them on purpose — a run does
+    /// not get to change what kind of workspace it has while it is using it.
+    /// Adoption is the single exception, so it carries its own statement
+    /// rather than widening the general update for every other caller. The
+    /// two columns move together because the table's own CHECK will not have
+    /// them any other way.
+    ///
+    /// # Errors
+    /// Returns typed `SQLite` errors, or concurrent modification when another
+    /// writer has moved the workspace on.
+    pub(crate) fn adopt_workspace_branch(
+        &mut self,
+        workspace: &RunWorkspace,
+        expected_revision: WorkspaceRevision,
+    ) -> Result<WorkspaceRevision, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let next_revision = expected_revision
+            .value()
+            .checked_add(1)
+            .ok_or(StoreError::IntegerRange("next workspace revision"))?;
+        let changed = transaction.execute(
+            "UPDATE run_workspaces
+             SET branch_name = ?1, mode = ?2, branch_owned = ?3,
+                 revision = ?4, updated_at = ?5
+             WHERE run_id = ?6 AND revision = ?7",
+            params![
+                workspace.branch_name(),
+                workspace.mode().as_str(),
+                workspace.branch_owned(),
+                u64_to_i64(next_revision, "next workspace revision")?,
+                format_timestamp(workspace.updated_at()),
+                workspace.run_id().to_string(),
+                u64_to_i64(expected_revision.value(), "expected workspace revision")?,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::WorkspaceConcurrentModification {
+                run_id: workspace.run_id(),
+                expected: expected_revision.value(),
+            });
+        }
+        transaction.commit()?;
+        Ok(WorkspaceRevision::new(next_revision))
+    }
+
     /// Loads persisted recoverable apply intent for one run.
     ///
     /// # Errors
