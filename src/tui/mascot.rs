@@ -261,8 +261,8 @@ fn label(state: MascotState, activity: Option<MascotActivity>) -> &'static str {
 }
 
 /// What sits on POD's head, five pixel rows over the 17-pixel body column.
-/// The plain antenna for most jobs; the builder's hard hat and the lead's
-/// crown replace it.
+/// A bare head for most jobs; the builder wears the hard hat and the lead
+/// the crown.
 const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
     match activity {
         Some(MascotActivity::Implementation) => [
@@ -280,10 +280,10 @@ const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
             ".................",
         ],
         _ => [
-            "........GG.......",
-            "........GG.......",
-            "........GG.......",
-            ".......GGGG......",
+            ".................",
+            ".................",
+            ".................",
+            ".................",
             ".................",
         ],
     }
