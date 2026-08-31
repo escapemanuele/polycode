@@ -486,7 +486,12 @@ fn interrupt_records_evidence_leaves_no_session_and_cleanup_is_idempotent() {
     let manager = fixture.manager();
     let mut store = fixture.store();
     manager.start(&mut store, process.id()).unwrap();
+    // Output proves the child is alive. Interrupt needs something else: the
+    // runtime evidence the runner writes *after* spawning it, which carries
+    // the PIDs the signal is aimed at. Waiting on the first and then acting on
+    // the second is a race, and under CI load it is a lost one.
     wait_for_output(&manager, &store, process.id(), OutputStream::Stdout);
+    wait_for_runtime_evidence(&process);
 
     let interrupted = manager.interrupt(&mut store, process.id()).unwrap();
     assert_eq!(
@@ -590,6 +595,31 @@ fn wait_terminal<B: ProcessBackend>(
         std::thread::sleep(POLL_INTERVAL);
     }
     panic!("process did not reach terminal infrastructure state");
+}
+
+/// Waits for the runner to record the runtime evidence that signalling needs.
+///
+/// The runner spawns the child first and writes `runtime.json` afterwards, so
+/// a process can be producing output before the file that names its PIDs
+/// exists. Anything that signals a managed process has to wait for this, not
+/// for the child's own liveness.
+fn wait_for_runtime_evidence(process: &ManagedProcess) {
+    let path = process
+        .spec()
+        .stdout_path()
+        .parent()
+        .expect("stdout path has a parent")
+        .join("runtime.json");
+    for _ in 0..POLL_LIMIT {
+        if path.is_file() {
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "runner never recorded runtime evidence at {}",
+        path.display()
+    );
 }
 
 fn wait_for_output<B: ProcessBackend>(
