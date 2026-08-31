@@ -888,13 +888,49 @@ fn task_summary(task: Option<&str>) -> String {
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or(task);
-    let mut chars = first.trim().chars();
+    let first = compact_github_refs(first.trim());
+    let mut chars = first.chars();
     let summary = chars.by_ref().take(72).collect::<String>();
     if chars.next().is_some() {
         format!("{summary}…")
     } else {
         summary
     }
+}
+
+/// Rewrites pasted GitHub PR/issue URLs to `<number> <repo>` so a run like
+/// "Review <https://github.com/Automattic/wp-calypso/pull/113847>" lists as
+/// "Review 113847 wp-calypso" instead of a URL that never fits the column.
+fn compact_github_refs(line: &str) -> String {
+    line.split_whitespace()
+        .map(|word| compact_github_ref(word).unwrap_or_else(|| word.to_owned()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn compact_github_ref(word: &str) -> Option<String> {
+    let rest = word
+        .strip_prefix("https://")
+        .or_else(|| word.strip_prefix("http://"))?;
+    let rest = rest
+        .strip_prefix("github.com/")
+        .or_else(|| rest.strip_prefix("www.github.com/"))?;
+    let mut segments = rest.split('/');
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    let kind = segments.next()?;
+    if owner.is_empty() || repo.is_empty() || !matches!(kind, "pull" | "issues") {
+        return None;
+    }
+    let number: String = segments
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if number.is_empty() {
+        return None;
+    }
+    Some(format!("{number} {repo}"))
 }
 
 /// Folds committed usage events into one summary per reporting runtime.
@@ -1114,6 +1150,42 @@ mod tests {
         assert_eq!(
             stage_span(&[], &StageId::new("implementation").unwrap()),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn task_summary_compacts_github_urls_to_number_and_repo() {
+        assert_eq!(
+            task_summary(Some(
+                "Review https://github.com/Automattic/wp-calypso/pull/113847"
+            )),
+            "Review 113847 wp-calypso"
+        );
+        assert_eq!(
+            task_summary(Some("Fix https://github.com/rust-lang/rust/issues/42")),
+            "Fix 42 rust"
+        );
+        assert_eq!(
+            task_summary(Some(
+                "Compare https://github.com/a/b/pull/1/files and https://github.com/a/b/pull/2"
+            )),
+            "Compare 1 b and 2 b"
+        );
+    }
+
+    #[test]
+    fn task_summary_leaves_non_reference_urls_alone() {
+        assert_eq!(
+            task_summary(Some("See https://github.com/Automattic/wp-calypso")),
+            "See https://github.com/Automattic/wp-calypso"
+        );
+        assert_eq!(
+            task_summary(Some("See https://github.com/a/b/pull/not-a-number")),
+            "See https://github.com/a/b/pull/not-a-number"
+        );
+        assert_eq!(
+            task_summary(Some("See https://example.com/a/b/pull/3")),
+            "See https://example.com/a/b/pull/3"
         );
     }
 }
