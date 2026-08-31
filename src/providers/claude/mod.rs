@@ -23,7 +23,8 @@ use crate::engine::{
     ProviderSignal,
 };
 use crate::process::{
-    ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend, ProcessManager, TmuxBackend,
+    ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend,
+    ProcessManager, TmuxBackend,
 };
 use crate::providers::{
     PendingProviderAttention, ProviderCommit, ProviderSessionMutation, ProviderSessionRecord,
@@ -38,6 +39,9 @@ use protocol::{ClaudeRecord, PermissionDenial, first_record};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Ceiling for one record. A single line larger than this fails the poll
+/// rather than growing the read without bound.
+const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub struct ClaudeProvider<B = TmuxBackend> {
@@ -275,9 +279,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             self.manager.start(store, process_id)?;
         }
         let inspection = self.manager.inspect(store, process_id)?;
-        let chunk =
-            self.manager
-                .read_output(store, process_id, OutputStream::Stdout, MAX_OUTPUT_BYTES)?;
+        let chunk = self.read_record_chunk(store, process_id)?;
         if let Some((record, consumed)) = first_record(chunk.bytes())? {
             let consumed = u64::try_from(consumed)
                 .map_err(|_| ClaudeProviderError::Protocol("record size overflow".to_owned()))?;
@@ -290,6 +292,29 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             return Ok(ProviderPoll::Pending);
         }
         Self::map_terminal_without_result(request, session, chunk, inspection.process.status())
+    }
+
+    /// Reads unacknowledged stdout, widening the window whenever it fills
+    /// without containing a newline. A record only completes at a newline, so
+    /// a saturated window without one can never yield a record no matter how
+    /// often the same-sized read is retried — a single record carrying a full
+    /// build or test log can exceed one window, which stalled a run for good.
+    fn read_record_chunk(
+        &self,
+        store: &SqliteStore,
+        process_id: ManagedProcessId,
+    ) -> Result<OutputChunk, ClaudeProviderError> {
+        let mut max_bytes = MAX_OUTPUT_BYTES;
+        loop {
+            let chunk =
+                self.manager
+                    .read_output(store, process_id, OutputStream::Stdout, max_bytes)?;
+            let saturated = chunk.bytes().len() == max_bytes;
+            if !saturated || chunk.bytes().contains(&b'\n') || max_bytes >= MAX_RECORD_BYTES {
+                return Ok(chunk);
+            }
+            max_bytes = MAX_RECORD_BYTES.min(max_bytes.saturating_mul(2));
+        }
     }
 
     #[allow(
@@ -1290,6 +1315,42 @@ mod tests {
             crate::domain::StageStatus::Ready,
             "a stage whose launch died before it started never started"
         );
+    }
+
+    /// One record can outgrow a whole read window (a result carrying a full
+    /// build or test log). The read must widen until the record's newline
+    /// fits, or the run stalls on a poll that can never see a complete record.
+    #[test]
+    fn a_record_larger_than_one_read_window_still_completes_the_run() {
+        let log = "line of build output\\n".repeat(MAX_OUTPUT_BYTES / 16);
+        let output = format!(
+            concat!(
+                "{{\"type\":\"system\",\"subtype\":\"init\",",
+                "\"session_id\":\"native-session-1\",\"model\":\"fixture-model\"}}\n",
+                "{{\"type\":\"assistant\",\"message\":{{\"usage\":{{\"input_tokens\":7,",
+                "\"output_tokens\":3}},\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n",
+                "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,",
+                "\"result\":\"# Completed\\nFixture result\",",
+                "\"session_id\":\"native-session-1\",\"permission_denials\":[]}}\n"
+            ),
+            log
+        );
+        assert!(output.lines().any(|line| line.len() > MAX_OUTPUT_BYTES));
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), false);
+        backend.set_silent_exit(1, output);
+        let mut engine = WorkflowEngine::new(provider, "make fixture change");
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished { run_status } => {
+                    assert_eq!(run_status, RunStatus::Completed);
+                    break;
+                }
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
     }
 
     #[test]
