@@ -361,12 +361,14 @@ impl StageHeadline {
 }
 
 /// Whether this run could actually carry out a fix: it reaches a verdict for
-/// one to answer, and its sealed configuration can route the stages one adds.
+/// one to answer, and its sealed configuration can execute the stages one
+/// adds — a route for each role, with a requested effort behind it.
 ///
-/// The second half matters because configuration is written once, at creation.
-/// A run created before fix-cycle routing existed has no route for the role
-/// that would do the fixing, and offering a key that can only fail — after it
-/// has already appended the stages — is worse than not offering it.
+/// Both halves matter because configuration is written once, at creation.
+/// A run created before fix-cycle routing existed has no route — or no
+/// effort — for the role that would do the fixing, and offering a key that
+/// can only fail — after it has already appended the stages — is worse than
+/// not offering it.
 ///
 /// The roles come from [`fix_cycle_stages`] itself rather than being named
 /// here, so this cannot drift from what a fix cycle is actually made of.
@@ -385,7 +387,7 @@ fn can_be_fixed(details: &RunDetails) -> bool {
             details
                 .routes
                 .iter()
-                .any(|route| route.role == added.role())
+                .any(|route| route.role == added.role() && route.requested_effort.is_some())
         })
 }
 
