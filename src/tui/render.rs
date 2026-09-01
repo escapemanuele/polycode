@@ -354,7 +354,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
     let width = area.width.saturating_sub(3);
     let mut lines = vec![theme::centered_rule(width), theme::section("STATUS")];
     lines.extend(
-        status_sentences(details, now)
+        status_sentences(details, now, width)
             .into_iter()
             .map(|sentence| Line::from(Span::styled(sentence, theme::text()))),
     );
@@ -371,8 +371,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
 
 /// What the run is doing right now, then how far along it is. The first
 /// sentence follows the run's canonical status; the second counts stages, so
-/// both stay facts the domain already asserted.
-fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
+/// both stay facts the domain already asserted. `width` bounds the failure
+/// reason: the strip is a fixed [`STATUS_HEIGHT`] rows, so a long reason must
+/// be cut to fit its line rather than wrap and push the stage-count sentence
+/// out of the box.
+fn status_sentences(details: &RunDetails, now: DateTime<Utc>, width: u16) -> Vec<String> {
     let running = details
         .stages
         .iter()
@@ -397,16 +400,31 @@ fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
         RunStatus::Completed => completed_sentence(details),
         RunStatus::Applied => "Changes applied to the repository.".to_owned(),
         RunStatus::Discarded => "Run discarded.".to_owned(),
+        // The blocking stage, never merely the first failed one in workflow
+        // order: an optional dependency can fail without stopping the run,
+        // so a stage that failed on the way to the real, completion-blocking
+        // failure elsewhere must not be mistaken for the cause.
         RunStatus::Failed => details
             .stages
             .iter()
-            .find(|stage| stage.status == StageStatus::Failed)
+            .find(|stage| stage.status == StageStatus::Failed && stage.blocking)
             .map_or_else(
                 || "Run failed.".to_owned(),
                 |stage| {
                     stage.failure_reason.as_deref().map_or_else(
                         || format!("{} failed — its logs say why.", stage_title(stage.kind)),
-                        |reason| format!("{} failed: {reason}", stage_title(stage.kind)),
+                        |reason| {
+                            let prefix = format!("{} failed: ", stage_title(stage.kind));
+                            // Reserve one column for `truncate_title`'s own
+                            // ellipsis: it is added on top of the budget it
+                            // is given, so the untrimmed budget would let a
+                            // truncated line land one column past `width`.
+                            let budget = (width as usize)
+                                .saturating_sub(prefix.chars().count())
+                                .saturating_sub(1)
+                                .max(1);
+                            format!("{prefix}{}", format::truncate_title(reason, budget))
+                        },
                     )
                 },
             ),
@@ -2444,6 +2462,7 @@ mod tests {
             finished_at: None,
             waiting: None,
             failure_reason: None,
+            blocking: false,
         }
     }
 
@@ -3013,8 +3032,9 @@ mod tests {
         details.stages[1].status = StageStatus::Failed;
         details.stages[1].finished_at = Some(at(12, 3, 0));
         details.stages[1].failure_reason = Some("compile failed: missing semicolon".to_owned());
+        details.stages[1].blocking = true;
 
-        let sentences = status_sentences(state.details.as_ref().unwrap(), at(12, 13, 0));
+        let sentences = status_sentences(state.details.as_ref().unwrap(), at(12, 13, 0), 160);
         assert_eq!(
             sentences[0],
             "Implementation failed: compile failed: missing semicolon"
@@ -3039,6 +3059,35 @@ mod tests {
         details.stages[1].finished_at = Some(at(12, 3, 0));
         let text = render_text(&state, 160, 40);
         assert!(text.contains("The provider ended this stage before it completed"));
+    }
+
+    /// The strip is a fixed [`STATUS_HEIGHT`] rows. A reason near the 200
+    /// character cap must be cut to the strip's own width rather than wrap
+    /// and push the stage-count sentence out of the box.
+    #[test]
+    fn status_strip_truncates_a_long_reason_to_fit_the_available_width() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        failing.blocking = true;
+        let run = details(RunStatus::Failed, vec![failing]);
+
+        let width = 40u16;
+        let sentences = status_sentences(&run, at(12, 13, 0), width);
+        assert!(
+            sentences[0].chars().count() <= width as usize,
+            "the reason line must fit the strip's fixed width: {:?}",
+            sentences[0]
+        );
+        assert!(sentences[0].ends_with('…'), "the cut is visible");
+        assert_eq!(
+            sentences[1], "0 of 1 stages complete, 1 failed.",
+            "the stage-count sentence survives a long reason instead of being pushed out"
+        );
     }
 
     #[test]
@@ -3644,7 +3693,7 @@ mod tests {
     fn a_run_completed_over_a_failure_says_so_everywhere_it_counts() {
         // The sentences are asserted at the seam — the rendered rail wraps
         // long lines, so `contains` on the screen text cannot see them whole.
-        let sentences = status_sentences(&completed_with_failure_details(), at(12, 13, 0));
+        let sentences = status_sentences(&completed_with_failure_details(), at(12, 13, 0), 160);
         assert_eq!(
             sentences[0],
             "Run complete — Spec review failed, but the decision was still reached. \

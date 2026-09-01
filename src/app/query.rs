@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::domain::{
     ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
-    DependencyOutcome, DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus,
-    StageDependencyReport, StageId, StageKind, StageStatus, WorkflowKind,
+    CompletionBlockerReason, DependencyOutcome, DomainEventKind, EffortSetting, NativeModelUsage,
+    Role, RunId, RunStatus, StageDependencyReport, StageId, StageKind, StageStatus, WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
 use crate::providers::{InputAccounting, input_accounting};
@@ -71,6 +71,15 @@ pub struct StageSummary {
     /// when the stage never failed, or failed without the runtime reporting
     /// why.
     pub failure_reason: Option<String>,
+    /// Whether this stage's failure is one the workflow graph cannot route
+    /// around: a failed leaf stage, or a failed stage with a dependent that
+    /// requires it rather than merely tolerating its absence. Reuses
+    /// [`crate::domain::Run::completion_blockers`], the same notion the
+    /// engine checks before letting a run complete. Always `false` for a
+    /// stage that has not failed, and for a failed stage every one of whose
+    /// dependents treats it as optional — the workflow already planned for
+    /// exactly that, and something downstream carries on in degraded mode.
+    pub blocking: bool,
 }
 
 /// One dependency stage referenced from a [`StageWaitingSummary`] bucket,
@@ -426,6 +435,23 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         })
         .collect::<Vec<_>>();
     routes.sort_by_key(|route| role_order(route.role));
+    // The stages, if any, whose failure the workflow graph cannot route
+    // around — reused per stage below so a failed-but-optional dependency
+    // (degraded-tolerant, like a review the workflow can complete without)
+    // never gets mistaken for the failure that actually stopped the run.
+    let blocking_failed_stages: std::collections::HashSet<StageId> = loaded
+        .run
+        .completion_blockers()
+        .into_iter()
+        .filter(|blocker| {
+            matches!(
+                blocker.reason,
+                CompletionBlockerReason::FailedLeafStage
+                    | CompletionBlockerReason::RequiredStageFailed
+            )
+        })
+        .map(|blocker| blocker.stage_id)
+        .collect();
     let mut stages = Vec::new();
     for stage in loaded.run.stages() {
         let (started_at, finished_at) = stage_span(&events, stage.id());
@@ -476,6 +502,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .stage_dependency_report(stage.id())
             .map(|report| waiting_summary(&loaded.run, report));
         let failure_reason = stage_failure_reason(&events, stage.id());
+        let blocking = blocking_failed_stages.contains(stage.id());
         stages.push(StageSummary {
             id: stage.id().clone(),
             kind: stage.kind(),
@@ -514,15 +541,19 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             finished_at,
             waiting,
             failure_reason,
+            blocking,
         });
     }
-    // The run's own reason is the blocking failed stage's, so a caller
-    // showing run-level status never has to walk `stages` looking for it.
+    // The run's own reason is the *blocking* failed stage's — never merely
+    // the first failed stage in workflow order, which can be a degraded,
+    // non-blocking optional dependency that failed on the way to a
+    // completion-blocking failure somewhere else. A caller showing run-level
+    // status never has to walk `stages` looking for the right one.
     let failure_reason = (loaded.run.status() == RunStatus::Failed)
         .then(|| {
             stages
                 .iter()
-                .find(|stage| stage.status == StageStatus::Failed)
+                .find(|stage| stage.status == StageStatus::Failed && stage.blocking)
                 .and_then(|stage| stage.failure_reason.clone())
         })
         .flatten();
@@ -581,22 +612,46 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
     })
 }
 
-/// One display line: whitespace/newlines collapsed to single spaces and
+/// One display line: whitespace/newlines collapsed to single spaces, every
+/// remaining control character replaced with a visible placeholder, and
 /// capped at [`FAILURE_REASON_LIMIT`] characters with an ellipsis.
 ///
 /// Persisted reasons are free text from provider stderr or an exit message:
-/// untrimmed, possibly multi-line, unbounded in length. Every surface that
-/// shows one wants the same short, single-line form, so the fold produces it
-/// once here instead of each caller re-deriving it. `None` only for a reason
-/// that is empty or all whitespace.
+/// untrimmed, possibly multi-line, unbounded in length, and never sanitized
+/// upstream. That text flows verbatim into a TUI span and CLI stdout, so
+/// beyond whitespace collapse this also strips every C0/C1 control character
+/// (ESC, BEL, raw ANSI escape sequences, …) — left alone, a garbled or
+/// hostile reason could move the cursor or repaint the operator's terminal.
+/// Every surface that shows a reason wants the same short, single-line, safe
+/// form, so the fold produces it once here instead of each caller
+/// re-deriving it. `None` only for a reason that is empty or all whitespace.
 const FAILURE_REASON_LIMIT: usize = 200;
+
+/// Whether a character must never reach a terminal buffer unescaped.
+/// `char::is_control()` covers the C0 range (including ESC and BEL) and C1,
+/// but misses DEL and the zero-width family some terminals still act on —
+/// the same extra guard the TUI's own `viewer_line` sanitizer uses for diff
+/// and log content.
+fn is_terminal_unsafe(character: char) -> bool {
+    character.is_control() || matches!(character, '\u{7f}'..='\u{9f}' | '\u{200b}'..='\u{200f}')
+}
 
 fn sanitize_failure_reason(reason: &str) -> Option<String> {
     let collapsed = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;
     }
-    let mut characters = collapsed.chars();
+    let escaped: String = collapsed
+        .chars()
+        .map(|character| {
+            if is_terminal_unsafe(character) {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut characters = escaped.chars();
     let head: String = characters.by_ref().take(FAILURE_REASON_LIMIT).collect();
     Some(if characters.next().is_some() {
         format!("{head}…")
@@ -686,22 +741,37 @@ fn stage_span(
 /// somewhere other than where it was routed is still charged the reason it
 /// actually reported.
 ///
-/// Takes the *last* event that carried one: a retried stage's earlier
-/// failure never leaks into what the current status reports, and a terminal
-/// `ProviderFailed` with no reason does not erase an earlier one that had it.
+/// Scoped to the current attempt only: `StageStarted` and
+/// `StageRetryScheduled` both close out whatever the previous attempt
+/// reported, matching the attempt boundary the scheduler's own checkpoint
+/// fold uses (`StageRetryScheduled` advances `attempt` in
+/// `engine::scheduler::reduce_checkpoint`). Without this, a retried stage
+/// that is still pending — or has since succeeded — would go on reporting
+/// the failure of the attempt it already left behind. Within one attempt the
+/// *last* reason wins, and a terminal `ProviderFailed` with no reason never
+/// erases an earlier one that had it.
 fn stage_failure_reason(events: &[SequencedEvent], stage_id: &StageId) -> Option<String> {
-    events.iter().rev().find_map(|event| {
-        if event.event.stage_id() != Some(stage_id) {
-            return None;
-        }
+    let mut reason = None;
+    for event in events
+        .iter()
+        .filter(|event| event.event.stage_id() == Some(stage_id))
+    {
         match event.event.kind() {
+            DomainEventKind::StageStarted | DomainEventKind::StageRetryScheduled => {
+                reason = None;
+            }
             DomainEventKind::ProviderFailed {
-                reason: Some(reason),
+                reason: Some(new_reason),
                 ..
-            } => sanitize_failure_reason(reason),
-            _ => None,
+            } => {
+                if let Some(sanitized) = sanitize_failure_reason(new_reason) {
+                    reason = Some(sanitized);
+                }
+            }
+            _ => {}
         }
-    })
+    }
+    reason
 }
 
 pub(crate) fn list_artifacts(
@@ -1492,21 +1562,132 @@ mod tests {
     }
 
     #[test]
-    fn stage_failure_reason_prefers_the_last_reason_over_a_reasonless_terminal_event() {
+    fn stage_failure_reason_prefers_the_last_reason_within_one_attempt() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first signal: disk full")),
+            provider_failed_event(2, "implementation", Some("terminal: compile failed")),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("terminal: compile failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn stage_failure_reason_a_reasonless_failure_never_erases_an_earlier_one_in_the_same_attempt() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first attempt: OOM")),
+            provider_failed_event(2, "implementation", None),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("first attempt: OOM".to_owned())
+        );
+    }
+
+    /// A `StageRetryScheduled` closes out whatever the abandoned attempt
+    /// reported. A stage waiting to run again after that carries no reason —
+    /// showing the previous attempt's failure while the retry has not even
+    /// started would blame the wrong run.
+    #[test]
+    fn stage_failure_reason_clears_at_retry_while_the_new_attempt_is_pending() {
+        let events = vec![
+            event(
+                1,
+                at(12, 0, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+            provider_failed_event(2, "implementation", Some("first attempt: OOM")),
+            event(
+                3,
+                at(12, 1, 0),
+                Some("implementation"),
+                DomainEventKind::StageFailed,
+            ),
+            event(
+                4,
+                at(12, 2, 0),
+                Some("implementation"),
+                DomainEventKind::StageRetryScheduled,
+            ),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            None,
+            "a retried stage waiting to run again carries no stale reason"
+        );
+    }
+
+    /// A retry that goes on to succeed must never leave the abandoned
+    /// attempt's failure behind for a completed stage to still report.
+    #[test]
+    fn stage_failure_reason_clears_after_a_retry_that_succeeds() {
         let events = vec![
             provider_failed_event(1, "implementation", Some("first attempt: OOM")),
             event(
                 2,
-                at(12, 5, 0),
+                at(12, 1, 0),
                 Some("implementation"),
                 DomainEventKind::StageRetryScheduled,
             ),
-            provider_failed_event(3, "implementation", None),
+            event(
+                3,
+                at(12, 2, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+            event(
+                4,
+                at(12, 3, 0),
+                Some("implementation"),
+                DomainEventKind::StageCompleted,
+            ),
         ];
         assert_eq!(
             stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
-            Some("first attempt: OOM".to_owned()),
-            "a reasonless failure never erases the last reason that was reported"
+            None,
+            "a retry that goes on to succeed leaves no reason behind"
+        );
+    }
+
+    /// A retry that fails again must report only the new attempt's reason,
+    /// never the one the abandoned attempt carried.
+    #[test]
+    fn stage_failure_reason_after_a_retry_reports_only_the_new_attempts_reason() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first attempt: OOM")),
+            event(
+                2,
+                at(12, 1, 0),
+                Some("implementation"),
+                DomainEventKind::StageRetryScheduled,
+            ),
+            event(
+                3,
+                at(12, 2, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+            provider_failed_event(4, "implementation", Some("second attempt: disk full")),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("second attempt: disk full".to_owned()),
+            "the abandoned attempt's reason never leaks into the retry's own failure"
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_escapes_control_characters() {
+        assert_eq!(
+            sanitize_failure_reason("\u{1b}[31mCRASH\u{1b}[0m"),
+            Some("\u{fffd}[31mCRASH\u{fffd}[0m".to_owned()),
+            "an ANSI escape sequence must never reach the terminal unescaped"
+        );
+        assert_eq!(
+            sanitize_failure_reason("alert\u{7}bell"),
+            Some("alert\u{fffd}bell".to_owned())
         );
     }
 

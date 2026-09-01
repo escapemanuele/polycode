@@ -1297,6 +1297,7 @@ mod tests {
                 finished_at: None,
                 waiting: None,
                 failure_reason: None,
+                blocking: false,
             }],
             attention: Vec::new(),
             usage: crate::app::RunUsage::default(),

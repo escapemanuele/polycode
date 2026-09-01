@@ -2442,6 +2442,10 @@ mod tests {
             Some("compile failed: missing semicolon")
         );
         assert_eq!(implementation.status, StageStatus::Failed);
+        assert!(
+            implementation.blocking,
+            "a failed leaf stage with no dependents blocks completion on its own"
+        );
 
         // No other stage inherits a reason that was never theirs.
         assert!(
@@ -2451,6 +2455,75 @@ mod tests {
                 .filter(|stage| stage.id.as_str() != "implementation")
                 .all(|stage| stage.failure_reason.is_none()),
             "the reason is attributed to the failed stage only"
+        );
+    }
+
+    /// The Review workflow's `synthesis` treats `quality_review` and
+    /// `spec_review` as optional dependencies: either can fail and synthesis
+    /// still runs, degraded. If `quality_review` fails and synthesis then
+    /// fails too on its own merits, both stages carry `StageStatus::Failed`
+    /// — but only synthesis actually stops the run from completing, because
+    /// `decision` requires synthesis and nothing requires `quality_review`.
+    /// The run-level reason (and, by extension, the TUI's status sentence
+    /// built from it) must name synthesis, never the optional review that
+    /// merely happened to fail earlier in workflow order.
+    #[test]
+    fn inspect_attributes_the_run_level_reason_to_the_blocking_stage_not_the_first_failed_one() {
+        let fixture = Fixture::new();
+        let scenario = || {
+            FakeScenario::new()
+                .stage("research")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("quality_review")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::failed("quality review: lint runner crashed"),
+                ])
+                .stage("spec_review")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("synthesis")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::failed("synthesis: engineering lead ran out of context"),
+                ])
+        };
+        let failed = fixture
+            .scripted_service(scenario())
+            .start_run(
+                WorkflowKind::Review,
+                "optional review fails, then the real blocker does too",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(failed.details.status, RunStatus::Failed);
+
+        let details = fixture
+            .default_service()
+            .inspect_run(failed.details.id)
+            .unwrap();
+        let stage = |id: &str| {
+            details
+                .stages
+                .iter()
+                .find(|stage| stage.id.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} stage"))
+        };
+        assert_eq!(stage("quality_review").status, StageStatus::Failed);
+        assert!(
+            !stage("quality_review").blocking,
+            "synthesis only tolerates quality_review's failure, so it is not a blocker"
+        );
+        assert_eq!(stage("synthesis").status, StageStatus::Failed);
+        assert!(
+            stage("synthesis").blocking,
+            "decision requires synthesis, so its failure is what actually stops the run"
+        );
+        assert_eq!(
+            details.failure_reason.as_deref(),
+            Some("synthesis: engineering lead ran out of context"),
+            "the run-level reason names the blocking stage, not the first failed one"
         );
     }
 
