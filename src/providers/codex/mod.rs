@@ -759,14 +759,18 @@ fn read_capped_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::R
 /// A stream that carries no agent message reconstructs no final message, so it
 /// corroborates nothing and the completion is not trusted.
 ///
-/// The file is read through the artifact ceiling, never past it. A file larger
-/// than an artifact may hold could not be persisted as one whatever it says, so
-/// reading the rest to find that out is work a runaway or malformed final
-/// message would get for free.
+/// The file is read through the artifact ceiling, never past it, and measured
+/// the way the artifact writer measures it — trailing newline included. A file
+/// that could not be persisted as an artifact whatever it says corroborates
+/// nothing, and reading the rest of it to find that out is work a runaway or
+/// malformed final message would get for free.
 fn final_message_corroborates(final_path: &Path, stdout_path: &Path, end: u64) -> bool {
     let Some(file) = read_bounded(final_path, artifact::MAX_ARTIFACT_BYTES) else {
         return false;
     };
+    if !artifact::fits_ceiling(&file) {
+        return false;
+    }
     let Some(message) = last_agent_message(stdout_path, end) else {
         return false;
     };
@@ -1495,40 +1499,93 @@ mod tests {
         assert!(engine.drive(&mut store, run_id).is_err());
     }
 
-    /// A final message too large to become an artifact is rejected before it
-    /// is read, not after. Corroboration must never be a way to make the
-    /// adapter pull an unbounded file into memory — twice, counting the
-    /// artifact writer's own read.
+    /// A final message too large to become an artifact is refused before it is
+    /// read whole, and the ceiling is the one the artifact writer enforces —
+    /// counting the newline it appends. A file of exactly the ceiling without
+    /// that newline would be persisted one byte over it, so it must not pass;
+    /// the same size with the newline already there fits exactly and must.
     #[test]
-    fn an_oversized_final_message_is_refused_without_being_read_whole() {
-        let oversized = "x".repeat(artifact::MAX_ARTIFACT_BYTES + 1);
-        let output = format!(
-            "{}\n{}\n{}\n",
-            json!({"type":"thread.started","thread_id":"codex-thread-1"}),
-            json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":oversized}}),
-            json!({"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":20}}),
-        );
-        let (_temp, _database, run_id, mut store, provider) = fixture_with(
-            FixtureBackend::new(&output)
-                .with_exit(None)
-                .writing_final_message(&oversized),
-        );
-        let mut engine = WorkflowEngine::new(provider, "fixture task");
-        loop {
-            match engine.drive(&mut store, run_id).unwrap() {
-                EngineStatus::Interrupted { stages } => {
-                    assert_eq!(
-                        stages,
-                        vec![crate::domain::StageId::new("implementation").unwrap()]
-                    );
-                    break;
+    fn the_final_message_ceiling_is_measured_as_the_artifact_writer_measures_it() {
+        // At the ceiling and already terminated: persisted verbatim, exactly
+        // the ceiling. Over it, and at it but needing the appended newline:
+        // both would be persisted past the ceiling.
+        let at_ceiling = format!("{}\n", "x".repeat(artifact::MAX_ARTIFACT_BYTES - 1));
+        let unterminated = "x".repeat(artifact::MAX_ARTIFACT_BYTES);
+        let over_ceiling = "x".repeat(artifact::MAX_ARTIFACT_BYTES + 1);
+
+        // The stream reports the same bytes as the file, so only the ceiling
+        // ever decides these.
+        let stream = |message: &str| {
+            format!(
+                "{}\n{}\n{}\n",
+                json!({"type":"thread.started","thread_id":"codex-thread-1"}),
+                json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":message}}),
+                json!({"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":20}}),
+            )
+        };
+
+        for (message, completes) in [
+            (at_ceiling.as_str(), true),
+            (unterminated.as_str(), false),
+            (over_ceiling.as_str(), false),
+        ] {
+            let output = stream(message);
+            let (_temp, _database, run_id, mut store, provider) = fixture_with(
+                FixtureBackend::new(&output)
+                    .with_exit(None)
+                    .writing_final_message(message),
+            );
+            let mut engine = WorkflowEngine::new(provider, "fixture task");
+            let outcome = loop {
+                match engine.drive(&mut store, run_id).unwrap() {
+                    EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                    status => break status,
                 }
-                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
-                status => panic!("an oversized final message must not complete: {status:?}"),
+            };
+            let artifacts = store.list_artifacts(run_id).unwrap();
+            if completes {
+                assert!(
+                    matches!(
+                        outcome,
+                        EngineStatus::Finished {
+                            run_status: RunStatus::Completed
+                        }
+                    ),
+                    "a message that fits the ceiling must complete: {outcome:?}"
+                );
+                assert_eq!(artifacts.len(), 1);
+                assert_eq!(
+                    artifacts[0].content_size(),
+                    u64::try_from(artifact::MAX_ARTIFACT_BYTES).unwrap(),
+                    "the persisted artifact must be exactly the ceiling"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, EngineStatus::Interrupted { .. }),
+                    "a message past the ceiling must not complete: {outcome:?}"
+                );
+                assert!(artifacts.is_empty());
             }
         }
-        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-        assert_eq!(session.status(), ProviderSessionStatus::Interrupted);
+
+        // The same ceiling on the path that never corroborates anything: a
+        // clean exit whose file needs the appended newline to reach one byte
+        // past the ceiling is refused by the artifact writer, not written.
+        let output = stream(&unterminated);
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with(FixtureBackend::new(&output).writing_final_message(&unterminated));
+        let mut engine = WorkflowEngine::new(provider, "fixture task");
+        let failure = loop {
+            match engine.drive(&mut store, run_id) {
+                Ok(EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. }) => {}
+                Ok(status) => panic!("a clean exit past the ceiling must not settle: {status:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            failure.to_string().contains("exceeds"),
+            "the artifact ceiling must be reported: {failure}"
+        );
         assert!(store.list_artifacts(run_id).unwrap().is_empty());
     }
 

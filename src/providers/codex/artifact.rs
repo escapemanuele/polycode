@@ -16,6 +16,19 @@ use super::CodexProviderError;
 /// that could become one.
 pub(super) const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 
+/// Whether these bytes could be persisted as an artifact.
+///
+/// Measured as [`persist`] measures them, after the missing trailing newline
+/// it appends: that byte is written, so it counts against the ceiling. A
+/// message already ending in a newline may therefore be exactly the ceiling,
+/// and one that does not may not.
+pub(super) fn fits_ceiling(bytes: &[u8]) -> bool {
+    bytes
+        .len()
+        .saturating_add(usize::from(!bytes.ends_with(b"\n")))
+        <= MAX_ARTIFACT_BYTES
+}
+
 pub(crate) fn persist(
     root: &Path,
     final_message_path: &Path,
@@ -32,11 +45,14 @@ pub(crate) fn persist(
             error.into()
         }
     })?;
-    if bytes.len() > MAX_ARTIFACT_BYTES {
-        return Err(CodexProviderError::ArtifactTooLarge(MAX_ARTIFACT_BYTES));
-    }
+    // Normalize before measuring. The appended newline is part of what gets
+    // written, so checking the file's own length would let a message of
+    // exactly the ceiling be persisted one byte over it.
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
+    }
+    if bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(CodexProviderError::ArtifactTooLarge(MAX_ARTIFACT_BYTES));
     }
     let directory = root.join(request.run_id().to_string()).join("artifacts");
     std::fs::create_dir_all(&directory)?;
