@@ -1,5 +1,7 @@
 # Polycode Orchestration
 
+Agents should read `docs/features/README.md` before driving or changing a feature.
+
 Polycode coordinates recoverable engineering work performed by native coding-agent providers while preserving explicit human control over run progress and results.
 
 ## Language
