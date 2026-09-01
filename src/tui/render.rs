@@ -1914,7 +1914,10 @@ fn render_follow_ups(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     ];
     if let Some(text) = state.follow_ups_text.as_ref() {
         for line in text.lines() {
-            lines.push(Line::from(Span::styled(line.to_owned(), theme::text())));
+            lines.push(Line::from(Span::styled(
+                format::viewer_line(line),
+                theme::text(),
+            )));
         }
         lines.push(Line::from(""));
     }
@@ -3136,6 +3139,24 @@ mod tests {
             control_cells(&raw).is_empty(),
             "raw artifact viewer leaked control characters: {:?}",
             control_cells(&raw)
+        );
+
+        // The `[w]` overlay copies lines extracted from an agent-authored
+        // decision artifact, not a viewer reading a file — the same
+        // untrusted-content risk under a different entry point.
+        state.artifact_raw = false;
+        state.screen = Screen::RunDetail;
+        state.overlay = Some(Overlay::FollowUps);
+        state.follow_ups_text = Some(HOSTILE.to_owned());
+        let follow_ups = render_text(&state, 120, 30);
+        assert!(
+            control_cells(&follow_ups).is_empty(),
+            "follow-ups overlay leaked control characters: {:?}",
+            control_cells(&follow_ups)
+        );
+        assert!(
+            follow_ups.contains("let x = 1;"),
+            "content still renders: {follow_ups}"
         );
     }
 
