@@ -767,8 +767,9 @@ fn create_private_parent(path: &Path) -> Result<(), CodexProviderError> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::fs::File;
-    use std::io::{Read as _, Seek as _, SeekFrom};
+    // `File` and `Read` come from the adapter's own imports through the glob
+    // below; importing them again here is redundant.
+    use std::io::{Seek as _, SeekFrom};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
