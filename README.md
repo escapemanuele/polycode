@@ -117,13 +117,17 @@ Key bindings:
 | Global | `Enter`, `Esc` | Open/confirm, back/close |
 | Global | `n`, `R`, `?` | New run, runs screen, help |
 | Global | `q`, `Ctrl-C` | Quit/detach frontend |
-| Run | `r`, `t`, `u` | Resume/recover, retry selected failed stage, attention |
-| Run | `o`, `l`, `d` | Verified artifact, raw logs, diff |
+| Global | `x` | Dismiss notification |
+| Run | `r`, `s`, `t`, `u` | Resume/recover, stop (keeps the run and its work), retry selected failed stage, attention |
+| Run | `o`, `l`, `d`, `i` | Verified artifact, raw logs, diff, toggle technical details |
 | Run | `a`, `P`, `X` | Apply, publish pull request, or discard with confirmation |
+| Run | `f`, `c`, `w` | Fix a completed run's decision, continue it with a new instruction, work on its decision's Follow-ups |
+| Runs list | `h`, `H` | Hide/unhide selected run, show/hide hidden runs |
 | Viewer | `↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End` | Scroll |
+| Artifact viewer | `m` | Toggle raw/rendered Markdown |
 | Composer | `Tab`/`Shift-Tab`, arrows, typing/paste | Move fields, choose values, edit |
 
-New-run composer defaults to Standard workflow and Recommended routing. Choices are Recommended, Claude only, Codex only, and Fake. Selection maps directly to M9 `ExecutionSelection`; UI never recomputes routes.
+New-run composer defaults to Standard workflow, Recommended routing, and native-default effort; arrows cycle the Workflow, Execution, and Effort fields. Execution choices are Recommended, Claude only, Codex only, and Fake. Selection maps directly to M9 `ExecutionSelection`; UI never recomputes routes.
 
 ## Evaluations
 
@@ -228,12 +232,14 @@ polycode fast "Fix the parser" --provider fake
 polycode runs
 polycode status <run-id>
 polycode resume <run-id>
+polycode stop <run-id>
 polycode resolve <run-id> <attention-id> [--response "answer"]
 polycode retry <run-id> <stage-id>
 polycode fix <run-id>
 polycode apply <run-id>
 polycode pr <run-id>
 polycode discard <run-id>
+polycode update [--check] [--yes]
 ```
 
 Workflow commands use current directory unless `--repo` is supplied. Omitting both selection flags starts the `recommended` profile, the same default the TUI's new-run composer opens on; the resolved profile is named in the report rather than assumed. Recommended never falls back to the development FakeProvider, so the default can refuse to start — `recommended profile requires authenticated Claude Code or Codex CLI` — but can never quietly run a task against something that only looks like work. Fake stays something you ask for by name. Flags are mutually exclusive:

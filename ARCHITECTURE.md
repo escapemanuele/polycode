@@ -2,7 +2,7 @@
 
 ## Status
 
-Milestone 11 adds local role-specific evaluation and versioned routing evidence; `recommended_v2` is the first Recommended profile authored from that evidence. Ratatui control room, frozen M9 `recommended_v1` (still decoded for persisted runs), reviewer specialization, native provider semantics, durable recovery, and explicit apply/discard remain unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, custom routing DSL, LLM judging, cloud benchmark service, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain deliberately absent.
+Current work is Milestone 13d3 (TUI visual polish). On top of Milestone 11's local role-specific evaluation and `recommended_v2` routing evidence, the code carries M13a resource observability (usage, latency, invocation count, injected prompt bytes), M13a.5 change handoff for review stages, M13b effort policy (`--effort`, per-role `ResourcePlan`, config schema v3), M13e self-update (`polycode update`, install receipts), plus stop, fix/continue cycles, and pull-request publishing. Ratatui control room, frozen M9 `recommended_v1` (still decoded for persisted runs), reviewer specialization, native provider semantics, durable recovery, and explicit apply/discard remain unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, custom routing DSL, LLM judging, cloud benchmark service, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -369,7 +369,7 @@ On success, Claude result becomes human-readable stage artifact. Downstream prom
 
 Codex maps both specialized reviewer stage kinds to native `read-only` sandbox with approval `never`. Implementation and Fix alone receive `workspace-write`; adding reviewer roles never weakens this stage-derived policy.
 
-Execution controls are explicit and separate. `Implementation` and `Fix` select `workspace-write`; all other stage kinds select `read-only`. Approval is `never` for deterministic non-interactive execution but sandbox remains enabled. Dangerous sandbox/approval bypass, `danger-full-access`, ephemeral sessions, Git-check bypass, and native config/rules bypass are prohibited.
+Execution controls are explicit and separate. `Implementation`, `Fix`, and `FollowUp` select `workspace-write`; all other stage kinds select `read-only`. Approval is `never` for deterministic non-interactive execution but sandbox remains enabled. Dangerous sandbox/approval bypass, `danger-full-access`, ephemeral sessions, Git-check bypass, and native config/rules bypass are prohibited.
 
 `thread.started` binds provider-issued `thread_id` to generic native session identity. Duplicate identical identity checkpoints; conflict fails closed. Recovery consumes retained output first, then resumes exact persisted thread through `codex exec ... resume <thread-id> -` in new invocation. Failed-stage retry creates new provider session and thread. If process disappears before any thread identity exists, retained output is still parsed; only absence of recoverable identity permits later initial invocation for same attempt.
 
@@ -472,6 +472,8 @@ src/
 │   └── error.rs      typed application failures
 ├── config/
 │   └── mod.rs       side-effect-free configuration path resolution
+├── bin/
+│   └── polycode-test-agent.rs fixture executable driven by process tests
 ├── domain/
 │   ├── run.rs       aggregate, lifecycle, dependency and attention rules
 │   ├── stage.rs     stage state machine
@@ -480,6 +482,7 @@ src/
 │   ├── event.rs     provider-neutral semantic events
 │   ├── artifact.rs  typed artifact metadata
 │   ├── role.rs      provider/model-independent responsibility
+│   ├── effort.rs    provider-neutral resource intent
 │   ├── rehydration.rs persistence-neutral reconstruction data
 │   └── ids.rs       strong domain identities
 ├── engine/
@@ -507,6 +510,8 @@ src/
 │   ├── checkpoint.rs atomic provider commit payload
 │   ├── artifact.rs  immutable artifact record
 │   ├── stage_prompt.rs shared provider-neutral stage semantics
+│   ├── change_handoff.rs deterministic bounded implementation-change handoff for review stages
+│   ├── continue_instruction.rs immutable run-private storage for one continue cycle's instruction
 │   ├── claude/      native discovery, argv, prompts, JSONL decoder, adapter
 │   └── codex/       native discovery, exec argv, prompts, JSONL decoder, adapter
 ├── store/
@@ -524,12 +529,20 @@ src/
 │   ├── command.rs    native Git command runner
 │   ├── repository.rs canonical repository identity
 │   ├── worktree.rs   create/inspect/remove and branch ownership
+│   ├── remote.rs     remote URL lookup and non-forced branch push
 │   ├── patch.rs      temporary-index patch generation and apply
 │   └── error.rs      typed Git failures
 ├── workspace/
-    ├── manager.rs    intent/effect/finalize orchestration
-    ├── model.rs      workspace and apply-operation records
-    └── error.rs      typed lifecycle/reconciliation failures
+│   ├── manager.rs    intent/effect/finalize orchestration
+│   ├── model.rs      workspace and apply-operation records
+│   ├── github.rs     minimal GitHub CLI (`gh`) boundary for opening pull requests
+│   └── error.rs      typed lifecycle/reconciliation failures
+├── update/
+│   ├── mod.rs        update discovery for official releases
+│   ├── release.rs    official release metadata behind an injectable source
+│   ├── cache.rs      tiny forward-compatible update-check cache
+│   ├── install.rs    how this Polycode was installed and what an update may touch
+│   └── installer.rs  safe replacement of an official binary
 └── tui/
     ├── app.rs        refresh/event loop and application-action dispatch
     ├── state.rs      ephemeral presentation state and composer editing
@@ -537,6 +550,14 @@ src/
     ├── input.rs      terminal key-to-intent mapping
     ├── worker.rs     one serialized standard-thread action worker
     ├── terminal.rs   raw-mode/alternate-screen RAII and panic restoration
+    ├── bottom_line.rs artifact's own opening statement reduced to one line
+    ├── follow_ups.rs decision's `## Follow-ups` section read verbatim
+    ├── section.rs    shared Markdown heading matching for bottom_line and follow_ups
+    ├── markdown.rs   bounded terminal Markdown renderer for artifact viewing
+    ├── format.rs     deterministic operational formatters
+    ├── theme.rs      one palette and the surfaces built from it
+    ├── motion.rs     when the interface is allowed to move
+    ├── mascot.rs     POD, the Polycode Operator Droid
     └── mod.rs        public TUI entry point
 ```
 
