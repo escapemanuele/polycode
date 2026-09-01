@@ -193,7 +193,11 @@ impl EvalRunner {
         materialize_fixture(case, &source).map_err(infrastructure)?;
         initialize_repository(&source).map_err(infrastructure)?;
         let runtime = repetition_root.join("runtime");
-        let workflow = WorkflowDefinition::built_in(case.workflow);
+        // Verification is not part of what an evaluation measures; see
+        // `WorkflowDefinition::without_verification`.
+        let workflow = WorkflowDefinition::built_in(case.workflow)
+            .without_verification()
+            .map_err(|error| infrastructure(error.to_string()))?;
         let target_stage = target_stage(&workflow, case).map_err(infrastructure)?;
         let provider_id = ProviderId::new(self.options.target.provider.as_str())
             .map_err(|error| infrastructure(error.to_string()))?;
@@ -225,7 +229,7 @@ impl EvalRunner {
             resolver,
         );
         let mut report = service
-            .start_run_with_config(case.workflow, case.task, &source, &config)
+            .start_run_with_config(workflow.clone(), case.task, &source, &config)
             .map_err(|error| infrastructure(error.to_string()))?;
         let run_id = report.details.id;
         if self.options.target.provider == EvalProvider::Claude {

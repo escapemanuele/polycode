@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-use crate::domain::{EventId, EventMetadata, Run, RunId, RunStatus, RunTransition};
+use crate::domain::{
+    EventId, EventMetadata, Run, RunId, RunStatus, RunTransition, StageKind, StageStatus,
+};
 use crate::git::{
     GitRepository, apply_patch, branch_exists, branch_tip, check_patch, commit_all_in_worktree,
     create_branch_in_worktree, create_worktree, delete_owned_branch, detach_worktree,
@@ -308,6 +310,7 @@ impl WorkspaceManager {
         if loaded.run.status() == RunStatus::Applied {
             return Err(WorkspaceError::ApplyAlreadyPerformed(run_id));
         }
+        ensure_verification_passed(&loaded.run)?;
         if loaded.run.status() != RunStatus::Completed {
             return Err(invalid_run_status(&loaded.run, "apply"));
         }
@@ -419,6 +422,7 @@ impl WorkspaceManager {
         gh: &GhClient,
     ) -> Result<PublishReceipt, WorkspaceError> {
         let loaded = store.load_run(run_id)?;
+        ensure_verification_passed(&loaded.run)?;
         if loaded.run.status() != RunStatus::Completed {
             return Err(invalid_run_status(&loaded.run, "publish"));
         }
@@ -1049,6 +1053,42 @@ fn publish_body(task: Option<&str>, run_id: RunId) -> String {
         Some(task) => format!("{task}\n\n---\n{footer}"),
         None => footer,
     }
+}
+
+/// Refuses to move a run's changes anywhere unless its latest verification
+/// passed.
+///
+/// The rule: take the run's most recent verify stage — the last one in
+/// definition order, since every fix or continue cycle appends its own —
+/// and refuse if it failed, or if the run is `Completed` and it is not
+/// `Completed`. Older verify stages do not count: a fix cycle whose
+/// `verify_n` passed has answered the failure that came before it, and a
+/// verification that went red on the first attempt is exactly what a fix
+/// cycle exists to turn green.
+///
+/// Asked before the run-status check, so a failure is refused by name rather
+/// than by whatever status it caused. The decision only optionally depends
+/// on verification, so a failed check completes the run, reaches the lead
+/// as evidence, and leaves fix and continue available; this gate is what
+/// keeps such a run from being applied or published in the meantime.
+fn ensure_verification_passed(run: &Run) -> Result<(), WorkspaceError> {
+    let Some(latest) = run
+        .stages()
+        .iter()
+        .rev()
+        .find(|stage| stage.kind() == StageKind::Verify)
+    else {
+        return Ok(());
+    };
+    let blocked = latest.status() == StageStatus::Failed
+        || (run.status() == RunStatus::Completed && latest.status() != StageStatus::Completed);
+    if blocked {
+        return Err(WorkspaceError::VerificationNotPassed {
+            stage_id: latest.id().clone(),
+            status: format!("{:?}", latest.status()).to_lowercase(),
+        });
+    }
+    Ok(())
 }
 
 fn invalid_run_status(run: &Run, operation: &'static str) -> WorkspaceError {

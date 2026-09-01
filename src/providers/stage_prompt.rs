@@ -76,6 +76,11 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
         (Role::EngineeringLead, _) => {
             "Integrate direct dependency evidence into one actionable engineering result."
         }
+        // Never sent anywhere: the verifier is the deterministic `verify`
+        // provider, which runs commands rather than reading a contract.
+        (Role::Verifier, _) => {
+            "Run the repository's verification commands and report every exit code."
+        }
     }
 }
 

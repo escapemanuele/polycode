@@ -62,10 +62,18 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     assert!(decision.contains("# quality_review result"));
     assert!(decision.contains("# spec_review result"));
 
+    // Six native sessions plus the verify stage's own artifact: verification
+    // is command execution, so it opens no provider session and is routed
+    // implicitly rather than by the recommended profile.
     let artifacts = store.list_artifacts(run_id).unwrap();
-    assert_eq!(artifacts.len(), 6);
+    assert_eq!(artifacts.len(), 7);
     for artifact in artifacts {
-        let expected = by_stage[artifact.metadata().stage_id().as_str()];
+        let stage = artifact.metadata().stage_id().as_str();
+        let expected = if stage == "verify" {
+            "verify"
+        } else {
+            by_stage[stage]
+        };
         assert_eq!(
             artifact.metadata().provider_id().unwrap().as_str(),
             expected

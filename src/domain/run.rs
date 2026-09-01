@@ -990,18 +990,55 @@ impl Run {
         })
     }
 
+    /// Every stage downstream of `stage_id`, transitively, in definition
+    /// order.
+    fn descendants(&self, stage_id: &StageId) -> Vec<StageId> {
+        let mut reached = vec![stage_id.clone()];
+        let mut descendants = Vec::new();
+        for stage in &self.stages {
+            if stage
+                .dependencies()
+                .iter()
+                .any(|dependency| reached.contains(dependency.stage_id()))
+            {
+                reached.push(stage.id().clone());
+                descendants.push(stage.id().clone());
+            }
+        }
+        descendants
+    }
+
+    /// The stages a retry of `stage_id` would return to pending with it:
+    /// every downstream stage that was skipped, which a failure upstream
+    /// is the only way to become. They never ran, so nothing they hold is
+    /// invalidated; leaving them skipped would let the retried stage
+    /// succeed into a run that can never complete.
+    #[must_use]
+    pub fn skipped_descendants(&self, stage_id: &StageId) -> Vec<StageId> {
+        self.descendants(stage_id)
+            .into_iter()
+            .filter(|id| {
+                self.stage(id)
+                    .is_some_and(|stage| stage.status() == StageStatus::Skipped)
+            })
+            .collect()
+    }
+
+    /// A retry may discard nothing: every downstream stage, direct or not,
+    /// must still be pending, ready, or skipped. Skipped counts as nothing
+    /// done because it is exactly that, and the retry un-skips it.
     fn ensure_retry_safe(&self, stage_id: &StageId) -> Result<(), RunStageError> {
         let advanced = self
-            .stages
-            .iter()
-            .filter(|stage| {
-                stage
-                    .dependencies()
-                    .iter()
-                    .any(|dependency| dependency.stage_id() == stage_id)
-                    && !matches!(stage.status(), StageStatus::Pending | StageStatus::Ready)
+            .descendants(stage_id)
+            .into_iter()
+            .filter(|id| {
+                self.stage(id).is_some_and(|stage| {
+                    !matches!(
+                        stage.status(),
+                        StageStatus::Pending | StageStatus::Ready | StageStatus::Skipped
+                    )
+                })
             })
-            .map(|stage| stage.id().clone())
             .collect::<Vec<_>>();
         if advanced.is_empty() {
             Ok(())
@@ -1415,6 +1452,7 @@ mod tests {
             "simplification",
             "quality_review",
             "spec_review",
+            "verify",
             "decision",
         ] {
             complete_stage(&mut run, &id(stage), event);
@@ -1438,26 +1476,27 @@ mod tests {
     #[test]
     fn a_rejected_run_grows_a_fix_and_a_fresh_decision_over_it_and_reopens() {
         let mut run = decided_run();
-        assert_eq!(run.stages().len(), 6);
+        assert_eq!(run.stages().len(), 7);
 
         let event = run.request_fix(metadata(200, 8)).unwrap();
 
         // The run reopens rather than a second run adopting its workspace.
         assert_eq!(run.status(), RunStatus::Running);
-        assert_eq!(run.stages().len(), 8);
+        assert_eq!(run.stages().len(), 10);
         assert!(matches!(
             event.kind(),
             DomainEventKind::RunFixRequested { stage_ids }
                 if stage_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
-                    == vec!["fix_1".to_owned(), "decision_1".to_owned()]
+                    == vec!["fix_1".to_owned(), "verify_1".to_owned(), "decision_1".to_owned()]
         ));
 
-        // The fix answers the verdict that sent the work back, and the new
-        // decision reads both the fix and that verdict.
+        // The fix answers the verdict that sent the work back, verification
+        // checks the fix, and the new decision reads all of it.
         assert_eq!(dependency_ids(&run, &id("fix_1")), vec!["decision"]);
+        assert_eq!(dependency_ids(&run, &id("verify_1")), vec!["fix_1"]);
         assert_eq!(
             dependency_ids(&run, &id("decision_1")),
-            vec!["fix_1", "decision"]
+            vec!["fix_1", "verify_1", "decision"]
         );
 
         // Nothing already done is disturbed, and the new work has not started.
@@ -1465,7 +1504,7 @@ mod tests {
             run.stage(&id("implementation")).unwrap().status(),
             StageStatus::Completed
         );
-        for stage in ["fix_1", "decision_1"] {
+        for stage in ["fix_1", "verify_1", "decision_1"] {
             assert_eq!(
                 run.stage(&id(stage)).unwrap().status(),
                 StageStatus::Pending
@@ -1535,7 +1574,7 @@ mod tests {
         let mut run = decided_run();
         run.request_fix(metadata(200, 8)).unwrap();
         let mut event = 210;
-        for stage in ["fix_1", "decision_1"] {
+        for stage in ["fix_1", "verify_1", "decision_1"] {
             complete_stage(&mut run, &id(stage), event);
             event += 10;
         }
@@ -1543,11 +1582,11 @@ mod tests {
             .unwrap();
 
         run.request_fix(metadata(400, 10)).unwrap();
-        assert_eq!(run.stages().len(), 10);
+        assert_eq!(run.stages().len(), 13);
         assert_eq!(dependency_ids(&run, &id("fix_2")), vec!["decision_1"]);
         assert_eq!(
             dependency_ids(&run, &id("decision_2")),
-            vec!["fix_2", "decision_1"]
+            vec!["fix_2", "verify_2", "decision_1"]
         );
         run.validate_invariants().unwrap();
     }
@@ -1555,31 +1594,39 @@ mod tests {
     #[test]
     fn a_rejected_run_grows_a_follow_up_and_a_fresh_decision_over_it_and_reopens() {
         let mut run = decided_run();
-        assert_eq!(run.stages().len(), 6);
+        assert_eq!(run.stages().len(), 7);
 
         let event = run.request_continue(metadata(200, 8)).unwrap();
 
         // The run reopens rather than a second run adopting its workspace.
         assert_eq!(run.status(), RunStatus::Running);
-        assert_eq!(run.stages().len(), 8);
+        assert_eq!(run.stages().len(), 10);
         assert!(matches!(
             event.kind(),
             DomainEventKind::RunContinueRequested { stage_ids }
                 if stage_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
-                    == vec!["followup_1".to_owned(), "followup_decision_1".to_owned()]
+                    == vec![
+                        "followup_1".to_owned(),
+                        "followup_verify_1".to_owned(),
+                        "followup_decision_1".to_owned()
+                    ]
         ));
 
         assert_eq!(dependency_ids(&run, &id("followup_1")), vec!["decision"]);
         assert_eq!(
+            dependency_ids(&run, &id("followup_verify_1")),
+            vec!["followup_1"]
+        );
+        assert_eq!(
             dependency_ids(&run, &id("followup_decision_1")),
-            vec!["followup_1", "decision"]
+            vec!["followup_1", "followup_verify_1", "decision"]
         );
 
         assert_eq!(
             run.stage(&id("implementation")).unwrap().status(),
             StageStatus::Completed
         );
-        for stage in ["followup_1", "followup_decision_1"] {
+        for stage in ["followup_1", "followup_verify_1", "followup_decision_1"] {
             assert_eq!(
                 run.stage(&id(stage)).unwrap().status(),
                 StageStatus::Pending
@@ -1617,7 +1664,7 @@ mod tests {
         let mut run = decided_run();
         run.request_fix(metadata(200, 8)).unwrap();
         let mut event = 210;
-        for stage in ["fix_1", "decision_1"] {
+        for stage in ["fix_1", "verify_1", "decision_1"] {
             complete_stage(&mut run, &id(stage), event);
             event += 10;
         }
@@ -1626,7 +1673,7 @@ mod tests {
 
         run.request_continue(metadata(400, 10)).unwrap();
 
-        assert_eq!(run.stages().len(), 10);
+        assert_eq!(run.stages().len(), 13);
         assert_eq!(dependency_ids(&run, &id("fix_1")), vec!["decision"]);
         assert_eq!(
             dependency_ids(&run, &id("followup_1")),
@@ -1634,6 +1681,106 @@ mod tests {
             "the continue cycle answers the decision the run most recently reached"
         );
         run.validate_invariants().unwrap();
+    }
+
+    /// A failure skips everything downstream of it. Retrying the failure
+    /// returns those skipped stages to pending with it — they never ran, so
+    /// nothing is discarded — while anything downstream that did run, even
+    /// through an optional edge, still refuses the retry.
+    #[test]
+    fn retrying_a_failed_stage_returns_its_skipped_descendants_to_pending() {
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Fast,
+            vec![
+                StageDefinition::new(
+                    id("implementation"),
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    id("verify"),
+                    StageKind::Verify,
+                    Role::Verifier,
+                    vec![Dependency::required(id("implementation"))],
+                ),
+                StageDefinition::new(
+                    id("decision"),
+                    StageKind::Decision,
+                    Role::EngineeringLead,
+                    vec![Dependency::required(id("verify"))],
+                ),
+                StageDefinition::new(
+                    id("synthesis"),
+                    StageKind::Synthesis,
+                    Role::EngineeringLead,
+                    vec![Dependency::optional(id("verify"))],
+                ),
+            ],
+        )
+        .unwrap();
+        let mut run = new_run(workflow);
+        start_run(&mut run);
+        run.transition_stage(
+            &id("implementation"),
+            StageTransition::MarkReady,
+            metadata(10, 4),
+        )
+        .unwrap();
+        run.transition_stage(
+            &id("implementation"),
+            StageTransition::Start,
+            metadata(11, 5),
+        )
+        .unwrap();
+        run.transition_stage(
+            &id("implementation"),
+            StageTransition::Fail,
+            metadata(12, 6),
+        )
+        .unwrap();
+        for stage in ["verify", "decision"] {
+            run.transition_stage(&id(stage), StageTransition::Skip, metadata(13, 7))
+                .unwrap();
+        }
+        assert_eq!(
+            run.skipped_descendants(&id("implementation")),
+            vec![id("verify"), id("decision")]
+        );
+
+        let mut retried = run.clone();
+        for stage in ["implementation", "verify", "decision"] {
+            retried
+                .transition_stage(&id(stage), StageTransition::Retry, metadata(14, 8))
+                .unwrap();
+            assert_eq!(
+                retried.stage(&id(stage)).unwrap().status(),
+                StageStatus::Pending
+            );
+        }
+
+        // Synthesis only optionally needed verification, so it ran to
+        // completion over the skip; that outcome is what a retry would
+        // now invalidate.
+        run.transition_stage(
+            &id("synthesis"),
+            StageTransition::MarkReady,
+            metadata(15, 8),
+        )
+        .unwrap();
+        run.transition_stage(&id("synthesis"), StageTransition::Start, metadata(16, 9))
+            .unwrap();
+        run.transition_stage(
+            &id("synthesis"),
+            StageTransition::Complete,
+            metadata(17, 10),
+        )
+        .unwrap();
+        assert!(matches!(
+            run.transition_stage(&id("implementation"), StageTransition::Retry, metadata(18, 11)),
+            Err(RunStageError::RetryWouldInvalidate { advanced_dependents, .. })
+                if advanced_dependents == vec![id("synthesis")]
+        ));
     }
 
     #[test]

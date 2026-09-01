@@ -336,7 +336,7 @@ mod tests {
         let worker = Worker::spawn(RunService::new(
             fixture.path().join("polycode.db"),
             fixture.path().join("worktrees"),
-            DevelopmentFakeProviderFactory,
+            DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
         ));
         worker.send(WorkerCommand::StartRun {
             workflow: WorkflowKind::Standard,
@@ -365,7 +365,7 @@ mod tests {
         let worker = Worker::spawn(RunService::new(
             fixture.path().join("polycode.db"),
             fixture.path().join("worktrees"),
-            DevelopmentFakeProviderFactory,
+            DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
         ));
         worker.send(WorkerCommand::StartRun {
             workflow: WorkflowKind::Fast,
@@ -413,7 +413,7 @@ mod tests {
         let worker = Worker::spawn(RunService::new(
             fixture.path().join("polycode.db"),
             fixture.path().join("worktrees"),
-            DevelopmentFakeProviderFactory,
+            DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
         ));
         for task in ["first", "second"] {
             worker.send(WorkerCommand::StartRun {

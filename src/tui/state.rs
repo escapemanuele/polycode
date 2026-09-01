@@ -378,6 +378,8 @@ impl StageHeadline {
 ///
 /// The roles come from [`fix_cycle_stages`] itself rather than being named
 /// here, so this cannot drift from what a fix cycle is actually made of.
+/// The verifier is the one exception: it is never a persisted route, the
+/// router answers for it implicitly, so no snapshot can lack it.
 fn can_be_fixed(details: &RunDetails) -> bool {
     let Some(decision) = details
         .stages
@@ -389,6 +391,7 @@ fn can_be_fixed(details: &RunDetails) -> bool {
     };
     crate::domain::fix_cycle_stages(1, &decision.id)
         .iter()
+        .filter(|added| added.role() != crate::domain::Role::Verifier)
         .all(|added| {
             details
                 .routes
@@ -414,6 +417,7 @@ fn can_be_continued(details: &RunDetails) -> bool {
     };
     crate::domain::continue_cycle_stages(1, &decision.id)
         .iter()
+        .filter(|added| added.role() != crate::domain::Role::Verifier)
         .all(|added| {
             details
                 .routes

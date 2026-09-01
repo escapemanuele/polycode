@@ -46,6 +46,15 @@ pub enum WorkspaceError {
     SourceCheckoutDirty(PathBuf),
     #[error("review/detached workspace cannot be applied")]
     ReviewWorkspaceNotApplicable,
+    /// The run's latest verify stage did not pass. A failed verification
+    /// still completes the run — the decision only optionally depends on
+    /// it — so this gate, not the run status, is what keeps unverified
+    /// changes out of the source checkout and off the remote.
+    #[error("verification did not pass: stage {stage_id} is {status}")]
+    VerificationNotPassed {
+        stage_id: crate::domain::StageId,
+        status: String,
+    },
     #[error("workspace has no changes to apply")]
     EmptyPatch,
     #[error("workspace has no changes to publish")]

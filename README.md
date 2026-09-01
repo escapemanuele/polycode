@@ -66,15 +66,19 @@ See [Updates](#updates) for what a check sends and how to switch it off.
 New runs use these graph definitions:
 
 ```text
-Fast:      Implementation
+Fast:      Implementation -> Verify
 
 Standard:  Architecture ---> Implementation ---> Simplification ---> Code Quality Review --+
-                 |                |                     |                                  |
-                 +----------------+---------------------+--> Specification Review ---------+-> Decision
+           |                 |                   |                                         |
+           +-----------------+-------------------+--> Specification Review ----------------+-> Decision
+                                                 |                                         |
+                                                 +--> Verify ------------------------------+
 
 Deep:      Research -> Architecture ---> Implementation ---> Simplification ---> Code Quality Review --+
-                                |                |                     |                              |
-                                +----------------+---------------------+--> Specification Review -----+-> Decision
+                       |                 |                   |                                         |
+                       +-----------------+-------------------+--> Specification Review ----------------+-> Decision
+                                                             |                                         |
+                                                             +--> Verify ------------------------------+
 
 Review:    Research -> Code Quality Review --+
                    `-> Specification Review -+-> Synthesis -> Decision
@@ -83,7 +87,7 @@ Review:    Research -> Code Quality Review --+
 A decision is where a run ends, not where the operator's options do. `polycode fix <run-id>`, or `f` in the run detail view, sends a completed run back to remediate its own result:
 
 ```text
-... -> Decision --> Fix 1 -> Decision 1 --> Fix 2 -> Decision 2 -> ...
+... -> Decision --> Fix 1 -> Verify 1 -> Decision 1 --> Fix 2 -> Verify 2 -> Decision 2 -> ...
 ```
 
 The run grows one cycle per request, keeping its workspace, its artifacts and its identity, so it stays one thing to apply or discard. The fix answers the decision that rejected it and is bounded by that decision's blocking findings; the fresh decision reads both the fix and the verdict it answers, and judges the fix against the code rather than against its own claims. Pressing fix again answers the newest verdict. Nothing re-runs the reviews — start a review run over the result if you want them back.
@@ -93,6 +97,20 @@ Polycode never reads the verdict to decide whether a fix is warranted. A decisio
 Simplification edits the implementation change in place before anyone judges it: it removes accidental complexity — comments that restate code, single-caller abstractions, speculative generality — bounded by the run delta and forbidden from changing observable behavior. It runs in a writable workspace like Implementation, and both reviews then inspect the simplified result, doubling as a safety net over its edits.
 
 Code Quality Review inspects actual repository state and judges how implementation is engineered. Specification Review independently compares delivered behavior with immutable task intent and available design evidence, classifying gaps as Missing, Wrong, or Unrequested. Both are read-only and create separate stage-ID-based Markdown artifacts. Existing persisted runs retain their original stored graph, including legacy generic review stages.
+
+### Verification
+
+After the last stage that edits the worktree, Polycode runs the repository's own verification commands there — no agent involved — and records every command and exit code in a Markdown artifact whose bottom line the control room quotes. The stage completes only when every command exits zero. In Standard and Deep a failed check does not fail the run: the decision still runs with the failure in front of it and the run completes, so `fix` can answer it in place — each fix cycle re-verifies — while `apply` and `pr` refuse by name until the run's latest verification passes. In Fast there is no decision, so a failed check fails the run and `retry <run-id> verify` re-runs it. The reviews run beside verification and the decision waits for it.
+
+The repository says what "verified" means in `<repo>/.polycode.toml`:
+
+```toml
+[verify]
+commands = ["cargo fmt --check", "cargo clippy --all-targets", "cargo test"]
+timeout_seconds = 1800
+```
+
+Without that table Polycode runs the one command the build file implies (`Cargo.toml` → `cargo test`, `package.json` → `npm test`, `pyproject.toml`/`pytest.ini` → `pytest`, `go.mod` → `go test ./...`), and with no recognised build file it completes having checked nothing and says so. Commands are argv, not shell — no pipes or `&&` — and the sequence stops at the first failure.
 
 ## Local control room
 
@@ -328,7 +346,7 @@ Resolution order:
 2. `$XDG_CONFIG_HOME/polycode/config.toml`
 3. `$HOME/.config/polycode/config.toml`
 
-Repository overrides will eventually live at `<repo>/.polycode.toml`. Current code resolves paths but does not read or create configuration files, so the update opt-out below is an environment variable rather than a configuration key.
+Repository settings live at `<repo>/.polycode.toml`; today only its `[verify]` table is read (see Verification above). The user configuration file is resolved but never read or created, so the update opt-out below is an environment variable rather than a configuration key.
 
 ### Appearance
 

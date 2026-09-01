@@ -12,6 +12,7 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 | Workflows | Built-in Fast/Standard/Deep/Review graphs plus fix and continue cycles | [workflows.md](workflows.md) |
 | Control room | Ratatui TUI: screens, overlays, exact keys | [control-room.md](control-room.md) |
 | Workspace | Isolated worktrees, apply, discard, pull request | [workspace.md](workspace.md) |
+| Verification | Run the repository's own checks after the last edit; failed checks block completion and apply | [verification.md](verification.md) |
 | Routing | Roles to providers/models, `--provider`, `--profile recommended`, v1 frozen / v2 current | [routing.md](routing.md) |
 | Native providers | Claude Code and Codex adapters, permissions, sandboxes, attention | [providers.md](providers.md) |
 | Evaluations | `eval list/run/report`, suites under `evals/`, evidence layout | [evaluations.md](evaluations.md) |

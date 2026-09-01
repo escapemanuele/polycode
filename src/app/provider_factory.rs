@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
@@ -9,12 +10,13 @@ use crate::engine::{
 };
 use crate::providers::claude::{ClaudeInstallation, ClaudeProvider, ClaudeProviderError};
 use crate::providers::codex::{CodexInstallation, CodexProvider, CodexProviderError};
+use crate::providers::verify::VerifyProvider;
 use crate::store::{ResolvedConfigSnapshot, SequencedEvent, SqliteStore};
 
 use super::AppError;
 use super::routing::{
     ExecutionSelection, ExecutionTarget, RecommendedAvailability, ResourcePlan, RoutingPlan,
-    UniformProvider, resolve_config,
+    UniformProvider, VERIFY_PROVIDER_ID, resolve_config,
 };
 
 pub trait ProviderFactory {
@@ -76,11 +78,27 @@ impl<T: ProviderFactory> ProviderResolver for T {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DevelopmentFakeProviderFactory;
+/// Fakes every agent role and runs verification for real, writing its
+/// artifacts under an explicit root rather than the developer's data
+/// directory — every in-process test would otherwise leave a `verify.md`
+/// in `~/.polycode/runs`.
+#[derive(Clone, Debug)]
+pub struct DevelopmentFakeProviderFactory {
+    artifact_root: PathBuf,
+}
+
+impl DevelopmentFakeProviderFactory {
+    #[must_use]
+    pub fn new(artifact_root: PathBuf) -> Self {
+        Self { artifact_root }
+    }
+}
 
 impl ProviderFactory for DevelopmentFakeProviderFactory {
-    type Provider = FakeProvider;
+    /// Routed rather than a bare `FakeProvider`: every agent role is faked,
+    /// but the verifier is never an agent, so the run's verify stages go
+    /// to the real `verify` provider here exactly as they do in production.
+    type Provider = RoutedProvider;
 
     fn config_for_new_run(
         &self,
@@ -125,7 +143,9 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
                 "development factory only supports fake routes".to_owned(),
             ));
         }
-        Ok(FakeProvider::new(FakeScenario::successful(workflow))?)
+        let resource_plan = ResourcePlan::from_snapshot(config, workflow)?;
+        Ok(RoutedProvider::new(plan, resource_plan, workflow.clone())
+            .with_artifact_root(self.artifact_root.clone()))
     }
 }
 
@@ -133,6 +153,7 @@ pub enum RuntimeProvider {
     Fake(FakeProvider),
     Claude(ClaudeProvider),
     Codex(CodexProvider),
+    Verify(VerifyProvider),
 }
 
 impl Provider for RuntimeProvider {
@@ -141,6 +162,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.provider_id_for(request),
             Self::Claude(provider) => provider.provider_id_for(request),
             Self::Codex(provider) => provider.provider_id_for(request),
+            Self::Verify(provider) => provider.provider_id_for(request),
         }
     }
 
@@ -149,6 +171,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.supports_role(role),
             Self::Claude(provider) => provider.supports_role(role),
             Self::Codex(provider) => provider.supports_role(role),
+            Self::Verify(provider) => provider.supports_role(role),
         }
     }
 
@@ -157,6 +180,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.keep_attached_for(request),
             Self::Claude(provider) => provider.keep_attached_for(request),
             Self::Codex(provider) => provider.keep_attached_for(request),
+            Self::Verify(provider) => provider.keep_attached_for(request),
         }
     }
 
@@ -170,6 +194,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.stage_attention_response(store, context, response),
             Self::Claude(provider) => provider.stage_attention_response(store, context, response),
             Self::Codex(provider) => provider.stage_attention_response(store, context, response),
+            Self::Verify(provider) => provider.stage_attention_response(store, context, response),
         }
     }
 
@@ -182,6 +207,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.can_auto_resolve_attention(store, context),
             Self::Claude(provider) => provider.can_auto_resolve_attention(store, context),
             Self::Codex(provider) => provider.can_auto_resolve_attention(store, context),
+            Self::Verify(provider) => provider.can_auto_resolve_attention(store, context),
         }
     }
 
@@ -203,6 +229,9 @@ impl Provider for RuntimeProvider {
             Self::Codex(provider) => {
                 provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
             }
+            Self::Verify(provider) => {
+                provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
+            }
         }
     }
 
@@ -218,6 +247,9 @@ impl Provider for RuntimeProvider {
                 provider.discard_continue_instruction(store, run_id, stage_id)
             }
             Self::Codex(provider) => provider.discard_continue_instruction(store, run_id, stage_id),
+            Self::Verify(provider) => {
+                provider.discard_continue_instruction(store, run_id, stage_id)
+            }
         }
     }
 
@@ -230,6 +262,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.poll(store, request),
             Self::Claude(provider) => provider.poll(store, request),
             Self::Codex(provider) => provider.poll(store, request),
+            Self::Verify(provider) => provider.poll(store, request),
         }
     }
 }
@@ -240,7 +273,10 @@ pub struct RoutedProvider {
     resource_plan: ResourcePlan,
     workflow: WorkflowDefinition,
     runtimes: HashMap<(ExecutionTarget, EffortSetting), RuntimeProvider>,
-    isolated_runtime: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    isolated_runtime: Option<(PathBuf, PathBuf)>,
+    /// Where the verify provider writes its artifacts when not the
+    /// configured data directory: the eval runtime root, or a test fixture.
+    artifact_root: Option<PathBuf>,
     eval_auto_approve: bool,
 }
 
@@ -257,8 +293,18 @@ impl RoutedProvider {
             workflow,
             runtimes: HashMap::new(),
             isolated_runtime: None,
+            artifact_root: None,
             eval_auto_approve: false,
         }
+    }
+
+    /// The same provider with verification artifacts redirected under
+    /// `root`, the tree the native adapters would use under the data
+    /// directory.
+    #[must_use]
+    pub fn with_artifact_root(mut self, root: PathBuf) -> Self {
+        self.artifact_root = Some(root);
+        self
     }
 
     /// A provider whose *runtime* is redirected: process data root and runner
@@ -275,14 +321,15 @@ impl RoutedProvider {
         plan: RoutingPlan,
         resource_plan: ResourcePlan,
         workflow: WorkflowDefinition,
-        process_root: std::path::PathBuf,
-        runner_executable: std::path::PathBuf,
+        process_root: PathBuf,
+        runner_executable: PathBuf,
     ) -> Self {
         Self {
             plan,
             resource_plan,
             workflow,
             runtimes: HashMap::new(),
+            artifact_root: Some(process_root.clone()),
             isolated_runtime: Some((process_root, runner_executable)),
             eval_auto_approve: true,
         }
@@ -337,6 +384,7 @@ impl RoutedProvider {
                             ))
                         })?,
                 ),
+                VERIFY_PROVIDER_ID => RuntimeProvider::Verify(self.verify_provider()?),
                 other => {
                     return Err(ProviderError::new(format!(
                         "unsupported configured provider {other:?}"
@@ -367,6 +415,20 @@ impl RoutedProvider {
                 ClaudeProvider::from_runtime(model, root.clone(), runner.clone())
             }
             None => ClaudeProvider::from_environment(model),
+        }
+    }
+
+    /// The verifier writes artifacts where the native adapters do: under
+    /// the explicit root when one was given (eval runtime, test fixture),
+    /// else the configured data directory.
+    fn verify_provider(&self) -> Result<VerifyProvider, ProviderError> {
+        match &self.artifact_root {
+            Some(root) => Ok(VerifyProvider::new(root.clone())),
+            None => VerifyProvider::from_environment().map_err(|error| {
+                ProviderError::new(format!(
+                    "configured provider unavailable for verify target: {error}"
+                ))
+            }),
         }
     }
 
@@ -600,8 +662,6 @@ fn probe_recommended_availability() -> Result<RecommendedAvailability, AppError>
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::domain::{StageId, StageKind, StageStatus, WorkflowKind};
 

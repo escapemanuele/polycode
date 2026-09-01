@@ -9,6 +9,7 @@ pub(crate) mod continue_instruction;
 pub(crate) mod section;
 mod session;
 mod stage_prompt;
+pub mod verify;
 
 pub use artifact::{ArtifactRecord, ArtifactRecordError};
 pub use checkpoint::{ProviderCommit, ProviderSessionMutation};

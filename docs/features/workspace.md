@@ -6,6 +6,7 @@ Every run works in its own Git worktree; the source checkout changes only when y
 - worktree: `~/.polycode/worktrees/<sanitized-repo>-<common-dir-hash>/<run-id>` from the committed `HEAD` at creation (the base commit).
 - modes: implementation workflows own a `polycode/run-<run-id>` branch; review workflows use a detached worktree.
 - apply: patch transfer from base commit to a clean source checkout; no staging, no commit.
+- verification-gate: `apply` and `pr` refuse unless the run's latest Verify stage — the last one in the graph, since every fix or continue cycle appends its own — is `Completed` (`verification did not pass: stage verify is failed`). Older verify stages do not count: a failed `verify` answered by a passed `verify_1` no longer blocks. Checked before the run-status check.
 - pr: commit the delta on the run's branch, push to `origin`, open a PR through `gh`; source checkout untouched.
 - pr-draft: the PR title and description are quoted from the `## Pull request` section of the latest editing stage's artifact (Implementation, Simplification, Fix, FollowUp); the task's first line and text stand in when no stage wrote one.
 - discard: record `Discarded`, then remove owned worktree and branch.
@@ -25,7 +26,8 @@ polycode status <run-id>      # Workspace and Base lines
 TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, `X` then Enter discard.
 
 ## Where it lives
-- `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`.
+- `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`, `ensure_verification_passed`.
+- `src/workspace/error.rs` — `WorkspaceError`, incl. `VerificationNotPassed`.
 - `src/workspace/model.rs` — `RunWorkspace`, `WorkspaceStatus`, apply operation records.
 - `src/workspace/github.rs` — `gh pr list --head` / `gh pr create` boundary.
 - `src/workspace/pull_request.rs` — `PullRequestDraft`, `extract` of the artifact's `## Pull request` section; `src/app/query.rs` `pull_request_draft` picks the artifact.
@@ -38,7 +40,8 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, 
 ## Gotchas
 - Apply requires a fully clean source checkout; preparation does not (the worktree starts from committed `HEAD`).
 - Apply never stages or commits; an empty diff is a successful no-op (`No workspace changes to apply.`).
-- `pr` rejects non-completed runs, detached (review) workspaces, empty deltas and repositories without an `origin` remote. PR failure (no `gh`, not authenticated) is reported in the receipt and never undoes the push.
+- `pr` rejects runs whose latest verification did not pass, non-completed runs, detached (review) workspaces, empty deltas and repositories without an `origin` remote.
+- A Standard/Deep run can be `Completed` and still unapplicable: a failed verification completes the run (the decision's edge to it is optional) precisely so it can be fixed in place; `apply`/`pr` name verification until a later cycle's check passes. A Fast run with a failed verify is `Failed` instead; `retry` the verify stage there. PR failure (no `gh`, not authenticated) is reported in the receipt and never undoes the push.
 - `pr` never force-pushes; a diverged remote branch is an error by design. `GIT_TERMINAL_PROMPT=0` turns a credential prompt into an error instead of a hang.
 - After `pr` the run stays `Completed`, so apply, fix and discard remain available; publishing again after a fix updates the same branch and PR. The PR body is only written on creation: a fix's fresh draft changes the commit subject but not an already-open PR's text.
 - The drafted title is cut at 72 characters; a corrupt latest editing artifact fails the publish (artifact integrity fails closed) rather than silently publishing from the task.
