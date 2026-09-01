@@ -3246,8 +3246,8 @@ mod tests {
             "implementer running reads BUILDING"
         );
         assert!(
-            text.contains("█▀▀▀█▀▀▀█"),
-            "the builder's brick wall stands beside POD"
+            text.contains("▄███████▄"),
+            "the builder's laptop stands beside POD"
         );
         assert!(!render_text(&running, 70, 24).contains(POD_SHELL));
     }

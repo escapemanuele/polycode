@@ -8,8 +8,8 @@
 //!
 //! Each pipeline job is a scene: the researcher wears reading glasses next
 //! to a stack of books, the architect draws with a pencil, the builder wears
-//! a hard hat beside a brick wall, the quality reviewer holds a magnifying
-//! glass, the spec reviewer works through a checklist, the crowned lead
+//! a hard hat and takes a hammer to a laptop, the quality reviewer holds a
+//! magnifying glass, the spec reviewer works through a checklist, the crowned lead
 //! weighs the balance scales in Synthesis and sits at the gavel in Decision.
 //! The scene follows the *selected stage* in every state, while the state
 //! owns the expression (eyes, brow, mouth), the body color and the label.
@@ -299,7 +299,8 @@ const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
 ///
 /// - Research: a stack of three books; the top book slides out.
 /// - Architecture: a pencil drawing its line; it lifts and the line grows.
-/// - Implementation: a half-laid brick wall; fresh mortar lands on top.
+/// - Implementation: a hammer raised over an open laptop; it comes down
+///   and the screen cracks.
 /// - `QualityReview`: a magnifying glass, lens and handle; it sweeps.
 /// - `SpecReview`: a checklist with ticked boxes; the next box gets ticked.
 /// - Synthesis: the balance scales; the pans tilt as they weigh.
@@ -338,14 +339,14 @@ const fn resting_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
             "DDDD.....",
         ],
         MascotActivity::Implementation => [
-            "DDDDDDDDD",
-            "DBBBDBBBD",
-            "DDDDDDDDD",
-            "DBDBBBDBB",
-            "DDDDDDDDD",
-            "DBBBDBBBD",
-            "DDDDDDDDD",
-            "DBDBBBDBB",
+            "......YYY",
+            "......YYY",
+            "BBBBBB.DD",
+            "BWWWWB.DD",
+            "BWWWWB...",
+            "BWWWWB...",
+            "BBBBBB...",
+            ".DDDDDDD.",
             "DDDDDDDDD",
         ],
         MascotActivity::QualityReview => [
@@ -422,14 +423,14 @@ const fn working_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
             "DDDDDD...",
         ],
         MascotActivity::Implementation => [
-            "DDDWWWDDD",
-            "DBBBDBBBD",
-            "DDDDDDDDD",
-            "DBDBBBDBB",
-            "DDDDDDDDD",
-            "DBBBDBBBD",
-            "DDDDDDDDD",
-            "DBDBBBDBB",
+            ".........",
+            ".........",
+            "BBBBBB...",
+            "BW.WWB.DD",
+            "BWW.WB.DD",
+            "BWWW.BYYY",
+            "BBBBBBYYY",
+            ".DDDDDDD.",
             "DDDDDDDDD",
         ],
         MascotActivity::QualityReview => [
