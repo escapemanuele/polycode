@@ -2,10 +2,11 @@ use anyhow::Result;
 use clap::CommandFactory;
 
 use crate::app::{
-    ApplyOutcome, ExecutionReport, ExecutionSelection, QuiescentState, RunDetails, RunService,
-    RuntimeProviderFactory, UniformProvider,
+    ApplyOutcome, BlockedDependencyRef, ExecutionReport, ExecutionSelection, QuiescentState,
+    RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef, StageWaitingSummary,
+    UniformProvider,
 };
-use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
+use crate::domain::{DependencyOutcome, DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
 
 use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs, UpdateArgs};
@@ -672,6 +673,9 @@ fn print_details(details: &RunDetails) {
                 .unwrap_or("unavailable"),
             stage.process_status.as_deref().unwrap_or("unavailable")
         );
+        if let Some(line) = waiting_line(stage.waiting.as_ref()) {
+            println!("    {line}");
+        }
     }
     println!();
     println!("Attention");
@@ -691,6 +695,55 @@ fn print_details(details: &RunDetails) {
     println!();
     for line in usage_lines(&details.usage) {
         println!("{line}");
+    }
+}
+
+/// Why a Pending/Ready stage isn't running, as one extra indented CLI line.
+/// `None` when the stage isn't Pending/Ready, or its dependencies are all
+/// satisfied and the scheduler just hasn't marked it Ready yet. A blocked
+/// required dependency outranks the rest: this stage is about to be skipped
+/// in turn.
+fn waiting_line(waiting: Option<&StageWaitingSummary>) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let waiting = waiting?;
+    if !waiting.blocked_by.is_empty() {
+        return Some(format!("blocked by: {}", blocked_ids(&waiting.blocked_by)));
+    }
+    if waiting.waiting_on.is_empty() {
+        return None;
+    }
+    let mut line = format!("waiting on: {}", dependency_ids(&waiting.waiting_on));
+    if !waiting.degraded.is_empty() {
+        let _ = write!(line, " (degraded: {})", dependency_ids(&waiting.degraded));
+    }
+    Some(line)
+}
+
+/// Raw dependency stage ids, comma-joined — same technical register as the
+/// stage rows above them.
+fn dependency_ids(dependencies: &[StageDependencyRef]) -> String {
+    dependencies
+        .iter()
+        .map(|dependency| dependency.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Raw dependency stage ids with their outcome, comma-joined — a skipped
+/// dependency is never reported as having failed.
+fn blocked_ids(dependencies: &[BlockedDependencyRef]) -> String {
+    dependencies
+        .iter()
+        .map(|dependency| format!("{} ({})", dependency.id, outcome_word(dependency.outcome)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+const fn outcome_word(outcome: DependencyOutcome) -> &'static str {
+    match outcome {
+        DependencyOutcome::Failed => "failed",
+        DependencyOutcome::Skipped => "skipped",
     }
 }
 
@@ -807,6 +860,34 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{StageId, StageKind};
+
+    /// A skipped required dependency must never print as "failed": each
+    /// blocked dependency states its own outcome.
+    #[test]
+    fn waiting_line_states_each_blocked_dependencys_own_outcome() {
+        let waiting = StageWaitingSummary {
+            waiting_on: Vec::new(),
+            blocked_by: vec![
+                BlockedDependencyRef {
+                    id: StageId::new("quality_review").unwrap(),
+                    kind: StageKind::CodeQualityReview,
+                    outcome: DependencyOutcome::Failed,
+                },
+                BlockedDependencyRef {
+                    id: StageId::new("spec_review").unwrap(),
+                    kind: StageKind::SpecReview,
+                    outcome: DependencyOutcome::Skipped,
+                },
+            ],
+            degraded: Vec::new(),
+        };
+
+        assert_eq!(
+            waiting_line(Some(&waiting)),
+            Some("blocked by: quality_review (failed), spec_review (skipped)".to_owned())
+        );
+    }
 
     /// The `--check` form is report-only by construction: there is one path to
     /// the installer, and this decision closes it.
