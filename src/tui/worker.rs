@@ -139,9 +139,9 @@ pub(crate) enum WorkerSuccess {
 impl WorkerSuccess {
     pub(crate) const fn report(&self) -> &ExecutionReport {
         match self {
-            Self::Execution(report)
-            | Self::Applied(_, report)
-            | Self::Published(_, report) => report,
+            Self::Execution(report) | Self::Applied(_, report) | Self::Published(_, report) => {
+                report
+            }
         }
     }
 }

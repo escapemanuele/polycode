@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use super::command::{Git, os, text_output};
 use super::GitError;
+use super::command::{Git, os, text_output};
 
 /// Returns the fetch URL of `remote` as configured for the repository owning
 /// `path`, or `None` when no such remote exists.
