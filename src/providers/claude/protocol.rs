@@ -18,13 +18,11 @@ pub(crate) struct PermissionDenial {
     pub tool_input: Value,
 }
 
-/// Stage kinds that may never mutate repository content. Same predicate as
-/// `WorkflowDefinition::requires_writable_workspace`.
+/// Stage kinds that may never mutate repository content: the complement of
+/// `StageKind::edits_workspace`, so a new editing kind is never read-only here
+/// by omission.
 pub(crate) const fn read_only_stage(kind: StageKind) -> bool {
-    !matches!(
-        kind,
-        StageKind::Implementation | StageKind::Fix | StageKind::FollowUp
-    )
+    !kind.edits_workspace()
 }
 
 impl PermissionDenial {
@@ -1000,6 +998,7 @@ mod tests {
         }
         for kind in [
             StageKind::Implementation,
+            StageKind::Simplification,
             StageKind::Fix,
             StageKind::FollowUp,
         ] {
@@ -1031,6 +1030,7 @@ mod tests {
             StageKind::Research,
             StageKind::Architecture,
             StageKind::Implementation,
+            StageKind::Simplification,
             StageKind::CodeQualityReview,
             StageKind::SpecReview,
             StageKind::Review,

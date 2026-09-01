@@ -10,7 +10,9 @@
 //! — still have an opening paragraph, which is quoted instead and marked as
 //! what it is. Presentation only: the persisted artifact is never rewritten.
 
-use super::{format, section};
+use crate::providers::section;
+
+use super::format;
 
 /// One line lifted from an artifact, and whether it came from the contracted
 /// section or from the artifact's first paragraph.

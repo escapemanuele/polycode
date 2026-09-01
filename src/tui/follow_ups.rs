@@ -9,7 +9,7 @@
 //! one line: a follow-up instruction is meant to be handed back to an agent,
 //! not read as a headline.
 
-use super::section;
+use crate::providers::section;
 
 /// Reads the artifact's `## Follow-ups` section, if it wrote one. `None`
 /// when the artifact carries no such section, or wrote an empty one.

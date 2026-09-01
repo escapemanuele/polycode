@@ -42,6 +42,19 @@ pub enum StageKind {
     FollowUp,
 }
 
+impl StageKind {
+    /// Whether a stage of this kind may modify repository content. The one
+    /// predicate behind writable-workspace requirements, provider read-only
+    /// guards, and which stages draft the pull request when a run publishes.
+    #[must_use]
+    pub const fn edits_workspace(self) -> bool {
+        matches!(
+            self,
+            Self::Implementation | Self::Simplification | Self::Fix | Self::FollowUp
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyKind {
@@ -208,15 +221,9 @@ impl WorkflowDefinition {
     /// Whether any stage can modify repository content.
     #[must_use]
     pub fn requires_writable_workspace(&self) -> bool {
-        self.stages.iter().any(|stage| {
-            matches!(
-                stage.kind(),
-                StageKind::Implementation
-                    | StageKind::Simplification
-                    | StageKind::Fix
-                    | StageKind::FollowUp
-            )
-        })
+        self.stages
+            .iter()
+            .any(|stage| stage.kind().edits_workspace())
     }
 }
 

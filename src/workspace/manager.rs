@@ -13,6 +13,7 @@ use crate::git::{
 use crate::store::{RunRevision, SqliteStore, worktree_root};
 
 use super::github::GhClient;
+use super::pull_request::PullRequestDraft;
 use super::{
     ApplyStatus, RunApplyOperation, RunWorkspace, WorkspaceError, WorkspaceMode, WorkspaceStatus,
 };
@@ -402,14 +403,19 @@ impl WorkspaceManager {
         &self,
         store: &mut SqliteStore,
         run_id: RunId,
+        draft: Option<&PullRequestDraft>,
     ) -> Result<PublishReceipt, WorkspaceError> {
-        self.publish_with(store, run_id, &GhClient::default())
+        self.publish_with(store, run_id, draft, &GhClient::default())
     }
 
+    /// `draft` is the pull request the latest editing stage wrote for its
+    /// change, when it wrote one; the task text stands in for whatever the
+    /// draft lacks, so a run that predates the contract publishes as before.
     fn publish_with(
         &self,
         store: &mut SqliteStore,
         run_id: RunId,
+        draft: Option<&PullRequestDraft>,
         gh: &GhClient,
     ) -> Result<PublishReceipt, WorkspaceError> {
         let loaded = store.load_run(run_id)?;
@@ -452,7 +458,10 @@ impl WorkspaceManager {
         let task = store
             .load_run_input(run_id)?
             .map(|input| input.task().to_owned());
-        let title = publish_title(task.as_deref(), run_id);
+        let title = draft.map_or_else(
+            || publish_title(task.as_deref(), run_id),
+            |draft| bounded_title(&draft.title),
+        );
         let commit = if tree_is_clean(&self.git, worktree)? {
             inspect_worktree(&self.git, worktree)?.head_commit
         } else {
@@ -467,7 +476,10 @@ impl WorkspaceManager {
         let pull_request = match gh.existing_pull_request(worktree, &branch) {
             Ok(Some(url)) => PullRequestStatus::AlreadyExists(url),
             Ok(None) => {
-                let body = publish_body(task.as_deref(), run_id);
+                let body = draft.filter(|draft| !draft.body.is_empty()).map_or_else(
+                    || publish_body(task.as_deref(), run_id),
+                    |draft| draft.body.clone(),
+                );
                 match gh.create_pull_request(worktree, &branch, &title, &body) {
                     Ok(url) => PullRequestStatus::Created(url),
                     Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
@@ -1008,17 +1020,20 @@ impl FaultPoint {
     }
 }
 
-/// One line naming the work, for the commit subject and pull-request title.
+/// One line naming the work when no editing stage drafted a title: the
+/// task's first line, for the commit subject and pull-request title.
 fn publish_title(task: Option<&str>, run_id: RunId) -> String {
-    const LIMIT: usize = 72;
     let first_line = task
         .map(str::trim)
         .and_then(|task| task.lines().next())
         .map(str::trim)
         .filter(|line| !line.is_empty());
-    let Some(line) = first_line else {
-        return format!("Polycode run {run_id}");
-    };
+    first_line.map_or_else(|| format!("Polycode run {run_id}"), bounded_title)
+}
+
+/// A title cut to the length Git and GitHub show in full.
+fn bounded_title(line: &str) -> String {
+    const LIMIT: usize = 72;
     if line.chars().count() <= LIMIT {
         line.to_owned()
     } else {
@@ -2371,7 +2386,7 @@ mod tests {
              dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
              case \"$1 $2\" in\n\
              \"pr list\") cat \"$dir/list-output\" 2>/dev/null; exit 0 ;;\n\
-             \"pr create\") echo \"https://example.invalid/pull/7\"; exit 0 ;;\n\
+             \"pr create\") printf '%s\\n' \"$@\" > \"$dir/create-args\"; echo \"https://example.invalid/pull/7\"; exit 0 ;;\n\
              *) exit 1 ;;\n\
              esac\n",
         )
@@ -2396,7 +2411,7 @@ mod tests {
 
         let receipt = fixture
             .manager()
-            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
             .unwrap();
 
         let branch = format!("polycode/run-{}", fixture.run_id);
@@ -2437,7 +2452,7 @@ mod tests {
         fs::write(workspace.worktree_path().join("README.md"), "one\n").unwrap();
         fixture
             .manager()
-            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
             .unwrap();
 
         // The pull request now exists, and the worktree gained more work —
@@ -2450,7 +2465,7 @@ mod tests {
         fs::write(workspace.worktree_path().join("README.md"), "two\n").unwrap();
         let receipt = fixture
             .manager()
-            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
             .unwrap();
 
         assert_eq!(
@@ -2459,6 +2474,62 @@ mod tests {
         );
         let reference = format!("refs/heads/polycode/run-{}", fixture.run_id);
         assert_eq!(git_text(&origin, ["rev-parse", &reference]), receipt.commit);
+    }
+
+    /// The pull request is the editing stage's own words when it wrote them:
+    /// the drafted title becomes the commit subject and the pull request
+    /// title, and the drafted description reaches gh unchanged.
+    #[test]
+    fn a_drafted_pull_request_is_quoted_over_the_task_text() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let _origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("new.txt"), "added\n").unwrap();
+        let draft = PullRequestDraft {
+            title: "Add the file the task asked for".to_owned(),
+            body: "Fixes https://issues.invalid/1\n\n## Why\n\nIt was missing.".to_owned(),
+        };
+
+        fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, Some(&draft), &gh)
+            .unwrap();
+
+        assert_eq!(
+            git_text(workspace.worktree_path(), ["log", "-1", "--format=%s"]),
+            draft.title
+        );
+        let args = fs::read_to_string(fixture.temp.path().join("create-args")).unwrap();
+        assert!(args.contains(&format!("--title\n{}\n", draft.title)));
+        assert!(args.contains(&format!("--body\n{}\n", draft.body)));
+        assert!(!args.contains("Opened by Polycode"));
+    }
+
+    /// A drafted title with nothing under it still names the work; only the
+    /// description falls back to the task text.
+    #[test]
+    fn a_draft_without_a_description_borrows_the_task_for_the_body_alone() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let _origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("new.txt"), "added\n").unwrap();
+        let draft = PullRequestDraft {
+            title: "Add the file".to_owned(),
+            body: String::new(),
+        };
+
+        fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, Some(&draft), &gh)
+            .unwrap();
+
+        let args = fs::read_to_string(fixture.temp.path().join("create-args")).unwrap();
+        assert!(args.contains("--title\nAdd the file\n"));
+        assert!(args.contains(&format!("Opened by Polycode from run {}.", fixture.run_id)));
     }
 
     #[test]
@@ -2472,7 +2543,7 @@ mod tests {
 
         let receipt = fixture
             .manager()
-            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
             .unwrap();
 
         assert!(matches!(
@@ -2495,7 +2566,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .manager()
-                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+                .publish_with(&mut fixture.store, fixture.run_id, None, &gh),
             Err(WorkspaceError::NoRemote(_))
         ));
         assert_eq!(
@@ -2517,7 +2588,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .manager()
-                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+                .publish_with(&mut fixture.store, fixture.run_id, None, &gh),
             Err(WorkspaceError::NothingToPublish)
         ));
 
@@ -2529,7 +2600,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .manager()
-                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+                .publish_with(&mut fixture.store, fixture.run_id, None, &gh),
             Err(WorkspaceError::InvalidRunStatus { .. })
         ));
 
@@ -2542,7 +2613,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .manager()
-                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+                .publish_with(&mut fixture.store, fixture.run_id, None, &gh),
             Err(WorkspaceError::ReviewWorkspaceNotApplicable)
         ));
     }
@@ -2557,7 +2628,7 @@ mod tests {
         fs::write(workspace.worktree_path().join("README.md"), "published\n").unwrap();
         fixture
             .manager()
-            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
             .unwrap();
 
         fixture
@@ -2590,7 +2661,7 @@ mod tests {
         fs::write(workspace.worktree_path().join("new.txt"), "added\n").unwrap();
         fixture
             .manager()
-            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
             .unwrap();
 
         fixture
@@ -2629,7 +2700,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .manager()
-                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+                .publish_with(&mut fixture.store, fixture.run_id, None, &gh),
             Err(WorkspaceError::ApplyInProgress(_))
         ));
     }
@@ -2649,6 +2720,9 @@ mod tests {
         let title = publish_title(Some(&long), run_id);
         assert_eq!(title.chars().count(), 72);
         assert!(title.ends_with('…'));
+        // A drafted title is bounded the same way the task's first line is.
+        assert_eq!(bounded_title(&long), title);
+        assert_eq!(bounded_title("short"), "short");
         assert_eq!(
             publish_body(None, run_id),
             format!("Opened by Polycode from run {run_id}.")

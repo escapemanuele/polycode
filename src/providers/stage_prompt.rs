@@ -25,6 +25,17 @@ pub(crate) fn direct_dependency_artifacts<'a>(
 /// work is the only party that may state what the work concluded.
 pub(crate) const BOTTOM_LINE: &str = "Open the returned Markdown with a `## Bottom line` section, before every other section including any title-adjacent scope note. Write at most two sentences, at most forty words total, in plain conversational language a tired reviewer reads in one glance: the verdict, and the single thing that matters most. No file paths, no symbol names, no counts, no hedging, and nothing the rest of the artifact does not already justify. Every other required section follows it, unchanged.";
 
+/// Provider-neutral closing contract for every stage that edits the
+/// workspace.
+///
+/// Publishing a run opens a pull request, and its title and description are
+/// quoted from this section of the latest editing stage's artifact — never
+/// composed by Polycode from the task text, which knows what was asked and
+/// nothing about what was done. The agent that changed the code is the only
+/// party that can describe the change; every editing stage restates it
+/// because a fix or follow-up leaves the earlier description stale.
+pub(crate) const PULL_REQUEST: &str = "Close the returned Markdown with a `## Pull request` section and put nothing after it; Polycode quotes it verbatim as the pull request when this run is published. Its first line is the title alone: imperative, specific, at most 72 characters, with no issue URL and no run identifier. Everything under that line is the description, written for a reviewer who has never opened this codebase and covering the whole change this workspace now carries against its base, not only this stage's part of it. If the task names an issue URL, open the description with `Fixes <url>` on its own line. Then `### Proposed changes`: one bold sentence saying what changed, followed by at most three one-line bullets. Then `### Why`: two or three plain sentences on the problem and what it cost, without walking through code. Then `### Testing`: the fewest numbered steps a human needs to see the change work once; automated checks do not belong there. Name a file, symbol, or flag only where a reviewer must search for it, paste no diffs, and add no checklists, footers, or rationale the diff already shows.";
+
 /// Provider-neutral semantic contract for one engineering responsibility.
 /// Native adapters add transport and safety framing around this text.
 pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
@@ -158,6 +169,26 @@ mod tests {
             BOTTOM_LINE.contains("nothing the rest of the artifact does not already justify"),
             "a headline is a quote of the work, never an addition to it"
         );
+    }
+
+    /// Publish quotes this section verbatim, so the contract has to name the
+    /// heading, put the title where the reader looks first, and ask for the
+    /// sections a reviewer expects to find.
+    #[test]
+    fn pull_request_contract_names_the_section_and_its_shape() {
+        assert!(PULL_REQUEST.contains("## Pull request"));
+        assert!(PULL_REQUEST.contains("put nothing after it"));
+        assert!(PULL_REQUEST.contains("first line is the title alone"));
+        assert!(PULL_REQUEST.contains("72 characters"));
+        for section in ["### Proposed changes", "### Why", "### Testing"] {
+            assert!(PULL_REQUEST.contains(section), "{section}");
+        }
+        assert!(PULL_REQUEST.contains("Fixes <url>"));
+        assert!(
+            PULL_REQUEST.contains("whole change this workspace now carries"),
+            "a fix restates the pull request for the branch, not for its own part"
+        );
+        assert!(PULL_REQUEST.contains("no checklists, footers"));
     }
 
     #[test]
