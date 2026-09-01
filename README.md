@@ -1,10 +1,19 @@
 # Polycode
 
-> One task. Multiple coding models. Each doing what it does best.
+**The engineering layer above coding agents.**
 
-Polycode is a local-first terminal orchestrator for native coding-agent CLIs. It is designed to coordinate agents such as Claude Code, Codex CLI, and Gemini CLI as specialized engineering roles without replacing their existing authentication or execution model.
+One task. Specialist agents. Independent review. One controlled change.
 
-Polycode is early-stage software. It routes one task through role-specialized stages across native Claude Code, Codex CLI, and a deterministic FakeProvider, driven from a Ratatui control room or the CLI. It uses locally installed `claude` and `codex` executables with their existing authentication and native configuration; it calls neither vendor API directly. Validated domain state, restart-safe SQLite persistence, isolated Git worktrees with explicit apply, DAG scheduling, crash-reconcilable tmux supervision, and immutable versioned Recommended routing (`recommended_v1` frozen, `recommended_v2` current) are in place. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain future work.
+Use Claude Code, Codex and other native coding agents for what each does best.
+Polycode routes engineering roles across them, independently reviews the
+implementation and the specification, and keeps you in control of what reaches
+your codebase.
+
+> Don’t just run more agents. Give each agent the right job — and make them check each other.
+
+Polycode is a local-first terminal orchestrator for native coding-agent CLIs, driven from a Ratatui control room or the CLI. It runs the locally installed `claude` and `codex` executables as specialized engineering roles with their existing authentication and native configuration; it calls no vendor API directly. Every run works in its own Git worktree and reaches your checkout only through an explicit apply, or your remote only through an explicit pull request.
+
+Polycode is early-stage software. Validated domain state, restart-safe SQLite persistence, DAG scheduling, crash-reconcilable tmux supervision, and immutable versioned Recommended routing (`recommended_v1` frozen, `recommended_v2` current) are in place. Gemini, runtime failover, custom routing, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain future work.
 
 ## Install
 
