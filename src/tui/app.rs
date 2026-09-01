@@ -385,6 +385,12 @@ impl TuiApp {
             selection: self.state.new_run.execution.selection(),
             effort: self.state.new_run.effort.setting(),
         }) {
+            // The task belongs to the run that was just dispatched; leaving it
+            // in the composer makes the next run open on another run's words.
+            // Repository, workflow, execution and effort stay: those are the
+            // operator's standing preferences, not this run's content.
+            self.state.new_run.task = super::state::TextField::default();
+            self.state.new_run.focus = 0;
             self.state.screen = Screen::Runs;
         }
     }
@@ -1992,6 +1998,32 @@ mod tests {
             "a new run holds no existing run, so nothing can hold it back"
         );
         assert_eq!(app.state.in_flight.len(), 3, "all three are working");
+    }
+
+    /// The composer's task belongs to the run it starts; reopening the
+    /// composer must not offer a finished run's words as the next draft.
+    #[test]
+    fn a_dispatched_task_does_not_linger_in_the_composer() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+        app.state.new_run.task =
+            crate::tui::state::TextField::new("ship the follow-ups".to_owned());
+        app.state.new_run.focus = 3;
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.busy_label().as_deref(), Some("starting run"));
+        assert_eq!(
+            app.state.new_run.task.text(),
+            "",
+            "the dispatched task must not become the next run's draft"
+        );
+        assert_eq!(
+            app.state.new_run.focus, 0,
+            "an empty composer starts at its task"
+        );
+        assert!(
+            !app.state.new_run.repository.text().is_empty(),
+            "the repository is a standing preference, not run content, and survives"
+        );
     }
 
     /// Two actions on one run would race each other over the same durable
