@@ -6,8 +6,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph
 
 use chrono::{DateTime, Utc};
 
-use crate::app::{RunDetails, StageDependencyRef, StageSummary};
-use crate::domain::{AttentionKind, RunStatus, StageKind, StageStatus};
+use crate::app::{BlockedDependencyRef, RunDetails, StageDependencyRef, StageSummary};
+use crate::domain::{AttentionKind, DependencyOutcome, RunStatus, StageKind, StageStatus};
 
 use super::state::{Overlay, Screen, TuiState, UiMessageKind};
 use super::{format, markdown, mascot, theme};
@@ -805,7 +805,7 @@ fn waiting_message(stage: &StageSummary) -> String {
         return FALLBACK.to_owned();
     };
     if !waiting.blocked_by.is_empty() {
-        return format!("Blocked: {} failed", dependency_names(&waiting.blocked_by));
+        return blocked_message(&waiting.blocked_by);
     }
     if waiting.waiting_on.is_empty() {
         return FALLBACK.to_owned();
@@ -828,6 +828,30 @@ fn dependency_names(dependencies: &[StageDependencyRef]) -> String {
         .map(|dependency| stage_title(dependency.kind))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// "Blocked: X failed, Y was skipped" — each blocked dependency states its
+/// own outcome rather than assuming every one of them failed, since a
+/// required dependency can also land here by being skipped in turn.
+fn blocked_message(blocked: &[BlockedDependencyRef]) -> String {
+    let parts = blocked
+        .iter()
+        .map(|dependency| {
+            format!(
+                "{} {}",
+                stage_title(dependency.kind),
+                outcome_phrase(dependency.outcome)
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("Blocked: {}", parts.join(", "))
+}
+
+const fn outcome_phrase(outcome: DependencyOutcome) -> &'static str {
+    match outcome {
+        DependencyOutcome::Failed => "failed",
+        DependencyOutcome::Skipped => "was skipped",
+    }
 }
 
 /// Operational runtime line: which agent is doing the work, at what effort.
@@ -2218,7 +2242,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::app::{RouteSummary, RunListItem, StageSummary, UsageSummary};
+    use crate::app::{RouteSummary, RunListItem, StageSummary, StageWaitingSummary, UsageSummary};
     use crate::domain::{EffortSetting, Role, RunId, StageId, StageKind, WorkflowKind};
     use crate::tui::state::StageHeadline;
 
@@ -2403,6 +2427,39 @@ mod tests {
             finished_at: None,
             waiting: None,
         }
+    }
+
+    /// A skipped required dependency must never read as "failed": each
+    /// blocked dependency states its own outcome.
+    #[test]
+    fn blocked_message_states_each_dependencys_own_outcome() {
+        let mut pending = stage(
+            "decision",
+            StageKind::Decision,
+            Role::EngineeringLead,
+            StageStatus::Pending,
+        );
+        pending.waiting = Some(StageWaitingSummary {
+            waiting_on: Vec::new(),
+            blocked_by: vec![
+                BlockedDependencyRef {
+                    id: StageId::new("quality_review").unwrap(),
+                    kind: StageKind::CodeQualityReview,
+                    outcome: DependencyOutcome::Failed,
+                },
+                BlockedDependencyRef {
+                    id: StageId::new("spec_review").unwrap(),
+                    kind: StageKind::SpecReview,
+                    outcome: DependencyOutcome::Skipped,
+                },
+            ],
+            degraded: Vec::new(),
+        });
+
+        assert_eq!(
+            waiting_message(&pending),
+            "Blocked: Quality review failed, Spec review was skipped"
+        );
     }
 
     fn details(status: RunStatus, stages: Vec<StageSummary>) -> RunDetails {

@@ -2,10 +2,11 @@ use anyhow::Result;
 use clap::CommandFactory;
 
 use crate::app::{
-    ApplyOutcome, ExecutionReport, ExecutionSelection, QuiescentState, RunDetails, RunService,
-    RuntimeProviderFactory, StageDependencyRef, StageWaitingSummary, UniformProvider,
+    ApplyOutcome, BlockedDependencyRef, ExecutionReport, ExecutionSelection, QuiescentState,
+    RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef, StageWaitingSummary,
+    UniformProvider,
 };
-use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
+use crate::domain::{DependencyOutcome, DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
 
 use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs, UpdateArgs};
@@ -707,10 +708,7 @@ fn waiting_line(waiting: Option<&StageWaitingSummary>) -> Option<String> {
 
     let waiting = waiting?;
     if !waiting.blocked_by.is_empty() {
-        return Some(format!(
-            "blocked by: {} failed",
-            dependency_ids(&waiting.blocked_by)
-        ));
+        return Some(format!("blocked by: {}", blocked_ids(&waiting.blocked_by)));
     }
     if waiting.waiting_on.is_empty() {
         return None;
@@ -730,6 +728,23 @@ fn dependency_ids(dependencies: &[StageDependencyRef]) -> String {
         .map(|dependency| dependency.id.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Raw dependency stage ids with their outcome, comma-joined — a skipped
+/// dependency is never reported as having failed.
+fn blocked_ids(dependencies: &[BlockedDependencyRef]) -> String {
+    dependencies
+        .iter()
+        .map(|dependency| format!("{} ({})", dependency.id, outcome_word(dependency.outcome)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+const fn outcome_word(outcome: DependencyOutcome) -> &'static str {
+    match outcome {
+        DependencyOutcome::Failed => "failed",
+        DependencyOutcome::Skipped => "skipped",
+    }
 }
 
 /// Provider-native units, one line per runtime that reported any.
@@ -845,6 +860,34 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{StageId, StageKind};
+
+    /// A skipped required dependency must never print as "failed": each
+    /// blocked dependency states its own outcome.
+    #[test]
+    fn waiting_line_states_each_blocked_dependencys_own_outcome() {
+        let waiting = StageWaitingSummary {
+            waiting_on: Vec::new(),
+            blocked_by: vec![
+                BlockedDependencyRef {
+                    id: StageId::new("quality_review").unwrap(),
+                    kind: StageKind::CodeQualityReview,
+                    outcome: DependencyOutcome::Failed,
+                },
+                BlockedDependencyRef {
+                    id: StageId::new("spec_review").unwrap(),
+                    kind: StageKind::SpecReview,
+                    outcome: DependencyOutcome::Skipped,
+                },
+            ],
+            degraded: Vec::new(),
+        };
+
+        assert_eq!(
+            waiting_line(Some(&waiting)),
+            Some("blocked by: quality_review (failed), spec_review (skipped)".to_owned())
+        );
+    }
 
     /// The `--check` form is report-only by construction: there is one path to
     /// the installer, and this decision closes it.

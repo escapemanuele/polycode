@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::domain::{
     ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
-    DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus,
+    DependencyOutcome, DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus,
     StageDependencyReport, StageId, StageKind, StageStatus, WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
@@ -76,6 +76,16 @@ pub struct StageDependencyRef {
     pub kind: StageKind,
 }
 
+/// A required dependency holding a stage back, with the outcome that put it
+/// there. `outcome` distinguishes a dependency that failed outright from one
+/// that was itself skipped — rendering must say which.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedDependencyRef {
+    pub id: StageId,
+    pub kind: StageKind,
+    pub outcome: DependencyOutcome,
+}
+
 /// Dependency readiness for one Pending/Ready stage, recomputed read-only
 /// from [`crate::domain::Run::stage_dependency_report`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,7 +94,7 @@ pub struct StageWaitingSummary {
     pub waiting_on: Vec<StageDependencyRef>,
     /// Required dependencies that failed or were skipped; this stage will be
     /// skipped in turn.
-    pub blocked_by: Vec<StageDependencyRef>,
+    pub blocked_by: Vec<BlockedDependencyRef>,
     /// Optional dependencies that failed or were skipped; this stage will
     /// still run, without them.
     pub degraded: Vec<StageDependencyRef>,
@@ -579,9 +589,22 @@ fn waiting_summary(run: &crate::domain::Run, report: StageDependencyReport) -> S
             })
             .collect::<Vec<_>>()
     };
+    let resolve_blocked = |blocked: Vec<crate::domain::BlockedDependency>| {
+        blocked
+            .into_iter()
+            .filter_map(|blocked| {
+                run.stage(&blocked.stage_id)
+                    .map(|dependency| BlockedDependencyRef {
+                        kind: dependency.kind(),
+                        id: blocked.stage_id,
+                        outcome: blocked.outcome,
+                    })
+            })
+            .collect::<Vec<_>>()
+    };
     StageWaitingSummary {
         waiting_on: resolve(report.waiting_on),
-        blocked_by: resolve(report.blocked_by),
+        blocked_by: resolve_blocked(report.blocked_by),
         degraded: resolve(report.degraded),
     }
 }

@@ -27,9 +27,9 @@ pub use rehydration::{
 };
 pub use role::Role;
 pub use run::{
-    CompletionBlocker, CompletionBlockerReason, Run, RunAttentionError, RunFixError,
-    RunInvariantError, RunProviderEventError, RunRehydrationError, RunStageError, RunStatus,
-    RunTransition, RunTransitionError, StageDependencyReport,
+    BlockedDependency, CompletionBlocker, CompletionBlockerReason, DependencyOutcome, Run,
+    RunAttentionError, RunFixError, RunInvariantError, RunProviderEventError, RunRehydrationError,
+    RunStageError, RunStatus, RunTransition, RunTransitionError, StageDependencyReport,
 };
 pub use stage::{Stage, StageRehydrationError, StageStatus, StageTransition, StageTransitionError};
 pub use workflow::{
