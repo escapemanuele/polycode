@@ -323,6 +323,26 @@ pub trait Provider {
         Ok(())
     }
 
+    /// Walks back one [`Self::stage_continue_instruction`] write when the
+    /// domain transition it was staged for never became durable.
+    ///
+    /// A refused continue request, or one whose commit lost a concurrency
+    /// race, must leave no staged content behind — otherwise a retry with
+    /// different text fails against instruction bytes that were never
+    /// actually used by any stage. Default providers staged nothing and so
+    /// discard nothing.
+    ///
+    /// # Errors
+    /// Returns provider-specific durable-storage failures.
+    fn discard_continue_instruction(
+        &mut self,
+        _store: &mut SqliteStore,
+        _run_id: RunId,
+        _stage_id: &StageId,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Reports whether explicit eval policy may resolve this attention request
     /// without human input. Production providers default to false.
     ///

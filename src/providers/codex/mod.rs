@@ -559,6 +559,16 @@ impl<B: ProcessBackend> Provider for CodexProvider<B> {
         .map_err(|error| ProviderError::new(error.to_string()))
     }
 
+    fn discard_continue_instruction(
+        &mut self,
+        _store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+    ) -> Result<(), ProviderError> {
+        crate::providers::continue_instruction::discard(&self.artifact_root, run_id, stage_id)
+            .map_err(|error| ProviderError::new(error.to_string()))
+    }
+
     fn poll(
         &mut self,
         store: &mut SqliteStore,

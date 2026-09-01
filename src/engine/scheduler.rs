@@ -353,6 +353,13 @@ where
     /// one step earlier: nothing here can create a stage whose agent finds no
     /// instruction waiting for it.
     ///
+    /// A refusal must stay side-effect-free. If the domain transition is
+    /// rejected, or its commit loses a concurrency race, the just-staged
+    /// instruction is walked back before the error returns — otherwise it
+    /// would durably occupy the exact stage identity a retry, possibly with
+    /// different text, is about to reuse, and that retry would fail against
+    /// content no stage ever actually read.
+    ///
     /// # Errors
     /// Returns boundary, provider, lifecycle, or persistence failures.
     pub fn request_continue(
@@ -362,18 +369,35 @@ where
         instruction: &str,
     ) -> Result<EngineStatus, EngineError> {
         let (mut loaded, _) = load_execution_boundary(store, run_id)?;
-        if let Some(stage_id) = crate::domain::next_follow_up_stage_id(loaded.run.workflow()) {
+        let follow_up_stage_id = crate::domain::next_follow_up_stage_id(loaded.run.workflow());
+        if let Some(stage_id) = &follow_up_stage_id {
             self.provider.stage_continue_instruction(
                 store,
                 run_id,
-                &stage_id,
+                stage_id,
                 Role::Implementer,
                 instruction,
             )?;
         }
         let metadata = self.metadata_for(&loaded.run);
-        let event = loaded.run.request_continue(metadata)?;
-        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        let outcome = loaded
+            .run
+            .request_continue(metadata)
+            .map_err(EngineError::from)
+            .and_then(|event| commit_execution(store, &loaded.run, loaded.revision, &[event]));
+        if let Err(error) = outcome {
+            if let Some(stage_id) = &follow_up_stage_id {
+                // Best-effort: the domain transition this instruction was
+                // staged for never became durable, so it must not outlive
+                // this call. The original error still wins even if cleanup
+                // itself fails — an orphaned file is a retry-time conflict to
+                // resolve, not a reason to hide why the continue was refused.
+                let _ = self
+                    .provider
+                    .discard_continue_instruction(store, run_id, stage_id);
+            }
+            return Err(error);
+        }
         Ok(EngineStatus::Advanced {
             run_status: loaded.run.status(),
         })
@@ -1080,7 +1104,7 @@ mod tests {
     }
 
     struct Fixture {
-        _temp: TempDir,
+        temp: TempDir,
         database: PathBuf,
         store: SqliteStore,
         run_id: RunId,
@@ -1109,6 +1133,60 @@ mod tests {
         }
     }
 
+    /// Wraps `FakeProvider` with a real `continue_instruction` root, unlike
+    /// `FakeProvider` itself, which accepts the trait's no-op default. Tests
+    /// that need to observe whether an instruction file was actually staged
+    /// or cleaned up use this instead.
+    struct InstrumentedProvider {
+        root: PathBuf,
+        inner: FakeProvider,
+    }
+
+    impl Provider for InstrumentedProvider {
+        fn provider_id_for(&self, request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+            self.inner.provider_id_for(request)
+        }
+
+        fn supports_role(&self, role: crate::domain::Role) -> bool {
+            self.inner.supports_role(role)
+        }
+
+        fn poll(
+            &mut self,
+            store: &mut SqliteStore,
+            request: &ProviderRequest,
+        ) -> Result<ProviderPoll, ProviderError> {
+            self.inner.poll(store, request)
+        }
+
+        fn stage_continue_instruction(
+            &mut self,
+            _store: &mut SqliteStore,
+            run_id: RunId,
+            stage_id: &StageId,
+            _role: crate::domain::Role,
+            instruction: &str,
+        ) -> Result<(), ProviderError> {
+            crate::providers::continue_instruction::write_once(
+                &self.root,
+                run_id,
+                stage_id,
+                instruction,
+            )
+            .map_err(|error| ProviderError::new(error.to_string()))
+        }
+
+        fn discard_continue_instruction(
+            &mut self,
+            _store: &mut SqliteStore,
+            run_id: RunId,
+            stage_id: &StageId,
+        ) -> Result<(), ProviderError> {
+            crate::providers::continue_instruction::discard(&self.root, run_id, stage_id)
+                .map_err(|error| ProviderError::new(error.to_string()))
+        }
+    }
+
     impl Fixture {
         fn new(kind: WorkflowKind, run_value: u128) -> Self {
             let temp = TempDir::new().unwrap();
@@ -1134,7 +1212,7 @@ mod tests {
                 .prepare_run_workspace(&mut store, run_id, &source)
                 .unwrap();
             Self {
-                _temp: temp,
+                temp,
                 database,
                 store,
                 run_id,
@@ -1673,6 +1751,76 @@ mod tests {
                 status: ApplyStatus::Prepared
             }) if run_id == apply_fixture.run_id
         ));
+    }
+
+    /// A refused continue must be side-effect-free: the instruction staged
+    /// for the follow-up stage before the domain call cannot outlive a
+    /// refusal, or a retry that edits the text would durably conflict
+    /// against content no stage ever read. `request_continue` is called
+    /// while the run is still `Ready` (not `Completed`), which the domain
+    /// refuses with `RunFixError::RunNotCompleted` — exactly the "domain
+    /// refuses" branch this behavior protects, entirely independent of the
+    /// commit-time concurrency-race branch it also protects.
+    #[test]
+    fn a_refused_continue_leaves_no_instruction_file_and_a_retry_with_different_text_succeeds() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard, 1_600_000);
+        let root = fixture.temp.path().join("continue-instructions-root");
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let scenario = FakeScenario::successful(&workflow);
+        let mut engine = WorkflowEngine::with_context(
+            InstrumentedProvider {
+                root: root.clone(),
+                inner: FakeProvider::new(scenario).unwrap(),
+            },
+            "exercise continue refusal cleanup".to_owned(),
+            TestContext::new(1_700_000),
+        );
+        let follow_up_stage_id = StageId::new("followup_1").unwrap();
+
+        // The run is freshly prepared (`Ready`), not `Completed`, so the
+        // domain refuses this request after the instruction was already
+        // staged for the stage it would have created.
+        let refused = engine.request_continue(&mut fixture.store, fixture.run_id, "first text");
+        assert!(matches!(
+            refused,
+            Err(EngineError::Fix(
+                crate::domain::RunFixError::RunNotCompleted(RunStatus::Ready)
+            ))
+        ));
+        assert_eq!(
+            crate::providers::continue_instruction::read(
+                &root,
+                fixture.run_id,
+                &follow_up_stage_id,
+            )
+            .unwrap(),
+            None,
+            "a refused continue must leave no staged instruction behind"
+        );
+
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Completed
+            }
+        );
+
+        // Retried with different text than the refused attempt used, which
+        // would fail with `ContinueInstructionError::Conflict` if the first
+        // attempt's file had survived.
+        engine
+            .request_continue(&mut fixture.store, fixture.run_id, "second text")
+            .unwrap();
+        assert_eq!(
+            crate::providers::continue_instruction::read(
+                &root,
+                fixture.run_id,
+                &follow_up_stage_id,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("second text")
+        );
     }
 
     fn init_repository(path: &Path) {

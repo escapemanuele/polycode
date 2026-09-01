@@ -104,6 +104,29 @@ pub(crate) fn write_once(
     Ok(())
 }
 
+/// Removes one follow-up stage's staged instruction, if present.
+///
+/// Walks back [`write_once`] when the domain transition it was staged for
+/// never became durable — a refused or lost commit must not leave content
+/// behind that a retry, possibly with different text, would then conflict
+/// against. Removing a file that was never written is not an error: the
+/// caller may not know whether its own write actually landed before the
+/// failure it is unwinding.
+///
+/// # Errors
+/// Returns wrapped I/O failures other than the file's expected absence.
+pub(crate) fn discard(
+    root: &Path,
+    run_id: RunId,
+    stage_id: &StageId,
+) -> Result<(), ContinueInstructionError> {
+    match std::fs::remove_file(path(root, run_id, stage_id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Reads back one follow-up stage's persisted instruction, if any invocation
 /// of it has ever been asked for. `None` for any stage that never had one —
 /// every stage kind other than `FollowUp` — so callers read unconditionally
@@ -177,6 +200,30 @@ mod tests {
             write_once(temp.path(), run_id(), &stage_id(), "different instruction"),
             Err(ContinueInstructionError::Conflict(_))
         ));
+    }
+
+    /// The failure-path cleanup this exists for: a write that never became
+    /// durable domain state must not permanently block a retry that carries
+    /// different text.
+    #[test]
+    fn a_discarded_instruction_lets_a_retry_with_different_text_succeed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        write_once(temp.path(), run_id(), &stage_id(), "first instruction").unwrap();
+
+        discard(temp.path(), run_id(), &stage_id()).unwrap();
+
+        assert_eq!(read(temp.path(), run_id(), &stage_id()).unwrap(), None);
+        write_once(temp.path(), run_id(), &stage_id(), "different instruction").unwrap();
+        assert_eq!(
+            read(temp.path(), run_id(), &stage_id()).unwrap().as_deref(),
+            Some("different instruction")
+        );
+    }
+
+    #[test]
+    fn discarding_an_instruction_that_was_never_written_is_not_an_error() {
+        let temp = tempfile::TempDir::new().unwrap();
+        assert!(discard(temp.path(), run_id(), &stage_id()).is_ok());
     }
 
     #[test]

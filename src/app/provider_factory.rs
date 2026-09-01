@@ -206,6 +206,21 @@ impl Provider for RuntimeProvider {
         }
     }
 
+    fn discard_continue_instruction(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+    ) -> Result<(), ProviderError> {
+        match self {
+            Self::Fake(provider) => provider.discard_continue_instruction(store, run_id, stage_id),
+            Self::Claude(provider) => {
+                provider.discard_continue_instruction(store, run_id, stage_id)
+            }
+            Self::Codex(provider) => provider.discard_continue_instruction(store, run_id, stage_id),
+        }
+    }
+
     fn poll(
         &mut self,
         store: &mut SqliteStore,
@@ -458,6 +473,21 @@ impl Provider for RoutedProvider {
         let effort = self.effort_for_role(role)?;
         self.runtime_for(&target, effort)?
             .stage_continue_instruction(store, run_id, stage_id, role, instruction)
+    }
+
+    /// Same route resolution as [`Self::stage_continue_instruction`]: the
+    /// stage still has no provider session, so the leaf runtime is resolved
+    /// from `Role::Implementer` directly, not from session lookup.
+    fn discard_continue_instruction(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+    ) -> Result<(), ProviderError> {
+        let target = self.target_for_role(Role::Implementer)?;
+        let effort = self.effort_for_role(Role::Implementer)?;
+        self.runtime_for(&target, effort)?
+            .discard_continue_instruction(store, run_id, stage_id)
     }
 
     fn poll(
