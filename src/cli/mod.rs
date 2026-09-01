@@ -73,6 +73,8 @@ pub enum Command {
     Fix { run_id: RunId },
     /// Apply completed workspace changes to source repository.
     Apply { run_id: RunId },
+    /// Publish completed workspace changes as a remote branch and pull request.
+    Pr { run_id: RunId },
     /// Discard run and remove owned workspace resources.
     Discard { run_id: RunId },
     /// Check for a newer official Polycode release.

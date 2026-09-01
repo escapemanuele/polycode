@@ -48,6 +48,10 @@ pub enum WorkspaceError {
     ReviewWorkspaceNotApplicable,
     #[error("workspace has no changes to apply")]
     EmptyPatch,
+    #[error("workspace has no changes to publish")]
+    NothingToPublish,
+    #[error("repository at {0} has no 'origin' remote to publish to")]
+    NoRemote(PathBuf),
     #[error("patch cannot be applied cleanly")]
     PatchCheckFailed,
     #[error("apply state is ambiguous; manual recovery required")]

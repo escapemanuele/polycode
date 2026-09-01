@@ -31,6 +31,7 @@ pub(crate) enum Overlay {
     Help,
     Attention,
     ApplyConfirm,
+    PublishConfirm,
     DiscardConfirm,
     /// Application-level software update. Deliberately the lowest-priority
     /// overlay: run attention always outranks it.

@@ -3,6 +3,7 @@
 mod command;
 mod error;
 mod patch;
+mod remote;
 mod repository;
 mod worktree;
 
@@ -16,7 +17,9 @@ pub(crate) use patch::{
     ChangedFileRecord, PatchPreview, apply_patch, check_patch, generate_change_evidence,
     generate_patch, generate_patch_preview, source_is_clean, tree_is_clean,
 };
+pub(crate) use remote::{push_branch, remote_url};
 pub(crate) use worktree::{
-    WorktreeIdentity, branch_exists, branch_tip, create_branch_in_worktree, create_worktree,
-    delete_owned_branch, detach_worktree, inspect_worktree, remove_worktree,
+    WorktreeIdentity, branch_exists, branch_tip, commit_all_in_worktree,
+    create_branch_in_worktree, create_worktree, delete_owned_branch, detach_worktree,
+    inspect_worktree, remove_worktree,
 };

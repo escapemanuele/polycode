@@ -177,6 +177,7 @@ impl TuiApp {
             Intent::Logs => self.open_logs(),
             Intent::Diff => self.open_diff(),
             Intent::Apply => self.open_apply_confirmation(),
+            Intent::Publish => self.open_publish_confirmation(),
             Intent::Fix => self.request_fix(),
             Intent::Continue => self.open_continue(),
             Intent::FollowUps => self.open_follow_ups(),
@@ -218,13 +219,23 @@ impl TuiApp {
                     self.state.overlay = None;
                 }
             }
+            Overlay::PublishConfirm if intent == Intent::Enter => {
+                if let Some(run_id) = self.state.selected_run {
+                    self.dispatch(WorkerCommand::PublishRun { run_id });
+                    self.state.overlay = None;
+                }
+            }
             Overlay::DiscardConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
                     self.dispatch(WorkerCommand::DiscardRun { run_id });
                     self.state.overlay = None;
                 }
             }
-            Overlay::Help | Overlay::ApplyConfirm | Overlay::DiscardConfirm | Overlay::Update => {}
+            Overlay::Help
+            | Overlay::ApplyConfirm
+            | Overlay::PublishConfirm
+            | Overlay::DiscardConfirm
+            | Overlay::Update => {}
         }
     }
 
@@ -799,6 +810,26 @@ impl TuiApp {
         }
     }
 
+    /// Publish shares apply's gate — a completed branch run — because both
+    /// transport the same delta; they differ only in where it lands.
+    fn open_publish_confirmation(&mut self) {
+        let Some(run_id) = self.state.selected_run else {
+            return;
+        };
+        if !self.state.run_is_applyable() {
+            self.state
+                .notify(UiMessageKind::Info, apply_unavailable_reason(&self.state));
+            return;
+        }
+        match self.reader.preview_run_diff(run_id) {
+            Ok(diff) => {
+                self.state.diff = Some(diff);
+                self.state.overlay = Some(Overlay::PublishConfirm);
+            }
+            Err(error) => self.state.set_error(error.to_string()),
+        }
+    }
+
     fn selected_stage_identity(&self) -> Option<(crate::domain::RunId, crate::domain::StageId)> {
         Some((self.state.selected_run?, self.state.selected_stage.clone()?))
     }
@@ -847,6 +878,17 @@ impl TuiApp {
                 }
                 let message = match success {
                     WorkerSuccess::Applied(outcome, _) => format!("Apply finished: {outcome:?}"),
+                    WorkerSuccess::Published(receipt, _) => match receipt.pull_request {
+                        crate::workspace::PullRequestStatus::Created(url) => {
+                            format!("Pull request created: {url}")
+                        }
+                        crate::workspace::PullRequestStatus::AlreadyExists(url) => {
+                            format!("Branch pushed; pull request already open: {url}")
+                        }
+                        crate::workspace::PullRequestStatus::Unavailable(reason) => {
+                            format!("Branch {} pushed. {reason}", receipt.branch)
+                        }
+                    },
                     WorkerSuccess::Execution(_) => {
                         format!("{} finished for {run_id}", result.action.label())
                     }
@@ -1404,18 +1446,21 @@ mod tests {
             (RunStatus::Applied, WorkflowKind::Standard),
             (RunStatus::Completed, WorkflowKind::Review),
         ] {
-            let (mut app, _fixture) = app_with(details(status, workflow));
-            app.handle_intent(Intent::Apply);
-            assert_eq!(
-                app.state.overlay, None,
-                "apply confirmation must not open for {status:?}/{workflow:?}"
-            );
-            assert!(
-                app.state.in_flight.is_empty(),
-                "no worker command dispatched for {status:?}/{workflow:?}"
-            );
-            let message = app.state.message.as_ref().expect("user is told why");
-            assert_eq!(message.kind, UiMessageKind::Info, "refusal is not an error");
+            // Publish shares apply's gate, so both intents refuse identically.
+            for intent in [Intent::Apply, Intent::Publish] {
+                let (mut app, _fixture) = app_with(details(status, workflow));
+                app.handle_intent(intent);
+                assert_eq!(
+                    app.state.overlay, None,
+                    "{intent:?} confirmation must not open for {status:?}/{workflow:?}"
+                );
+                assert!(
+                    app.state.in_flight.is_empty(),
+                    "no worker command dispatched for {status:?}/{workflow:?}"
+                );
+                let message = app.state.message.as_ref().expect("user is told why");
+                assert_eq!(message.kind, UiMessageKind::Info, "refusal is not an error");
+            }
         }
     }
 
@@ -1494,6 +1539,17 @@ mod tests {
         assert!(
             app.state.in_flight.is_empty(),
             "opening the confirmation still dispatches nothing"
+        );
+
+        // Publish rides the same gate and diff preview, behind its own
+        // confirmation.
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        app.handle_intent(Intent::Publish);
+        assert_eq!(app.state.overlay, Some(Overlay::PublishConfirm));
+        assert!(
+            app.state.in_flight.is_empty(),
+            "opening the publish confirmation still dispatches nothing"
         );
     }
 

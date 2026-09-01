@@ -74,6 +74,26 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             print_report(&report);
             Ok(())
         }
+        Some(Command::Pr { run_id }) => {
+            let (receipt, report) = service()?.publish_run(*run_id)?;
+            println!(
+                "Pushed branch {} at {} to origin.",
+                receipt.branch, receipt.commit
+            );
+            match receipt.pull_request {
+                crate::workspace::PullRequestStatus::Created(url) => {
+                    println!("Pull request created: {url}");
+                }
+                crate::workspace::PullRequestStatus::AlreadyExists(url) => {
+                    println!("Pull request already open: {url}");
+                }
+                crate::workspace::PullRequestStatus::Unavailable(reason) => {
+                    println!("Pull request not created: {reason}");
+                }
+            }
+            print_report(&report);
+            Ok(())
+        }
         Some(Command::Fix { run_id }) => {
             print_report(&service()?.request_fix(*run_id)?);
             Ok(())
