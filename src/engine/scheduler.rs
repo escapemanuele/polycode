@@ -1251,9 +1251,13 @@ mod tests {
                 .load_run(run_id)
                 .map_err(|error| ProviderError::new(error.to_string()))?;
             let mut winning_run = winner.run;
+            // Stamped from the run's own clock, not wall time: the engine's
+            // test context advances one millisecond per event, so a fast
+            // drive leaves the run's latest event ahead of real `now()` and
+            // a wall-clock stamp would be rejected as preceding it.
             let metadata = EventMetadata::new(
                 EventId::from_u128(9_000_000_000),
-                std::time::SystemTime::now().into(),
+                *winning_run.updated_at() + Duration::milliseconds(1),
             );
             let event = winning_run
                 .request_continue(metadata)
