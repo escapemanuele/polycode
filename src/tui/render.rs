@@ -369,6 +369,18 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
     );
 }
 
+/// A char budget for `format::truncate_title` that leaves room for the
+/// ellipsis it appends on top of whatever budget it is given: passing a hard
+/// column width straight through would let a truncated line land one column
+/// past it, which Ratatui then wraps — pushing whatever follows down a row.
+/// Char count, not true display width, matching every other width budget in
+/// this file (`span_width`, the footer's navigation-hint fitting): this
+/// codebase has no display-width-aware helper, and every line it truncates
+/// this way is already assumed to render as one column per `char`.
+fn ellipsis_budget(width: usize) -> usize {
+    width.saturating_sub(1).max(1)
+}
+
 /// What the run is doing right now, then how far along it is. The first
 /// sentence follows the run's canonical status; the second counts stages, so
 /// both stay facts the domain already asserted. `width` bounds the failure
@@ -415,15 +427,11 @@ fn status_sentences(details: &RunDetails, now: DateTime<Utc>, width: u16) -> Vec
                         || format!("{} failed — its logs say why.", stage_title(stage.kind)),
                         |reason| {
                             let prefix = format!("{} failed: ", stage_title(stage.kind));
-                            // Reserve one column for `truncate_title`'s own
-                            // ellipsis: it is added on top of the budget it
-                            // is given, so the untrimmed budget would let a
-                            // truncated line land one column past `width`.
-                            let budget = (width as usize)
-                                .saturating_sub(prefix.chars().count())
-                                .saturating_sub(1)
-                                .max(1);
-                            format!("{prefix}{}", format::truncate_title(reason, budget))
+                            let budget = (width as usize).saturating_sub(prefix.chars().count());
+                            format!(
+                                "{prefix}{}",
+                                format::truncate_title(reason, ellipsis_budget(budget))
+                            )
                         },
                     )
                 },
@@ -646,20 +654,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         theme::muted(),
     )));
     if details.attention.is_empty() && !applyable {
-        // A failed stage's reason outranks the generic activity line — it is
-        // the one place the hero says *why*, not just *that*. Truncated to
-        // one line: the hero stays a hero, not a log viewer. Every other
-        // status (including Pending/Ready, whose waiting/blocked-on text
-        // `activity_message` itself derives from `stage.waiting`) falls
-        // through to the generic, state-driven message.
-        let activity = if selected.status == StageStatus::Failed
-            && let Some(reason) = selected.failure_reason.as_deref()
-        {
-            Some(format::truncate_title(reason, width as usize))
-        } else {
-            activity_message(selected)
-        };
-        if let Some(activity) = activity {
+        if let Some(activity) = hero_activity_text(selected, width) {
             lines.push(Line::from(Span::styled(activity, theme::text())));
         }
     }
@@ -886,6 +881,26 @@ const fn outcome_phrase(outcome: DependencyOutcome) -> &'static str {
     match outcome {
         DependencyOutcome::Failed => "failed",
         DependencyOutcome::Skipped => "was skipped",
+    }
+}
+
+/// The hero's one-line "what's happening" text. A failed stage's own reason
+/// outranks the generic [`activity_message`] — it is the one place the hero
+/// says *why*, not just *that* — truncated to fit `width` so the hero stays
+/// a hero, not a log viewer: an untruncated line would wrap in Ratatui and
+/// push whatever follows it down a row. Every other status, Pending/Ready
+/// included, falls through to `activity_message`, which derives its own
+/// waiting/blocked-on text from `stage.waiting`.
+fn hero_activity_text(stage: &StageSummary, width: u16) -> Option<String> {
+    if stage.status == StageStatus::Failed
+        && let Some(reason) = stage.failure_reason.as_deref()
+    {
+        Some(format::truncate_title(
+            reason,
+            ellipsis_budget(width as usize),
+        ))
+    } else {
+        activity_message(stage)
     }
 }
 
@@ -3087,6 +3102,125 @@ mod tests {
         assert_eq!(
             sentences[1], "0 of 1 stages complete, 1 failed.",
             "the stage-count sentence survives a long reason instead of being pushed out"
+        );
+    }
+
+    /// `format::truncate_title` appends its ellipsis on top of the budget it
+    /// is handed, so passing the panel's full width straight through used to
+    /// yield one character past it — Ratatui would then wrap that line and
+    /// shift the result section down a row. The rendered activity line must
+    /// never exceed the panel width it was truncated to.
+    #[test]
+    fn hero_activity_text_never_exceeds_the_panel_width_it_was_truncated_to() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        for width in [10u16, 30, 50, 80] {
+            let text = hero_activity_text(&failing, width).unwrap();
+            assert!(
+                text.chars().count() <= width as usize,
+                "width {width}: {text:?} is {} chars",
+                text.chars().count()
+            );
+            assert!(
+                text.ends_with('…'),
+                "width {width}: the cut must be visible"
+            );
+        }
+    }
+
+    /// A short reason that already fits is never truncated or given a false
+    /// ellipsis just because the budget reservation exists.
+    #[test]
+    fn hero_activity_text_leaves_a_short_reason_untouched() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("compile failed".to_owned());
+        assert_eq!(
+            hero_activity_text(&failing, 80),
+            Some("compile failed".to_owned())
+        );
+    }
+
+    /// A non-failed status, or a failed one with no reason, falls back to
+    /// the generic typed activity text regardless of width.
+    #[test]
+    fn hero_activity_text_falls_back_to_the_generic_message_without_a_reason() {
+        let failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        assert_eq!(
+            hero_activity_text(&failing, 80),
+            Some("The provider ended this stage before it completed".to_owned())
+        );
+        let running = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Running,
+        );
+        assert_eq!(
+            hero_activity_text(&running, 80),
+            Some("Agent is working…".to_owned())
+        );
+    }
+
+    /// The composed priority order end to end: a failed stage with a reason
+    /// shows the reason; a Pending/Ready stage falls through to the waiting
+    /// text `activity_message` derives from `stage.waiting`; neither
+    /// feature regresses the other now that both live on `StageSummary`.
+    #[test]
+    fn hero_activity_text_prefers_the_failure_reason_over_waiting_info_by_status() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("compile failed".to_owned());
+        failing.waiting = Some(StageWaitingSummary {
+            waiting_on: vec![StageDependencyRef {
+                id: StageId::new("architecture").unwrap(),
+                kind: StageKind::Architecture,
+            }],
+            blocked_by: Vec::new(),
+            degraded: Vec::new(),
+        });
+        assert_eq!(
+            hero_activity_text(&failing, 80),
+            Some("compile failed".to_owned()),
+            "a failure reason outranks stale waiting info on the same stage"
+        );
+
+        let mut pending = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Pending,
+        );
+        pending.waiting = Some(StageWaitingSummary {
+            waiting_on: vec![StageDependencyRef {
+                id: StageId::new("architecture").unwrap(),
+                kind: StageKind::Architecture,
+            }],
+            blocked_by: Vec::new(),
+            degraded: Vec::new(),
+        });
+        assert_eq!(
+            hero_activity_text(&pending, 80),
+            Some("Waiting on: Architecture".to_owned()),
+            "a Pending stage with no failure falls through to its waiting info"
         );
     }
 

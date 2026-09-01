@@ -636,28 +636,53 @@ fn is_terminal_unsafe(character: char) -> bool {
     character.is_control() || matches!(character, '\u{7f}'..='\u{9f}' | '\u{200b}'..='\u{200f}')
 }
 
+/// Single bounded pass, deliberately: a persisted reason is untrusted,
+/// unbounded-length free text (a garbled or hostile provider record can run
+/// to tens of megabytes), and the naive approach — collapse the whole thing,
+/// escape the whole collapsed copy, then take a prefix — allocates multiple
+/// full-length copies before ever looking at the 200-character budget. This
+/// instead builds the output incrementally and stops consuming the input the
+/// moment the budget (plus room for the ellipsis) is spent, so memory use
+/// stays a small constant regardless of how long `reason` is.
 fn sanitize_failure_reason(reason: &str) -> Option<String> {
-    let collapsed = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
+    let mut output = String::new();
+    let mut len = 0usize;
+    let mut pending_space = false;
+    let mut truncated = false;
+    for character in reason.chars() {
+        if character.is_whitespace() {
+            // Leading whitespace never becomes a visible leading space.
+            if len > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        // The pending collapsed space and the character itself both need to
+        // fit inside the budget, or neither is written this iteration.
+        let needed = if pending_space { 2 } else { 1 };
+        if len + needed > FAILURE_REASON_LIMIT {
+            truncated = true;
+            break;
+        }
+        if pending_space {
+            output.push(' ');
+            len += 1;
+            pending_space = false;
+        }
+        output.push(if is_terminal_unsafe(character) {
+            '\u{fffd}'
+        } else {
+            character
+        });
+        len += 1;
+    }
+    if output.is_empty() {
         return None;
     }
-    let escaped: String = collapsed
-        .chars()
-        .map(|character| {
-            if is_terminal_unsafe(character) {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .collect();
-    let mut characters = escaped.chars();
-    let head: String = characters.by_ref().take(FAILURE_REASON_LIMIT).collect();
-    Some(if characters.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
-    })
+    if truncated {
+        output.push('…');
+    }
+    Some(output)
 }
 
 /// Folds the run's semantic span from committed lifecycle events. Resuming
@@ -1724,6 +1749,29 @@ mod tests {
     fn sanitize_failure_reason_treats_blank_text_as_no_reason() {
         assert_eq!(sanitize_failure_reason(""), None);
         assert_eq!(sanitize_failure_reason("   \n\t  "), None);
+    }
+
+    /// A garbled or hostile provider record can run to tens of megabytes.
+    /// The bounded single-pass implementation must produce exactly the same
+    /// capped, single-line output a short input would — proving the early
+    /// break on the 200-character budget still yields correct results — and
+    /// must do it without the naive collapse-then-escape-then-slice approach
+    /// ever materializing a copy proportional to the input's length. The
+    /// interesting content sits in the first few characters and everything
+    /// after it is discarded padding, so a bounded scan finishes almost
+    /// immediately no matter how long the tail is; this is the property
+    /// `sanitize_failure_reason`'s doc comment claims.
+    #[test]
+    fn sanitize_failure_reason_caps_a_multi_megabyte_input() {
+        let huge = format!("compile failed{}", "z".repeat(8 * 1024 * 1024));
+        let sanitized = sanitize_failure_reason(&huge).unwrap();
+        assert_eq!(
+            sanitized.chars().count(),
+            201,
+            "200 characters plus the ellipsis, regardless of the input's real length"
+        );
+        assert!(sanitized.starts_with("compile failed"));
+        assert!(sanitized.ends_with('…'));
     }
 
     #[test]
