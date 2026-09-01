@@ -28,6 +28,27 @@ pub(crate) fn first_record(
     Ok(Some((decode(&value)?, newline + 1)))
 }
 
+/// The verbatim text of one completed agent message, if this line is one.
+///
+/// Deliberately separate from [`decode`], which turns every item into an
+/// opaque progress string: corroborating a final-message file needs the exact
+/// bytes Codex said it produced, not a description of them. A line that is not
+/// valid JSON, not an `item.completed`, or not an agent message is simply not
+/// one of these, so it is `None` rather than an error.
+pub(crate) fn agent_message_text(line: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("item.completed") {
+        return None;
+    }
+    let item = value.get("item")?;
+    if item.get("type").and_then(Value::as_str) != Some("agent_message") {
+        return None;
+    }
+    item.get("text")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn decode(value: &Value) -> Result<CodexRecord, CodexProviderError> {
     match value.get("type").and_then(Value::as_str) {
         Some("thread.started") => Ok(CodexRecord::ThreadStarted {
@@ -206,6 +227,31 @@ mod tests {
             first_record(b"{\"type\":\"broken\"\n"),
             Err(CodexProviderError::Protocol(_))
         ));
+    }
+
+    /// The final-message file is corroborated against this text, so it must
+    /// come back byte for byte — multi-line content, escapes and all — and
+    /// nothing that merely looks like a message may masquerade as one.
+    #[test]
+    fn an_agent_message_yields_its_exact_text_and_nothing_else_does() {
+        // Shape copied structurally from a real Codex `item.completed`
+        // agent_message record, whose text is what `--output-last-message`
+        // holds byte for byte.
+        let raw = br##"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"# Result\n\n- Fixed `double` to multiply.\n"}}"##;
+        assert_eq!(
+            agent_message_text(raw).as_deref(),
+            Some("# Result\n\n- Fixed `double` to multiply.\n")
+        );
+
+        for other in [
+            &br#"{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"cargo test"}}"#[..],
+            &br#"{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"private chain"}}"#[..],
+            &br#"{"type":"item.started","item":{"id":"m1","type":"agent_message","text":"not finished"}}"#[..],
+            &br#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#[..],
+            &b"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_mess"[..],
+        ] {
+            assert_eq!(agent_message_text(other), None);
+        }
     }
 
     #[test]

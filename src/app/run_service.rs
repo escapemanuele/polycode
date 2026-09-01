@@ -1959,6 +1959,141 @@ mod tests {
         );
     }
 
+    /// The dependency information the scheduler computes and used to discard
+    /// is now queryable: a `decision` stage stalled behind an interrupted
+    /// `spec_review` reports exactly that stage as `waiting_on`, and reports
+    /// nothing for the sibling `quality_review` dependency it already has.
+    #[test]
+    fn inspect_reports_waiting_on_for_a_stage_stalled_on_an_unfinished_dependency() {
+        let fixture = Fixture::new();
+        let scenario = FakeScenario::new()
+            .stage("architecture")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("implementation")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("simplification")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("verify")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("quality_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("spec_review")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::Interrupted,
+                FakeEvent::Completed,
+            ])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let interrupted = fixture
+            .scripted_service(scenario)
+            .start_run(
+                WorkflowKind::Standard,
+                "waiting reason for a stalled decision",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+
+        let decision = interrupted
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == StageId::new("decision").unwrap())
+            .expect("decision stage exists");
+        assert_eq!(decision.status, StageStatus::Pending);
+        let waiting = decision
+            .waiting
+            .as_ref()
+            .expect("a pending stage reports why it is not running");
+        assert_eq!(
+            waiting
+                .waiting_on
+                .iter()
+                .map(|dependency| dependency.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["spec_review".to_owned()],
+            "quality_review already completed, so only spec_review is outstanding"
+        );
+        assert!(waiting.blocked_by.is_empty());
+        assert!(waiting.degraded.is_empty());
+
+        // Every other stage has either finished or has nothing left to wait
+        // on, so none of them carries a waiting summary.
+        for stage in &interrupted.details.stages {
+            if stage.id != StageId::new("decision").unwrap() {
+                assert!(
+                    stage.waiting.is_none(),
+                    "stage {} unexpectedly carries a waiting summary",
+                    stage.id
+                );
+            }
+        }
+    }
+
+    /// `waiting: Some(..)` must mean "this stage is actually waiting on
+    /// something" — never "this stage is merely Pending or Ready". A stage
+    /// requesting attention halts the *whole run* (unlike an interrupted
+    /// stage, which only blocks its own branch — the engine keeps advancing
+    /// every other stage it can), so parking `quality_review` on
+    /// `NeedsUser` catches `spec_review` at exactly the moment its own
+    /// required dependencies (architecture, implementation, simplification)
+    /// are all satisfied but the scheduler has only gotten around to marking
+    /// it `Ready`, never started: `inspect_run` must report `waiting: None`.
+    #[test]
+    fn inspect_reports_no_waiting_summary_for_a_ready_stage_with_satisfied_dependencies() {
+        let fixture = Fixture::new();
+        let scenario = FakeScenario::new()
+            .stage("architecture")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("implementation")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("simplification")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("quality_review")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::needs_user(AttentionKind::Decision, "Approve the quality pass"),
+                FakeEvent::Completed,
+            ])
+            .stage("spec_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let blocked = fixture
+            .scripted_service(scenario)
+            .start_run(
+                WorkflowKind::Standard,
+                "ready stage needs no waiting summary",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(blocked.details.status, RunStatus::NeedsUser);
+
+        let quality_review = blocked
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == StageId::new("quality_review").unwrap())
+            .expect("quality_review stage exists");
+        assert_eq!(quality_review.status, StageStatus::NeedsUser);
+
+        let spec_review = blocked
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == StageId::new("spec_review").unwrap())
+            .expect("spec_review stage exists");
+        assert_eq!(spec_review.status, StageStatus::Ready);
+        assert!(
+            spec_review.waiting.is_none(),
+            "a ready stage whose dependencies are all satisfied has nothing left to report"
+        );
+    }
+
     #[test]
     fn normalized_immutable_task_reaches_every_provider_poll_exactly() {
         let fixture = Fixture::new();
@@ -2517,6 +2652,137 @@ mod tests {
                         | DomainEventKind::ProviderProgress { .. }
                 )
         }));
+    }
+
+    /// A failed run's reason, persisted in the committing `ProviderFailed`
+    /// event, must survive a fresh read: `inspect_run` on a brand-new service
+    /// instance is the same read `polycode status` and the TUI both use, so
+    /// it is the only path this test exercises.
+    #[test]
+    fn inspect_surfaces_the_failure_reason_on_the_right_stage_and_run() {
+        let fixture = Fixture::new();
+        let scenario = || {
+            FakeScenario::new().stage("implementation").events([
+                FakeEvent::Started,
+                FakeEvent::failed("compile failed: missing semicolon"),
+            ])
+        };
+        let failed = fixture
+            .scripted_service(scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "failing task with a reason",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(failed.details.status, RunStatus::Failed);
+
+        // A read on a fresh service instance never touches the provider, so
+        // the assertion is against exactly what `polycode status` would see.
+        let details = fixture
+            .default_service()
+            .inspect_run(failed.details.id)
+            .unwrap();
+        assert_eq!(
+            details.failure_reason.as_deref(),
+            Some("compile failed: missing semicolon"),
+            "the run-level reason is the blocking failed stage's"
+        );
+        let implementation = details
+            .stages
+            .iter()
+            .find(|stage| stage.id.as_str() == "implementation")
+            .expect("implementation stage");
+        assert_eq!(
+            implementation.failure_reason.as_deref(),
+            Some("compile failed: missing semicolon")
+        );
+        assert_eq!(implementation.status, StageStatus::Failed);
+        assert!(
+            implementation.blocking,
+            "a failed leaf stage with no dependents blocks completion on its own"
+        );
+
+        // No other stage inherits a reason that was never theirs.
+        assert!(
+            details
+                .stages
+                .iter()
+                .filter(|stage| stage.id.as_str() != "implementation")
+                .all(|stage| stage.failure_reason.is_none()),
+            "the reason is attributed to the failed stage only"
+        );
+    }
+
+    /// The Review workflow's `synthesis` treats `quality_review` and
+    /// `spec_review` as optional dependencies: either can fail and synthesis
+    /// still runs, degraded. If `quality_review` fails and synthesis then
+    /// fails too on its own merits, both stages carry `StageStatus::Failed`
+    /// — but only synthesis actually stops the run from completing, because
+    /// `decision` requires synthesis and nothing requires `quality_review`.
+    /// The run-level reason (and, by extension, the TUI's status sentence
+    /// built from it) must name synthesis, never the optional review that
+    /// merely happened to fail earlier in workflow order.
+    #[test]
+    fn inspect_attributes_the_run_level_reason_to_the_blocking_stage_not_the_first_failed_one() {
+        let fixture = Fixture::new();
+        let scenario = || {
+            FakeScenario::new()
+                .stage("research")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("quality_review")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::failed("quality review: lint runner crashed"),
+                ])
+                .stage("spec_review")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("synthesis")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::failed("synthesis: engineering lead ran out of context"),
+                ])
+        };
+        let failed = fixture
+            .scripted_service(scenario())
+            .start_run(
+                WorkflowKind::Review,
+                "optional review fails, then the real blocker does too",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(failed.details.status, RunStatus::Failed);
+
+        let details = fixture
+            .default_service()
+            .inspect_run(failed.details.id)
+            .unwrap();
+        let stage = |id: &str| {
+            details
+                .stages
+                .iter()
+                .find(|stage| stage.id.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} stage"))
+        };
+        assert_eq!(stage("quality_review").status, StageStatus::Failed);
+        assert!(
+            !stage("quality_review").blocking,
+            "synthesis only tolerates quality_review's failure, so it is not a blocker"
+        );
+        assert_eq!(stage("synthesis").status, StageStatus::Failed);
+        assert!(
+            stage("synthesis").blocking,
+            "decision requires synthesis, so its failure is what actually stops the run"
+        );
+        assert_eq!(
+            details.failure_reason.as_deref(),
+            Some("synthesis: engineering lead ran out of context"),
+            "the run-level reason names the blocking stage, not the first failed one"
+        );
     }
 
     /// The failed implementation skipped the verify stage after it; the
