@@ -1098,11 +1098,10 @@ mod tests {
     /// the run reopens, grows exactly one follow-up stage and a fresh
     /// decision, and reaches `Completed` again.
     ///
-    /// `ScriptedFactory` scripts the follow-up cycle's stages up front
-    /// because `DevelopmentFakeProviderFactory` only scripts a workflow's
-    /// stages as they exist when its provider is constructed — the same
-    /// snapshot-at-construction limit that makes production routing
-    /// role-based rather than stage-scripted.
+    /// `ScriptedFactory` also pins the follow-up cycle's stages to explicit,
+    /// deliberately narrated scripts — belt and braces alongside
+    /// `request_continue_completes_on_a_fake_run_without_prescripting_appended_stages`,
+    /// which proves the same cycle completes with no scripting at all.
     #[test]
     fn a_completed_run_grows_a_continue_cycle_and_completes_again() {
         let fixture = Fixture::new();
@@ -1143,6 +1142,72 @@ mod tests {
             .expect("a follow-up stage was appended");
         assert_eq!(follow_up.status, StageStatus::Completed);
         assert_eq!(follow_up.id.to_string(), "followup_1");
+    }
+
+    /// Regression: `FakeScenario::successful` used to be a snapshot of the
+    /// workflow at provider-construction time, so a stage a remediation
+    /// cycle appended mid-drive had no script and polling it failed with
+    /// "no fake script for stage …" — breaking `[c]`/`[w]` (and, latently,
+    /// `[f]`) for every fake-provider run, `--provider fake` included since
+    /// `RoutedProvider` builds its own fake runtime the same way. Driven
+    /// through the plain `default_service()` — no `ScriptedFactory`, no
+    /// stage prescripted by hand — so this only stays green if the fake
+    /// runtime itself heals the gap.
+    #[test]
+    fn request_continue_completes_on_a_fake_run_without_prescripting_appended_stages() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let started = service
+            .start_run(
+                WorkflowKind::Standard,
+                "task for continue",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(started.details.status, RunStatus::Completed);
+
+        let report = service
+            .request_continue(started.details.id, "add more tests".to_owned())
+            .unwrap();
+
+        assert_eq!(report.details.status, RunStatus::Completed);
+        assert!(report.details.stages.iter().any(
+            |stage| stage.kind == StageKind::FollowUp && stage.status == StageStatus::Completed
+        ));
+    }
+
+    /// Same regression as
+    /// `request_continue_completes_on_a_fake_run_without_prescripting_appended_stages`,
+    /// for the sibling cycle: `[f]` Fix had the identical latent bug on a
+    /// fake run before the runtime fix, just never a test to catch it.
+    #[test]
+    fn request_fix_completes_on_a_fake_run_without_prescripting_appended_stages() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let started = service
+            .start_run(
+                WorkflowKind::Standard,
+                "task for fix",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(started.details.status, RunStatus::Completed);
+
+        let report = service.request_fix(started.details.id).unwrap();
+
+        assert_eq!(report.details.status, RunStatus::Completed);
+        assert!(
+            report
+                .details
+                .stages
+                .iter()
+                .any(|stage| stage.kind == StageKind::Fix
+                    && stage.status == StageStatus::Completed)
+        );
     }
 
     #[test]

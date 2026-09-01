@@ -64,12 +64,21 @@ impl FakeEvent {
 #[derive(Clone, Debug, Default)]
 pub struct FakeScenario {
     stages: Vec<(String, Vec<FakeEvent>)>,
+    /// Whether an unscripted stage should still succeed generically, rather
+    /// than fail the poll. Set only by [`Self::successful`]: a hand-rolled
+    /// scenario built through [`Self::new`]/[`Self::stage`] keeps failing
+    /// closed on an unknown stage, because that refusal is what catches a
+    /// scheduler bug in a test that scripted every stage it expected to see.
+    default_success: bool,
 }
 
 impl FakeScenario {
     #[must_use]
     pub const fn new() -> Self {
-        Self { stages: Vec::new() }
+        Self {
+            stages: Vec::new(),
+            default_success: false,
+        }
     }
 
     #[must_use]
@@ -80,20 +89,42 @@ impl FakeScenario {
         }
     }
 
-    /// Builds restart-stable success scripts from graph data only.
+    /// Builds restart-stable success scripts from graph data only, and keeps
+    /// succeeding generically for any stage appended after the fact.
+    ///
+    /// A completed run's `[f]`/`[c]` remediation cycle appends stages the
+    /// workflow did not have when this scenario was built — the whole point
+    /// of a fake "everything succeeds" provider is that it should not need
+    /// to be told about them in advance. `RunFixError`/continue growth
+    /// happens on the same provider instance mid-drive, so the eager script
+    /// map here is necessarily a snapshot; [`FakeProvider::poll`] tops it up
+    /// lazily rather than failing a stage this scenario's own promise
+    /// covers.
     #[must_use]
     pub fn successful(workflow: &WorkflowDefinition) -> Self {
-        let mut scenario = Self::new();
+        let mut scenario = Self {
+            default_success: true,
+            ..Self::new()
+        };
         for stage in workflow.stages() {
-            scenario = scenario.stage(stage.id().as_str()).events([
-                FakeEvent::Started,
-                FakeEvent::progress(format!("Executing {}", stage.id())),
-                FakeEvent::Usage(UsageDelta::stable(10, 5)),
-                FakeEvent::Completed,
-            ]);
+            scenario = scenario
+                .stage(stage.id().as_str())
+                .events(default_success_events(stage.id()));
         }
         scenario
     }
+}
+
+/// The generic success script one stage gets, whether scripted up front by
+/// [`FakeScenario::successful`] or synthesized lazily by
+/// [`FakeProvider::poll`] for a stage that scenario did not know about yet.
+fn default_success_events(stage_id: &StageId) -> Vec<FakeEvent> {
+    vec![
+        FakeEvent::Started,
+        FakeEvent::progress(format!("Executing {stage_id}")),
+        FakeEvent::Usage(UsageDelta::stable(10, 5)),
+        FakeEvent::Completed,
+    ]
 }
 
 pub struct FakeStageBuilder {
@@ -115,6 +146,9 @@ impl FakeStageBuilder {
 pub struct FakeProvider {
     id: ProviderId,
     scripts: HashMap<StageId, Vec<FakeEvent>>,
+    /// Carried from [`FakeScenario::default_success`]: whether a stage
+    /// missing from `scripts` should still succeed generically.
+    default_success: bool,
     released_gates: HashSet<(StageId, String)>,
 }
 
@@ -138,6 +172,7 @@ impl FakeProvider {
         Ok(Self {
             id,
             scripts,
+            default_success: scenario.default_success,
             released_gates: HashSet::new(),
         })
     }
@@ -172,9 +207,26 @@ impl Provider for FakeProvider {
         _store: &mut SqliteStore,
         request: &ProviderRequest,
     ) -> Result<ProviderPoll, ProviderError> {
-        let events = self.scripts.get(request.stage_id()).ok_or_else(|| {
-            ProviderError::new(format!("no fake script for stage {}", request.stage_id()))
-        })?;
+        if !self.scripts.contains_key(request.stage_id()) {
+            if !self.default_success {
+                return Err(ProviderError::new(format!(
+                    "no fake script for stage {}",
+                    request.stage_id()
+                )));
+            }
+            // A remediation cycle appended this stage after the scenario was
+            // built; `successful()` promised every stage succeeds, so this
+            // one gets the same generic script the eager loop would have
+            // given it had it existed at construction time.
+            self.scripts.insert(
+                request.stage_id().clone(),
+                default_success_events(request.stage_id()),
+            );
+        }
+        let events = self
+            .scripts
+            .get(request.stage_id())
+            .expect("just inserted or already present");
         let mut signal_index = 0_usize;
         for event in events {
             if let FakeEvent::Delay(gate) = event {
