@@ -51,7 +51,7 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
             "Perform legacy/general independent review. Prioritize correctness, regressions, and missing tests. Do not edit files."
         }
         (Role::EngineeringLead, StageKind::Decision) => {
-            "Synthesize direct review evidence across two distinct axes: implementation quality and specification compliance. Do not count findings mechanically or infer approval from reviewer completion. Surface disagreements between reviewers and make an explicit engineering decision. When a previous decision and a fix answering it are both in evidence, judge whether that fix actually resolves the findings the previous decision called blocking; a fix artifact claiming a finding is resolved is a claim to verify against the code, not a resolution."
+            "Synthesize direct review evidence across two distinct axes: implementation quality and specification compliance. Do not count findings mechanically or infer approval from reviewer completion. Surface disagreements between reviewers and make an explicit engineering decision. When a previous decision and a fix answering it are both in evidence, judge whether that fix actually resolves the findings the previous decision called blocking; a fix artifact claiming a finding is resolved is a claim to verify against the code, not a resolution. When you see reasonable next steps that are not blocking findings — follow-on work, generalizations, or things worth doing but not required by this task — add an optional `## Follow-ups` section, one bullet per item, written as an instruction an operator could hand back to an agent verbatim. Omit the section entirely when there is nothing worth suggesting; never pad it to have something to say."
         }
         (Role::EngineeringLead, _) => {
             "Integrate direct dependency evidence into one actionable engineering result."
@@ -125,5 +125,19 @@ mod tests {
         assert!(decision.contains("implementation quality"));
         assert!(decision.contains("specification compliance"));
         assert!(decision.contains("Surface disagreements"));
+    }
+
+    /// The follow-ups section is a suggestion, not a verdict: it must read as
+    /// optional and non-blocking, and it must ask for the exact heading the
+    /// TUI's extraction later looks for.
+    #[test]
+    fn decision_contract_asks_for_an_optional_non_blocking_follow_ups_section() {
+        let decision = instruction(Role::EngineeringLead, StageKind::Decision);
+        assert!(decision.contains("## Follow-ups"));
+        assert!(decision.contains("optional"));
+        assert!(decision.contains("not blocking findings"));
+        assert!(
+            decision.contains("Omit the section entirely when there is nothing worth suggesting")
+        );
     }
 }
