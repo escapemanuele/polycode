@@ -23,7 +23,7 @@ Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home
 Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage, `u` attention overlay, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `P` pull request (Enter confirms), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `i` technical details.
 Runs list: `h` hide/unhide selected run, `H` show/hide hidden runs.
 Artifact viewer: `m` toggle raw/rendered Markdown.
-Composer: `Tab`/`Shift-Tab` move fields, `←`/`→` cycle Workflow and Execution, typing/paste edits Task and Repository, `Enter` submits, `Esc` back.
+Composer: `Tab`/`Shift-Tab` move fields, `←`/`→` cycle Workflow, Execution and Effort, typing/paste edits Task and Repository, `Enter` submits, `Esc` back.
 Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for this process.
 
 ## Where it lives
@@ -44,4 +44,3 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 - The TUI caps concurrently working agents at 4 (`CONCURRENT_AGENTS`); a booked fix that cannot start yet stays booked silently. The CLI has no such cap.
 - Attention overlays outrank the update overlay; the update prompt is shown at most once per process.
 - Stop dispatches without confirmation; apply, publish and discard require Enter in a confirmation overlay.
-- The README key table omits `s`, `f`, `c`, `w`, `h`, `H`, `x`, `m`, `i`; the help overlay in `render.rs` is complete.

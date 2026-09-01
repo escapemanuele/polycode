@@ -25,6 +25,15 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 
 When code under a feature's "Where it lives" paths changes, update that feature file in the same PR. Add a new file and a table row when a new user-facing feature lands; delete both when one is removed.
 
+`cargo test --test feature_map` runs in CI and checks the mechanical part: every cited path exists, every `polycode ...` line in a `Driving it` block is a command with flags the binary accepts, every key named in control-room.md is bound in `src/tui/input.rs`. A rename or a removed flag turns the map red instead of stale.
+
+The semantic part is a reading job. At the end of every milestone, an agent runs this pass:
+
+1. For each feature file, open every path under "Where it lives" and compare with the file: sub-features that exist in code but have no line, lines that describe code that is gone, defaults and status names that changed.
+2. For each gotcha, find the code or test that makes it true. If none exists any more, delete the gotcha.
+3. Check README.md and ARCHITECTURE.md against the same code; those two drift the same way.
+4. Open one PR titled `docs: feature map pass after <milestone>` with only those edits.
+
 A stale entry looks like one of these:
 
 - A command, flag, subcommand or key that `polycode --help`, `src/cli/mod.rs` or `src/tui/input.rs` no longer has, or has under a different name.
