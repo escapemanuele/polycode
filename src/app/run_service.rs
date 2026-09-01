@@ -2396,6 +2396,64 @@ mod tests {
         )));
     }
 
+    /// A failed run's reason, persisted in the committing `ProviderFailed`
+    /// event, must survive a fresh read: `inspect_run` on a brand-new service
+    /// instance is the same read `polycode status` and the TUI both use, so
+    /// it is the only path this test exercises.
+    #[test]
+    fn inspect_surfaces_the_failure_reason_on_the_right_stage_and_run() {
+        let fixture = Fixture::new();
+        let scenario = || {
+            FakeScenario::new().stage("implementation").events([
+                FakeEvent::Started,
+                FakeEvent::failed("compile failed: missing semicolon"),
+            ])
+        };
+        let failed = fixture
+            .scripted_service(scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "failing task with a reason",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(failed.details.status, RunStatus::Failed);
+
+        // A read on a fresh service instance never touches the provider, so
+        // the assertion is against exactly what `polycode status` would see.
+        let details = fixture
+            .default_service()
+            .inspect_run(failed.details.id)
+            .unwrap();
+        assert_eq!(
+            details.failure_reason.as_deref(),
+            Some("compile failed: missing semicolon"),
+            "the run-level reason is the blocking failed stage's"
+        );
+        let implementation = details
+            .stages
+            .iter()
+            .find(|stage| stage.id.as_str() == "implementation")
+            .expect("implementation stage");
+        assert_eq!(
+            implementation.failure_reason.as_deref(),
+            Some("compile failed: missing semicolon")
+        );
+        assert_eq!(implementation.status, StageStatus::Failed);
+
+        // No other stage inherits a reason that was never theirs.
+        assert!(
+            details
+                .stages
+                .iter()
+                .filter(|stage| stage.id.as_str() != "implementation")
+                .all(|stage| stage.failure_reason.is_none()),
+            "the reason is attributed to the failed stage only"
+        );
+    }
+
     #[test]
     fn failed_run_requires_retry_and_empty_apply_is_successful_no_op() {
         let fixture = Fixture::new();

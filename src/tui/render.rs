@@ -403,7 +403,12 @@ fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
             .find(|stage| stage.status == StageStatus::Failed)
             .map_or_else(
                 || "Run failed.".to_owned(),
-                |stage| format!("{} failed — its logs say why.", stage_title(stage.kind)),
+                |stage| {
+                    stage.failure_reason.as_deref().map_or_else(
+                        || format!("{} failed — its logs say why.", stage_title(stage.kind)),
+                        |reason| format!("{} failed: {reason}", stage_title(stage.kind)),
+                    )
+                },
             ),
         RunStatus::Paused | RunStatus::Interrupted => {
             "Run suspended — resume when ready.".to_owned()
@@ -622,11 +627,23 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         runtime_summary(selected),
         theme::muted(),
     )));
-    if details.attention.is_empty()
-        && !applyable
-        && let Some(activity) = activity_message(selected)
-    {
-        lines.push(Line::from(Span::styled(activity, theme::text())));
+    if details.attention.is_empty() && !applyable {
+        // A failed stage's reason outranks the generic activity line — it is
+        // the one place the hero says *why*, not just *that*. Truncated to
+        // one line: the hero stays a hero, not a log viewer. Every other
+        // status (including Pending/Ready, whose waiting/blocked-on text
+        // `activity_message` itself derives from `stage.waiting`) falls
+        // through to the generic, state-driven message.
+        let activity = if selected.status == StageStatus::Failed
+            && let Some(reason) = selected.failure_reason.as_deref()
+        {
+            Some(format::truncate_title(reason, width as usize))
+        } else {
+            activity_message(selected)
+        };
+        if let Some(activity) = activity {
+            lines.push(Line::from(Span::styled(activity, theme::text())));
+        }
     }
     lines.push(Line::from(""));
     // After the pivot the panel speaks for the run, so the result section
@@ -2426,6 +2443,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             waiting: None,
+            failure_reason: None,
         }
     }
 
@@ -2510,6 +2528,7 @@ mod tests {
             ]),
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         }
     }
 
@@ -2981,6 +3000,45 @@ mod tests {
             !text.contains("provider exited"),
             "raw provider metadata stays out of the operational view"
         );
+    }
+
+    /// The failure reason folded onto a stage is the one place the operator
+    /// learns *why* without ever leaving the panel: the strip's sentence and
+    /// the hero's activity line both show it in place of the generic text.
+    #[test]
+    fn a_failed_stage_shows_its_reason_instead_of_generic_text() {
+        let mut state = running_state();
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::Failed;
+        details.stages[1].status = StageStatus::Failed;
+        details.stages[1].finished_at = Some(at(12, 3, 0));
+        details.stages[1].failure_reason = Some("compile failed: missing semicolon".to_owned());
+
+        let sentences = status_sentences(state.details.as_ref().unwrap(), at(12, 13, 0));
+        assert_eq!(
+            sentences[0],
+            "Implementation failed: compile failed: missing semicolon"
+        );
+
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("compile failed: missing semicolon"));
+        assert!(
+            !text.contains("The provider ended this stage before it completed"),
+            "the reason replaces the generic activity line, not adds to it"
+        );
+    }
+
+    /// A stage that failed without the runtime reporting why keeps the
+    /// generic activity text — the reason is a bonus, never a requirement.
+    #[test]
+    fn a_failed_stage_without_a_reason_keeps_the_generic_text() {
+        let mut state = running_state();
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::Failed;
+        details.stages[1].status = StageStatus::Failed;
+        details.stages[1].finished_at = Some(at(12, 3, 0));
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("The provider ended this stage before it completed"));
     }
 
     #[test]

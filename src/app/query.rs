@@ -65,6 +65,12 @@ pub struct StageSummary {
     /// every other status, and for a Pending/Ready stage whose dependencies
     /// are all satisfied (the scheduler just hasn't marked it Ready yet).
     pub waiting: Option<StageWaitingSummary>,
+    /// Why the stage's current attempt ended in failure, folded from the last
+    /// committed `ProviderFailed` event that carried one. Sanitized to one
+    /// line and capped for display; see [`sanitize_failure_reason`]. `None`
+    /// when the stage never failed, or failed without the runtime reporting
+    /// why.
+    pub failure_reason: Option<String>,
 }
 
 /// One dependency stage referenced from a [`StageWaitingSummary`] bucket,
@@ -273,6 +279,11 @@ pub struct RunDetails {
     /// `RunStarted` and terminal run events. Resuming does not restart it.
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// The blocking failed stage's [`StageSummary::failure_reason`], carried
+    /// up so a run-level view never has to walk `stages` to find it. `None`
+    /// unless `status` is `RunStatus::Failed`, and `None` even then when the
+    /// failed stage carries no reason.
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -464,6 +475,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .run
             .stage_dependency_report(stage.id())
             .map(|report| waiting_summary(&loaded.run, report));
+        let failure_reason = stage_failure_reason(&events, stage.id());
         stages.push(StageSummary {
             id: stage.id().clone(),
             kind: stage.kind(),
@@ -501,8 +513,19 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             started_at,
             finished_at,
             waiting,
+            failure_reason,
         });
     }
+    // The run's own reason is the blocking failed stage's, so a caller
+    // showing run-level status never has to walk `stages` looking for it.
+    let failure_reason = (loaded.run.status() == RunStatus::Failed)
+        .then(|| {
+            stages
+                .iter()
+                .find(|stage| stage.status == StageStatus::Failed)
+                .and_then(|stage| stage.failure_reason.clone())
+        })
+        .flatten();
     Ok(RunDetails {
         id: loaded.run.id(),
         task: input.map(|input| input.task().to_owned()),
@@ -554,6 +577,31 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         usage,
         started_at: run_span.0,
         finished_at: run_span.1,
+        failure_reason,
+    })
+}
+
+/// One display line: whitespace/newlines collapsed to single spaces and
+/// capped at [`FAILURE_REASON_LIMIT`] characters with an ellipsis.
+///
+/// Persisted reasons are free text from provider stderr or an exit message:
+/// untrimmed, possibly multi-line, unbounded in length. Every surface that
+/// shows one wants the same short, single-line form, so the fold produces it
+/// once here instead of each caller re-deriving it. `None` only for a reason
+/// that is empty or all whitespace.
+const FAILURE_REASON_LIMIT: usize = 200;
+
+fn sanitize_failure_reason(reason: &str) -> Option<String> {
+    let collapsed = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let mut characters = collapsed.chars();
+    let head: String = characters.by_ref().take(FAILURE_REASON_LIMIT).collect();
+    Some(if characters.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
     })
 }
 
@@ -630,6 +678,30 @@ fn stage_span(
         }
     }
     span
+}
+
+/// Folds one stage's failure reason from its committed `ProviderFailed`
+/// events, keyed by the event envelope's own `stage_id` — the same
+/// attribution [`stage_execution_evidence`] uses, so a stage that ran
+/// somewhere other than where it was routed is still charged the reason it
+/// actually reported.
+///
+/// Takes the *last* event that carried one: a retried stage's earlier
+/// failure never leaks into what the current status reports, and a terminal
+/// `ProviderFailed` with no reason does not erase an earlier one that had it.
+fn stage_failure_reason(events: &[SequencedEvent], stage_id: &StageId) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if event.event.stage_id() != Some(stage_id) {
+            return None;
+        }
+        match event.event.kind() {
+            DomainEventKind::ProviderFailed {
+                reason: Some(reason),
+                ..
+            } => sanitize_failure_reason(reason),
+            _ => None,
+        }
+    })
 }
 
 pub(crate) fn list_artifacts(
@@ -1379,6 +1451,98 @@ mod tests {
             )),
             "Compare 1 b and 2 b"
         );
+    }
+
+    fn provider_failed_event(sequence: u64, stage: &str, reason: Option<&str>) -> SequencedEvent {
+        event(
+            sequence,
+            at(12, 0, 0),
+            Some(stage),
+            DomainEventKind::ProviderFailed {
+                provider_id: crate::domain::ProviderId::new("codex").unwrap(),
+                session_id: None,
+                reason: reason.map(ToOwned::to_owned),
+            },
+        )
+    }
+
+    #[test]
+    fn stage_failure_reason_is_attributed_to_the_event_own_stage() {
+        let events = vec![
+            provider_failed_event(1, "research", Some("research provider timed out")),
+            provider_failed_event(
+                2,
+                "implementation",
+                Some("compile failed: missing semicolon"),
+            ),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("compile failed: missing semicolon".to_owned())
+        );
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("research").unwrap()),
+            Some("research provider timed out".to_owned())
+        );
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("decision").unwrap()),
+            None,
+            "a stage with no failure event carries no reason"
+        );
+    }
+
+    #[test]
+    fn stage_failure_reason_prefers_the_last_reason_over_a_reasonless_terminal_event() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first attempt: OOM")),
+            event(
+                2,
+                at(12, 5, 0),
+                Some("implementation"),
+                DomainEventKind::StageRetryScheduled,
+            ),
+            provider_failed_event(3, "implementation", None),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("first attempt: OOM".to_owned()),
+            "a reasonless failure never erases the last reason that was reported"
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_collapses_whitespace_to_one_line() {
+        assert_eq!(
+            sanitize_failure_reason("exit code 1\n\nstderr:\n  compile failed\n"),
+            Some("exit code 1 stderr: compile failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_caps_long_text_with_ellipsis() {
+        let reason = "x".repeat(250);
+        let sanitized = sanitize_failure_reason(&reason).unwrap();
+        assert_eq!(
+            sanitized.chars().count(),
+            201,
+            "200 characters plus the ellipsis"
+        );
+        assert!(sanitized.ends_with('…'));
+        assert!(sanitized.starts_with(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn sanitize_failure_reason_leaves_short_text_untouched() {
+        assert_eq!(
+            sanitize_failure_reason("compile failed"),
+            Some("compile failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_treats_blank_text_as_no_reason() {
+        assert_eq!(sanitize_failure_reason(""), None);
+        assert_eq!(sanitize_failure_reason("   \n\t  "), None);
     }
 
     #[test]
