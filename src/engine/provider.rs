@@ -300,6 +300,49 @@ pub trait Provider {
         Ok(())
     }
 
+    /// Stages the operator's continue-cycle instruction before the follow-up
+    /// stage that will carry it exists.
+    ///
+    /// Mirrors [`Self::stage_attention_response`] in shape and in reason: the
+    /// instruction is immutable run-private content, not domain event data,
+    /// so it must be durable before the domain commit that creates the stage
+    /// — same ordering, one step earlier, because a continue cycle has no
+    /// provider session yet to stage it against. Default providers (Fake)
+    /// need no out-of-band instruction material.
+    ///
+    /// # Errors
+    /// Returns provider-specific validation or durable input failures.
+    fn stage_continue_instruction(
+        &mut self,
+        _store: &mut SqliteStore,
+        _run_id: RunId,
+        _stage_id: &StageId,
+        _role: Role,
+        _instruction: &str,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// Walks back one [`Self::stage_continue_instruction`] write when the
+    /// domain transition it was staged for never became durable.
+    ///
+    /// A refused continue request, or one whose commit lost a concurrency
+    /// race, must leave no staged content behind — otherwise a retry with
+    /// different text fails against instruction bytes that were never
+    /// actually used by any stage. Default providers staged nothing and so
+    /// discard nothing.
+    ///
+    /// # Errors
+    /// Returns provider-specific durable-storage failures.
+    fn discard_continue_instruction(
+        &mut self,
+        _store: &mut SqliteStore,
+        _run_id: RunId,
+        _stage_id: &StageId,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Reports whether explicit eval policy may resolve this attention request
     /// without human input. Production providers default to false.
     ///

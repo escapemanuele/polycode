@@ -31,6 +31,11 @@ pub enum StageKind {
     Synthesis,
     Decision,
     Fix,
+    /// A continue cycle's implementer stage, carrying an operator-supplied
+    /// instruction rather than answering blocking findings. Additive: it
+    /// changes no persisted snapshot or database shape, the same way `Fix`
+    /// did when reviewer specialization introduced it.
+    FollowUp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -199,9 +204,12 @@ impl WorkflowDefinition {
     /// Whether any stage can modify repository content.
     #[must_use]
     pub fn requires_writable_workspace(&self) -> bool {
-        self.stages
-            .iter()
-            .any(|stage| matches!(stage.kind(), StageKind::Implementation | StageKind::Fix))
+        self.stages.iter().any(|stage| {
+            matches!(
+                stage.kind(),
+                StageKind::Implementation | StageKind::Fix | StageKind::FollowUp
+            )
+        })
     }
 }
 
@@ -353,6 +361,74 @@ pub fn fix_cycle_stages(index: u32, after_decision: &StageId) -> Vec<StageDefini
             ],
         ),
     ]
+}
+
+/// Identity of the follow-up stage one continue cycle at this index would
+/// use. Kept in one place so [`continue_cycle_stages`] and
+/// [`next_follow_up_stage_id`] can never disagree about it.
+fn follow_up_id(index: u32) -> StageId {
+    StageId::new(format!("followup_{index}")).expect("follow-up stage ID must remain valid")
+}
+
+/// The stages of one continue cycle: an implementer follow-up stage carrying
+/// the operator's own instruction, then a fresh decision over it.
+///
+/// Named and numbered independently from [`fix_cycle_stages`] — `followup_N`
+/// and `followup_decision_N` rather than `fix_N` and `decision_N` — so a run
+/// that grows both kinds of cycle, in either order, never collides two
+/// stages onto the same identity. The dependency wiring mirrors the fix
+/// cycle exactly: the follow-up depends on the decision it grows from, and
+/// the new decision requires both the follow-up and that same prior
+/// decision, so no verdict is ever recorded over work that has not happened.
+///
+/// # Panics
+/// Panics only if `index` could produce an invalid stage identity, which it
+/// cannot: the identities are built from a decimal integer.
+#[must_use]
+pub fn continue_cycle_stages(index: u32, after_decision: &StageId) -> Vec<StageDefinition> {
+    let follow_up_id = follow_up_id(index);
+    let decision_id = StageId::new(format!("followup_decision_{index}"))
+        .expect("follow-up decision stage ID must remain valid");
+    vec![
+        StageDefinition::new(
+            follow_up_id.clone(),
+            StageKind::FollowUp,
+            Role::Implementer,
+            vec![Dependency::required(after_decision.clone())],
+        ),
+        StageDefinition::new(
+            decision_id,
+            StageKind::Decision,
+            Role::EngineeringLead,
+            vec![
+                Dependency::required(follow_up_id),
+                Dependency::required(after_decision.clone()),
+            ],
+        ),
+    ]
+}
+
+/// The follow-up stage identity the next continue cycle on this workflow
+/// would use, without appending anything.
+///
+/// A continue request has to persist the operator's instruction under this
+/// exact key before the stage exists, because the instruction is immutable
+/// run-private content rather than domain event data — the same reason an
+/// attention response is written before the resolution it answers commits.
+/// [`Run::request_continue`](super::Run::request_continue) independently
+/// derives the identical identity when it actually appends the cycle, from
+/// the same count of existing `FollowUp` stages, so the two can never
+/// address different stages. `None` only on an unreachable stage-count
+/// overflow, which `Run::request_continue` also refuses.
+#[must_use]
+pub fn next_follow_up_stage_id(workflow: &WorkflowDefinition) -> Option<StageId> {
+    let count = workflow
+        .stages()
+        .iter()
+        .filter(|stage| stage.kind() == StageKind::FollowUp)
+        .count();
+    let index = u32::try_from(count).ok()?.checked_add(1)?;
+    Some(follow_up_id(index))
 }
 
 fn stage(id: &str, kind: StageKind, role: Role, dependencies: Vec<Dependency>) -> StageDefinition {
@@ -680,6 +756,20 @@ mod tests {
         );
     }
 
+    /// Additive like `Fix` before it: the new variant round-trips through
+    /// the same inspectable snake-case shape, changing no persisted schema.
+    #[test]
+    fn follow_up_stage_kind_round_trips_through_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&StageKind::FollowUp).unwrap(),
+            "\"follow_up\""
+        );
+        assert_eq!(
+            serde_json::from_str::<StageKind>("\"follow_up\"").unwrap(),
+            StageKind::FollowUp
+        );
+    }
+
     #[test]
     fn every_built_in_is_a_valid_nonempty_dag() {
         for kind in [
@@ -708,8 +798,92 @@ mod tests {
             )],
         )
         .unwrap();
+        let follow_up = WorkflowDefinition::new(
+            WorkflowKind::Review,
+            vec![StageDefinition::new(
+                id("followup_1"),
+                StageKind::FollowUp,
+                Role::Implementer,
+                vec![],
+            )],
+        )
+        .unwrap();
 
         assert!(!read_only.requires_writable_workspace());
         assert!(mutating.requires_writable_workspace());
+        assert!(follow_up.requires_writable_workspace());
+    }
+
+    /// A continue cycle wires exactly like a fix cycle, but under identities
+    /// that cannot collide with it: `followup_N`/`followup_decision_N` rather
+    /// than `fix_N`/`decision_N`.
+    #[test]
+    fn a_continue_cycle_wires_a_follow_up_stage_and_a_fresh_decision_over_it() {
+        let after = id("decision");
+        let stages = continue_cycle_stages(1, &after);
+
+        assert_eq!(stages.len(), 2);
+        let follow_up = &stages[0];
+        assert_eq!(follow_up.id(), &id("followup_1"));
+        assert_eq!(follow_up.kind(), StageKind::FollowUp);
+        assert_eq!(follow_up.role(), Role::Implementer);
+        assert_eq!(
+            follow_up.dependencies(),
+            &[Dependency::required(after.clone())]
+        );
+
+        let decision = &stages[1];
+        assert_eq!(decision.id(), &id("followup_decision_1"));
+        assert_eq!(decision.kind(), StageKind::Decision);
+        assert_eq!(decision.role(), Role::EngineeringLead);
+        assert_eq!(
+            decision.dependencies(),
+            &[
+                Dependency::required(id("followup_1")),
+                Dependency::required(after),
+            ]
+        );
+    }
+
+    /// A fix cycle and a continue cycle over the very same decision must not
+    /// address the same stage.
+    #[test]
+    fn fix_and_continue_cycles_over_the_same_decision_never_collide() {
+        let after = id("decision");
+        let fix_ids = fix_cycle_stages(1, &after)
+            .iter()
+            .map(StageDefinition::id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let continue_ids = continue_cycle_stages(1, &after)
+            .iter()
+            .map(StageDefinition::id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(fix_ids.iter().all(|id| !continue_ids.contains(id)));
+    }
+
+    /// The identity a caller predicts before the cycle exists must be the
+    /// same one the cycle actually uses, on the first cycle and after one
+    /// already grew.
+    #[test]
+    fn next_follow_up_stage_id_predicts_what_a_continue_cycle_would_append() {
+        let base = WorkflowDefinition::new(WorkflowKind::Standard, vec![stage("decision", vec![])])
+            .unwrap();
+        assert_eq!(
+            next_follow_up_stage_id(&base),
+            Some(id("followup_1")),
+            "no follow-up cycle exists yet"
+        );
+
+        let grown = base
+            .extended(continue_cycle_stages(1, &id("decision")))
+            .unwrap();
+        assert_eq!(
+            next_follow_up_stage_id(&grown),
+            Some(id("followup_2")),
+            "one cycle already grew, so the next one is the second"
+        );
     }
 }

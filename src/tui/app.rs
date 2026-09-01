@@ -109,7 +109,10 @@ impl TuiApp {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 let text_mode = self.state.screen == Screen::NewRun
                     && matches!(self.state.new_run.focus, 0 | 2)
-                    || self.state.overlay == Some(Overlay::Attention);
+                    || matches!(
+                        self.state.overlay,
+                        Some(Overlay::Attention | Overlay::Continue)
+                    );
                 let intent = if text_mode {
                     map_text_key(key)
                 } else {
@@ -175,6 +178,8 @@ impl TuiApp {
             Intent::Diff => self.open_diff(),
             Intent::Apply => self.open_apply_confirmation(),
             Intent::Fix => self.request_fix(),
+            Intent::Continue => self.open_continue(),
+            Intent::FollowUps => self.open_follow_ups(),
             Intent::Discard => self.state.overlay = Some(Overlay::DiscardConfirm),
             Intent::Hide if self.state.screen == Screen::Runs => self.toggle_selected_hidden(),
             Intent::ShowHidden if self.state.screen == Screen::Runs => {
@@ -205,6 +210,8 @@ impl TuiApp {
         }
         match overlay {
             Overlay::Attention => self.handle_attention_intent(intent),
+            Overlay::Continue => self.handle_continue_intent(intent),
+            Overlay::FollowUps => self.handle_follow_ups_intent(intent),
             Overlay::ApplyConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
                     self.dispatch(WorkerCommand::ApplyRun { run_id });
@@ -353,6 +360,8 @@ impl TuiApp {
     fn handle_paste(&mut self, text: &str) {
         if self.state.overlay == Some(Overlay::Attention) {
             self.state.attention_response.paste(text);
+        } else if self.state.overlay == Some(Overlay::Continue) {
+            self.state.continue_instruction.paste(text);
         } else if self.state.screen == Screen::NewRun {
             self.edit_text(|field| field.paste(text));
         }
@@ -482,6 +491,139 @@ impl TuiApp {
         }
         self.state
             .notify(UiMessageKind::Info, fix_unavailable_reason(&self.state));
+    }
+
+    /// Opens the free-text "how should the agent continue?" prompt.
+    ///
+    /// Same eligibility as `[f]` Fix, and the same reason for not gating on
+    /// the decision's own words: the operator read the verdict and pressed
+    /// the key, and that is the whole signal. Refusing here for a run the
+    /// domain would decline only avoids dispatching a doomed action.
+    fn open_continue(&mut self) {
+        if !self.state.run_can_be_continued() {
+            self.state.notify(
+                UiMessageKind::Info,
+                continue_unavailable_reason(&self.state),
+            );
+            return;
+        }
+        self.state.continue_instruction = super::state::TextField::default();
+        self.state.overlay = Some(Overlay::Continue);
+    }
+
+    fn handle_continue_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::Left => self.state.continue_instruction.left(),
+            Intent::Right => self.state.continue_instruction.right(),
+            Intent::Home => self.state.continue_instruction.home(),
+            Intent::End => self.state.continue_instruction.end(),
+            Intent::Backspace => self.state.continue_instruction.backspace(),
+            Intent::Delete => self.state.continue_instruction.delete(),
+            Intent::Character(character) => self.state.continue_instruction.insert(character),
+            Intent::Enter => {
+                let Some(run_id) = self.state.selected_run else {
+                    return;
+                };
+                let instruction = self.state.continue_instruction.text().trim().to_owned();
+                if instruction.is_empty() {
+                    self.state.set_error("Instruction cannot be empty");
+                    return;
+                }
+                self.dispatch(WorkerCommand::RequestContinue {
+                    run_id,
+                    instruction,
+                });
+                self.state.overlay = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the "work on follow-ups" chooser, pre-filled from the decision
+    /// artifact's own `## Follow-ups` section.
+    ///
+    /// Eligibility is exactly `[c]` Continue's, plus one more thing a verdict
+    /// may simply not have written: a Follow-ups section to work from.
+    /// Absence is explained rather than silent, the same as every other
+    /// refusal in this interface.
+    fn open_follow_ups(&mut self) {
+        if !self.state.run_can_be_continued() {
+            self.state.notify(
+                UiMessageKind::Info,
+                continue_unavailable_reason(&self.state),
+            );
+            return;
+        }
+        let Some(run_id) = self.state.selected_run else {
+            return;
+        };
+        let Some(decision_id) = self.state.details.as_ref().and_then(|details| {
+            details
+                .stages
+                .iter()
+                .rev()
+                .find(|stage| stage.kind == crate::domain::StageKind::Decision)
+                .map(|stage| stage.id.clone())
+        }) else {
+            return;
+        };
+        let text = match self.reader.read_artifact(run_id, &decision_id) {
+            Ok(artifact) => super::follow_ups::extract(&artifact.text),
+            Err(error) => {
+                self.state.set_error(error.to_string());
+                return;
+            }
+        };
+        let Some(text) = text else {
+            self.state.notify(
+                UiMessageKind::Info,
+                "This decision has no Follow-ups section to work from.",
+            );
+            return;
+        };
+        self.state.follow_ups_text = Some(text);
+        self.state.follow_ups_as_new_run = false;
+        self.state.overlay = Some(Overlay::FollowUps);
+    }
+
+    fn handle_follow_ups_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::Up | Intent::Down => {
+                self.state.follow_ups_as_new_run = !self.state.follow_ups_as_new_run;
+            }
+            Intent::Enter => {
+                let Some(text) = self.state.follow_ups_text.clone() else {
+                    self.state.overlay = None;
+                    return;
+                };
+                if self.state.follow_ups_as_new_run {
+                    let repository = self
+                        .state
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.repository.clone());
+                    self.state.new_run.task = super::state::TextField::new(text);
+                    if let Some(repository) = repository {
+                        self.state.new_run.repository =
+                            super::state::TextField::new(repository.display().to_string());
+                    }
+                    self.state.new_run.focus = 0;
+                    self.state.overlay = None;
+                    self.state.screen = Screen::NewRun;
+                } else {
+                    let Some(run_id) = self.state.selected_run else {
+                        self.state.overlay = None;
+                        return;
+                    };
+                    self.dispatch(WorkerCommand::RequestContinue {
+                        run_id,
+                        instruction: text,
+                    });
+                    self.state.overlay = None;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Starts the fixes the operator booked while their runs were still working.
@@ -870,6 +1012,22 @@ fn fix_unavailable_reason(state: &TuiState) -> String {
         );
     }
     "This workflow has no decision stage, so there is no verdict to answer.".to_owned()
+}
+
+/// Explains, in operational language, why Continue/Work on follow-ups is not
+/// offered yet. Same shape as [`fix_unavailable_reason`]: both cycles need a
+/// completed run that reached a decision.
+fn continue_unavailable_reason(state: &TuiState) -> String {
+    let Some(details) = state.details.as_ref() else {
+        return "Select a run before continuing it.".to_owned();
+    };
+    if details.status != crate::domain::RunStatus::Completed {
+        return format!(
+            "{} Continue answers a decision, so the run has to reach one first.",
+            apply_unavailable_reason(state)
+        );
+    }
+    "This workflow has no decision stage, so there is nothing to continue.".to_owned()
 }
 
 /// Explains, in operational language, why apply is not offered yet.
@@ -1336,6 +1494,333 @@ mod tests {
         assert!(
             app.state.in_flight.is_empty(),
             "opening the confirmation still dispatches nothing"
+        );
+    }
+
+    /// Continue and Work on follow-ups share Fix's own eligibility: a
+    /// completed run that reached a decision whose sealed configuration can
+    /// route the cycle it would grow.
+    #[test]
+    fn continue_and_follow_ups_share_fixs_own_eligibility() {
+        for (label, run) in [
+            (
+                "a rejected standard run",
+                decided(details(RunStatus::Completed, WorkflowKind::Standard)),
+            ),
+            (
+                "a decided review",
+                decided(details(RunStatus::Completed, WorkflowKind::Review)),
+            ),
+        ] {
+            let (app, _fixture) = app_with(run);
+            assert!(app.state.run_can_be_continued(), "{label}");
+        }
+
+        for (label, run) in [
+            (
+                "still running",
+                details(RunStatus::Running, WorkflowKind::Standard),
+            ),
+            (
+                "no decision stage",
+                details(RunStatus::Completed, WorkflowKind::Fast),
+            ),
+            (
+                "configuration sealed before continue-cycle routing",
+                unroutable(decided(details(RunStatus::Completed, WorkflowKind::Review))),
+            ),
+        ] {
+            let (app, _fixture) = app_with(run);
+            assert!(!app.state.run_can_be_continued(), "{label}");
+        }
+    }
+
+    /// `[c]` opens the overlay only where eligible, and explains itself
+    /// otherwise — the same shape as Fix's own refusal.
+    #[test]
+    fn continue_overlay_opens_only_for_a_completed_run_that_reached_a_decision() {
+        let (mut app, _fixture) = app_with(decided(details(
+            RunStatus::Completed,
+            WorkflowKind::Standard,
+        )));
+        app.handle_intent(Intent::Continue);
+        assert_eq!(app.state.overlay, Some(Overlay::Continue));
+        assert!(app.state.continue_instruction.text().is_empty());
+
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Fast));
+        app.handle_intent(Intent::Continue);
+        assert_eq!(
+            app.state.overlay, None,
+            "no decision stage to continue past"
+        );
+        assert!(app.state.message.is_some(), "the refusal explains itself");
+    }
+
+    /// Typed text becomes the dispatched instruction; a blank one is
+    /// refused without closing the overlay; Escape cancels without
+    /// dispatching anything.
+    #[test]
+    fn continue_overlay_input_flow_submits_or_cancels() {
+        let (mut app, _fixture) = app_with(decided(details(
+            RunStatus::Completed,
+            WorkflowKind::Standard,
+        )));
+        app.handle_intent(Intent::Continue);
+        for character in "add tests".chars() {
+            app.handle_intent(Intent::Character(character));
+        }
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.busy_label().as_deref(), Some("continuing run"));
+
+        let (mut app, _fixture) = app_with(decided(details(
+            RunStatus::Completed,
+            WorkflowKind::Standard,
+        )));
+        app.handle_intent(Intent::Continue);
+        app.handle_intent(Intent::Enter);
+        assert_eq!(
+            app.state.overlay,
+            Some(Overlay::Continue),
+            "a blank instruction is refused, and the overlay stays open to fix it"
+        );
+        assert!(app.state.message.is_some());
+
+        let (mut app, _fixture) = app_with(decided(details(
+            RunStatus::Completed,
+            WorkflowKind::Standard,
+        )));
+        app.handle_intent(Intent::Continue);
+        app.handle_intent(Intent::Character('x'));
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        assert!(
+            app.state.in_flight.is_empty(),
+            "Escape cancels without dispatching"
+        );
+    }
+
+    /// Builds a real completed Standard run through a real git repository and
+    /// the Fake provider, mirroring
+    /// `apply_opens_confirmation_for_a_real_completed_branch_run`'s own
+    /// setup. Follow-ups extraction reads an actual artifact file through the
+    /// store, so it needs a genuine run rather than the lightweight
+    /// `RunDetails` fixtures the eligibility tests use.
+    fn real_completed_standard_run() -> (TempDir, PathBuf, PathBuf, PathBuf, RunDetails) {
+        let fixture = TempDir::new().unwrap();
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&arguments)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        std::fs::write(repo.join("README.md"), "baseline\n").unwrap();
+        for arguments in [vec!["add", "README.md"], vec!["commit", "-qm", "initial"]] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&arguments)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let database = fixture.path().join("polycode.db");
+        let worktrees = fixture.path().join("worktrees");
+        let report = RunService::new(
+            database.clone(),
+            worktrees.clone(),
+            crate::app::DevelopmentFakeProviderFactory,
+        )
+        .start_run(
+            WorkflowKind::Standard,
+            "follow-ups fixture",
+            &repo,
+            Some(crate::app::ExecutionSelection::Uniform(
+                crate::app::UniformProvider::Fake,
+            )),
+            EffortSetting::NativeDefault,
+        )
+        .unwrap();
+        assert_eq!(report.details.status, RunStatus::Completed);
+        (fixture, database, worktrees, repo, report.details)
+    }
+
+    fn tui_app_over(
+        fixture_path: &std::path::Path,
+        database: PathBuf,
+        worktrees: PathBuf,
+        details: RunDetails,
+    ) -> TuiApp {
+        let mut state = TuiState::new(fixture_path);
+        state.screen = Screen::RunDetail;
+        state.selected_run = Some(details.id);
+        state.replace_details(details);
+        TuiApp {
+            state,
+            reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
+            worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            update: mpsc::channel().1,
+            installing: None,
+            last_refresh: Instant::now(),
+            started: Instant::now(),
+            orphaned: None,
+        }
+    }
+
+    /// Persists one Markdown artifact directly through the store, the same
+    /// way `artifact_read_revalidates_hash_and_does_not_mutate_run` in
+    /// `run_service.rs` does: real content behind a real artifact record,
+    /// without needing a provider to have written it.
+    fn insert_markdown_artifact(
+        fixture_path: &std::path::Path,
+        database: &std::path::Path,
+        run_id: RunId,
+        stage_id: &StageId,
+        content: &str,
+    ) {
+        let artifact_path = fixture_path.join(format!("{stage_id}.md"));
+        std::fs::write(&artifact_path, content).unwrap();
+        let created_at: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+        let metadata = crate::domain::ArtifactMetadata::new(
+            crate::domain::ArtifactId::new(),
+            run_id,
+            stage_id.clone(),
+            crate::domain::ArtifactKind::Decision,
+            Role::EngineeringLead,
+            crate::domain::ArtifactStatus::Complete,
+            created_at,
+        )
+        .with_provider(crate::domain::ProviderId::new("fake").unwrap(), None);
+        let bytes = content.as_bytes();
+        let artifact = crate::providers::ArtifactRecord::new(
+            metadata,
+            1,
+            artifact_path,
+            sha256_hex(bytes),
+            u64::try_from(bytes.len()).unwrap(),
+            created_at,
+        )
+        .unwrap();
+        let mut store = crate::store::SqliteStore::open(database).unwrap();
+        store.insert_artifact(&artifact).unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        let mut hash = String::with_capacity(64);
+        for byte in Sha256::digest(bytes) {
+            write!(hash, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        hash
+    }
+
+    fn decision_stage_id(details: &RunDetails) -> StageId {
+        details
+            .stages
+            .iter()
+            .rev()
+            .find(|stage| stage.kind == StageKind::Decision)
+            .expect("Standard workflow reaches a decision")
+            .id
+            .clone()
+    }
+
+    /// The whole `[w]` path, end to end: the decision's own `## Follow-ups`
+    /// section is extracted verbatim and offered back either to this run or
+    /// to a new one, exactly the choice the spec describes.
+    #[test]
+    fn follow_ups_offers_working_in_this_run_or_starting_a_new_one() {
+        let (fixture, database, worktrees, repo, details) = real_completed_standard_run();
+        let decision_id = decision_stage_id(&details);
+        insert_markdown_artifact(
+            fixture.path(),
+            &database,
+            details.id,
+            &decision_id,
+            "# Decision\n\n## Verdict\n\nApproved.\n\n## Follow-ups\n- Add integration coverage\n- Generalize the helper\n",
+        );
+
+        // Default choice: continue in this run.
+        let mut app = tui_app_over(
+            fixture.path(),
+            database.clone(),
+            worktrees.clone(),
+            details.clone(),
+        );
+        app.handle_intent(Intent::FollowUps);
+        assert_eq!(app.state.overlay, Some(Overlay::FollowUps));
+        assert_eq!(
+            app.state.follow_ups_text.as_deref(),
+            Some("- Add integration coverage\n- Generalize the helper")
+        );
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.busy_label().as_deref(), Some("continuing run"));
+
+        // Toggled choice: hand the same text to a new run's composer, with
+        // the repository the run itself was created against — canonicalized
+        // by discovery, which is why this compares against the run's own
+        // recorded repository rather than the pre-canonicalization path the
+        // fixture built it from.
+        let expected_repository = details
+            .repository
+            .clone()
+            .expect("a started run always records its repository");
+        assert_eq!(expected_repository.file_name(), repo.file_name());
+        let mut app = tui_app_over(fixture.path(), database, worktrees, details);
+        app.handle_intent(Intent::FollowUps);
+        app.handle_intent(Intent::Up);
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.screen, Screen::NewRun);
+        assert_eq!(
+            app.state.new_run.task.text(),
+            "- Add integration coverage\n- Generalize the helper"
+        );
+        assert_eq!(
+            app.state.new_run.repository.text(),
+            expected_repository.display().to_string()
+        );
+    }
+
+    /// A decision that wrote no Follow-ups section explains why, rather than
+    /// opening an empty chooser.
+    #[test]
+    fn follow_ups_explains_when_the_decision_wrote_no_such_section() {
+        let (fixture, database, worktrees, _repo, details) = real_completed_standard_run();
+        let decision_id = decision_stage_id(&details);
+        insert_markdown_artifact(
+            fixture.path(),
+            &database,
+            details.id,
+            &decision_id,
+            "# Decision\n\n## Verdict\n\nApproved.\n",
+        );
+
+        let mut app = tui_app_over(fixture.path(), database, worktrees, details);
+        app.handle_intent(Intent::FollowUps);
+        assert_eq!(app.state.overlay, None);
+        assert!(
+            app.state
+                .message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("Follow-ups")),
+            "the refusal names what is missing"
         );
     }
 

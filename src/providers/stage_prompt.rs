@@ -40,6 +40,9 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
         (Role::Implementer, StageKind::Fix) => {
             "Resolve the blocking findings in the decision that sent this work back, and only those. The implementation already exists in this workspace; correct it rather than rewriting it, and leave findings the decision did not treat as blocking alone. Where you disagree with a finding, say so in the artifact and leave the code as it is rather than silently declining. Run proportionate verification. Return Markdown with # Fix and one section per finding stating what changed or why nothing did."
         }
+        (Role::Implementer, StageKind::FollowUp) => {
+            "Continue the work in this workspace as the operator instructs below. The previous decision artifact is context, not a boundary. Run proportionate verification. Return Markdown with # Follow-up and one section per instruction item stating what changed."
+        }
         (Role::Implementer, _) => "Implement requested change and run proportionate verification.",
         (Role::CodeQualityReviewer, _) => {
             "Assess implementation quality independently. Inspect actual repository state and do not edit files."
@@ -51,7 +54,7 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
             "Perform legacy/general independent review. Prioritize correctness, regressions, and missing tests. Do not edit files."
         }
         (Role::EngineeringLead, StageKind::Decision) => {
-            "Synthesize direct review evidence across two distinct axes: implementation quality and specification compliance. Do not count findings mechanically or infer approval from reviewer completion. Surface disagreements between reviewers and make an explicit engineering decision. When a previous decision and a fix answering it are both in evidence, judge whether that fix actually resolves the findings the previous decision called blocking; a fix artifact claiming a finding is resolved is a claim to verify against the code, not a resolution."
+            "Synthesize direct review evidence across two distinct axes: implementation quality and specification compliance. Do not count findings mechanically or infer approval from reviewer completion. Surface disagreements between reviewers and make an explicit engineering decision. When a previous decision and a fix answering it are both in evidence, judge whether that fix actually resolves the findings the previous decision called blocking; a fix artifact claiming a finding is resolved is a claim to verify against the code, not a resolution. When you see reasonable next steps that are not blocking findings — follow-on work, generalizations, or things worth doing but not required by this task — add an optional `## Follow-ups` section, one bullet per item, written as an instruction an operator could hand back to an agent verbatim. Omit the section entirely when there is nothing worth suggesting; never pad it to have something to say."
         }
         (Role::EngineeringLead, _) => {
             "Integrate direct dependency evidence into one actionable engineering result."
@@ -94,6 +97,21 @@ mod tests {
         assert!(fix.contains("say so in the artifact"));
     }
 
+    /// Unlike a fix, a follow-up carries no findings of its own to bound it —
+    /// the operator's instruction is the whole scope, and the contract must
+    /// say the prior decision is context rather than a limit on it.
+    #[test]
+    fn the_follow_up_contract_treats_the_operators_instruction_as_the_scope() {
+        let follow_up = instruction(Role::Implementer, StageKind::FollowUp);
+        let fix = instruction(Role::Implementer, StageKind::Fix);
+        let implementation = instruction(Role::Implementer, StageKind::Implementation);
+        assert_ne!(follow_up, fix);
+        assert_ne!(follow_up, implementation);
+        assert!(follow_up.contains("as the operator instructs below"));
+        assert!(follow_up.contains("context, not a boundary"));
+        assert!(follow_up.contains("# Follow-up"));
+    }
+
     #[test]
     fn a_decision_over_a_fix_verifies_it_against_the_code() {
         let decision = instruction(Role::EngineeringLead, StageKind::Decision);
@@ -125,5 +143,19 @@ mod tests {
         assert!(decision.contains("implementation quality"));
         assert!(decision.contains("specification compliance"));
         assert!(decision.contains("Surface disagreements"));
+    }
+
+    /// The follow-ups section is a suggestion, not a verdict: it must read as
+    /// optional and non-blocking, and it must ask for the exact heading the
+    /// TUI's extraction later looks for.
+    #[test]
+    fn decision_contract_asks_for_an_optional_non_blocking_follow_ups_section() {
+        let decision = instruction(Role::EngineeringLead, StageKind::Decision);
+        assert!(decision.contains("## Follow-ups"));
+        assert!(decision.contains("optional"));
+        assert!(decision.contains("not blocking findings"));
+        assert!(
+            decision.contains("Omit the section entirely when there is nothing worth suggesting")
+        );
     }
 }

@@ -185,6 +185,42 @@ impl Provider for RuntimeProvider {
         }
     }
 
+    fn stage_continue_instruction(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+        role: crate::domain::Role,
+        instruction: &str,
+    ) -> Result<(), ProviderError> {
+        match self {
+            Self::Fake(provider) => {
+                provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
+            }
+            Self::Claude(provider) => {
+                provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
+            }
+            Self::Codex(provider) => {
+                provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
+            }
+        }
+    }
+
+    fn discard_continue_instruction(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+    ) -> Result<(), ProviderError> {
+        match self {
+            Self::Fake(provider) => provider.discard_continue_instruction(store, run_id, stage_id),
+            Self::Claude(provider) => {
+                provider.discard_continue_instruction(store, run_id, stage_id)
+            }
+            Self::Codex(provider) => provider.discard_continue_instruction(store, run_id, stage_id),
+        }
+    }
+
     fn poll(
         &mut self,
         store: &mut SqliteStore,
@@ -418,6 +454,40 @@ impl Provider for RoutedProvider {
         let effort = self.effort_for_role(context.role())?;
         self.runtime_for(&target, effort)?
             .can_auto_resolve_attention(store, context)
+    }
+
+    /// No provider session exists yet for the stage this instruction is
+    /// staged for, so — unlike attention, which resolves its route from an
+    /// existing session — this resolves the route from `role` directly. Every
+    /// continue cycle's follow-up stage routes through `Role::Implementer`,
+    /// so the caller supplies exactly the role that stage will use.
+    fn stage_continue_instruction(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+        role: crate::domain::Role,
+        instruction: &str,
+    ) -> Result<(), ProviderError> {
+        let target = self.target_for_role(role)?;
+        let effort = self.effort_for_role(role)?;
+        self.runtime_for(&target, effort)?
+            .stage_continue_instruction(store, run_id, stage_id, role, instruction)
+    }
+
+    /// Same route resolution as [`Self::stage_continue_instruction`]: the
+    /// stage still has no provider session, so the leaf runtime is resolved
+    /// from `Role::Implementer` directly, not from session lookup.
+    fn discard_continue_instruction(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+    ) -> Result<(), ProviderError> {
+        let target = self.target_for_role(Role::Implementer)?;
+        let effort = self.effort_for_role(Role::Implementer)?;
+        self.runtime_for(&target, effort)?
+            .discard_continue_instruction(store, run_id, stage_id)
     }
 
     fn poll(

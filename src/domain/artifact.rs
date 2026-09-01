@@ -16,6 +16,7 @@ pub enum ArtifactKind {
     Decision,
     Fix,
     Synthesis,
+    FollowUp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -167,6 +168,20 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ArtifactKind>("\"review\"").unwrap(),
             ArtifactKind::Review
+        );
+    }
+
+    /// Additive like `Fix` before it: the new variant round-trips through
+    /// the same inspectable snake-case shape.
+    #[test]
+    fn follow_up_artifact_kind_round_trips_through_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ArtifactKind::FollowUp).unwrap(),
+            "\"follow_up\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ArtifactKind>("\"follow_up\"").unwrap(),
+            ArtifactKind::FollowUp
         );
     }
 }

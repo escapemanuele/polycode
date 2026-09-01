@@ -755,6 +755,7 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
         DomainEventKind::RunApplied => "run applied",
         DomainEventKind::RunDiscarded => "run discarded",
         DomainEventKind::RunFixRequested { .. } => "fix requested",
+        DomainEventKind::RunContinueRequested { .. } => "continue requested",
         DomainEventKind::StageReady { .. } => "ready",
         DomainEventKind::StageStarted => "started",
         DomainEventKind::StagePaused => "paused",

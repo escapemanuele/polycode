@@ -167,6 +167,18 @@ pub enum DomainEventKind {
     RunFixRequested {
         stage_ids: Vec<StageId>,
     },
+    /// An operator asked a completed run to continue with a fresh instruction
+    /// of their own, rather than answering the verdict's blocking findings.
+    ///
+    /// Distinct from `RunFixRequested` in meaning, not in shape: a continue
+    /// cycle carries the operator's own next instruction rather than
+    /// resolving findings the decision called blocking. The instruction text
+    /// itself is never in this payload — it is immutable run-private stdin
+    /// content, the same mechanism an attention response uses — so, exactly
+    /// like its sibling event, this records only which stages appeared.
+    RunContinueRequested {
+        stage_ids: Vec<StageId>,
+    },
     UsageUpdated,
     /// What the native runtime's own records say it ran for this stage.
     ///

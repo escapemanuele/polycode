@@ -21,7 +21,10 @@ pub(crate) struct PermissionDenial {
 /// Stage kinds that may never mutate repository content. Same predicate as
 /// `WorkflowDefinition::requires_writable_workspace`.
 pub(crate) const fn read_only_stage(kind: StageKind) -> bool {
-    !matches!(kind, StageKind::Implementation | StageKind::Fix)
+    !matches!(
+        kind,
+        StageKind::Implementation | StageKind::Fix | StageKind::FollowUp
+    )
 }
 
 impl PermissionDenial {
@@ -995,14 +998,63 @@ mod tests {
                     .requires_terminal_attention(kind)
             );
         }
-        for kind in [StageKind::Implementation, StageKind::Fix] {
-            assert!(!read_only_stage(kind));
+        for kind in [
+            StageKind::Implementation,
+            StageKind::Fix,
+            StageKind::FollowUp,
+        ] {
+            assert!(
+                !read_only_stage(kind),
+                "{kind:?} mutates the workspace, same as Implementation and Fix"
+            );
             assert!(edit.requires_terminal_attention(kind));
             assert!(question.requires_terminal_attention(kind));
             assert!(bash("sed -i '' 's/a/b/' src/lib.rs").requires_terminal_attention(kind));
             assert!(
                 !tool("Read", serde_json::json!({"file_path":"/x"}))
                     .requires_terminal_attention(kind)
+            );
+        }
+    }
+
+    /// `read_only_stage`'s doc comment claims it is the same predicate as
+    /// `WorkflowDefinition::requires_writable_workspace`; this pins that
+    /// claim so the two cannot drift apart the way they already did once —
+    /// `FollowUp` was added to one and silently missed in the other.
+    #[test]
+    fn read_only_stage_agrees_with_workspace_writability_for_every_stage_kind() {
+        use crate::domain::{
+            Dependency, Role, StageDefinition, StageId, WorkflowDefinition, WorkflowKind,
+        };
+
+        for kind in [
+            StageKind::Research,
+            StageKind::Architecture,
+            StageKind::Implementation,
+            StageKind::CodeQualityReview,
+            StageKind::SpecReview,
+            StageKind::Review,
+            StageKind::IndependentReview,
+            StageKind::DeepAnalysis,
+            StageKind::Synthesis,
+            StageKind::Decision,
+            StageKind::Fix,
+            StageKind::FollowUp,
+        ] {
+            let workflow = WorkflowDefinition::new(
+                WorkflowKind::Standard,
+                vec![StageDefinition::new(
+                    StageId::new("stage").unwrap(),
+                    kind,
+                    Role::Implementer,
+                    Vec::<Dependency>::new(),
+                )],
+            )
+            .unwrap();
+            assert_eq!(
+                !read_only_stage(kind),
+                workflow.requires_writable_workspace(),
+                "{kind:?} disagrees between read_only_stage and requires_writable_workspace"
             );
         }
     }

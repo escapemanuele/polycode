@@ -63,6 +63,16 @@ fix-cycle routing existed and has no route for {role:?}. Start a new run to act 
         run_id: RunId,
         role: crate::domain::Role,
     },
+    #[error(
+        "run {run_id} cannot continue: its execution configuration was sealed before \
+continue-cycle routing existed and has no route for {role:?}. Start a new run instead."
+    )]
+    UnroutableContinueCycle {
+        run_id: RunId,
+        role: crate::domain::Role,
+    },
+    #[error("run {0} was asked to continue with an empty instruction")]
+    EmptyContinueInstruction(RunId),
     #[error("run {0} was discarded and cannot continue")]
     DiscardedRun(RunId),
     #[error("run {run_id} stage {stage_id} has no verified artifact")]

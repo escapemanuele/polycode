@@ -26,10 +26,17 @@ pub enum CodexProviderError {
     MissingFinalMessage(PathBuf),
     #[error("Codex artifact exceeds {0} bytes")]
     ArtifactTooLarge(usize),
+    #[error(
+        "Codex follow-up stage {0} has no room left in the composed prompt for the operator's \
+         instruction; refusing to run the stage unscoped"
+    )]
+    ContinueInstructionOmitted(crate::domain::StageId),
     #[error("Codex artifact path conflict: {0}")]
     ArtifactConflict(PathBuf),
     #[error(transparent)]
     ChangeHandoff(#[from] crate::providers::change_handoff::ChangeHandoffError),
+    #[error(transparent)]
+    ContinueInstruction(#[from] crate::providers::continue_instruction::ContinueInstructionError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

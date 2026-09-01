@@ -586,6 +586,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
     };
     let applyable = state.run_is_applyable();
     let fix = FixOffer::of(state);
+    let continuable = state.run_can_be_continued();
     let mut lines = if applyable {
         completed_hero(details, width, now)
     } else {
@@ -614,7 +615,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         lines.push(Line::from(""));
         lines.push(Line::from(theme::chip("READY TO REVIEW", theme::success())));
         lines.push(Line::from(""));
-        lines.extend(hero_actions(applyable, fix, selected.status));
+        lines.extend(hero_actions(applyable, fix, continuable, selected.status));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -647,7 +648,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
             .map(|line| Line::from(Span::styled(line, theme::text()))),
     );
     if !applyable {
-        let actions = hero_actions(applyable, fix, selected.status);
+        let actions = hero_actions(applyable, fix, continuable, selected.status);
         if actions
             .iter()
             .all(|line| span_width(&line.spans) <= width as usize)
@@ -879,6 +880,7 @@ const fn result_statement(kind: StageKind) -> &'static str {
         StageKind::Synthesis => "Synthesis ready",
         StageKind::Decision => "Decision reached",
         StageKind::Fix => "Fix ready",
+        StageKind::FollowUp => "Follow-up ready",
     }
 }
 
@@ -1023,7 +1025,12 @@ impl FixOffer {
     }
 }
 
-fn hero_actions(applyable: bool, fix: FixOffer, status: StageStatus) -> Vec<Line<'static>> {
+fn hero_actions(
+    applyable: bool,
+    fix: FixOffer,
+    continuable: bool,
+    status: StageStatus,
+) -> Vec<Line<'static>> {
     let mut spans = Vec::new();
     if applyable {
         spans.extend(theme::action("d", "Review diff", theme::accent()));
@@ -1033,6 +1040,7 @@ fn hero_actions(applyable: bool, fix: FixOffer, status: StageStatus) -> Vec<Line
             spans.push(Span::raw("   "));
             spans.extend(theme::action("f", label, theme::attention()));
         }
+        spans.extend(continue_action_spans(continuable));
         spans.push(Span::raw("   "));
         spans.extend(theme::action("X", "Discard", theme::danger()));
     } else if status == StageStatus::Failed {
@@ -1048,15 +1056,30 @@ fn hero_actions(applyable: bool, fix: FixOffer, status: StageStatus) -> Vec<Line
         spans.push(Span::raw("   "));
         spans.extend(theme::action("d", "Diff", theme::accent()));
         // A review reaches a verdict without ever becoming applyable, so this
-        // is the only place its fix is ever offered.
+        // is the only place its fix and continue cycle are ever offered.
         if let Some(label) = fix.label() {
             spans.push(Span::raw("   "));
             spans.extend(theme::action("f", label, theme::attention()));
         }
+        spans.extend(continue_action_spans(continuable));
     }
     spans.push(Span::raw("   "));
     spans.extend(theme::action("i", "Details", theme::muted_color()));
     vec![Line::from(spans)]
+}
+
+/// The `[c]`/`[w]` pair, offered together: both answer a decision the same
+/// way `[f]` Fix does, so whichever cycle the operator picks starts from the
+/// same completed-and-decided run.
+fn continue_action_spans(continuable: bool) -> Vec<Span<'static>> {
+    if !continuable {
+        return Vec::new();
+    }
+    let mut spans = vec![Span::raw("   ")];
+    spans.extend(theme::action("c", "Continue", theme::attention()));
+    spans.push(Span::raw("   "));
+    spans.extend(theme::action("w", "Follow-ups", theme::attention()));
+    spans
 }
 
 /// Human stage name for operational rows; technical mode keeps the raw
@@ -1074,6 +1097,7 @@ const fn stage_title(kind: StageKind) -> &'static str {
         StageKind::Synthesis => "Synthesis",
         StageKind::Decision => "Decision",
         StageKind::Fix => "Fix",
+        StageKind::FollowUp => "Follow-up",
     }
 }
 
@@ -1530,6 +1554,10 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
                 if let Some(label) = FixOffer::of(state).label() {
                     push("f", label, theme::attention());
                 }
+                if state.run_can_be_continued() {
+                    push("c", "Continue", theme::attention());
+                    push("w", "Follow-ups", theme::attention());
+                }
                 push("X", "Discard", theme::danger());
             } else {
                 push("o", "Result", theme::accent());
@@ -1540,6 +1568,10 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
                 }
                 if let Some(label) = FixOffer::of(state).label() {
                     push("f", label, theme::attention());
+                }
+                if state.run_can_be_continued() {
+                    push("c", "Continue", theme::attention());
+                    push("w", "Follow-ups", theme::attention());
                 }
                 // A running run normally has its driver in this process and
                 // needs no key; one nobody holds was left behind by a dead
@@ -1667,7 +1699,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -1676,6 +1708,8 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::Update => render_update(frame, area, state),
         Overlay::ApplyConfirm => render_confirmation(frame, popup, state, true),
         Overlay::DiscardConfirm => render_confirmation(frame, popup, state, false),
+        Overlay::Continue => render_continue(frame, popup, state),
+        Overlay::FollowUps => render_follow_ups(frame, popup, state),
     }
 }
 
@@ -1843,6 +1877,78 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(overlay_block(" Attention ", theme::attention())),
+        area,
+    );
+}
+
+/// Single-field prompt for `[c]` Continue: an operator instruction that,
+/// once submitted, becomes the follow-up stage's own task.
+fn render_continue(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let lines = vec![
+        Line::from(theme::chip("CONTINUE", theme::attention())),
+        Line::from(""),
+        Line::from("How should the agent continue?"),
+        Line::from(""),
+        Line::from(field_display(&state.continue_instruction, true)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "type instruction · Enter submit · Esc cancel",
+            theme::muted(),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" Continue ", theme::attention())),
+        area,
+    );
+}
+
+/// Two-option chooser for `[w]` Work on follow-ups: continue the operator's
+/// own extracted text in this run, or hand it to a new run's composer.
+/// Mirrors the update prompt's own up/down toggle.
+fn render_follow_ups(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let mut lines = vec![
+        Line::from(theme::chip("FOLLOW-UPS", theme::attention())),
+        Line::from(""),
+    ];
+    if let Some(text) = state.follow_ups_text.as_ref() {
+        for line in text.lines() {
+            lines.push(Line::from(Span::styled(
+                format::viewer_line(line),
+                theme::text(),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    for (selected, label) in [
+        (!state.follow_ups_as_new_run, "In this run"),
+        (state.follow_ups_as_new_run, "As new run"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "  → " } else { "    " },
+                Style::default().fg(theme::attention()),
+            ),
+            Span::styled(
+                label,
+                if selected {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::muted()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ choose · Enter confirm · Esc cancel",
+        theme::muted(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" Work on follow-ups ", theme::attention())),
         area,
     );
 }
@@ -2784,6 +2890,37 @@ mod tests {
         assert!(!narrow.contains("? help"), "navigation yields first");
     }
 
+    /// A run whose sealed configuration routes both cycle roles offers `[c]`
+    /// Continue and `[w]` Follow-ups beside `[f]` Fix, in both the footer
+    /// and the hero panel; one that cannot route them offers neither.
+    #[test]
+    fn continue_and_follow_ups_hints_follow_the_same_gate_as_fix() {
+        let mut continuable = completed_with_failure_details();
+        continuable.routes.push(RouteSummary {
+            role: Role::EngineeringLead,
+            configured_provider: "codex".to_owned(),
+            configured_model: None,
+            reason: "test".to_owned(),
+            requested_effort: Some(EffortSetting::NativeDefault),
+        });
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.screen = Screen::RunDetail;
+        state.selected_run = Some(RunId::from_u128(3));
+        state.replace_details(continuable);
+
+        let actions = actions_text(&state);
+        assert!(actions.contains("[c] Continue"));
+        assert!(actions.contains("[w] Follow-ups"));
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("[c] Continue"));
+        assert!(text.contains("[w] Follow-ups"));
+
+        // Without the EngineeringLead route, neither cycle can be offered.
+        let unroutable = actions_text(&completed_with_failure_state());
+        assert!(!unroutable.contains("Continue"));
+        assert!(!unroutable.contains("Follow-ups"));
+    }
+
     #[test]
     fn footer_offers_resume_for_suspended_and_orphaned_runs() {
         // Running with nobody driving it: left behind by a dead instance.
@@ -3002,6 +3139,24 @@ mod tests {
             control_cells(&raw).is_empty(),
             "raw artifact viewer leaked control characters: {:?}",
             control_cells(&raw)
+        );
+
+        // The `[w]` overlay copies lines extracted from an agent-authored
+        // decision artifact, not a viewer reading a file — the same
+        // untrusted-content risk under a different entry point.
+        state.artifact_raw = false;
+        state.screen = Screen::RunDetail;
+        state.overlay = Some(Overlay::FollowUps);
+        state.follow_ups_text = Some(HOSTILE.to_owned());
+        let follow_ups = render_text(&state, 120, 30);
+        assert!(
+            control_cells(&follow_ups).is_empty(),
+            "follow-ups overlay leaked control characters: {:?}",
+            control_cells(&follow_ups)
+        );
+        assert!(
+            follow_ups.contains("let x = 1;"),
+            "content still renders: {follow_ups}"
         );
     }
 

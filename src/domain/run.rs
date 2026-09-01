@@ -483,6 +483,71 @@ impl Run {
         ))
     }
 
+    /// Grows a completed run by one continue cycle and reopens it.
+    ///
+    /// The sibling of [`Self::request_fix`]: same shape, same reopening, and
+    /// the same reason it exists — the workspace, artifacts, and identity a
+    /// fresh run would have to adopt or begin without are already here. It
+    /// differs in what the appended implementer stage answers to. A fix
+    /// resolves the verdict's own blocking findings; a continue cycle carries
+    /// the operator's own instruction instead, so this event carries no
+    /// instruction text of its own — same as `request_fix` never reads the
+    /// verdict it grows from, the run has no basis to hold that text, and the
+    /// operator asking is the whole signal. The instruction reaches the
+    /// stage's agent as immutable run-private stdin content, addressed by the
+    /// exact stage identity [`super::next_follow_up_stage_id`] predicts.
+    ///
+    /// # Errors
+    /// Rejects runs that have not completed, runs already applied or
+    /// discarded, and cycles that would not form a valid DAG.
+    pub fn request_continue(
+        &mut self,
+        metadata: EventMetadata,
+    ) -> Result<DomainEvent, RunFixError> {
+        if self.status != RunStatus::Completed {
+            return Err(RunFixError::RunNotCompleted(self.status));
+        }
+        let last_decision = self
+            .workflow
+            .stages()
+            .iter()
+            .rev()
+            .find(|stage| stage.kind() == StageKind::Decision)
+            .map(|stage| stage.id().clone())
+            .ok_or(RunFixError::NoDecisionToAnswer)?;
+        let index = u32::try_from(
+            self.workflow
+                .stages()
+                .iter()
+                .filter(|stage| stage.kind() == StageKind::FollowUp)
+                .count(),
+        )
+        .map_err(|_| RunFixError::TooManyCycles)?
+            + 1;
+        let additional = super::continue_cycle_stages(index, &last_decision);
+        let stage_ids = additional
+            .iter()
+            .map(|stage| stage.id().clone())
+            .collect::<Vec<_>>();
+        let workflow = self.workflow.extended(additional)?;
+        let new_stages = workflow
+            .stages()
+            .iter()
+            .filter(|stage| stage_ids.contains(stage.id()))
+            .map(|definition| Stage::from_definition(self.id, definition))
+            .collect::<Vec<_>>();
+        self.workflow = workflow;
+        self.stages.extend(new_stages);
+        self.status = RunStatus::Running;
+        self.updated_at = metadata.occurred_at();
+        Ok(DomainEvent::new(
+            metadata,
+            self.id,
+            None,
+            DomainEventKind::RunContinueRequested { stage_ids },
+        ))
+    }
+
     /// Adds one pending attention request and moves stage/run to `NeedsUser`.
     ///
     /// # Errors
@@ -1358,6 +1423,90 @@ mod tests {
         assert_eq!(
             dependency_ids(&run, &id("decision_2")),
             vec!["fix_2", "decision_1"]
+        );
+        run.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_rejected_run_grows_a_follow_up_and_a_fresh_decision_over_it_and_reopens() {
+        let mut run = decided_run();
+        assert_eq!(run.stages().len(), 5);
+
+        let event = run.request_continue(metadata(200, 8)).unwrap();
+
+        // The run reopens rather than a second run adopting its workspace.
+        assert_eq!(run.status(), RunStatus::Running);
+        assert_eq!(run.stages().len(), 7);
+        assert!(matches!(
+            event.kind(),
+            DomainEventKind::RunContinueRequested { stage_ids }
+                if stage_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
+                    == vec!["followup_1".to_owned(), "followup_decision_1".to_owned()]
+        ));
+
+        assert_eq!(dependency_ids(&run, &id("followup_1")), vec!["decision"]);
+        assert_eq!(
+            dependency_ids(&run, &id("followup_decision_1")),
+            vec!["followup_1", "decision"]
+        );
+
+        assert_eq!(
+            run.stage(&id("implementation")).unwrap().status(),
+            StageStatus::Completed
+        );
+        for stage in ["followup_1", "followup_decision_1"] {
+            assert_eq!(
+                run.stage(&id(stage)).unwrap().status(),
+                StageStatus::Pending
+            );
+        }
+        run.validate_invariants().unwrap();
+    }
+
+    /// Same guard as `request_fix`, reused rather than duplicated: reopening
+    /// is for a run that finished and was judged.
+    #[test]
+    fn only_a_completed_run_can_be_sent_back_to_continue() {
+        let mut run = new_run(WorkflowDefinition::built_in(WorkflowKind::Standard));
+        start_run(&mut run);
+        assert_eq!(
+            run.request_continue(metadata(200, 8)).unwrap_err(),
+            RunFixError::RunNotCompleted(RunStatus::Running)
+        );
+
+        let mut run = new_run(fast_workflow());
+        start_run(&mut run);
+        complete_stage(&mut run, &id("implementation"), 10);
+        run.transition(RunTransition::Complete, metadata(100, 7))
+            .unwrap();
+        assert_eq!(
+            run.request_continue(metadata(200, 8)).unwrap_err(),
+            RunFixError::NoDecisionToAnswer
+        );
+    }
+
+    /// A fix cycle and a continue cycle can both grow the same run without
+    /// their stage identities ever colliding.
+    #[test]
+    fn a_run_can_grow_both_a_fix_cycle_and_a_continue_cycle_over_the_same_decision() {
+        let mut run = decided_run();
+        run.request_fix(metadata(200, 8)).unwrap();
+        let mut event = 210;
+        for stage in ["fix_1", "decision_1"] {
+            complete_stage(&mut run, &id(stage), event);
+            event += 10;
+        }
+        run.transition(RunTransition::Complete, metadata(300, 9))
+            .unwrap();
+
+        run.request_continue(metadata(400, 10)).unwrap();
+
+        assert_eq!(run.stages().len(), 9);
+        assert_eq!(dependency_ids(&run, &id("fix_1")), vec!["decision"]);
+        assert_eq!(
+            dependency_ids(&run, &id("followup_1")),
+            vec!["decision_1"],
+            "the continue cycle answers the decision the run most recently reached"
         );
         run.validate_invariants().unwrap();
     }

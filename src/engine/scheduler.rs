@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     AttentionRequest, AttentionRequestId, AttentionStatus, DomainEvent, DomainEventKind, EventId,
-    EventMetadata, ProviderId, ProviderSessionId, Run, RunId, RunStageError, RunStatus,
+    EventMetadata, ProviderId, ProviderSessionId, Role, Run, RunId, RunStageError, RunStatus,
     RunTransition, RunTransitionError, StageId, StageStatus, StageTransition,
 };
 use crate::store::{LoadedRun, RunRevision, SequencedEvent, SqliteStore};
@@ -336,6 +336,84 @@ where
         let metadata = self.metadata_for(&loaded.run);
         let event = loaded.run.request_fix(metadata)?;
         commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
+    /// Reopens a completed run with one continue cycle appended, carrying the
+    /// operator's own instruction rather than answering blocking findings.
+    ///
+    /// Same execution boundary as [`Self::request_fix`], for the same reason:
+    /// a run whose workspace is gone or whose apply is already under way is
+    /// refused here rather than discovered halfway through the cycle. Stages
+    /// the instruction with the provider — under the exact stage identity the
+    /// cycle is about to use — before the domain commit that creates that
+    /// stage, mirroring [`Self::resolve_attention_with_response`]'s ordering
+    /// one step earlier: nothing here can create a stage whose agent finds no
+    /// instruction waiting for it.
+    ///
+    /// A refusal must stay side-effect-free. If the domain transition is
+    /// rejected, or its commit loses a concurrency race, the just-staged
+    /// instruction is walked back before the error returns — otherwise it
+    /// would durably occupy the exact stage identity a retry, possibly with
+    /// different text, is about to reuse, and that retry would fail against
+    /// content no stage ever actually read.
+    ///
+    /// That cleanup must not be unconditional. The predicted stage identity
+    /// is deterministic, so two concurrent callers issuing the same request
+    /// can stage the identical instruction under the identical path before
+    /// either commits; one commit wins the race and the other loses it. If
+    /// the loser discarded on sight, it would delete the file the winner's
+    /// own follow-up stage is about to read. So a failed commit is followed
+    /// by one more read: only when the predicted stage still does not exist
+    /// afterward is it safe to conclude nothing durable ever claimed this
+    /// call's write, and only then does cleanup proceed. An unreadable state
+    /// after the failure counts as "someone else's" and skips cleanup too —
+    /// an orphaned file is a retry-time conflict to resolve, never a reason
+    /// to risk deleting a winner's instruction.
+    ///
+    /// # Errors
+    /// Returns boundary, provider, lifecycle, or persistence failures.
+    pub fn request_continue(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        instruction: &str,
+    ) -> Result<EngineStatus, EngineError> {
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let follow_up_stage_id = crate::domain::next_follow_up_stage_id(loaded.run.workflow());
+        if let Some(stage_id) = &follow_up_stage_id {
+            self.provider.stage_continue_instruction(
+                store,
+                run_id,
+                stage_id,
+                Role::Implementer,
+                instruction,
+            )?;
+        }
+        let metadata = self.metadata_for(&loaded.run);
+        let outcome = loaded
+            .run
+            .request_continue(metadata)
+            .map_err(EngineError::from)
+            .and_then(|event| commit_execution(store, &loaded.run, loaded.revision, &[event]));
+        if let Err(error) = outcome {
+            if let Some(stage_id) = &follow_up_stage_id {
+                // Best-effort, and only when nothing durable now owns this
+                // identity — see the doc comment above for why an
+                // unconditional discard is unsafe under a concurrent winner.
+                let claimed_by_someone_else = store
+                    .load_run(run_id)
+                    .map_or(true, |reloaded| reloaded.run.stage(stage_id).is_some());
+                if !claimed_by_someone_else {
+                    let _ = self
+                        .provider
+                        .discard_continue_instruction(store, run_id, stage_id);
+                }
+            }
+            return Err(error);
+        }
         Ok(EngineStatus::Advanced {
             run_status: loaded.run.status(),
         })
@@ -1042,7 +1120,7 @@ mod tests {
     }
 
     struct Fixture {
-        _temp: TempDir,
+        temp: TempDir,
         database: PathBuf,
         store: SqliteStore,
         run_id: RunId,
@@ -1071,6 +1149,131 @@ mod tests {
         }
     }
 
+    /// Wraps `FakeProvider` with a real `continue_instruction` root, unlike
+    /// `FakeProvider` itself, which accepts the trait's no-op default. Tests
+    /// that need to observe whether an instruction file was actually staged
+    /// or cleaned up use this instead.
+    struct InstrumentedProvider {
+        root: PathBuf,
+        inner: FakeProvider,
+    }
+
+    impl Provider for InstrumentedProvider {
+        fn provider_id_for(&self, request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+            self.inner.provider_id_for(request)
+        }
+
+        fn supports_role(&self, role: crate::domain::Role) -> bool {
+            self.inner.supports_role(role)
+        }
+
+        fn poll(
+            &mut self,
+            store: &mut SqliteStore,
+            request: &ProviderRequest,
+        ) -> Result<ProviderPoll, ProviderError> {
+            self.inner.poll(store, request)
+        }
+
+        fn stage_continue_instruction(
+            &mut self,
+            _store: &mut SqliteStore,
+            run_id: RunId,
+            stage_id: &StageId,
+            _role: crate::domain::Role,
+            instruction: &str,
+        ) -> Result<(), ProviderError> {
+            crate::providers::continue_instruction::write_once(
+                &self.root,
+                run_id,
+                stage_id,
+                instruction,
+            )
+            .map_err(|error| ProviderError::new(error.to_string()))
+        }
+
+        fn discard_continue_instruction(
+            &mut self,
+            _store: &mut SqliteStore,
+            run_id: RunId,
+            stage_id: &StageId,
+        ) -> Result<(), ProviderError> {
+            crate::providers::continue_instruction::discard(&self.root, run_id, stage_id)
+                .map_err(|error| ProviderError::new(error.to_string()))
+        }
+    }
+
+    /// Simulates a concurrent second caller of `request_continue` racing the
+    /// call under test: from inside the very hook the code under test uses
+    /// to stage its own instruction, this also stages the identical
+    /// instruction (a real concurrent caller issuing the same request would)
+    /// and independently commits its own continue cycle before the outer
+    /// call's commit runs — reproducing the exact "loser" interleaving
+    /// without needing real threads.
+    struct RacyContinueProvider {
+        root: PathBuf,
+        inner: FakeProvider,
+    }
+
+    impl Provider for RacyContinueProvider {
+        fn provider_id_for(&self, request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
+            self.inner.provider_id_for(request)
+        }
+
+        fn supports_role(&self, role: crate::domain::Role) -> bool {
+            self.inner.supports_role(role)
+        }
+
+        fn poll(
+            &mut self,
+            store: &mut SqliteStore,
+            request: &ProviderRequest,
+        ) -> Result<ProviderPoll, ProviderError> {
+            self.inner.poll(store, request)
+        }
+
+        fn stage_continue_instruction(
+            &mut self,
+            store: &mut SqliteStore,
+            run_id: RunId,
+            stage_id: &StageId,
+            _role: crate::domain::Role,
+            instruction: &str,
+        ) -> Result<(), ProviderError> {
+            crate::providers::continue_instruction::write_once(
+                &self.root,
+                run_id,
+                stage_id,
+                instruction,
+            )
+            .map_err(|error| ProviderError::new(error.to_string()))?;
+            let winner = store
+                .load_run(run_id)
+                .map_err(|error| ProviderError::new(error.to_string()))?;
+            let mut winning_run = winner.run;
+            let metadata = EventMetadata::new(
+                EventId::from_u128(9_000_000_000),
+                std::time::SystemTime::now().into(),
+            );
+            let event = winning_run
+                .request_continue(metadata)
+                .map_err(|error| ProviderError::new(error.to_string()))?;
+            commit_execution(store, &winning_run, winner.revision, &[event])
+                .map_err(|error| ProviderError::new(error.to_string()))?;
+            Ok(())
+        }
+
+        fn discard_continue_instruction(
+            &mut self,
+            _store: &mut SqliteStore,
+            run_id: RunId,
+            stage_id: &StageId,
+        ) -> Result<(), ProviderError> {
+            crate::providers::continue_instruction::discard(&self.root, run_id, stage_id)
+                .map_err(|error| ProviderError::new(error.to_string()))
+        }
+    }
+
     impl Fixture {
         fn new(kind: WorkflowKind, run_value: u128) -> Self {
             let temp = TempDir::new().unwrap();
@@ -1096,7 +1299,7 @@ mod tests {
                 .prepare_run_workspace(&mut store, run_id, &source)
                 .unwrap();
             Self {
-                _temp: temp,
+                temp,
                 database,
                 store,
                 run_id,
@@ -1635,6 +1838,131 @@ mod tests {
                 status: ApplyStatus::Prepared
             }) if run_id == apply_fixture.run_id
         ));
+    }
+
+    /// A refused continue must be side-effect-free: the instruction staged
+    /// for the follow-up stage before the domain call cannot outlive a
+    /// refusal, or a retry that edits the text would durably conflict
+    /// against content no stage ever read. `request_continue` is called
+    /// while the run is still `Ready` (not `Completed`), which the domain
+    /// refuses with `RunFixError::RunNotCompleted` — exactly the "domain
+    /// refuses" branch this behavior protects, entirely independent of the
+    /// commit-time concurrency-race branch it also protects.
+    #[test]
+    fn a_refused_continue_leaves_no_instruction_file_and_a_retry_with_different_text_succeeds() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard, 1_600_000);
+        let root = fixture.temp.path().join("continue-instructions-root");
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let scenario = FakeScenario::successful(&workflow);
+        let mut engine = WorkflowEngine::with_context(
+            InstrumentedProvider {
+                root: root.clone(),
+                inner: FakeProvider::new(scenario).unwrap(),
+            },
+            "exercise continue refusal cleanup".to_owned(),
+            TestContext::new(1_700_000),
+        );
+        let follow_up_stage_id = StageId::new("followup_1").unwrap();
+
+        // The run is freshly prepared (`Ready`), not `Completed`, so the
+        // domain refuses this request after the instruction was already
+        // staged for the stage it would have created.
+        let refused = engine.request_continue(&mut fixture.store, fixture.run_id, "first text");
+        assert!(matches!(
+            refused,
+            Err(EngineError::Fix(
+                crate::domain::RunFixError::RunNotCompleted(RunStatus::Ready)
+            ))
+        ));
+        assert_eq!(
+            crate::providers::continue_instruction::read(
+                &root,
+                fixture.run_id,
+                &follow_up_stage_id,
+            )
+            .unwrap(),
+            None,
+            "a refused continue must leave no staged instruction behind"
+        );
+
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Completed
+            }
+        );
+
+        // Retried with different text than the refused attempt used, which
+        // would fail with `ContinueInstructionError::Conflict` if the first
+        // attempt's file had survived.
+        engine
+            .request_continue(&mut fixture.store, fixture.run_id, "second text")
+            .unwrap();
+        assert_eq!(
+            crate::providers::continue_instruction::read(
+                &root,
+                fixture.run_id,
+                &follow_up_stage_id,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("second text")
+        );
+    }
+
+    /// The concurrency-race branch of the same safety property: two callers
+    /// compute the identical deterministic follow-up stage identity from the
+    /// same completed run and stage the identical instruction, but only one
+    /// commit can win. The loser's own commit fails, yet by then the
+    /// winner's stage already durably exists — the loser's cleanup must
+    /// recognize that and leave the shared instruction file alone rather
+    /// than deleting content the winner's stage is about to read.
+    #[test]
+    fn a_lost_commit_race_never_deletes_a_concurrent_winners_instruction() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard, 1_800_000);
+        let root = fixture.temp.path().join("continue-instructions-root");
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let scenario = FakeScenario::successful(&workflow);
+        let mut engine = WorkflowEngine::with_context(
+            RacyContinueProvider {
+                root: root.clone(),
+                inner: FakeProvider::new(scenario).unwrap(),
+            },
+            "exercise a lost commit race".to_owned(),
+            TestContext::new(1_900_000),
+        );
+        let follow_up_stage_id = StageId::new("followup_1").unwrap();
+
+        assert_eq!(
+            engine.drive(&mut fixture.store, fixture.run_id).unwrap(),
+            EngineStatus::Finished {
+                run_status: RunStatus::Completed
+            }
+        );
+
+        let lost =
+            engine.request_continue(&mut fixture.store, fixture.run_id, "shared instruction");
+
+        assert!(
+            matches!(lost, Err(EngineError::Store(_))),
+            "the outer call's own commit must be the one that lost the race"
+        );
+        // The concurrent "winner" injected by RacyContinueProvider committed
+        // the exact same predicted follow-up stage before the outer call's
+        // own commit ran.
+        let after = fixture.store.load_run(fixture.run_id).unwrap();
+        assert!(after.run.stage(&follow_up_stage_id).is_some());
+        assert_eq!(
+            crate::providers::continue_instruction::read(
+                &root,
+                fixture.run_id,
+                &follow_up_stage_id,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("shared instruction"),
+            "the loser's cleanup must not delete the winner's staged instruction"
+        );
     }
 
     fn init_repository(path: &Path) {

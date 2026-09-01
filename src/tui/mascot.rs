@@ -110,7 +110,9 @@ pub(crate) const fn mascot_activity(kind: StageKind) -> MascotActivity {
     match kind {
         StageKind::Research | StageKind::DeepAnalysis => MascotActivity::Research,
         StageKind::Architecture => MascotActivity::Architecture,
-        StageKind::Implementation | StageKind::Fix => MascotActivity::Implementation,
+        StageKind::Implementation | StageKind::Fix | StageKind::FollowUp => {
+            MascotActivity::Implementation
+        }
         StageKind::CodeQualityReview | StageKind::Review | StageKind::IndependentReview => {
             MascotActivity::QualityReview
         }
