@@ -5,15 +5,36 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::{EventId, EventMetadata, Run, RunId, RunStatus, RunTransition};
 use crate::git::{
-    GitRepository, apply_patch, branch_exists, branch_tip, check_patch, create_branch_in_worktree,
-    create_worktree, delete_owned_branch, detach_worktree, generate_patch, generate_patch_preview,
-    inspect_worktree, remove_worktree, source_is_clean, tree_is_clean,
+    GitRepository, apply_patch, branch_exists, branch_tip, check_patch, commit_all_in_worktree,
+    create_branch_in_worktree, create_worktree, delete_owned_branch, detach_worktree,
+    generate_patch, generate_patch_preview, inspect_worktree, push_branch, remote_url,
+    remove_worktree, source_is_clean, tree_is_clean,
 };
 use crate::store::{RunRevision, SqliteStore, worktree_root};
 
+use super::github::GhClient;
 use super::{
     ApplyStatus, RunApplyOperation, RunWorkspace, WorkspaceError, WorkspaceMode, WorkspaceStatus,
 };
+
+/// What one publish actually did: the branch and commit that reached the
+/// remote, and what became of the pull request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishReceipt {
+    pub branch: String,
+    pub commit: String,
+    pub pull_request: PullRequestStatus,
+}
+
+/// The pull-request half of a publish, which is allowed to fall short without
+/// failing the publish: once the branch is pushed, the work is safe, and a
+/// missing or unauthenticated `gh` only costs the convenience.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PullRequestStatus {
+    Created(String),
+    AlreadyExists(String),
+    Unavailable(String),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReconciliationOutcome {
@@ -356,6 +377,106 @@ impl WorkspaceManager {
         let operation =
             store.update_apply_operation(&operation, ApplyStatus::AppliedToSource, None, now())?;
         Self::finalize_apply(store, loaded.run, loaded.revision, &operation)
+    }
+
+    /// Publishes a completed run as a remote branch and pull request, never
+    /// touching the operator's checkout.
+    ///
+    /// The counterpart to apply for a source the operator does not want
+    /// written to: the run's delta is committed on the branch the run already
+    /// owns, the branch is pushed to `origin`, and a pull request is opened
+    /// through the GitHub CLI. Runs stay `Completed` — publish is transport,
+    /// not disposition, so apply, fix, and discard all remain available, and
+    /// publishing again after a fix cycle updates the same branch and pull
+    /// request.
+    ///
+    /// Push-first by design: pull-request failures (no `gh`, not
+    /// authenticated) are reported inside the receipt, because by then the
+    /// work is already safe on the remote.
+    ///
+    /// # Errors
+    /// Rejects non-completed runs, detached/review workspaces, workspaces with
+    /// nothing to publish, and repositories without an `origin` remote.
+    /// Returns Git errors from committing or pushing.
+    pub fn publish(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<PublishReceipt, WorkspaceError> {
+        self.publish_with(store, run_id, &GhClient::default())
+    }
+
+    fn publish_with(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        gh: &GhClient,
+    ) -> Result<PublishReceipt, WorkspaceError> {
+        let loaded = store.load_run(run_id)?;
+        if loaded.run.status() != RunStatus::Completed {
+            return Err(invalid_run_status(&loaded.run, "publish"));
+        }
+        let workspace = Self::ready_workspace(store, run_id)?;
+        if workspace.mode() != WorkspaceMode::Branch {
+            return Err(WorkspaceError::ReviewWorkspaceNotApplicable);
+        }
+        self.validate_workspace(&workspace, false)?;
+        self.validate_source(&workspace)?;
+        let branch = workspace
+            .branch_name()
+            .ok_or(WorkspaceError::MissingBranch(workspace.mode()))?
+            .to_owned();
+        let worktree = workspace.worktree_path();
+        // The same gate cleanup honors: a run stranded mid-apply-recovery has
+        // an operation whose outcome is not yet known, and nothing else may
+        // move until apply resolves it.
+        if store.load_apply_operation(run_id)?.is_some_and(|operation| {
+            matches!(
+                operation.status(),
+                ApplyStatus::Prepared | ApplyStatus::AppliedToSource
+            )
+        }) {
+            return Err(WorkspaceError::ApplyInProgress(run_id));
+        }
+        // Every pure refusal comes before the commit, so a refused publish
+        // leaves the worktree exactly as it found it.
+        if remote_url(&self.git, worktree, "origin")?.is_none() {
+            return Err(WorkspaceError::NoRemote(
+                workspace.source_repo_path().to_path_buf(),
+            ));
+        }
+
+        let task = store
+            .load_run_input(run_id)?
+            .map(|input| input.task().to_owned());
+        let title = publish_title(task.as_deref(), run_id);
+        let commit = if tree_is_clean(&self.git, worktree)? {
+            inspect_worktree(&self.git, worktree)?.head_commit
+        } else {
+            let message = format!("{title}\n\nPolycode run {run_id}");
+            commit_all_in_worktree(&self.git, worktree, &message)?
+        };
+        if commit == workspace.base_commit() {
+            return Err(WorkspaceError::NothingToPublish);
+        }
+        push_branch(&self.git, worktree, "origin", &branch)?;
+
+        let pull_request = match gh.existing_pull_request(worktree, &branch) {
+            Ok(Some(url)) => PullRequestStatus::AlreadyExists(url),
+            Ok(None) => {
+                let body = publish_body(task.as_deref(), run_id);
+                match gh.create_pull_request(worktree, &branch, &title, &body) {
+                    Ok(url) => PullRequestStatus::Created(url),
+                    Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
+                }
+            }
+            Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
+        };
+        Ok(PublishReceipt {
+            branch,
+            commit,
+            pull_request,
+        })
     }
 
     /// Builds a bounded read-only preview from same temporary-index delta used by apply.
@@ -884,6 +1005,34 @@ impl FaultPoint {
     }
 }
 
+/// One line naming the work, for the commit subject and pull-request title.
+fn publish_title(task: Option<&str>, run_id: RunId) -> String {
+    const LIMIT: usize = 72;
+    let first_line = task
+        .map(str::trim)
+        .and_then(|task| task.lines().next())
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let Some(line) = first_line else {
+        return format!("Polycode run {run_id}");
+    };
+    if line.chars().count() <= LIMIT {
+        line.to_owned()
+    } else {
+        let mut title: String = line.chars().take(LIMIT - 1).collect();
+        title.push('…');
+        title
+    }
+}
+
+fn publish_body(task: Option<&str>, run_id: RunId) -> String {
+    let footer = format!("Opened by Polycode from run {run_id}.");
+    match task.map(str::trim).filter(|task| !task.is_empty()) {
+        Some(task) => format!("{task}\n\n---\n{footer}"),
+        None => footer,
+    }
+}
+
 fn invalid_run_status(run: &Run, operation: &'static str) -> WorkspaceError {
     WorkspaceError::InvalidRunStatus {
         run_id: run.id(),
@@ -953,7 +1102,7 @@ mod tests {
     use crate::store::ResolvedConfigSnapshot;
 
     struct Fixture {
-        _temp: TempDir,
+        temp: TempDir,
         source: PathBuf,
         root: PathBuf,
         store: SqliteStore,
@@ -969,7 +1118,7 @@ mod tests {
             let mut store = SqliteStore::open_in_memory().unwrap();
             let run_id = create_run(&mut store, kind, 1);
             Self {
-                _temp: temp,
+                temp,
                 source,
                 root,
                 store,
@@ -2192,6 +2341,316 @@ mod tests {
             .transition(RunTransition::Complete, metadata(at))
             .unwrap();
         store.commit_run_update(&run, revision, &[event]).unwrap();
+    }
+
+    /// A bare repository wired up as the source's `origin`, so push has
+    /// somewhere real to go without any network.
+    fn add_origin(fixture: &Fixture) -> PathBuf {
+        let parent = fixture.source.parent().unwrap().to_path_buf();
+        git(&parent, ["init", "--bare", "-b", "main", "origin.git"]);
+        let origin = parent.join("origin.git");
+        git(
+            &fixture.source,
+            ["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        origin
+    }
+
+    /// A `gh` stand-in: `pr list` prints whatever `list-output` beside the
+    /// script holds, `pr create` prints a fixed URL. No stub ever reaches a
+    /// network.
+    fn stub_gh(directory: &Path) -> GhClient {
+        use std::os::unix::fs::PermissionsExt;
+        let script = directory.join("gh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
+             case \"$1 $2\" in\n\
+             \"pr list\") cat \"$dir/list-output\" 2>/dev/null; exit 0 ;;\n\
+             \"pr create\") echo \"https://example.invalid/pull/7\"; exit 0 ;;\n\
+             *) exit 1 ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        GhClient::with_executable(script)
+    }
+
+    #[test]
+    fn publish_commits_pushes_and_opens_a_pull_request_without_touching_the_source() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        // The operator is mid-edit: exactly the situation apply refuses and
+        // publish exists for.
+        fs::write(fixture.source.join("mid-edit.txt"), "mine\n").unwrap();
+        let before = source_snapshot(&fixture.source);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "published\n").unwrap();
+        fs::write(workspace.worktree_path().join("new.txt"), "added\n").unwrap();
+
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .unwrap();
+
+        let branch = format!("polycode/run-{}", fixture.run_id);
+        assert_eq!(receipt.branch, branch);
+        assert_eq!(
+            receipt.pull_request,
+            PullRequestStatus::Created("https://example.invalid/pull/7".to_owned())
+        );
+        let reference = format!("refs/heads/{branch}");
+        assert_eq!(git_text(&origin, ["rev-parse", &reference]), receipt.commit);
+        assert_eq!(
+            git_text(workspace.worktree_path(), ["log", "-1", "--format=%s"]),
+            format!("Polycode run {}", fixture.run_id)
+        );
+        assert!(git_status(
+            workspace.worktree_path(),
+            ["diff", "--quiet", "HEAD"]
+        ));
+        assert_eq!(
+            source_snapshot(&fixture.source),
+            before,
+            "publish wrote to the operator's checkout"
+        );
+        // The run keeps every disposition: publish is transport.
+        assert_eq!(
+            fixture.store.load_run(fixture.run_id).unwrap().run.status(),
+            RunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn a_second_publish_reuses_the_branch_and_reports_the_open_pull_request() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "one\n").unwrap();
+        fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .unwrap();
+
+        // The pull request now exists, and the worktree gained more work —
+        // the shape of a fix cycle followed by another publish.
+        fs::write(
+            fixture.temp.path().join("list-output"),
+            "https://example.invalid/pull/7\n",
+        )
+        .unwrap();
+        fs::write(workspace.worktree_path().join("README.md"), "two\n").unwrap();
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .unwrap();
+
+        assert_eq!(
+            receipt.pull_request,
+            PullRequestStatus::AlreadyExists("https://example.invalid/pull/7".to_owned())
+        );
+        let reference = format!("refs/heads/polycode/run-{}", fixture.run_id);
+        assert_eq!(git_text(&origin, ["rev-parse", &reference]), receipt.commit);
+    }
+
+    #[test]
+    fn a_missing_gh_costs_the_pull_request_but_never_the_push() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let origin = add_origin(&fixture);
+        let gh = GhClient::with_executable(fixture.temp.path().join("missing-gh"));
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "pushed\n").unwrap();
+
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .unwrap();
+
+        assert!(matches!(
+            receipt.pull_request,
+            PullRequestStatus::Unavailable(_)
+        ));
+        let reference = format!("refs/heads/polycode/run-{}", fixture.run_id);
+        assert_eq!(git_text(&origin, ["rev-parse", &reference]), receipt.commit);
+    }
+
+    #[test]
+    fn publish_refusals_leave_the_workspace_unchanged() {
+        // No origin remote: refused before anything is committed or pushed,
+        // leaving the worktree's uncommitted delta exactly as it was.
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let gh = stub_gh(fixture.temp.path());
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "change\n").unwrap();
+        assert!(matches!(
+            fixture
+                .manager()
+                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+            Err(WorkspaceError::NoRemote(_))
+        ));
+        assert_eq!(
+            git_text(workspace.worktree_path(), ["rev-parse", "HEAD"]),
+            workspace.base_commit(),
+            "a refused publish committed anyway"
+        );
+        assert!(!git_status(
+            workspace.worktree_path(),
+            ["diff", "--quiet", "HEAD"]
+        ));
+
+        // Nothing to publish: a worktree still at its base.
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let gh = stub_gh(fixture.temp.path());
+        add_origin(&fixture);
+        fixture.prepare();
+        fixture.complete();
+        assert!(matches!(
+            fixture
+                .manager()
+                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+            Err(WorkspaceError::NothingToPublish)
+        ));
+
+        // A run that has not completed.
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let gh = stub_gh(fixture.temp.path());
+        add_origin(&fixture);
+        fixture.prepare();
+        assert!(matches!(
+            fixture
+                .manager()
+                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+            Err(WorkspaceError::InvalidRunStatus { .. })
+        ));
+
+        // A detached review workspace has no branch to publish.
+        let mut fixture = Fixture::new(WorkflowKind::Review);
+        let gh = stub_gh(fixture.temp.path());
+        add_origin(&fixture);
+        fixture.prepare();
+        fixture.complete();
+        assert!(matches!(
+            fixture
+                .manager()
+                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+            Err(WorkspaceError::ReviewWorkspaceNotApplicable)
+        ));
+    }
+
+    #[test]
+    fn a_published_run_still_cleans_up_completely() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "published\n").unwrap();
+        fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .unwrap();
+
+        fixture
+            .manager()
+            .discard(&mut fixture.store, fixture.run_id)
+            .unwrap();
+        assert!(!workspace.worktree_path().exists());
+        let reference = format!("refs/heads/polycode/run-{}", fixture.run_id);
+        assert!(
+            !git_status(
+                &fixture.source,
+                ["rev-parse", "--verify", "--quiet", &reference]
+            ),
+            "the local branch outlived its discard"
+        );
+    }
+
+    /// Publish is transport, not disposition: the same delta must still be
+    /// transferable into the operator's checkout afterwards. This leans on
+    /// `generate_patch` diffing the base commit against working-tree content —
+    /// a publish commit on the branch must not change what apply transfers.
+    #[test]
+    fn apply_still_transfers_the_same_delta_after_publish() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "published\n").unwrap();
+        fs::write(workspace.worktree_path().join("new.txt"), "added\n").unwrap();
+        fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, &gh)
+            .unwrap();
+
+        fixture
+            .manager()
+            .apply(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(fixture.source.join("README.md")).unwrap(),
+            "published\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.source.join("new.txt")).unwrap(),
+            "added\n"
+        );
+        assert_eq!(
+            fixture.store.load_run(fixture.run_id).unwrap().run.status(),
+            RunStatus::Applied
+        );
+    }
+
+    #[test]
+    fn a_run_frozen_mid_apply_recovery_cannot_publish() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "changed\n").unwrap();
+        let crashing = WorkspaceManager::with_fault(&fixture.root, FaultPoint::GitApplied);
+        assert!(matches!(
+            crashing.apply(&mut fixture.store, fixture.run_id),
+            Err(WorkspaceError::InjectedCrash(_))
+        ));
+
+        assert!(matches!(
+            fixture
+                .manager()
+                .publish_with(&mut fixture.store, fixture.run_id, &gh),
+            Err(WorkspaceError::ApplyInProgress(_))
+        ));
+    }
+
+    #[test]
+    fn publish_titles_and_bodies_survive_odd_tasks() {
+        let run_id = RunId::from_u128(9);
+        assert_eq!(
+            publish_title(None, run_id),
+            format!("Polycode run {run_id}")
+        );
+        assert_eq!(
+            publish_title(Some("  fix the flaky test\nwith details  "), run_id),
+            "fix the flaky test"
+        );
+        let long = "α".repeat(100);
+        let title = publish_title(Some(&long), run_id);
+        assert_eq!(title.chars().count(), 72);
+        assert!(title.ends_with('…'));
+        assert_eq!(
+            publish_body(None, run_id),
+            format!("Opened by Polycode from run {run_id}.")
+        );
+        assert!(publish_body(Some("task text"), run_id).starts_with("task text\n\n---\n"));
     }
 
     fn init_repository(path: &Path) {

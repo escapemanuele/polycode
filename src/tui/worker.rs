@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::{ApplyOutcome, ExecutionReport, ExecutionSelection, ProviderFactory, RunService};
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
+use crate::workspace::PublishReceipt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
@@ -15,6 +16,7 @@ pub(crate) enum ActionKind {
     Continue,
     ResolveAttention,
     Apply,
+    Publish,
     Discard,
 }
 
@@ -29,6 +31,7 @@ impl ActionKind {
             Self::Continue => "continuing run",
             Self::ResolveAttention => "resolving attention",
             Self::Apply => "applying changes",
+            Self::Publish => "publishing pull request",
             Self::Discard => "discarding run",
         }
     }
@@ -47,7 +50,7 @@ impl ActionKind {
             | Self::Fix
             | Self::Continue
             | Self::ResolveAttention => true,
-            Self::Stop | Self::Apply | Self::Discard => false,
+            Self::Stop | Self::Apply | Self::Publish | Self::Discard => false,
         }
     }
 }
@@ -86,6 +89,9 @@ pub(crate) enum WorkerCommand {
     ApplyRun {
         run_id: RunId,
     },
+    PublishRun {
+        run_id: RunId,
+    },
     DiscardRun {
         run_id: RunId,
     },
@@ -102,6 +108,7 @@ impl WorkerCommand {
             Self::RequestContinue { .. } => ActionKind::Continue,
             Self::ResolveAttention { .. } => ActionKind::ResolveAttention,
             Self::ApplyRun { .. } => ActionKind::Apply,
+            Self::PublishRun { .. } => ActionKind::Publish,
             Self::DiscardRun { .. } => ActionKind::Discard,
         }
     }
@@ -116,6 +123,7 @@ impl WorkerCommand {
             | Self::RequestContinue { run_id, .. }
             | Self::ResolveAttention { run_id, .. }
             | Self::ApplyRun { run_id }
+            | Self::PublishRun { run_id }
             | Self::DiscardRun { run_id } => Some(*run_id),
         }
     }
@@ -125,12 +133,15 @@ impl WorkerCommand {
 pub(crate) enum WorkerSuccess {
     Execution(ExecutionReport),
     Applied(ApplyOutcome, ExecutionReport),
+    Published(PublishReceipt, ExecutionReport),
 }
 
 impl WorkerSuccess {
     pub(crate) const fn report(&self) -> &ExecutionReport {
         match self {
-            Self::Execution(report) | Self::Applied(_, report) => report,
+            Self::Execution(report)
+            | Self::Applied(_, report)
+            | Self::Published(_, report) => report,
         }
     }
 }
@@ -290,6 +301,9 @@ where
         WorkerCommand::ApplyRun { run_id } => service
             .apply_run(run_id)
             .map(|(outcome, report)| WorkerSuccess::Applied(outcome, report)),
+        WorkerCommand::PublishRun { run_id } => service
+            .publish_run(run_id)
+            .map(|(receipt, report)| WorkerSuccess::Published(receipt, report)),
         WorkerCommand::DiscardRun { run_id } => {
             service.discard_run(run_id).map(WorkerSuccess::Execution)
         }

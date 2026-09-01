@@ -81,6 +81,47 @@ pub(crate) fn create_branch_in_worktree(
     Ok(())
 }
 
+/// Stages and commits every change in one worktree, returning the new HEAD.
+///
+/// The one place Polycode commits: turning a finished run's delta into a
+/// commit on the branch the run owns, so the branch can travel to a remote.
+/// Uses the worktree's real index deliberately — the tree belongs to the run,
+/// and the commit is meant to be its permanent record.
+///
+/// A machine-owned commit under a raw-mode interface, so nothing interactive
+/// or repository-local may run: hooks are skipped and signing is disabled,
+/// because a pinentry prompt beneath the alternate screen would hang the
+/// publish, and the operator's pre-commit hooks were written for their
+/// checkout, not for a worktree an agent already finished with. Staging that
+/// normalizes to nothing (a clean/autocrlf round trip) is answered with the
+/// unchanged HEAD rather than a "nothing to commit" failure.
+pub(crate) fn commit_all_in_worktree(
+    git: &Git,
+    path: &Path,
+    message: &str,
+) -> Result<String, GitError> {
+    git.checked(path, &[os("add"), os("-A"), os("--"), os(".")])?;
+    let staged = git.output(path, &[os("diff"), os("--cached"), os("--quiet")], &[])?;
+    if staged.status.code() == Some(1) {
+        git.checked(
+            path,
+            &[
+                os("-c"),
+                os("commit.gpgsign=false"),
+                os("commit"),
+                os("--no-verify"),
+                os("-m"),
+                os(message),
+            ],
+        )?;
+    } else {
+        staged.ensure_success()?;
+    }
+    let head = text_output(git.checked(path, &[os("rev-parse"), os("HEAD")])?)?;
+    validate_commit(&head)?;
+    Ok(head)
+}
+
 pub(crate) fn remove_worktree(
     git: &Git,
     repository: &GitRepository,

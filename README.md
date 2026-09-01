@@ -117,7 +117,7 @@ Key bindings:
 | Global | `q`, `Ctrl-C` | Quit/detach frontend |
 | Run | `r`, `t`, `u` | Resume/recover, retry selected failed stage, attention |
 | Run | `o`, `l`, `d` | Verified artifact, raw logs, diff |
-| Run | `a`, `X` | Apply or discard with confirmation |
+| Run | `a`, `P`, `X` | Apply, publish pull request, or discard with confirmation |
 | Viewer | `↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End` | Scroll |
 | Composer | `Tab`/`Shift-Tab`, arrows, typing/paste | Move fields, choose values, edit |
 
@@ -230,6 +230,7 @@ polycode resolve <run-id> <attention-id> [--response "answer"]
 polycode retry <run-id> <stage-id>
 polycode fix <run-id>
 polycode apply <run-id>
+polycode pr <run-id>
 polycode discard <run-id>
 ```
 
@@ -261,7 +262,7 @@ Codex uses documented non-interactive `codex exec --json` transport with prompt 
 
 Codex `thread.started` supplies opaque native thread identity; recovery resumes exact ID through a new managed invocation, never `--last`. Unknown valid JSONL records become durable non-semantic checkpoints; invalid complete records leave cursor untouched. Current stable exec JSON exposes no safe typed permission/question continuation, so Polycode never infers `NeedsUser` from prose. Native denial/terminal error fails stage instead. Successful `turn.completed` atomically records usage and completion from one raw record.
 
-`resume`, `resolve`, and `retry` reconcile persisted workspace first, reconstruct provider from immutable configuration, then execute to next quiescent condition. `resume` never bypasses attention or retries failure. `resolve` and `retry` perform requested explicit transition then continue. `apply` transfers actual completed workspace changes; empty diff is successful no-op. `discard` records logical disposition before owned-resource cleanup.
+`resume`, `resolve`, and `retry` reconcile persisted workspace first, reconstruct provider from immutable configuration, then execute to next quiescent condition. `resume` never bypasses attention or retries failure. `resolve` and `retry` perform requested explicit transition then continue. `apply` transfers actual completed workspace changes; empty diff is successful no-op. `pr` publishes a completed run without touching the source checkout: it commits the run's delta on its own `polycode/run-<id>` branch, pushes the branch to `origin`, and opens a pull request through the GitHub CLI (`gh`) when available — pull-request failure never undoes the push. The run stays `Completed`, so apply, fix, and discard all remain available, publishing again after a fix cycle updates the same branch and pull request, and any number of completed runs can publish concurrently because nothing serializes on the operator's checkout. `discard` records logical disposition before owned-resource cleanup.
 
 Normal blocked states (`needs_user`, paused, interrupted, failed) exit successfully because command completed and durable state remains inspectable. Operational failures exit 1; Clap argument errors exit 2. CLI progress comes only from committed semantic events.
 

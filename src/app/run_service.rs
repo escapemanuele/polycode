@@ -405,6 +405,27 @@ where
         Ok((outcome, report))
     }
 
+    /// Publishes completed workspace changes as a remote branch and pull
+    /// request, leaving the source checkout untouched.
+    ///
+    /// The parallel-friendly alternative to `apply_run`: nothing serializes on
+    /// the operator's checkout, so any number of completed runs can publish
+    /// concurrently. The run stays `Completed` — apply, fix, and discard all
+    /// remain available afterwards.
+    ///
+    /// # Errors
+    /// Returns workspace ownership, lifecycle, Git, remote, or store errors.
+    pub fn publish_run(
+        &self,
+        run_id: RunId,
+    ) -> Result<(crate::workspace::PublishReceipt, ExecutionReport), AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let before = last_sequence(&store, run_id)?;
+        let receipt = WorkspaceManager::new(&self.worktrees).publish(&mut store, run_id)?;
+        let report = Self::report(&mut store, run_id, before, None)?;
+        Ok((receipt, report))
+    }
+
     /// Stops execution while preserving everything the run produced.
     ///
     /// Stop is not disposition: the workspace, its changes, artifacts, logs,

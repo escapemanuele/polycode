@@ -1036,6 +1036,8 @@ fn hero_actions(
         spans.extend(theme::action("d", "Review diff", theme::accent()));
         spans.push(Span::raw("   "));
         spans.extend(theme::action("a", "Apply changes", theme::success()));
+        spans.push(Span::raw("   "));
+        spans.extend(theme::action("P", "Pull request", theme::success()));
         if let Some(label) = fix.label() {
             spans.push(Span::raw("   "));
             spans.extend(theme::action("f", label, theme::attention()));
@@ -1551,6 +1553,7 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
             } else if state.run_is_applyable() {
                 push("d", "Review diff", theme::accent());
                 push("a", "Apply", theme::success());
+                push("P", "Pull request", theme::success());
                 if let Some(label) = FixOffer::of(state).label() {
                     push("f", label, theme::attention());
                 }
@@ -1699,15 +1702,16 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
         ),
         Overlay::Attention => render_attention(frame, popup, state),
         Overlay::Update => render_update(frame, area, state),
-        Overlay::ApplyConfirm => render_confirmation(frame, popup, state, true),
-        Overlay::DiscardConfirm => render_confirmation(frame, popup, state, false),
+        Overlay::ApplyConfirm => render_confirmation(frame, popup, state, Confirmation::Apply),
+        Overlay::PublishConfirm => render_confirmation(frame, popup, state, Confirmation::Publish),
+        Overlay::DiscardConfirm => render_confirmation(frame, popup, state, Confirmation::Discard),
         Overlay::Continue => render_continue(frame, popup, state),
         Overlay::FollowUps => render_follow_ups(frame, popup, state),
     }
@@ -1953,14 +1957,26 @@ fn render_follow_ups(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
 }
 
-fn render_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState, apply: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    Apply,
+    Publish,
+    Discard,
+}
+
+fn render_confirmation(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    confirmation: Confirmation,
+) {
     let Some(details) = state.details.as_ref() else {
         return;
     };
-    let (action, color) = if apply {
-        ("APPLY", theme::success())
-    } else {
-        ("DISCARD", theme::danger())
+    let (action, color) = match confirmation {
+        Confirmation::Apply => ("APPLY", theme::success()),
+        Confirmation::Publish => ("PULL REQUEST", theme::success()),
+        Confirmation::Discard => ("DISCARD", theme::danger()),
     };
     let mut lines = vec![
         Line::from(theme::chip(action, color)),
@@ -1983,7 +1999,12 @@ fn render_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState, appl
         Line::from(Span::styled(format!("run {}", details.id), theme::muted())),
         Line::from(""),
     ];
-    if apply {
+    if confirmation == Confirmation::Discard {
+        lines.push(Line::from(
+            "Discard is logical disposition; owned cleanup follows application semantics.",
+        ));
+        lines.push(Line::from("Enter confirms discard."));
+    } else {
         if let Some(diff) = state.diff.as_ref() {
             lines.push(theme::section(&format!(
                 "{} FILES",
@@ -2001,21 +2022,23 @@ fn render_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState, appl
             }
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(
-            "Review [d] diff first when needed. Enter confirms apply.",
-        ));
-    } else {
-        lines.push(Line::from(
-            "Discard is logical disposition; owned cleanup follows application semantics.",
-        ));
-        lines.push(Line::from("Enter confirms discard."));
+        lines.push(Line::from(if confirmation == Confirmation::Apply {
+            "Review [d] diff first when needed. Enter confirms apply."
+        } else {
+            "Commits on the run's branch, pushes to origin, opens a pull request. \
+             Your checkout is untouched. Enter confirms."
+        }));
     }
     lines.push(Line::from(Span::styled("Esc cancels", theme::muted())));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(overlay_block(
-                if apply { " APPLY " } else { " DISCARD " },
+                match confirmation {
+                    Confirmation::Apply => " APPLY ",
+                    Confirmation::Publish => " PULL REQUEST ",
+                    Confirmation::Discard => " DISCARD ",
+                },
                 color,
             )),
         area,
