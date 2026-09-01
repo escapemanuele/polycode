@@ -88,10 +88,21 @@ pub(crate) fn compose(
     // decision, which can approach the per-artifact cap on its own) and
     // budgeted against whatever room is left, the same discipline the change
     // handoff below already follows: never silently dropped, and never
-    // allowed to push the turn over Codex's hard input ceiling.
+    // allowed to push the turn over Codex's hard input ceiling. Truncated is
+    // still acceptable — it survives marked INCOMPLETE — but a FollowUp
+    // stage exists to carry this instruction, so when there is no room for
+    // even that marked, truncated form, the stage must fail rather than run
+    // the mutating stage under the generic follow-up contract with the
+    // operator's actual scope never delivered.
     if let Some(instruction) = continue_instruction {
         let room = MAX_INPUT_BYTES.saturating_sub(prompt.len());
-        prompt.push_str(&continue_instruction_within(instruction, room));
+        let section = continue_instruction_within(instruction, room);
+        if section.is_empty() {
+            return Err(CodexProviderError::ContinueInstructionOmitted(
+                request.stage_id().clone(),
+            ));
+        }
+        prompt.push_str(&section);
     }
     if let Some(handoff) = handoff {
         // The change map is the one part that may legitimately dwarf the
@@ -395,11 +406,12 @@ mod tests {
     /// End-to-end boundary check at the actual `MAX_INPUT_BYTES` ceiling: a
     /// dependency artifact is sized (computed from the prompt's own fixed
     /// scaffolding, not guessed) so it leaves the operator instruction
-    /// section exactly zero bytes of room. The composed prompt must land
-    /// exactly at `MAX_INPUT_BYTES` — never over it — and carry no operator
-    /// instruction section at all.
+    /// section exactly zero bytes of room. Silently composing without the
+    /// instruction would let the follow-up stage run unscoped, so `compose`
+    /// must fail closed instead — the stage fails rather than an agent
+    /// making mutating changes without the operator's actual instruction.
     #[test]
-    fn a_composed_prompt_never_exceeds_the_input_limit_when_the_instruction_has_no_room() {
+    fn zero_room_for_the_operator_instruction_fails_closed_instead_of_composing_unscoped() {
         use chrono::{TimeZone, Utc};
 
         use crate::domain::{ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactStatus};
@@ -460,13 +472,15 @@ mod tests {
         );
         let artifact = build_artifact(&"d".repeat(content_len));
 
-        let prompt = compose(&request, &[artifact], None, Some(instruction)).unwrap();
+        let error = compose(&request, &[artifact], None, Some(instruction)).unwrap_err();
 
-        assert_eq!(
-            prompt.len(),
-            MAX_INPUT_BYTES,
-            "zero room was left for the instruction, so the prompt must be unchanged by it"
+        assert!(
+            matches!(
+                error,
+                CodexProviderError::ContinueInstructionOmitted(ref stage_id)
+                    if *stage_id == StageId::new("followup_1").unwrap()
+            ),
+            "error: {error}"
         );
-        assert!(!prompt.contains("# Operator instruction"));
     }
 }
