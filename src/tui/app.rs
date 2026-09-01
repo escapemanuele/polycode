@@ -344,10 +344,10 @@ impl TuiApp {
             Intent::Escape => self.back(),
             Intent::Tab => self.state.new_run.next_field(),
             Intent::BackTab => self.state.new_run.previous_field(),
-            Intent::Left if matches!(self.state.new_run.focus, 1 | 3) => {
+            Intent::Left if matches!(self.state.new_run.focus, 1 | 3 | 4) => {
                 self.state.new_run.cycle_value(false);
             }
-            Intent::Right if matches!(self.state.new_run.focus, 1 | 3) => {
+            Intent::Right if matches!(self.state.new_run.focus, 1 | 3 | 4) => {
                 self.state.new_run.cycle_value(true);
             }
             Intent::Left => self.edit_text(super::state::TextField::left),
@@ -2054,6 +2054,32 @@ mod tests {
             "a new run holds no existing run, so nothing can hold it back"
         );
         assert_eq!(app.state.in_flight.len(), 3, "all three are working");
+    }
+
+    /// Every choice field in the composer answers to the arrow keys. Effort
+    /// is the fourth field; it must cycle like workflow and execution do,
+    /// not fall through to the text editor that ignores it.
+    #[test]
+    fn arrow_keys_cycle_the_composer_effort_field() {
+        use crate::tui::state::EffortChoice;
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+        app.state.new_run.focus = 4;
+        let start = app.state.new_run.effort;
+        app.handle_intent(Intent::Right);
+        let next = app.state.new_run.effort;
+        assert_ne!(next, start, "Right must move Effort to another choice");
+        assert_eq!(
+            next,
+            EffortChoice::ALL[(EffortChoice::ALL.iter().position(|c| *c == start).unwrap() + 1)
+                % EffortChoice::ALL.len()],
+            "Right steps forward through EffortChoice::ALL"
+        );
+        app.handle_intent(Intent::Left);
+        assert_eq!(
+            app.state.new_run.effort, start,
+            "Left steps back to where it was"
+        );
     }
 
     /// The composer's task belongs to the run it starts; reopening the

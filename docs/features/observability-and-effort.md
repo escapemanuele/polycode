@@ -18,7 +18,7 @@ polycode standard "<task>" --effort high
 polycode standard "<task>" --effort native    # same as omitting the flag
 polycode status <run-id>
 ```
-TUI: `i` on run detail toggles technical details; the composer Effort field is intended to cycle Native default / Low / Medium / High (see gotcha).
+TUI: `i` on run detail toggles technical details; the composer Effort field cycles Native default / Low / Medium / High with ←/→.
 
 ## Where it lives
 - `src/domain/effort.rs` — `EffortSetting` (`NativeDefault | Level(Low|Medium|High)`), `EffortLevel`.
@@ -38,4 +38,3 @@ TUI: `i` on run detail toggles technical details; the composer Effort field is i
 - Never compare Claude and Codex usage units; comparable dimensions are latency, invocation count, injected prompt bytes and eval pass/fail.
 - Injected prompt bytes exclude everything the runtime reads on its own (repository, CLAUDE.md/AGENTS.md, MCP, skills, system prompts).
 - Telemetry never feeds routing, retries, permissions or effort; there is no escalation. Retry-with-higher-effort is deferred (M13b.1).
-- The TUI composer cannot currently change Effort with ←/→ (dispatch only covers focus 1 and 3); use the CLI flag. See control-room.md.

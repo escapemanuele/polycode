@@ -39,7 +39,6 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 
 ## Gotchas
 - Text mode (Task/Repository fields, attention and continue overlays) uses `map_text_key`: letters are input, not commands. `q` does not quit there; Ctrl-C still does.
-- The composer's Effort field (focus 4) is never cycled: `handle_new_run_intent` only routes ←/→ to `cycle_value` for focus 1 and 3, and `active_text_mut` returns None for focus 4. Effort stays at Native default in the TUI until that dispatch is fixed. `--effort` on the CLI works.
 - Quit never interrupts, discards or applies anything; reopen and press `r` to reconcile durable state and consume retained output.
 - Read paths are side-effect free except the 30 s abandoned-run observe pass; they never acknowledge provider output or create apply intent.
 - The TUI caps concurrently working agents at 4 (`CONCURRENT_AGENTS`); a booked fix that cannot start yet stays booked silently. The CLI has no such cap.
