@@ -15,6 +15,10 @@ const MAX_DEPENDENCY_BYTES: u64 = 1024 * 1024;
 /// in bytes can only undershoot the character limit.
 const MAX_INPUT_BYTES: usize = 1024 * 1024 - 16 * 1024;
 
+/// Heading the operator-instruction section always opens with, shared by its
+/// renderer and the tests that compute the same overhead it does.
+const OPERATOR_INSTRUCTION_HEADER: &str = "\n# Operator instruction\n";
+
 pub(crate) fn compose(
     request: &ProviderRequest,
     artifacts: &[ArtifactRecord],
@@ -103,26 +107,32 @@ pub(crate) fn compose(
 /// truncating the instruction text itself rather than silently dropping the
 /// section or letting the turn exceed Codex's hard input ceiling. Mirrors
 /// `change_handoff::render_within`'s bounded-partial-evidence pattern: the
-/// heading and an explicit INCOMPLETE marker always survive, because a
-/// provider with a hard limit should lose instruction detail, never the
-/// knowledge that detail is missing.
+/// heading and an explicit INCOMPLETE marker survive whenever they
+/// themselves fit, because a provider with a hard limit should lose
+/// instruction detail, never the knowledge that detail is missing — but when
+/// `max_bytes` is too small even for the header and marker alone (the rest
+/// of the prompt left no room, or none at all), the whole section is omitted
+/// instead of appending a fragment that would itself exceed the budget.
 fn continue_instruction_within(instruction: &str, max_bytes: usize) -> String {
-    const HEADER: &str = "\n# Operator instruction\n";
-    let full = format!("{HEADER}{instruction}\n");
+    let full = format!("{OPERATOR_INSTRUCTION_HEADER}{instruction}\n");
     if full.len() <= max_bytes {
         return full;
     }
     // Overhead is measured on the full-length marker and padded a little
     // further, so the marker's own digit count shrinking as `shown` drops
     // below `instruction.len()` can never push the result past the budget.
-    let overhead =
-        HEADER.len() + incomplete_marker(instruction.len(), instruction.len()).len() + 32;
+    let overhead = OPERATOR_INSTRUCTION_HEADER.len()
+        + incomplete_marker(instruction.len(), instruction.len()).len()
+        + 32;
+    if overhead > max_bytes {
+        return String::new();
+    }
     let mut room = max_bytes.saturating_sub(overhead).min(instruction.len());
     while room > 0 && !instruction.is_char_boundary(room) {
         room -= 1;
     }
     let mut section = String::with_capacity(max_bytes.min(instruction.len() + 256));
-    section.push_str(HEADER);
+    section.push_str(OPERATOR_INSTRUCTION_HEADER);
     section.push_str(&instruction[..room]);
     section.push_str(&incomplete_marker(room, instruction.len()));
     section
@@ -338,5 +348,125 @@ mod tests {
             prompt.contains("Completeness: INCOMPLETE"),
             "the instruction had to give way, and says so"
         );
+    }
+
+    /// Degenerate case the reviewed bug missed: when the rest of the prompt
+    /// left exactly zero room, the section used to still append its header
+    /// and completeness marker regardless, pushing the composed prompt past
+    /// `MAX_INPUT_BYTES`. Zero room must instead mean no section at all.
+    #[test]
+    fn no_room_left_omits_the_operator_instruction_section_entirely() {
+        assert_eq!(continue_instruction_within("add tests", 0), "");
+    }
+
+    /// One byte short of what the header and completeness marker alone
+    /// require (with even a zero-byte excerpt) must still omit the section
+    /// rather than append a fragment that overflows `max_bytes`.
+    #[test]
+    fn room_one_byte_short_of_header_and_marker_omits_the_section() {
+        // Long enough that `max_bytes` below is always short of the
+        // instruction's full rendered length, forcing the truncation path
+        // regardless of the (much larger) overhead computed from it.
+        let instruction = "x".repeat(10_000);
+        let overhead = OPERATOR_INSTRUCTION_HEADER.len()
+            + incomplete_marker(instruction.len(), instruction.len()).len()
+            + 32;
+
+        let section = continue_instruction_within(&instruction, overhead - 1);
+
+        assert_eq!(section, "", "section: {section:?}");
+    }
+
+    /// Exactly enough room for the header and marker (zero-byte excerpt) must
+    /// render the degenerate section, and it must still fit.
+    #[test]
+    fn room_exactly_at_the_overhead_boundary_renders_a_degenerate_section_that_fits() {
+        let instruction = "x".repeat(10_000);
+        let overhead = OPERATOR_INSTRUCTION_HEADER.len()
+            + incomplete_marker(instruction.len(), instruction.len()).len()
+            + 32;
+
+        let section = continue_instruction_within(&instruction, overhead);
+
+        assert!(section.len() <= overhead, "section: {}", section.len());
+        assert!(section.contains("Completeness: INCOMPLETE"));
+    }
+
+    /// End-to-end boundary check at the actual `MAX_INPUT_BYTES` ceiling: a
+    /// dependency artifact is sized (computed from the prompt's own fixed
+    /// scaffolding, not guessed) so it leaves the operator instruction
+    /// section exactly zero bytes of room. The composed prompt must land
+    /// exactly at `MAX_INPUT_BYTES` — never over it — and carry no operator
+    /// instruction section at all.
+    #[test]
+    fn a_composed_prompt_never_exceeds_the_input_limit_when_the_instruction_has_no_room() {
+        use chrono::{TimeZone, Utc};
+
+        use crate::domain::{ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactStatus};
+        use crate::providers::ArtifactRecord;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let decision_id = StageId::new("decision").unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 21, 0, 0, 0).single().unwrap();
+        let request = ProviderRequest::new(
+            RunId::from_u128(2),
+            StageId::new("followup_1").unwrap(),
+            StageKind::FollowUp,
+            StageStatus::Ready,
+            Role::Implementer,
+            "immutable task".to_owned(),
+            PathBuf::from("/managed/worktree"),
+            1,
+            0,
+            Option::<ProviderSessionId>::None,
+            vec![decision_id.clone()],
+        );
+        let instruction = "please also add a regression test";
+
+        let build_artifact = |content: &str| {
+            let path = temp.path().join("decision.md");
+            std::fs::write(&path, content).unwrap();
+            let metadata = ArtifactMetadata::new(
+                ArtifactId::new(),
+                RunId::from_u128(2),
+                decision_id.clone(),
+                ArtifactKind::Decision,
+                Role::EngineeringLead,
+                ArtifactStatus::Complete,
+                created_at,
+            );
+            ArtifactRecord::new(
+                metadata,
+                1,
+                path,
+                "a".repeat(64),
+                content.len() as u64,
+                created_at,
+            )
+            .unwrap()
+        };
+
+        // The dependency-writing code adds exactly `content.len()` bytes to
+        // the composed prompt for any content, so an empty-content probe
+        // measures every other fixed byte the prompt carries before the
+        // instruction section is appended.
+        let baseline_len = compose(&request, &[build_artifact("")], None, None)
+            .unwrap()
+            .len();
+        let content_len = MAX_INPUT_BYTES - baseline_len;
+        assert!(
+            (content_len as u64) < MAX_DEPENDENCY_BYTES,
+            "test assumption: the sized dependency must stay under its own cap"
+        );
+        let artifact = build_artifact(&"d".repeat(content_len));
+
+        let prompt = compose(&request, &[artifact], None, Some(instruction)).unwrap();
+
+        assert_eq!(
+            prompt.len(),
+            MAX_INPUT_BYTES,
+            "zero room was left for the instruction, so the prompt must be unchanged by it"
+        );
+        assert!(!prompt.contains("# Operator instruction"));
     }
 }
