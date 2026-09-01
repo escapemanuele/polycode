@@ -428,6 +428,8 @@ whether automatic updates are available for that installation.
 
 ## Architecture
 
+Agents should read [docs/features/README.md](docs/features/README.md) before driving or changing a feature; it maps every user-facing feature to its commands, keys, code paths and gotchas.
+
 See [ARCHITECTURE.md](ARCHITECTURE.md) and [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md). Claude, Codex, immutable role routing, `recommended_v1`/`recommended_v2`, local TUI, and separate role evaluation evidence are implemented; Gemini, adaptive routing/failover, Advisor, and direct provider chat remain future constraints.
 
 ## License

@@ -1,0 +1,53 @@
+# Run lifecycle
+
+Start one task as a run, watch it move through its stages, and get it moving again when it stops for you, for a failure, or for a crash.
+
+## Sub-features
+- start: `fast`/`standard`/`deep`/`review` create a run, prepare its workspace, and drive it to the first quiescent state.
+- statuses: Created -> Preparing -> Ready -> Running -> {NeedsUser, Paused, Interrupted, Completed, Failed} -> {Applied, Discarded}.
+- ready-boundary: `Ready` is a persisted atomic boundary; configuration and workspace succeeded but nothing executed yet.
+- resume-vs-recover: `Paused` (user asked) takes Resume; `Interrupted` (process or runtime lost) takes Recover. One command, `resume`, does both.
+- stop: interrupts live managed processes, then commits a run-level `Interrupted`; nothing is discarded.
+- retry: returns one `Failed` stage to `Pending`, only while every dependent is still `Pending` or `Ready`.
+- attention: `NeedsUser` holds one or more attention requests (permission, decision, question) that `resolve` answers.
+- inspect: `runs` lists runs; `status` prints routing, per-stage evidence, attention and usage.
+
+## How to get to it (user POV)
+From a Git checkout, run one workflow command with the task text. The command prints committed events and the run's details, then exits when the run is quiescent (completed, needs you, paused, interrupted, failed, or waiting for a provider). Use `polycode runs` to find the run id and `polycode status <run-id>` to inspect it. In the TUI the same actions are `r` (resume/recover), `s` (stop), `t` (retry the selected failed stage) and `u` (resolve attention) on the run detail screen.
+
+## Driving it
+```bash
+polycode fast "<task>" [--repo <path>] [--provider claude|codex|fake | --profile recommended] [--effort native|low|medium|high]
+polycode standard "<task>" [same flags]
+polycode deep "<task>" [same flags]
+polycode review "<task>" [same flags]
+polycode runs
+polycode status <run-id>
+polycode resume <run-id>
+polycode stop <run-id>
+polycode retry <run-id> <stage-id>
+polycode resolve <run-id> <attention-id>                    # approve a permission request
+polycode resolve <run-id> <attention-id> --response "<answer>"   # answer a question
+```
+TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage, `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves).
+
+## Where it lives
+- `src/cli/mod.rs` — clap definitions (`RunArgs`, `Command::{Runs,Status,Resume,Stop,Retry,Resolve}`).
+- `src/cli/commands.rs` — `start`, `parse_effort`, `print_report`, `print_details`; `QuiescentState` hints printed after each report.
+- `src/app/run_service.rs` — `start_run`, `resume_run`, `stop_run`, `retry_stage`, `resolve_attention_with_response`, `inspect_run`, `list_runs`; `ABANDONED_AFTER` 30 s observe pass.
+- `src/domain/run.rs` — `Run` aggregate, `RunTransition`, `ensure_retry_safe` (`RetryWouldInvalidate`).
+- `src/domain/stage.rs` — stage state machine.
+- `src/domain/attention.rs` — attention request lifecycle.
+- `src/app/query.rs` — `RunDetails`, `StageSummary`, `AttentionSummary` DTOs behind `status`.
+- `tests/cli.rs` — restart survival, default profile, read-only `runs`/`status`.
+- `tests/codex_cli.rs` — `stop_interrupts_a_live_run_while_its_driver_is_still_attached`, detach + resume consuming retained output, retry creating a new native thread.
+
+## Gotchas
+- Blocked quiescent states (`needs_user`, paused, interrupted, failed) exit 0; only operational errors exit 1 and clap errors exit 2. Do not treat exit 0 as "completed".
+- `resume` never bypasses attention and never retries a failed stage; use `resolve` or `retry` explicitly.
+- Retry is rejected once any dependent stage has started or reached an outcome; the error is `RetryWouldInvalidate`.
+- `stop` is refused unless the run is `Running` or `NeedsUser`; an `Interrupted` run reports its existing state instead of a second interruption.
+- `stop` is retried on lost-revision races because another Polycode process is usually still driving the run; the classifier is `AppError::is_concurrent_modification`, which asks each wrapper. `#[error(transparent)]` makes `.source()` skip the wrapper level, so walking the source chain silently missed the store error and 7 to 20 percent of stops failed under load. Add explicit `is_retryable`-style methods to wrappers; never rely on `.source()` through transparent errors.
+- A run reading `Running` whose processes all ended and nothing touched for 30 s is settled by a read (`runs`, `status`, TUI refresh) through `ResumeAction::Observe`; a read never resumes provider work.
+- Pre-M5 runs are inspectable but cannot resume when immutable input or execution config is absent (`<legacy input unavailable>` in `status`).
+- Routes are resolved once at creation; provider loss after creation fails the stage with configured-provider-unavailable, never reroutes.
