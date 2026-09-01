@@ -676,6 +676,9 @@ fn print_details(details: &RunDetails) {
         if let Some(line) = waiting_line(stage.waiting.as_ref()) {
             println!("    {line}");
         }
+        if let Some(reason) = stage.failure_reason.as_deref() {
+            println!("    reason: {reason}");
+        }
     }
     println!();
     println!("Attention");

@@ -354,7 +354,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
     let width = area.width.saturating_sub(3);
     let mut lines = vec![theme::centered_rule(width), theme::section("STATUS")];
     lines.extend(
-        status_sentences(details, now)
+        status_sentences(details, now, width)
             .into_iter()
             .map(|sentence| Line::from(Span::styled(sentence, theme::text()))),
     );
@@ -369,10 +369,59 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
     );
 }
 
+/// A char budget for `format::truncate_title` that leaves room for the
+/// ellipsis it appends on top of whatever budget it is given: passing a hard
+/// column width straight through would let a truncated line land one column
+/// past it, which Ratatui then wraps — pushing whatever follows down a row.
+/// Char count, not true display width, matching every other width budget in
+/// this file (`span_width`, the footer's navigation-hint fitting): this
+/// codebase has no display-width-aware helper, and every line it truncates
+/// this way is already assumed to render as one column per `char`.
+fn ellipsis_budget(width: usize) -> usize {
+    width.saturating_sub(1).max(1)
+}
+
+/// The strip's `RunStatus::Failed` sentence for the blocking failed stage.
+///
+/// Bounds the *composed* sentence to `width`, not just the reason: at the
+/// narrowest supported terminal (the 50-column minimum leaves the rail only
+/// about 16 columns) even the bare `"<Stage> failed: "` prefix can already
+/// exceed the available width — "Implementation failed: " alone is 23
+/// characters. Truncating only the reason to whatever budget was left after
+/// subtracting the prefix's length still let an oversized prefix push the
+/// whole line past `width` once the reason and its ellipsis were appended.
+/// When there is not even room for the prefix plus one character of reason,
+/// the reason is dropped for the reasonless generic sentence instead of a
+/// truncation that would land mid-word or mid-prefix.
+fn failed_stage_sentence(
+    stage_kind: StageKind,
+    failure_reason: Option<&str>,
+    width: u16,
+) -> String {
+    let title = stage_title(stage_kind);
+    let Some(reason) = failure_reason else {
+        return format!("{title} failed — its logs say why.");
+    };
+    let prefix = format!("{title} failed: ");
+    let composed = format!("{prefix}{reason}");
+    let width = width as usize;
+    if composed.chars().count() <= width {
+        return composed;
+    }
+    let budget = ellipsis_budget(width);
+    if prefix.chars().count() >= budget {
+        return format!("{title} failed — its logs say why.");
+    }
+    format::truncate_title(&composed, budget)
+}
+
 /// What the run is doing right now, then how far along it is. The first
 /// sentence follows the run's canonical status; the second counts stages, so
-/// both stay facts the domain already asserted.
-fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
+/// both stay facts the domain already asserted. `width` bounds the failure
+/// reason: the strip is a fixed [`STATUS_HEIGHT`] rows, so a long reason must
+/// be cut to fit its line rather than wrap and push the stage-count sentence
+/// out of the box.
+fn status_sentences(details: &RunDetails, now: DateTime<Utc>, width: u16) -> Vec<String> {
     let running = details
         .stages
         .iter()
@@ -397,13 +446,17 @@ fn status_sentences(details: &RunDetails, now: DateTime<Utc>) -> Vec<String> {
         RunStatus::Completed => completed_sentence(details),
         RunStatus::Applied => "Changes applied to the repository.".to_owned(),
         RunStatus::Discarded => "Run discarded.".to_owned(),
+        // The blocking stage, never merely the first failed one in workflow
+        // order: an optional dependency can fail without stopping the run,
+        // so a stage that failed on the way to the real, completion-blocking
+        // failure elsewhere must not be mistaken for the cause.
         RunStatus::Failed => details
             .stages
             .iter()
-            .find(|stage| stage.status == StageStatus::Failed)
+            .find(|stage| stage.status == StageStatus::Failed && stage.blocking)
             .map_or_else(
                 || "Run failed.".to_owned(),
-                |stage| format!("{} failed — its logs say why.", stage_title(stage.kind)),
+                |stage| failed_stage_sentence(stage.kind, stage.failure_reason.as_deref(), width),
             ),
         RunStatus::Paused | RunStatus::Interrupted => {
             "Run suspended — resume when ready.".to_owned()
@@ -622,11 +675,10 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         runtime_summary(selected),
         theme::muted(),
     )));
-    if details.attention.is_empty()
-        && !applyable
-        && let Some(activity) = activity_message(selected)
-    {
-        lines.push(Line::from(Span::styled(activity, theme::text())));
+    if details.attention.is_empty() && !applyable {
+        if let Some(activity) = hero_activity_text(selected, width) {
+            lines.push(Line::from(Span::styled(activity, theme::text())));
+        }
     }
     lines.push(Line::from(""));
     // After the pivot the panel speaks for the run, so the result section
@@ -851,6 +903,26 @@ const fn outcome_phrase(outcome: DependencyOutcome) -> &'static str {
     match outcome {
         DependencyOutcome::Failed => "failed",
         DependencyOutcome::Skipped => "was skipped",
+    }
+}
+
+/// The hero's one-line "what's happening" text. A failed stage's own reason
+/// outranks the generic [`activity_message`] — it is the one place the hero
+/// says *why*, not just *that* — truncated to fit `width` so the hero stays
+/// a hero, not a log viewer: an untruncated line would wrap in Ratatui and
+/// push whatever follows it down a row. Every other status, Pending/Ready
+/// included, falls through to `activity_message`, which derives its own
+/// waiting/blocked-on text from `stage.waiting`.
+fn hero_activity_text(stage: &StageSummary, width: u16) -> Option<String> {
+    if stage.status == StageStatus::Failed
+        && let Some(reason) = stage.failure_reason.as_deref()
+    {
+        Some(format::truncate_title(
+            reason,
+            ellipsis_budget(width as usize),
+        ))
+    } else {
+        activity_message(stage)
     }
 }
 
@@ -2426,6 +2498,8 @@ mod tests {
             started_at: None,
             finished_at: None,
             waiting: None,
+            failure_reason: None,
+            blocking: false,
         }
     }
 
@@ -2510,6 +2584,7 @@ mod tests {
             ]),
             started_at: None,
             finished_at: None,
+            failure_reason: None,
         }
     }
 
@@ -2980,6 +3055,265 @@ mod tests {
         assert!(
             !text.contains("provider exited"),
             "raw provider metadata stays out of the operational view"
+        );
+    }
+
+    /// The failure reason folded onto a stage is the one place the operator
+    /// learns *why* without ever leaving the panel: the strip's sentence and
+    /// the hero's activity line both show it in place of the generic text.
+    #[test]
+    fn a_failed_stage_shows_its_reason_instead_of_generic_text() {
+        let mut state = running_state();
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::Failed;
+        details.stages[1].status = StageStatus::Failed;
+        details.stages[1].finished_at = Some(at(12, 3, 0));
+        details.stages[1].failure_reason = Some("compile failed: missing semicolon".to_owned());
+        details.stages[1].blocking = true;
+
+        let sentences = status_sentences(state.details.as_ref().unwrap(), at(12, 13, 0), 160);
+        assert_eq!(
+            sentences[0],
+            "Implementation failed: compile failed: missing semicolon"
+        );
+
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("compile failed: missing semicolon"));
+        assert!(
+            !text.contains("The provider ended this stage before it completed"),
+            "the reason replaces the generic activity line, not adds to it"
+        );
+    }
+
+    /// A stage that failed without the runtime reporting why keeps the
+    /// generic activity text — the reason is a bonus, never a requirement.
+    #[test]
+    fn a_failed_stage_without_a_reason_keeps_the_generic_text() {
+        let mut state = running_state();
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::Failed;
+        details.stages[1].status = StageStatus::Failed;
+        details.stages[1].finished_at = Some(at(12, 3, 0));
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("The provider ended this stage before it completed"));
+    }
+
+    /// The strip is a fixed [`STATUS_HEIGHT`] rows. A reason near the 200
+    /// character cap must be cut to the strip's own width rather than wrap
+    /// and push the stage-count sentence out of the box.
+    #[test]
+    fn status_strip_truncates_a_long_reason_to_fit_the_available_width() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        failing.blocking = true;
+        let run = details(RunStatus::Failed, vec![failing]);
+
+        let width = 40u16;
+        let sentences = status_sentences(&run, at(12, 13, 0), width);
+        assert!(
+            sentences[0].chars().count() <= width as usize,
+            "the reason line must fit the strip's fixed width: {:?}",
+            sentences[0]
+        );
+        assert!(sentences[0].ends_with('…'), "the cut is visible");
+        assert_eq!(
+            sentences[1], "0 of 1 stages complete, 1 failed.",
+            "the stage-count sentence survives a long reason instead of being pushed out"
+        );
+    }
+
+    /// At the 50-column supported minimum the rail's inner width is only
+    /// about 16 columns — narrower than truncating just the reason ever
+    /// accounted for, since the untruncated `"<Stage> failed: "` prefix could
+    /// still push the composed line past `width`. With a short stage title
+    /// the prefix itself still fits, so the fix (bounding the whole composed
+    /// sentence) must truncate successfully rather than fall back, and the
+    /// result must never exceed the strip's width.
+    #[test]
+    fn status_strip_bounds_the_whole_composed_sentence_at_a_16_column_width() {
+        let mut failing = stage(
+            "fix",
+            StageKind::Fix,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        failing.blocking = true;
+        let run = details(RunStatus::Failed, vec![failing]);
+
+        let width = 16u16;
+        let sentences = status_sentences(&run, at(12, 13, 0), width);
+        assert!(
+            sentences[0].chars().count() <= width as usize,
+            "the composed sentence must fit the strip's width: {:?}",
+            sentences[0]
+        );
+        assert!(
+            sentences[0].starts_with("Fix failed: "),
+            "the prefix must survive intact, not be cut mid-word: {:?}",
+            sentences[0]
+        );
+        assert!(sentences[0].ends_with('…'), "the cut is visible");
+        assert_eq!(
+            sentences[1], "0 of 1 stages complete, 1 failed.",
+            "the stage-count sentence survives a bounded composed sentence"
+        );
+    }
+
+    /// The real bug this guards: `"Implementation failed: "` alone is 23
+    /// characters, already wider than the ~16-column rail at the smallest
+    /// supported terminal. No truncation of that prefix can produce anything
+    /// legible, so rather than land mid-word the strip drops the reason
+    /// entirely and falls back to the reasonless generic sentence — the same
+    /// text shown when a failed stage carries no reason at all. This
+    /// necessarily still exceeds 16 columns (an unavoidable consequence of
+    /// naming a 14-character stage at that width, present before failure
+    /// reasons existed), but the stage-count sentence must still be exactly
+    /// right — proving the fallback never corrupts anything past it.
+    #[test]
+    fn status_strip_falls_back_to_the_generic_sentence_when_even_the_prefix_cannot_fit() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        failing.blocking = true;
+        let run = details(RunStatus::Failed, vec![failing]);
+
+        let sentences = status_sentences(&run, at(12, 13, 0), 16);
+        assert_eq!(
+            sentences[0], "Implementation failed — its logs say why.",
+            "an unfittable prefix falls back cleanly instead of a garbled truncation"
+        );
+        assert_eq!(
+            sentences[1], "0 of 1 stages complete, 1 failed.",
+            "the stage-count sentence survives even the fallback path"
+        );
+    }
+
+    /// `format::truncate_title` appends its ellipsis on top of the budget it
+    /// is handed, so passing the panel's full width straight through used to
+    /// yield one character past it — Ratatui would then wrap that line and
+    /// shift the result section down a row. The rendered activity line must
+    /// never exceed the panel width it was truncated to.
+    #[test]
+    fn hero_activity_text_never_exceeds_the_panel_width_it_was_truncated_to() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        for width in [10u16, 30, 50, 80] {
+            let text = hero_activity_text(&failing, width).unwrap();
+            assert!(
+                text.chars().count() <= width as usize,
+                "width {width}: {text:?} is {} chars",
+                text.chars().count()
+            );
+            assert!(
+                text.ends_with('…'),
+                "width {width}: the cut must be visible"
+            );
+        }
+    }
+
+    /// A short reason that already fits is never truncated or given a false
+    /// ellipsis just because the budget reservation exists.
+    #[test]
+    fn hero_activity_text_leaves_a_short_reason_untouched() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("compile failed".to_owned());
+        assert_eq!(
+            hero_activity_text(&failing, 80),
+            Some("compile failed".to_owned())
+        );
+    }
+
+    /// A non-failed status, or a failed one with no reason, falls back to
+    /// the generic typed activity text regardless of width.
+    #[test]
+    fn hero_activity_text_falls_back_to_the_generic_message_without_a_reason() {
+        let failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        assert_eq!(
+            hero_activity_text(&failing, 80),
+            Some("The provider ended this stage before it completed".to_owned())
+        );
+        let running = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Running,
+        );
+        assert_eq!(
+            hero_activity_text(&running, 80),
+            Some("Agent is working…".to_owned())
+        );
+    }
+
+    /// The composed priority order end to end: a failed stage with a reason
+    /// shows the reason; a Pending/Ready stage falls through to the waiting
+    /// text `activity_message` derives from `stage.waiting`; neither
+    /// feature regresses the other now that both live on `StageSummary`.
+    #[test]
+    fn hero_activity_text_prefers_the_failure_reason_over_waiting_info_by_status() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("compile failed".to_owned());
+        failing.waiting = Some(StageWaitingSummary {
+            waiting_on: vec![StageDependencyRef {
+                id: StageId::new("architecture").unwrap(),
+                kind: StageKind::Architecture,
+            }],
+            blocked_by: Vec::new(),
+            degraded: Vec::new(),
+        });
+        assert_eq!(
+            hero_activity_text(&failing, 80),
+            Some("compile failed".to_owned()),
+            "a failure reason outranks stale waiting info on the same stage"
+        );
+
+        let mut pending = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Pending,
+        );
+        pending.waiting = Some(StageWaitingSummary {
+            waiting_on: vec![StageDependencyRef {
+                id: StageId::new("architecture").unwrap(),
+                kind: StageKind::Architecture,
+            }],
+            blocked_by: Vec::new(),
+            degraded: Vec::new(),
+        });
+        assert_eq!(
+            hero_activity_text(&pending, 80),
+            Some("Waiting on: Architecture".to_owned()),
+            "a Pending stage with no failure falls through to its waiting info"
         );
     }
 
@@ -3586,7 +3920,7 @@ mod tests {
     fn a_run_completed_over_a_failure_says_so_everywhere_it_counts() {
         // The sentences are asserted at the seam — the rendered rail wraps
         // long lines, so `contains` on the screen text cannot see them whole.
-        let sentences = status_sentences(&completed_with_failure_details(), at(12, 13, 0));
+        let sentences = status_sentences(&completed_with_failure_details(), at(12, 13, 0), 160);
         assert_eq!(
             sentences[0],
             "Run complete — Spec review failed, but the decision was still reached. \

@@ -235,6 +235,70 @@ impl Run {
         self.stages.iter().find(|stage| stage.id() == stage_id)
     }
 
+    /// Which stages, if any, presently stand between this run and
+    /// completion: one that has not reached a terminal outcome yet, or a
+    /// failed one the workflow graph cannot route around — a leaf with no
+    /// dependents, or one with a dependent that requires it rather than
+    /// merely tolerating its absence. A failed stage whose only dependents
+    /// treat it as optional is not a blocker: the workflow already planned
+    /// for exactly this, and something downstream is expected to carry on in
+    /// degraded mode.
+    ///
+    /// Read-only and side-effect-free, unlike the identical check
+    /// `transition(RunTransition::Complete, ..)` runs internally — this is
+    /// the only way to ask the question without attempting the transition,
+    /// which only a `Running` run can do in the first place. A caller that
+    /// wants *the* blocking failed stage of an already-`Failed` run (whose
+    /// other stages the fail transition already resolved to a terminal
+    /// status) filters this for [`CompletionBlockerReason::FailedLeafStage`]
+    /// or [`CompletionBlockerReason::RequiredStageFailed`].
+    #[must_use]
+    pub fn completion_blockers(&self) -> Vec<CompletionBlocker> {
+        let mut blockers = Vec::new();
+        for stage in &self.stages {
+            if !stage.status().is_terminal_outcome() {
+                blockers.push(CompletionBlocker {
+                    stage_id: stage.id().clone(),
+                    status: stage.status(),
+                    reason: CompletionBlockerReason::StageNotTerminal,
+                });
+                continue;
+            }
+            if stage.status() != StageStatus::Failed {
+                continue;
+            }
+
+            let dependent_edges = self
+                .stages
+                .iter()
+                .flat_map(|dependent| {
+                    dependent
+                        .dependencies()
+                        .iter()
+                        .filter(move |dependency| dependency.stage_id() == stage.id())
+                })
+                .collect::<Vec<_>>();
+            let reason = if dependent_edges.is_empty() {
+                Some(CompletionBlockerReason::FailedLeafStage)
+            } else if dependent_edges
+                .iter()
+                .any(|dependency| dependency.kind() == DependencyKind::Required)
+            {
+                Some(CompletionBlockerReason::RequiredStageFailed)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                blockers.push(CompletionBlocker {
+                    stage_id: stage.id().clone(),
+                    status: stage.status(),
+                    reason,
+                });
+            }
+        }
+        blockers
+    }
+
     #[must_use]
     pub fn attention_requests(&self) -> &[AttentionRequest] {
         &self.attention_requests
@@ -950,48 +1014,7 @@ impl Run {
     }
 
     fn ensure_completion_allowed(&self) -> Result<(), RunTransitionError> {
-        let mut blockers = Vec::new();
-        for stage in &self.stages {
-            if !stage.status().is_terminal_outcome() {
-                blockers.push(CompletionBlocker {
-                    stage_id: stage.id().clone(),
-                    status: stage.status(),
-                    reason: CompletionBlockerReason::StageNotTerminal,
-                });
-                continue;
-            }
-            if stage.status() != StageStatus::Failed {
-                continue;
-            }
-
-            let dependent_edges = self
-                .stages
-                .iter()
-                .flat_map(|dependent| {
-                    dependent
-                        .dependencies()
-                        .iter()
-                        .filter(move |dependency| dependency.stage_id() == stage.id())
-                })
-                .collect::<Vec<_>>();
-            let reason = if dependent_edges.is_empty() {
-                Some(CompletionBlockerReason::FailedLeafStage)
-            } else if dependent_edges
-                .iter()
-                .any(|dependency| dependency.kind() == DependencyKind::Required)
-            {
-                Some(CompletionBlockerReason::RequiredStageFailed)
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                blockers.push(CompletionBlocker {
-                    stage_id: stage.id().clone(),
-                    status: stage.status(),
-                    reason,
-                });
-            }
-        }
+        let blockers = self.completion_blockers();
         if self.pending_attention_count() > 0 {
             return Err(RunTransitionError::PendingAttention);
         }

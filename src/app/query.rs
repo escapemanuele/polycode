@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::domain::{
     ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
-    DependencyOutcome, DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus,
-    StageDependencyReport, StageId, StageKind, StageStatus, WorkflowKind,
+    CompletionBlockerReason, DependencyOutcome, DomainEventKind, EffortSetting, NativeModelUsage,
+    Role, RunId, RunStatus, StageDependencyReport, StageId, StageKind, StageStatus, WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
 use crate::providers::{InputAccounting, input_accounting};
@@ -65,6 +65,21 @@ pub struct StageSummary {
     /// every other status, and for a Pending/Ready stage whose dependencies
     /// are all satisfied (the scheduler just hasn't marked it Ready yet).
     pub waiting: Option<StageWaitingSummary>,
+    /// Why the stage's current attempt ended in failure, folded from the last
+    /// committed `ProviderFailed` event that carried one. Sanitized to one
+    /// line and capped for display; see [`sanitize_failure_reason`]. `None`
+    /// when the stage never failed, or failed without the runtime reporting
+    /// why.
+    pub failure_reason: Option<String>,
+    /// Whether this stage's failure is one the workflow graph cannot route
+    /// around: a failed leaf stage, or a failed stage with a dependent that
+    /// requires it rather than merely tolerating its absence. Reuses
+    /// [`crate::domain::Run::completion_blockers`], the same notion the
+    /// engine checks before letting a run complete. Always `false` for a
+    /// stage that has not failed, and for a failed stage every one of whose
+    /// dependents treats it as optional — the workflow already planned for
+    /// exactly that, and something downstream carries on in degraded mode.
+    pub blocking: bool,
 }
 
 /// One dependency stage referenced from a [`StageWaitingSummary`] bucket,
@@ -273,6 +288,11 @@ pub struct RunDetails {
     /// `RunStarted` and terminal run events. Resuming does not restart it.
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// The blocking failed stage's [`StageSummary::failure_reason`], carried
+    /// up so a run-level view never has to walk `stages` to find it. `None`
+    /// unless `status` is `RunStatus::Failed`, and `None` even then when the
+    /// failed stage carries no reason.
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -415,6 +435,23 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         })
         .collect::<Vec<_>>();
     routes.sort_by_key(|route| role_order(route.role));
+    // The stages, if any, whose failure the workflow graph cannot route
+    // around — reused per stage below so a failed-but-optional dependency
+    // (degraded-tolerant, like a review the workflow can complete without)
+    // never gets mistaken for the failure that actually stopped the run.
+    let blocking_failed_stages: std::collections::HashSet<StageId> = loaded
+        .run
+        .completion_blockers()
+        .into_iter()
+        .filter(|blocker| {
+            matches!(
+                blocker.reason,
+                CompletionBlockerReason::FailedLeafStage
+                    | CompletionBlockerReason::RequiredStageFailed
+            )
+        })
+        .map(|blocker| blocker.stage_id)
+        .collect();
     let mut stages = Vec::new();
     for stage in loaded.run.stages() {
         let (started_at, finished_at) = stage_span(&events, stage.id());
@@ -464,6 +501,8 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .run
             .stage_dependency_report(stage.id())
             .map(|report| waiting_summary(&loaded.run, report));
+        let failure_reason = stage_failure_reason(&events, stage.id());
+        let blocking = blocking_failed_stages.contains(stage.id());
         stages.push(StageSummary {
             id: stage.id().clone(),
             kind: stage.kind(),
@@ -501,8 +540,23 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             started_at,
             finished_at,
             waiting,
+            failure_reason,
+            blocking,
         });
     }
+    // The run's own reason is the *blocking* failed stage's — never merely
+    // the first failed stage in workflow order, which can be a degraded,
+    // non-blocking optional dependency that failed on the way to a
+    // completion-blocking failure somewhere else. A caller showing run-level
+    // status never has to walk `stages` looking for the right one.
+    let failure_reason = (loaded.run.status() == RunStatus::Failed)
+        .then(|| {
+            stages
+                .iter()
+                .find(|stage| stage.status == StageStatus::Failed && stage.blocking)
+                .and_then(|stage| stage.failure_reason.clone())
+        })
+        .flatten();
     Ok(RunDetails {
         id: loaded.run.id(),
         task: input.map(|input| input.task().to_owned()),
@@ -554,7 +608,81 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         usage,
         started_at: run_span.0,
         finished_at: run_span.1,
+        failure_reason,
     })
+}
+
+/// One display line: whitespace/newlines collapsed to single spaces, every
+/// remaining control character replaced with a visible placeholder, and
+/// capped at [`FAILURE_REASON_LIMIT`] characters with an ellipsis.
+///
+/// Persisted reasons are free text from provider stderr or an exit message:
+/// untrimmed, possibly multi-line, unbounded in length, and never sanitized
+/// upstream. That text flows verbatim into a TUI span and CLI stdout, so
+/// beyond whitespace collapse this also strips every C0/C1 control character
+/// (ESC, BEL, raw ANSI escape sequences, …) — left alone, a garbled or
+/// hostile reason could move the cursor or repaint the operator's terminal.
+/// Every surface that shows a reason wants the same short, single-line, safe
+/// form, so the fold produces it once here instead of each caller
+/// re-deriving it. `None` only for a reason that is empty or all whitespace.
+const FAILURE_REASON_LIMIT: usize = 200;
+
+/// Whether a character must never reach a terminal buffer unescaped.
+/// `char::is_control()` covers the C0 range (including ESC and BEL) and C1,
+/// but misses DEL and the zero-width family some terminals still act on —
+/// the same extra guard the TUI's own `viewer_line` sanitizer uses for diff
+/// and log content.
+fn is_terminal_unsafe(character: char) -> bool {
+    character.is_control() || matches!(character, '\u{7f}'..='\u{9f}' | '\u{200b}'..='\u{200f}')
+}
+
+/// Single bounded pass, deliberately: a persisted reason is untrusted,
+/// unbounded-length free text (a garbled or hostile provider record can run
+/// to tens of megabytes), and the naive approach — collapse the whole thing,
+/// escape the whole collapsed copy, then take a prefix — allocates multiple
+/// full-length copies before ever looking at the 200-character budget. This
+/// instead builds the output incrementally and stops consuming the input the
+/// moment the budget (plus room for the ellipsis) is spent, so memory use
+/// stays a small constant regardless of how long `reason` is.
+fn sanitize_failure_reason(reason: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut len = 0usize;
+    let mut pending_space = false;
+    let mut truncated = false;
+    for character in reason.chars() {
+        if character.is_whitespace() {
+            // Leading whitespace never becomes a visible leading space.
+            if len > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        // The pending collapsed space and the character itself both need to
+        // fit inside the budget, or neither is written this iteration.
+        let needed = if pending_space { 2 } else { 1 };
+        if len + needed > FAILURE_REASON_LIMIT {
+            truncated = true;
+            break;
+        }
+        if pending_space {
+            output.push(' ');
+            len += 1;
+            pending_space = false;
+        }
+        output.push(if is_terminal_unsafe(character) {
+            '\u{fffd}'
+        } else {
+            character
+        });
+        len += 1;
+    }
+    if output.is_empty() {
+        return None;
+    }
+    if truncated {
+        output.push('…');
+    }
+    Some(output)
 }
 
 /// Folds the run's semantic span from committed lifecycle events. Resuming
@@ -630,6 +758,45 @@ fn stage_span(
         }
     }
     span
+}
+
+/// Folds one stage's failure reason from its committed `ProviderFailed`
+/// events, keyed by the event envelope's own `stage_id` — the same
+/// attribution [`stage_execution_evidence`] uses, so a stage that ran
+/// somewhere other than where it was routed is still charged the reason it
+/// actually reported.
+///
+/// Scoped to the current attempt only: `StageStarted` and
+/// `StageRetryScheduled` both close out whatever the previous attempt
+/// reported, matching the attempt boundary the scheduler's own checkpoint
+/// fold uses (`StageRetryScheduled` advances `attempt` in
+/// `engine::scheduler::reduce_checkpoint`). Without this, a retried stage
+/// that is still pending — or has since succeeded — would go on reporting
+/// the failure of the attempt it already left behind. Within one attempt the
+/// *last* reason wins, and a terminal `ProviderFailed` with no reason never
+/// erases an earlier one that had it.
+fn stage_failure_reason(events: &[SequencedEvent], stage_id: &StageId) -> Option<String> {
+    let mut reason = None;
+    for event in events
+        .iter()
+        .filter(|event| event.event.stage_id() == Some(stage_id))
+    {
+        match event.event.kind() {
+            DomainEventKind::StageStarted | DomainEventKind::StageRetryScheduled => {
+                reason = None;
+            }
+            DomainEventKind::ProviderFailed {
+                reason: Some(new_reason),
+                ..
+            } => {
+                if let Some(sanitized) = sanitize_failure_reason(new_reason) {
+                    reason = Some(sanitized);
+                }
+            }
+            _ => {}
+        }
+    }
+    reason
 }
 
 pub(crate) fn list_artifacts(
@@ -1379,6 +1546,232 @@ mod tests {
             )),
             "Compare 1 b and 2 b"
         );
+    }
+
+    fn provider_failed_event(sequence: u64, stage: &str, reason: Option<&str>) -> SequencedEvent {
+        event(
+            sequence,
+            at(12, 0, 0),
+            Some(stage),
+            DomainEventKind::ProviderFailed {
+                provider_id: crate::domain::ProviderId::new("codex").unwrap(),
+                session_id: None,
+                reason: reason.map(ToOwned::to_owned),
+            },
+        )
+    }
+
+    #[test]
+    fn stage_failure_reason_is_attributed_to_the_event_own_stage() {
+        let events = vec![
+            provider_failed_event(1, "research", Some("research provider timed out")),
+            provider_failed_event(
+                2,
+                "implementation",
+                Some("compile failed: missing semicolon"),
+            ),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("compile failed: missing semicolon".to_owned())
+        );
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("research").unwrap()),
+            Some("research provider timed out".to_owned())
+        );
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("decision").unwrap()),
+            None,
+            "a stage with no failure event carries no reason"
+        );
+    }
+
+    #[test]
+    fn stage_failure_reason_prefers_the_last_reason_within_one_attempt() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first signal: disk full")),
+            provider_failed_event(2, "implementation", Some("terminal: compile failed")),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("terminal: compile failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn stage_failure_reason_a_reasonless_failure_never_erases_an_earlier_one_in_the_same_attempt() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first attempt: OOM")),
+            provider_failed_event(2, "implementation", None),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("first attempt: OOM".to_owned())
+        );
+    }
+
+    /// A `StageRetryScheduled` closes out whatever the abandoned attempt
+    /// reported. A stage waiting to run again after that carries no reason —
+    /// showing the previous attempt's failure while the retry has not even
+    /// started would blame the wrong run.
+    #[test]
+    fn stage_failure_reason_clears_at_retry_while_the_new_attempt_is_pending() {
+        let events = vec![
+            event(
+                1,
+                at(12, 0, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+            provider_failed_event(2, "implementation", Some("first attempt: OOM")),
+            event(
+                3,
+                at(12, 1, 0),
+                Some("implementation"),
+                DomainEventKind::StageFailed,
+            ),
+            event(
+                4,
+                at(12, 2, 0),
+                Some("implementation"),
+                DomainEventKind::StageRetryScheduled,
+            ),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            None,
+            "a retried stage waiting to run again carries no stale reason"
+        );
+    }
+
+    /// A retry that goes on to succeed must never leave the abandoned
+    /// attempt's failure behind for a completed stage to still report.
+    #[test]
+    fn stage_failure_reason_clears_after_a_retry_that_succeeds() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first attempt: OOM")),
+            event(
+                2,
+                at(12, 1, 0),
+                Some("implementation"),
+                DomainEventKind::StageRetryScheduled,
+            ),
+            event(
+                3,
+                at(12, 2, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+            event(
+                4,
+                at(12, 3, 0),
+                Some("implementation"),
+                DomainEventKind::StageCompleted,
+            ),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            None,
+            "a retry that goes on to succeed leaves no reason behind"
+        );
+    }
+
+    /// A retry that fails again must report only the new attempt's reason,
+    /// never the one the abandoned attempt carried.
+    #[test]
+    fn stage_failure_reason_after_a_retry_reports_only_the_new_attempts_reason() {
+        let events = vec![
+            provider_failed_event(1, "implementation", Some("first attempt: OOM")),
+            event(
+                2,
+                at(12, 1, 0),
+                Some("implementation"),
+                DomainEventKind::StageRetryScheduled,
+            ),
+            event(
+                3,
+                at(12, 2, 0),
+                Some("implementation"),
+                DomainEventKind::StageStarted,
+            ),
+            provider_failed_event(4, "implementation", Some("second attempt: disk full")),
+        ];
+        assert_eq!(
+            stage_failure_reason(&events, &StageId::new("implementation").unwrap()),
+            Some("second attempt: disk full".to_owned()),
+            "the abandoned attempt's reason never leaks into the retry's own failure"
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_escapes_control_characters() {
+        assert_eq!(
+            sanitize_failure_reason("\u{1b}[31mCRASH\u{1b}[0m"),
+            Some("\u{fffd}[31mCRASH\u{fffd}[0m".to_owned()),
+            "an ANSI escape sequence must never reach the terminal unescaped"
+        );
+        assert_eq!(
+            sanitize_failure_reason("alert\u{7}bell"),
+            Some("alert\u{fffd}bell".to_owned())
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_collapses_whitespace_to_one_line() {
+        assert_eq!(
+            sanitize_failure_reason("exit code 1\n\nstderr:\n  compile failed\n"),
+            Some("exit code 1 stderr: compile failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_caps_long_text_with_ellipsis() {
+        let reason = "x".repeat(250);
+        let sanitized = sanitize_failure_reason(&reason).unwrap();
+        assert_eq!(
+            sanitized.chars().count(),
+            201,
+            "200 characters plus the ellipsis"
+        );
+        assert!(sanitized.ends_with('…'));
+        assert!(sanitized.starts_with(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn sanitize_failure_reason_leaves_short_text_untouched() {
+        assert_eq!(
+            sanitize_failure_reason("compile failed"),
+            Some("compile failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn sanitize_failure_reason_treats_blank_text_as_no_reason() {
+        assert_eq!(sanitize_failure_reason(""), None);
+        assert_eq!(sanitize_failure_reason("   \n\t  "), None);
+    }
+
+    /// A garbled or hostile provider record can run to tens of megabytes.
+    /// The bounded single-pass implementation must produce exactly the same
+    /// capped, single-line output a short input would — proving the early
+    /// break on the 200-character budget still yields correct results — and
+    /// must do it without the naive collapse-then-escape-then-slice approach
+    /// ever materializing a copy proportional to the input's length. The
+    /// interesting content sits in the first few characters and everything
+    /// after it is discarded padding, so a bounded scan finishes almost
+    /// immediately no matter how long the tail is; this is the property
+    /// `sanitize_failure_reason`'s doc comment claims.
+    #[test]
+    fn sanitize_failure_reason_caps_a_multi_megabyte_input() {
+        let huge = format!("compile failed{}", "z".repeat(8 * 1024 * 1024));
+        let sanitized = sanitize_failure_reason(&huge).unwrap();
+        assert_eq!(
+            sanitized.chars().count(),
+            201,
+            "200 characters plus the ellipsis, regardless of the input's real length"
+        );
+        assert!(sanitized.starts_with("compile failed"));
+        assert!(sanitized.ends_with('…'));
     }
 
     #[test]
