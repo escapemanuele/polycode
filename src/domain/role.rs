@@ -7,6 +7,7 @@ pub enum Role {
     Researcher,
     Architect,
     Implementer,
+    Simplifier,
     CodeQualityReviewer,
     SpecReviewer,
     /// Legacy/general review responsibility retained for persisted runs.

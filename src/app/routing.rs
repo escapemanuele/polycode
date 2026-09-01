@@ -171,6 +171,12 @@ const RECOMMENDED_V2_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
             basis: DecisionBasis::Inherited,
             rationale: "legacy_compatibility_route_inherited_from_recommended_v1",
         },
+        RecommendedDecision {
+            role: Role::Simplifier,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "new_role_no_measured_evidence_provisional_policy",
+        },
     ],
 };
 
@@ -1069,6 +1075,51 @@ mod tests {
 
     type CorruptConfig = (&'static str, fn(&mut Value));
 
+    /// The standard workflow as persisted by runs sealed before the
+    /// simplification stage existed. Old snapshots resolve against their own
+    /// stored graph, never against today's built-in.
+    fn pre_simplification_standard_workflow() -> WorkflowDefinition {
+        use crate::domain::{Dependency, StageId};
+        let id = |value: &str| StageId::new(value).unwrap();
+        let required = |value: &str| Dependency::required(id(value));
+        WorkflowDefinition::new(
+            WorkflowKind::Standard,
+            vec![
+                StageDefinition::new(
+                    id("architecture"),
+                    StageKind::Architecture,
+                    Role::Architect,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    id("implementation"),
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    vec![required("architecture")],
+                ),
+                StageDefinition::new(
+                    id("quality_review"),
+                    StageKind::CodeQualityReview,
+                    Role::CodeQualityReviewer,
+                    vec![required("implementation")],
+                ),
+                StageDefinition::new(
+                    id("spec_review"),
+                    StageKind::SpecReview,
+                    Role::SpecReviewer,
+                    vec![required("implementation"), required("architecture")],
+                ),
+                StageDefinition::new(
+                    id("decision"),
+                    StageKind::Decision,
+                    Role::EngineeringLead,
+                    vec![required("quality_review"), required("spec_review")],
+                ),
+            ],
+        )
+        .unwrap()
+    }
+
     fn snapshot(selection: ExecutionSelection, available: RecommendedAvailability) -> RoutingPlan {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
         let snapshot = resolve_config(
@@ -1121,6 +1172,7 @@ mod tests {
             (Role::SpecReviewer, "codex"),
             (Role::EngineeringLead, "claude"),
             (Role::Reviewer, "claude"),
+            (Role::Simplifier, "claude"),
         ];
         assert_eq!(provenance.decisions.len(), expected.len());
         for (role, provider) in expected {
@@ -1137,7 +1189,10 @@ mod tests {
     fn recommended_v1_snapshot_still_resolves_v1_routes_unchanged() {
         // Byte-level persisted v1 payload: SpecReviewer routed to Claude with
         // the original v1 reasons. Introducing v2 must not reinterpret it.
-        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        // The workflow is the graph such a run persisted — the standard
+        // workflow as it existed before the simplification stage, since a
+        // stored run resolves routes against its own stored graph.
+        let workflow = pre_simplification_standard_workflow();
         let mut routes = serde_json::Map::new();
         for (role, provider, reason) in [
             ("architect", "claude", "recommended_default"),
@@ -1278,7 +1333,7 @@ mod tests {
                 codex: true,
             },
         );
-        assert_eq!(plan.routes().count(), 5);
+        assert_eq!(plan.routes().count(), 6);
 
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Fast);
         let config = resolve_config(

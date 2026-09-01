@@ -1639,6 +1639,8 @@ mod tests {
                 .events([FakeEvent::Started, FakeEvent::Completed])
                 .stage("implementation")
                 .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("simplification")
+                .events([FakeEvent::Started, FakeEvent::Completed])
                 .stage("quality_review")
                 .events([FakeEvent::Started, FakeEvent::Completed])
                 .stage("spec_review")

@@ -1288,6 +1288,7 @@ mod tests {
         for stage in [
             "architecture",
             "implementation",
+            "simplification",
             "quality_review",
             "spec_review",
             "decision",
@@ -1313,13 +1314,13 @@ mod tests {
     #[test]
     fn a_rejected_run_grows_a_fix_and_a_fresh_decision_over_it_and_reopens() {
         let mut run = decided_run();
-        assert_eq!(run.stages().len(), 5);
+        assert_eq!(run.stages().len(), 6);
 
         let event = run.request_fix(metadata(200, 8)).unwrap();
 
         // The run reopens rather than a second run adopting its workspace.
         assert_eq!(run.status(), RunStatus::Running);
-        assert_eq!(run.stages().len(), 7);
+        assert_eq!(run.stages().len(), 8);
         assert!(matches!(
             event.kind(),
             DomainEventKind::RunFixRequested { stage_ids }
@@ -1418,7 +1419,7 @@ mod tests {
             .unwrap();
 
         run.request_fix(metadata(400, 10)).unwrap();
-        assert_eq!(run.stages().len(), 9);
+        assert_eq!(run.stages().len(), 10);
         assert_eq!(dependency_ids(&run, &id("fix_2")), vec!["decision_1"]);
         assert_eq!(
             dependency_ids(&run, &id("decision_2")),
@@ -1430,13 +1431,13 @@ mod tests {
     #[test]
     fn a_rejected_run_grows_a_follow_up_and_a_fresh_decision_over_it_and_reopens() {
         let mut run = decided_run();
-        assert_eq!(run.stages().len(), 5);
+        assert_eq!(run.stages().len(), 6);
 
         let event = run.request_continue(metadata(200, 8)).unwrap();
 
         // The run reopens rather than a second run adopting its workspace.
         assert_eq!(run.status(), RunStatus::Running);
-        assert_eq!(run.stages().len(), 7);
+        assert_eq!(run.stages().len(), 8);
         assert!(matches!(
             event.kind(),
             DomainEventKind::RunContinueRequested { stage_ids }
@@ -1501,7 +1502,7 @@ mod tests {
 
         run.request_continue(metadata(400, 10)).unwrap();
 
-        assert_eq!(run.stages().len(), 9);
+        assert_eq!(run.stages().len(), 10);
         assert_eq!(dependency_ids(&run, &id("fix_1")), vec!["decision"]);
         assert_eq!(
             dependency_ids(&run, &id("followup_1")),

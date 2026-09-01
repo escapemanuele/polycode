@@ -1325,6 +1325,8 @@ mod tests {
                 FakeEvent::Usage(UsageDelta::stable(120, 45)),
                 FakeEvent::Completed,
             ])
+            .stage("simplification")
+            .events([FakeEvent::Started, FakeEvent::Completed])
             .stage("quality_review")
             .events([FakeEvent::Started, FakeEvent::Completed])
             .stage("spec_review")

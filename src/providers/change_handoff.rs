@@ -47,16 +47,18 @@ pub enum ChangeHandoffError {
     Store(#[from] crate::store::StoreError),
 }
 
-/// Stages whose responsibility is judging the implementation receive change
-/// evidence. Researcher/Architect run before implementation exists;
-/// Implementer authored the change; EngineeringLead/Decision already receives
-/// both review artifacts as direct dependency evidence, so injecting the diff
-/// again would duplicate context without a demonstrated benefit.
+/// Stages whose responsibility is judging or reshaping the implementation
+/// receive change evidence. Researcher/Architect run before implementation
+/// exists; Implementer authored the change; EngineeringLead/Decision already
+/// receives both review artifacts as direct dependency evidence, so injecting
+/// the diff again would duplicate context without a demonstrated benefit. The
+/// Simplifier receives it because the run delta is the boundary of what it may
+/// touch.
 #[must_use]
 pub(crate) const fn stage_receives(role: Role) -> bool {
     matches!(
         role,
-        Role::CodeQualityReviewer | Role::SpecReviewer | Role::Reviewer
+        Role::Simplifier | Role::CodeQualityReviewer | Role::SpecReviewer | Role::Reviewer
     )
 }
 
@@ -443,6 +445,7 @@ mod tests {
 
     #[test]
     fn only_implementation_judging_roles_receive_handoff() {
+        assert!(stage_receives(Role::Simplifier));
         assert!(stage_receives(Role::CodeQualityReviewer));
         assert!(stage_receives(Role::SpecReviewer));
         assert!(stage_receives(Role::Reviewer));

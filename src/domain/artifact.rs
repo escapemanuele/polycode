@@ -9,6 +9,7 @@ pub enum ArtifactKind {
     Research,
     Architecture,
     Implementation,
+    Simplification,
     CodeQualityReview,
     SpecReview,
     /// Legacy/general review artifact retained for persisted records.

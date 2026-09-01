@@ -18,9 +18,10 @@ pub(crate) enum CodexSandbox {
 impl CodexSandbox {
     pub(crate) const fn for_stage(kind: StageKind) -> Self {
         match kind {
-            StageKind::Implementation | StageKind::Fix | StageKind::FollowUp => {
-                Self::WorkspaceWrite
-            }
+            StageKind::Implementation
+            | StageKind::Simplification
+            | StageKind::Fix
+            | StageKind::FollowUp => Self::WorkspaceWrite,
             StageKind::Research
             | StageKind::Architecture
             | StageKind::CodeQualityReview

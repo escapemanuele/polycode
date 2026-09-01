@@ -44,6 +44,12 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
             "Continue the work in this workspace as the operator instructs below. The previous decision artifact is context, not a boundary. Run proportionate verification. Return Markdown with # Follow-up and one section per instruction item stating what changed."
         }
         (Role::Implementer, _) => "Implement requested change and run proportionate verification.",
+        (Role::Simplifier, StageKind::Simplification) => {
+            "Simplify the implementation change in this workspace by removing accidental complexity, and touch nothing outside the changed lines and what they directly force. Reduce, never improve: delete comments that restate code, inline abstractions with one caller, remove speculative generality, dead branches, needless defensive layers, and configuration nothing requests. Preserve observable behavior exactly; when a simplification would change behavior, leave the code alone and note it. Run proportionate verification after editing. Return Markdown with # Simplification and one section per simplification stating what was removed and why, or a single ## No changes section when the implementation is already minimal; never invent work to justify the stage."
+        }
+        (Role::Simplifier, _) => {
+            "Simplify the existing change in this workspace without altering observable behavior. Reduce, never improve. Run proportionate verification."
+        }
         (Role::CodeQualityReviewer, _) => {
             "Assess implementation quality independently. Inspect actual repository state and do not edit files."
         }
@@ -79,6 +85,23 @@ mod tests {
         assert!(spec.contains("Missing, Wrong, or Unrequested"));
         assert!(spec.contains("tests as evidence rather than product truth"));
         assert_ne!(quality, spec);
+    }
+
+    /// The simplifier reduces the existing change; it is neither a second
+    /// implementation pass nor a review, and it may not grow the work or
+    /// change what it does.
+    #[test]
+    fn the_simplification_contract_reduces_within_the_delta_without_changing_behavior() {
+        let simplification = instruction(Role::Simplifier, StageKind::Simplification);
+        let implementation = instruction(Role::Implementer, StageKind::Implementation);
+        assert_ne!(simplification, implementation);
+        assert!(simplification.contains("Reduce, never improve"));
+        assert!(simplification.contains("touch nothing outside the changed lines"));
+        assert!(simplification.contains("Preserve observable behavior exactly"));
+        // An already-minimal change is a valid outcome, never a failure to
+        // find work.
+        assert!(simplification.contains("## No changes"));
+        assert!(simplification.contains("never invent work"));
     }
 
     /// A fix answers a verdict; it is not a second implementation pass.
