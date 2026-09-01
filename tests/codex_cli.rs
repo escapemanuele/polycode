@@ -279,14 +279,15 @@ fn standard_run_uses_separate_threads_direct_artifacts_and_stage_sandboxes() {
         RunStatus::Completed
     );
     let sessions = store.list_provider_sessions(run_id).unwrap();
-    assert_eq!(sessions.len(), 5);
+    assert_eq!(sessions.len(), 6);
     let native = sessions
         .iter()
         .map(|session| session.native_session_id().unwrap().as_str().to_owned())
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(native.len(), 5);
+    assert_eq!(native.len(), 6);
     assert!(native.contains("codex-thread-architecture"));
     assert!(native.contains("codex-thread-implementation"));
+    assert!(native.contains("codex-thread-simplification"));
     assert!(native.contains("codex-thread-quality_review"));
     assert!(native.contains("codex-thread-spec_review"));
     assert!(native.contains("codex-thread-decision"));
@@ -311,11 +312,13 @@ fn standard_run_uses_separate_threads_direct_artifacts_and_stage_sandboxes() {
     assert!(!decision.contains("# architecture result"));
     assert!(!decision.contains("# implementation result"));
     assert!(decision.contains("implementation quality and specification compliance"));
-    assert!(
-        fs::read_to_string(fixture.capture.join("implementation.argv"))
-            .unwrap()
-            .contains("--sandbox\nworkspace-write")
-    );
+    for stage in ["implementation", "simplification"] {
+        assert!(
+            fs::read_to_string(fixture.capture.join(format!("{stage}.argv")))
+                .unwrap()
+                .contains("--sandbox\nworkspace-write")
+        );
+    }
     for stage in ["architecture", "quality_review", "spec_review", "decision"] {
         assert!(
             fs::read_to_string(fixture.capture.join(format!("{stage}.argv")))

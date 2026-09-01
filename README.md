@@ -68,13 +68,13 @@ New runs use these graph definitions:
 ```text
 Fast:      Implementation
 
-Standard:  Architecture ---> Implementation ---> Code Quality Review --+
-                 |                |                                  |
-                 +----------------+--> Specification Review ---------+-> Decision
+Standard:  Architecture ---> Implementation ---> Simplification ---> Code Quality Review --+
+                 |                |                     |                                  |
+                 +----------------+---------------------+--> Specification Review ---------+-> Decision
 
-Deep:      Research -> Architecture ---> Implementation ---> Code Quality Review --+
-                                |                |                                  |
-                                +----------------+--> Specification Review ---------+-> Decision
+Deep:      Research -> Architecture ---> Implementation ---> Simplification ---> Code Quality Review --+
+                                |                |                     |                              |
+                                +----------------+---------------------+--> Specification Review -----+-> Decision
 
 Review:    Research -> Code Quality Review --+
                    `-> Specification Review -+-> Synthesis -> Decision
@@ -89,6 +89,8 @@ A decision is where a run ends, not where the operator's options do. `polycode f
 The run grows one cycle per request, keeping its workspace, its artifacts and its identity, so it stays one thing to apply or discard. The fix answers the decision that rejected it and is bounded by that decision's blocking findings; the fresh decision reads both the fix and the verdict it answers, and judges the fix against the code rather than against its own claims. Pressing fix again answers the newest verdict. Nothing re-runs the reviews — start a review run over the result if you want them back.
 
 Polycode never reads the verdict to decide whether a fix is warranted. A decision artifact is prose written for a person; classifying it as a rejection is not something the system can support, so the action is offered on any completed run that reached a decision and your asking is the whole signal.
+
+Simplification edits the implementation change in place before anyone judges it: it removes accidental complexity — comments that restate code, single-caller abstractions, speculative generality — bounded by the run delta and forbidden from changing observable behavior. It runs in a writable workspace like Implementation, and both reviews then inspect the simplified result, doubling as a safety net over its edits.
 
 Code Quality Review inspects actual repository state and judges how implementation is engineered. Specification Review independently compares delivered behavior with immutable task intent and available design evidence, classifying gaps as Missing, Wrong, or Unrequested. Both are read-only and create separate stage-ID-based Markdown artifacts. Existing persisted runs retain their original stored graph, including legacy generic review stages.
 
@@ -199,7 +201,7 @@ Effort persists as a per-role ResourcePlan inside the immutable config snapshot 
 
 ## Implementation change map for review stages
 
-Review stages (CodeQualityReviewer, SpecReviewer, and the legacy Reviewer role) receive a deterministic bounded implementation-change map in their initial prompt: the changed-file inventory (with change kind and binary markers) plus a bounded textual diff of the managed worktree relative to the immutable run base — the exact delta semantics used by apply and diff preview, including untracked files. The handoff is navigation evidence, not the source of truth: reviewers retain full access to the real worktree and must inspect code as needed. Binary contents are never injected. Oversized diffs are explicitly marked INCOMPLETE with the shown/total byte counts — never silently truncated — and the changed-file inventory is always complete even when the diff is bounded. The handoff is provider-neutral (one shared section, byte-identical across Claude and Codex) and removes redundant mechanical change discovery, especially for future runtimes launched with restricted read-only tool sets that cannot run `git diff` themselves. Researcher, Architect, Implementer, and Decision stages do not receive it; resume/continuation prompts stay compact and never re-inject it. Its prompt cost is visible through the existing injected-prompt-bytes telemetry.
+Review stages (CodeQualityReviewer, SpecReviewer, and the legacy Reviewer role) and the Simplifier — for which the run delta is the boundary of what it may touch — receive a deterministic bounded implementation-change map in their initial prompt: the changed-file inventory (with change kind and binary markers) plus a bounded textual diff of the managed worktree relative to the immutable run base — the exact delta semantics used by apply and diff preview, including untracked files. The handoff is navigation evidence, not the source of truth: reviewers retain full access to the real worktree and must inspect code as needed. Binary contents are never injected. Oversized diffs are explicitly marked INCOMPLETE with the shown/total byte counts — never silently truncated — and the changed-file inventory is always complete even when the diff is bounded. The handoff is provider-neutral (one shared section, byte-identical across Claude and Codex) and removes redundant mechanical change discovery, especially for future runtimes launched with restricted read-only tool sets that cannot run `git diff` themselves. Researcher, Architect, Implementer, and Decision stages do not receive it; resume/continuation prompts stay compact and never re-inject it. Its prompt cost is visible through the existing injected-prompt-bytes telemetry.
 
 ## Current CLI
 
@@ -258,7 +260,7 @@ Claude uses supported non-interactive stream JSON mode. Polycode leaves model se
 
 When Claude reports denied permission or question, Polycode persists attention and stops. Permission resolution approves only exact safely representable native tool rule and resumes same Claude session UUID in new managed invocation. Questions require `--response`; response becomes run-private stdin, never argv. If permission cannot be represented safely, resume fails closed.
 
-Codex uses documented non-interactive `codex exec --json` transport with prompt on immutable stdin. Native Codex authentication, config, `AGENTS.md`, rules, skills, hooks/trust checks, and MCP configuration remain active. Polycode selects `read-only` sandbox for non-mutating stages and `workspace-write` for Implementation/Fix, with explicit `--ask-for-approval never`; approval policy never disables sandbox. Polycode never passes `--yolo`, dangerous bypass, `danger-full-access`, `--ephemeral`, Git-check bypass, or config/rules bypass.
+Codex uses documented non-interactive `codex exec --json` transport with prompt on immutable stdin. Native Codex authentication, config, `AGENTS.md`, rules, skills, hooks/trust checks, and MCP configuration remain active. Polycode selects `read-only` sandbox for non-mutating stages and `workspace-write` for Implementation/Simplification/Fix, with explicit `--ask-for-approval never`; approval policy never disables sandbox. Polycode never passes `--yolo`, dangerous bypass, `danger-full-access`, `--ephemeral`, Git-check bypass, or config/rules bypass.
 
 Codex `thread.started` supplies opaque native thread identity; recovery resumes exact ID through a new managed invocation, never `--last`. Unknown valid JSONL records become durable non-semantic checkpoints; invalid complete records leave cursor untouched. Current stable exec JSON exposes no safe typed permission/question continuation, so Polycode never infers `NeedsUser` from prose. Native denial/terminal error fails stage instead. Successful `turn.completed` atomically records usage and completion from one raw record.
 

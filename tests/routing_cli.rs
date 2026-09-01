@@ -39,13 +39,14 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     assert_eq!(loaded.run.status(), RunStatus::Completed);
     assert_eq!(loaded.config_snapshot.schema_version(), 2);
     let sessions = store.list_provider_sessions(run_id).unwrap();
-    assert_eq!(sessions.len(), 5);
+    assert_eq!(sessions.len(), 6);
     let by_stage = sessions
         .iter()
         .map(|session| (session.stage_id().as_str(), session.provider_id().as_str()))
         .collect::<HashMap<_, _>>();
     assert_eq!(by_stage["architecture"], "claude");
     assert_eq!(by_stage["implementation"], "codex");
+    assert_eq!(by_stage["simplification"], "claude");
     assert_eq!(by_stage["quality_review"], "claude");
     assert_eq!(by_stage["spec_review"], "codex");
     assert_eq!(by_stage["decision"], "claude");
@@ -62,7 +63,7 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     assert!(decision.contains("# spec_review result"));
 
     let artifacts = store.list_artifacts(run_id).unwrap();
-    assert_eq!(artifacts.len(), 5);
+    assert_eq!(artifacts.len(), 6);
     for artifact in artifacts {
         let expected = by_stage[artifact.metadata().stage_id().as_str()];
         assert_eq!(

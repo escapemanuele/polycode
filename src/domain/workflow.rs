@@ -22,6 +22,10 @@ pub enum StageKind {
     Research,
     Architecture,
     Implementation,
+    /// A post-implementation pass that edits the change in place to remove
+    /// accidental complexity. Additive: it changes no persisted snapshot or
+    /// database shape, the same way `Fix` and `FollowUp` did before it.
+    Simplification,
     CodeQualityReview,
     SpecReview,
     /// Legacy/general review stage retained for persisted runs.
@@ -207,7 +211,10 @@ impl WorkflowDefinition {
         self.stages.iter().any(|stage| {
             matches!(
                 stage.kind(),
-                StageKind::Implementation | StageKind::Fix | StageKind::FollowUp
+                StageKind::Implementation
+                    | StageKind::Simplification
+                    | StageKind::Fix
+                    | StageKind::FollowUp
             )
         })
     }
@@ -237,16 +244,26 @@ fn standard_stages() -> Vec<StageDefinition> {
             vec![required("architecture")],
         ),
         stage(
+            "simplification",
+            StageKind::Simplification,
+            Role::Simplifier,
+            vec![required("implementation")],
+        ),
+        stage(
             "quality_review",
             StageKind::CodeQualityReview,
             Role::CodeQualityReviewer,
-            vec![required("implementation")],
+            vec![required("implementation"), required("simplification")],
         ),
         stage(
             "spec_review",
             StageKind::SpecReview,
             Role::SpecReviewer,
-            vec![required("implementation"), required("architecture")],
+            vec![
+                required("implementation"),
+                required("simplification"),
+                required("architecture"),
+            ],
         ),
         stage(
             "decision",
@@ -273,16 +290,26 @@ fn deep_stages() -> Vec<StageDefinition> {
             vec![required("architecture")],
         ),
         stage(
+            "simplification",
+            StageKind::Simplification,
+            Role::Simplifier,
+            vec![required("implementation")],
+        ),
+        stage(
             "quality_review",
             StageKind::CodeQualityReview,
             Role::CodeQualityReviewer,
-            vec![required("implementation")],
+            vec![required("implementation"), required("simplification")],
         ),
         stage(
             "spec_review",
             StageKind::SpecReview,
             Role::SpecReviewer,
-            vec![required("implementation"), required("architecture")],
+            vec![
+                required("implementation"),
+                required("simplification"),
+                required("architecture"),
+            ],
         ),
         stage(
             "decision",
@@ -712,14 +739,24 @@ mod tests {
         for kind in [WorkflowKind::Standard, WorkflowKind::Deep] {
             let workflow = WorkflowDefinition::built_in(kind);
             assert!(workflow.stage(&id("review")).is_none());
+            let simplification = workflow.stage(&id("simplification")).unwrap();
             let quality = workflow.stage(&id("quality_review")).unwrap();
             let spec = workflow.stage(&id("spec_review")).unwrap();
             let decision = workflow.stage(&id("decision")).unwrap();
+            assert_eq!(simplification.kind(), StageKind::Simplification);
+            assert_eq!(simplification.role(), Role::Simplifier);
+            assert_eq!(
+                simplification.dependencies(),
+                &[Dependency::required(id("implementation"))]
+            );
             assert_eq!(quality.kind(), StageKind::CodeQualityReview);
             assert_eq!(quality.role(), Role::CodeQualityReviewer);
             assert_eq!(
                 quality.dependencies(),
-                &[Dependency::required(id("implementation"))]
+                &[
+                    Dependency::required(id("implementation")),
+                    Dependency::required(id("simplification")),
+                ]
             );
             assert_eq!(spec.kind(), StageKind::SpecReview);
             assert_eq!(spec.role(), Role::SpecReviewer);
@@ -727,6 +764,7 @@ mod tests {
                 spec.dependencies(),
                 &[
                     Dependency::required(id("implementation")),
+                    Dependency::required(id("simplification")),
                     Dependency::required(id("architecture")),
                 ]
             );
@@ -753,6 +791,20 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&StageKind::SpecReview).unwrap(),
             "\"spec_review\""
+        );
+    }
+
+    /// Additive like `Fix` before it: the new variant round-trips through
+    /// the same inspectable snake-case shape, changing no persisted schema.
+    #[test]
+    fn simplification_stage_kind_round_trips_through_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&StageKind::Simplification).unwrap(),
+            "\"simplification\""
+        );
+        assert_eq!(
+            serde_json::from_str::<StageKind>("\"simplification\"").unwrap(),
+            StageKind::Simplification
         );
     }
 

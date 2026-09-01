@@ -879,10 +879,11 @@ const fn role_order(role: Role) -> u8 {
         Role::Researcher => 0,
         Role::Architect => 1,
         Role::Implementer => 2,
-        Role::CodeQualityReviewer => 3,
-        Role::SpecReviewer => 4,
-        Role::Reviewer => 5,
-        Role::EngineeringLead => 6,
+        Role::Simplifier => 3,
+        Role::CodeQualityReviewer => 4,
+        Role::SpecReviewer => 5,
+        Role::Reviewer => 6,
+        Role::EngineeringLead => 7,
     }
 }
 

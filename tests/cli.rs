@@ -38,7 +38,7 @@ fn deep_command_survives_process_restart_and_status_is_read_only() {
     // one run-wide figure. `fake` declares no input-accounting convention, so
     // its numbers are reported raw with nothing derived from them.
     assert!(
-        status_before.contains("Usage      fake     60 input units · 30 output units"),
+        status_before.contains("Usage      fake     70 input units · 35 output units"),
         "{status_before}"
     );
     assert!(status_before.contains("quality_review"));
