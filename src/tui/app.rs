@@ -1295,6 +1295,7 @@ mod tests {
                 process_status: None,
                 started_at: None,
                 finished_at: None,
+                waiting: None,
             }],
             attention: Vec::new(),
             usage: crate::app::RunUsage::default(),

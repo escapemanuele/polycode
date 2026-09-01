@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph
 
 use chrono::{DateTime, Utc};
 
-use crate::app::{RunDetails, StageSummary};
+use crate::app::{RunDetails, StageDependencyRef, StageSummary};
 use crate::domain::{AttentionKind, RunStatus, StageKind, StageStatus};
 
 use super::state::{Overlay, Screen, TuiState, UiMessageKind};
@@ -624,7 +624,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
     )));
     if details.attention.is_empty()
         && !applyable
-        && let Some(activity) = activity_message(selected.status)
+        && let Some(activity) = activity_message(selected)
     {
         lines.push(Line::from(Span::styled(activity, theme::text())));
     }
@@ -780,16 +780,54 @@ fn hero_clock(span: chrono::TimeDelta) -> String {
 /// and never repeating an action the actions row already offers. A completed
 /// stage says nothing: its badge already reads COMPLETED, and the result
 /// section below speaks for what it produced.
-const fn activity_message(status: StageStatus) -> Option<&'static str> {
-    match status {
-        StageStatus::Running => Some("Agent is working…"),
-        StageStatus::Pending | StageStatus::Ready => Some("Waiting for the previous stage"),
+fn activity_message(stage: &StageSummary) -> Option<String> {
+    match stage.status {
+        StageStatus::Running => Some("Agent is working…".to_owned()),
+        StageStatus::Pending | StageStatus::Ready => Some(waiting_message(stage)),
         StageStatus::Completed => None,
-        StageStatus::Failed => Some("The provider ended this stage before it completed"),
-        StageStatus::Paused | StageStatus::Interrupted => Some("Stage suspended"),
-        StageStatus::NeedsUser => Some("Waiting on you"),
-        StageStatus::Skipped => Some("Stage skipped by the workflow"),
+        StageStatus::Failed => Some("The provider ended this stage before it completed".to_owned()),
+        StageStatus::Paused | StageStatus::Interrupted => Some("Stage suspended".to_owned()),
+        StageStatus::NeedsUser => Some("Waiting on you".to_owned()),
+        StageStatus::Skipped => Some("Stage skipped by the workflow".to_owned()),
     }
+}
+
+/// Specific reason a Pending/Ready stage isn't running, one line. A required
+/// dependency having failed or been skipped outranks the others: this stage
+/// is about to be skipped in turn, which matters more than what it was
+/// otherwise waiting on. Degraded (optional deps failed/skipped) is
+/// informational and only appended once there is something to wait on.
+fn waiting_message(stage: &StageSummary) -> String {
+    use std::fmt::Write as _;
+
+    const FALLBACK: &str = "Waiting for the previous stage";
+    let Some(waiting) = &stage.waiting else {
+        return FALLBACK.to_owned();
+    };
+    if !waiting.blocked_by.is_empty() {
+        return format!("Blocked: {} failed", dependency_names(&waiting.blocked_by));
+    }
+    if waiting.waiting_on.is_empty() {
+        return FALLBACK.to_owned();
+    }
+    let mut message = format!("Waiting on: {}", dependency_names(&waiting.waiting_on));
+    if !waiting.degraded.is_empty() {
+        let _ = write!(
+            message,
+            " (degraded: {})",
+            dependency_names(&waiting.degraded)
+        );
+    }
+    message
+}
+
+/// Human titles for a bucket of dependency stages, comma-joined.
+fn dependency_names(dependencies: &[StageDependencyRef]) -> String {
+    dependencies
+        .iter()
+        .map(|dependency| stage_title(dependency.kind))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Operational runtime line: which agent is doing the work, at what effort.
@@ -2363,6 +2401,7 @@ mod tests {
             process_status: Some("exited".to_owned()),
             started_at: None,
             finished_at: None,
+            waiting: None,
         }
     }
 

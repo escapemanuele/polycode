@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::domain::{
     ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
-    DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus, StageId, StageKind,
-    StageStatus, WorkflowKind,
+    DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus,
+    StageDependencyReport, StageId, StageKind, StageStatus, WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
 use crate::providers::{InputAccounting, input_accounting};
@@ -61,6 +61,33 @@ pub struct StageSummary {
     /// stay `None` when a run's events carry no such evidence.
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Why this stage is not running, when it's Pending or Ready. `None` for
+    /// every other status, and for a Pending/Ready stage whose dependencies
+    /// are all satisfied (the scheduler just hasn't marked it Ready yet).
+    pub waiting: Option<StageWaitingSummary>,
+}
+
+/// One dependency stage referenced from a [`StageWaitingSummary`] bucket,
+/// carrying its kind so a caller can render a human title without a second
+/// lookup against the run's stage list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageDependencyRef {
+    pub id: StageId,
+    pub kind: StageKind,
+}
+
+/// Dependency readiness for one Pending/Ready stage, recomputed read-only
+/// from [`crate::domain::Run::stage_dependency_report`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageWaitingSummary {
+    /// Dependencies that have not finished yet.
+    pub waiting_on: Vec<StageDependencyRef>,
+    /// Required dependencies that failed or were skipped; this stage will be
+    /// skipped in turn.
+    pub blocked_by: Vec<StageDependencyRef>,
+    /// Optional dependencies that failed or were skipped; this stage will
+    /// still run, without them.
+    pub degraded: Vec<StageDependencyRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,6 +450,10 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .map(|process_id| store.load_managed_process(process_id))
             .transpose()?
             .map(|process| process.status().as_str().to_owned());
+        let waiting = loaded
+            .run
+            .stage_dependency_report(stage.id())
+            .map(|report| waiting_summary(&loaded.run, report));
         stages.push(StageSummary {
             id: stage.id().clone(),
             kind: stage.kind(),
@@ -459,6 +490,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             process_status,
             started_at,
             finished_at,
+            waiting,
         });
     }
     Ok(RunDetails {
@@ -531,6 +563,27 @@ fn run_span(events: &[SequencedEvent]) -> (Option<DateTime<Utc>>, Option<DateTim
         }
     }
     span
+}
+
+/// Resolves each bucket of a [`StageDependencyReport`] to the dependency
+/// stage's kind, so a caller can render a human title without a further
+/// lookup against the run's stage list.
+fn waiting_summary(run: &crate::domain::Run, report: StageDependencyReport) -> StageWaitingSummary {
+    let resolve = |ids: Vec<StageId>| {
+        ids.into_iter()
+            .filter_map(|id| {
+                run.stage(&id).map(|dependency| StageDependencyRef {
+                    kind: dependency.kind(),
+                    id,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    StageWaitingSummary {
+        waiting_on: resolve(report.waiting_on),
+        blocked_by: resolve(report.blocked_by),
+        degraded: resolve(report.degraded),
+    }
 }
 
 /// Folds one stage's semantic span from committed lifecycle events. Each

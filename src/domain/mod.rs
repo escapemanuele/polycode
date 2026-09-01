@@ -29,7 +29,7 @@ pub use role::Role;
 pub use run::{
     CompletionBlocker, CompletionBlockerReason, Run, RunAttentionError, RunFixError,
     RunInvariantError, RunProviderEventError, RunRehydrationError, RunStageError, RunStatus,
-    RunTransition, RunTransitionError,
+    RunTransition, RunTransitionError, StageDependencyReport,
 };
 pub use stage::{Stage, StageRehydrationError, StageStatus, StageTransition, StageTransitionError};
 pub use workflow::{

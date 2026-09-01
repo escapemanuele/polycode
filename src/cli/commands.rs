@@ -3,7 +3,7 @@ use clap::CommandFactory;
 
 use crate::app::{
     ApplyOutcome, ExecutionReport, ExecutionSelection, QuiescentState, RunDetails, RunService,
-    RuntimeProviderFactory, UniformProvider,
+    RuntimeProviderFactory, StageDependencyRef, StageWaitingSummary, UniformProvider,
 };
 use crate::domain::{DomainEventKind, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
@@ -672,6 +672,9 @@ fn print_details(details: &RunDetails) {
                 .unwrap_or("unavailable"),
             stage.process_status.as_deref().unwrap_or("unavailable")
         );
+        if let Some(line) = waiting_line(stage.waiting.as_ref()) {
+            println!("    {line}");
+        }
     }
     println!();
     println!("Attention");
@@ -692,6 +695,41 @@ fn print_details(details: &RunDetails) {
     for line in usage_lines(&details.usage) {
         println!("{line}");
     }
+}
+
+/// Why a Pending/Ready stage isn't running, as one extra indented CLI line.
+/// `None` when the stage isn't Pending/Ready, or its dependencies are all
+/// satisfied and the scheduler just hasn't marked it Ready yet. A blocked
+/// required dependency outranks the rest: this stage is about to be skipped
+/// in turn.
+fn waiting_line(waiting: Option<&StageWaitingSummary>) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let waiting = waiting?;
+    if !waiting.blocked_by.is_empty() {
+        return Some(format!(
+            "blocked by: {} failed",
+            dependency_ids(&waiting.blocked_by)
+        ));
+    }
+    if waiting.waiting_on.is_empty() {
+        return None;
+    }
+    let mut line = format!("waiting on: {}", dependency_ids(&waiting.waiting_on));
+    if !waiting.degraded.is_empty() {
+        let _ = write!(line, " (degraded: {})", dependency_ids(&waiting.degraded));
+    }
+    Some(line)
+}
+
+/// Raw dependency stage ids, comma-joined — same technical register as the
+/// stage rows above them.
+fn dependency_ids(dependencies: &[StageDependencyRef]) -> String {
+    dependencies
+        .iter()
+        .map(|dependency| dependency.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Provider-native units, one line per runtime that reported any.

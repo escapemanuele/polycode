@@ -1718,6 +1718,77 @@ mod tests {
         );
     }
 
+    /// The dependency information the scheduler computes and used to discard
+    /// is now queryable: a `decision` stage stalled behind an interrupted
+    /// `spec_review` reports exactly that stage as `waiting_on`, and reports
+    /// nothing for the sibling `quality_review` dependency it already has.
+    #[test]
+    fn inspect_reports_waiting_on_for_a_stage_stalled_on_an_unfinished_dependency() {
+        let fixture = Fixture::new();
+        let scenario = FakeScenario::new()
+            .stage("architecture")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("implementation")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("simplification")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("quality_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("spec_review")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::Interrupted,
+                FakeEvent::Completed,
+            ])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let interrupted = fixture
+            .scripted_service(scenario)
+            .start_run(
+                WorkflowKind::Standard,
+                "waiting reason for a stalled decision",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+
+        let decision = interrupted
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == StageId::new("decision").unwrap())
+            .expect("decision stage exists");
+        assert_eq!(decision.status, StageStatus::Pending);
+        let waiting = decision
+            .waiting
+            .as_ref()
+            .expect("a pending stage reports why it is not running");
+        assert_eq!(
+            waiting
+                .waiting_on
+                .iter()
+                .map(|dependency| dependency.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["spec_review".to_owned()],
+            "quality_review already completed, so only spec_review is outstanding"
+        );
+        assert!(waiting.blocked_by.is_empty());
+        assert!(waiting.degraded.is_empty());
+
+        // Every other stage has either finished or has nothing left to wait
+        // on, so none of them carries a waiting summary.
+        for stage in &interrupted.details.stages {
+            if stage.id != StageId::new("decision").unwrap() {
+                assert!(
+                    stage.waiting.is_none(),
+                    "stage {} unexpectedly carries a waiting summary",
+                    stage.id
+                );
+            }
+        }
+    }
+
     #[test]
     fn normalized_immutable_task_reaches_every_provider_poll_exactly() {
         let fixture = Fixture::new();

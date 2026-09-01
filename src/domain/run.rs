@@ -831,7 +831,12 @@ impl Run {
             .ok_or_else(|| RunStageError::UnknownStage(stage_id.clone()))
     }
 
-    fn ensure_stage_ready(&self, index: usize) -> Result<Vec<StageId>, RunStageError> {
+    /// Buckets one stage's dependencies into waiting / blocked / degraded.
+    ///
+    /// The single source of truth for dependency readiness: both the mutating
+    /// [`Self::ensure_stage_ready`] and the read-only
+    /// [`Self::stage_dependency_report`] call this, so they cannot drift.
+    fn dependency_buckets(&self, index: usize) -> Result<DependencyBuckets, RunStageError> {
         let stage = &self.stages[index];
         let mut waiting = Vec::new();
         let mut blocked = Vec::new();
@@ -851,19 +856,55 @@ impl Run {
                 _ => waiting.push(dependency.stage_id().clone()),
             }
         }
-        if !blocked.is_empty() {
+        Ok(DependencyBuckets {
+            waiting,
+            blocked,
+            degraded,
+        })
+    }
+
+    fn ensure_stage_ready(&self, index: usize) -> Result<Vec<StageId>, RunStageError> {
+        let stage = &self.stages[index];
+        let buckets = self.dependency_buckets(index)?;
+        if !buckets.blocked.is_empty() {
             return Err(RunStageError::RequiredDependenciesBlocked {
                 stage_id: stage.id().clone(),
-                dependencies: blocked,
+                dependencies: buckets.blocked,
             });
         }
-        if !waiting.is_empty() {
+        if !buckets.waiting.is_empty() {
             return Err(RunStageError::DependenciesNotFinished {
                 stage_id: stage.id().clone(),
-                dependencies: waiting,
+                dependencies: buckets.waiting,
             });
         }
-        Ok(degraded)
+        Ok(buckets.degraded)
+    }
+
+    /// Read-only recomputation of why a Pending/Ready stage is not running.
+    ///
+    /// Reuses the exact bucketing [`Self::ensure_stage_ready`] applies when it
+    /// decides, so this can never disagree with the scheduler's own verdict.
+    /// `None` for an unknown stage or one that isn't Pending/Ready: dependency
+    /// readiness is meaningless once a stage has moved past waiting.
+    #[must_use]
+    pub fn stage_dependency_report(&self, stage_id: &StageId) -> Option<StageDependencyReport> {
+        let index = self
+            .stages
+            .iter()
+            .position(|stage| stage.id() == stage_id)?;
+        if !matches!(
+            self.stages[index].status(),
+            StageStatus::Pending | StageStatus::Ready
+        ) {
+            return None;
+        }
+        let buckets = self.dependency_buckets(index).ok()?;
+        Some(StageDependencyReport {
+            waiting_on: buckets.waiting,
+            blocked_by: buckets.blocked,
+            degraded: buckets.degraded,
+        })
     }
 
     fn ensure_retry_safe(&self, stage_id: &StageId) -> Result<(), RunStageError> {
@@ -1109,6 +1150,29 @@ pub enum RunFixError {
     TooManyCycles,
     #[error(transparent)]
     Workflow(#[from] WorkflowDefinitionError),
+}
+
+/// Private working set shared by the mutating and read-only dependency
+/// paths. Never exposed: callers get either a [`RunStageError`] (mutating) or
+/// a [`StageDependencyReport`] (read-only).
+struct DependencyBuckets {
+    waiting: Vec<StageId>,
+    blocked: Vec<StageId>,
+    degraded: Vec<StageId>,
+}
+
+/// Why a Pending/Ready stage is not running yet, recomputed read-only.
+///
+/// Mirrors the buckets [`Run::ensure_stage_ready`] computes when it decides
+/// whether a stage may become `Ready`: `waiting_on` has not finished yet,
+/// `blocked_by` is a required dependency that failed or was skipped (this
+/// stage will be skipped in turn), `degraded` is an optional dependency that
+/// failed or was skipped (this stage will still run, without it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageDependencyReport {
+    pub waiting_on: Vec<StageId>,
+    pub blocked_by: Vec<StageId>,
+    pub degraded: Vec<StageId>,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -1790,6 +1854,188 @@ mod tests {
             event.kind(),
             &DomainEventKind::StageReady { degraded: true }
         );
+    }
+
+    /// The read-only report agrees with the mutating path it shares its
+    /// bucketing with: unfinished dependencies show up as `waiting_on`, and
+    /// `MarkReady` still refuses for the same reason.
+    #[test]
+    fn stage_dependency_report_lists_unfinished_dependencies_as_waiting_on() {
+        let research = id("research");
+        let independent = id("independent");
+        let synthesis = id("synthesis");
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Review,
+            vec![
+                StageDefinition::new(
+                    research.clone(),
+                    StageKind::DeepAnalysis,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    independent.clone(),
+                    StageKind::IndependentReview,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    synthesis.clone(),
+                    StageKind::Synthesis,
+                    Role::Reviewer,
+                    vec![
+                        Dependency::required(research.clone()),
+                        Dependency::optional(independent.clone()),
+                    ],
+                ),
+            ],
+        )
+        .unwrap();
+        let mut run = new_run(workflow);
+        start_run(&mut run);
+
+        let report = run
+            .stage_dependency_report(&synthesis)
+            .expect("a pending stage reports its dependency readiness");
+        assert_eq!(
+            report.waiting_on,
+            vec![research.clone(), independent.clone()]
+        );
+        assert!(report.blocked_by.is_empty());
+        assert!(report.degraded.is_empty());
+
+        assert!(matches!(
+            run.transition_stage(&synthesis, StageTransition::MarkReady, metadata(80, 4)),
+            Err(RunStageError::DependenciesNotFinished { .. })
+        ));
+    }
+
+    /// A failed required dependency reports as `blocked_by`, matching the
+    /// mutating path's `RequiredDependenciesBlocked`.
+    #[test]
+    fn stage_dependency_report_lists_failed_required_dependency_as_blocked() {
+        let research = id("research");
+        let synthesis = id("synthesis");
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Review,
+            vec![
+                StageDefinition::new(
+                    research.clone(),
+                    StageKind::DeepAnalysis,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    synthesis.clone(),
+                    StageKind::Synthesis,
+                    Role::Reviewer,
+                    vec![Dependency::required(research.clone())],
+                ),
+            ],
+        )
+        .unwrap();
+        let mut run = new_run(workflow);
+        start_run(&mut run);
+        run.transition_stage(&research, StageTransition::MarkReady, metadata(80, 4))
+            .unwrap();
+        run.transition_stage(&research, StageTransition::Start, metadata(81, 5))
+            .unwrap();
+        run.transition_stage(&research, StageTransition::Fail, metadata(82, 6))
+            .unwrap();
+
+        let report = run
+            .stage_dependency_report(&synthesis)
+            .expect("a pending stage reports its dependency readiness");
+        assert_eq!(report.blocked_by, vec![research.clone()]);
+        assert!(report.waiting_on.is_empty());
+        assert!(report.degraded.is_empty());
+
+        assert!(matches!(
+            run.transition_stage(&synthesis, StageTransition::MarkReady, metadata(83, 7)),
+            Err(RunStageError::RequiredDependenciesBlocked { .. })
+        ));
+    }
+
+    /// A failed optional dependency reports as `degraded`, never as
+    /// `waiting_on` or `blocked_by` — it does not hold the stage back.
+    #[test]
+    fn stage_dependency_report_lists_failed_optional_dependency_as_degraded() {
+        let research = id("research");
+        let independent = id("independent");
+        let synthesis = id("synthesis");
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Review,
+            vec![
+                StageDefinition::new(
+                    research.clone(),
+                    StageKind::DeepAnalysis,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    independent.clone(),
+                    StageKind::IndependentReview,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    synthesis.clone(),
+                    StageKind::Synthesis,
+                    Role::Reviewer,
+                    vec![
+                        Dependency::required(research.clone()),
+                        Dependency::optional(independent.clone()),
+                    ],
+                ),
+            ],
+        )
+        .unwrap();
+        let mut run = new_run(workflow);
+        start_run(&mut run);
+        complete_stage(&mut run, &research, 81);
+        run.transition_stage(&independent, StageTransition::MarkReady, metadata(84, 7))
+            .unwrap();
+        run.transition_stage(&independent, StageTransition::Start, metadata(85, 8))
+            .unwrap();
+        run.transition_stage(&independent, StageTransition::Fail, metadata(86, 9))
+            .unwrap();
+
+        let report = run
+            .stage_dependency_report(&synthesis)
+            .expect("a pending stage reports its dependency readiness");
+        assert!(report.waiting_on.is_empty());
+        assert!(report.blocked_by.is_empty());
+        assert_eq!(report.degraded, vec![independent.clone()]);
+    }
+
+    /// Meaningful only while a stage is Pending or Ready: once it starts
+    /// running there is nothing left to wait on.
+    #[test]
+    fn stage_dependency_report_is_none_once_a_stage_leaves_pending_or_ready() {
+        let mut run = new_run(fast_workflow());
+        start_run(&mut run);
+        let stage_id = id("implementation");
+        assert!(run.stage_dependency_report(&stage_id).is_some());
+
+        run.transition_stage(&stage_id, StageTransition::MarkReady, metadata(80, 4))
+            .unwrap();
+        assert!(
+            run.stage_dependency_report(&stage_id).is_some(),
+            "Ready still reports readiness"
+        );
+
+        run.transition_stage(&stage_id, StageTransition::Start, metadata(81, 5))
+            .unwrap();
+        assert!(
+            run.stage_dependency_report(&stage_id).is_none(),
+            "a running stage has nothing left to wait on"
+        );
+    }
+
+    #[test]
+    fn stage_dependency_report_is_none_for_unknown_stage() {
+        let run = new_run(fast_workflow());
+        assert!(run.stage_dependency_report(&id("does-not-exist")).is_none());
     }
 
     #[test]
