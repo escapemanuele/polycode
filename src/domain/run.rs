@@ -898,8 +898,11 @@ impl Run {
     ///
     /// Reuses the exact bucketing [`Self::ensure_stage_ready`] applies when it
     /// decides, so this can never disagree with the scheduler's own verdict.
-    /// `None` for an unknown stage or one that isn't Pending/Ready: dependency
-    /// readiness is meaningless once a stage has moved past waiting.
+    /// `None` for an unknown stage, one that isn't Pending/Ready (dependency
+    /// readiness is meaningless once a stage has moved past waiting), or a
+    /// Pending/Ready stage whose dependencies are all already satisfied (the
+    /// scheduler just hasn't marked it `Ready` yet) — there is nothing to
+    /// report, so callers must never read `Some` as "this stage is waiting".
     #[must_use]
     pub fn stage_dependency_report(&self, stage_id: &StageId) -> Option<StageDependencyReport> {
         let index = self
@@ -913,6 +916,9 @@ impl Run {
             return None;
         }
         let buckets = self.dependency_buckets(index).ok()?;
+        if buckets.waiting.is_empty() && buckets.blocked.is_empty() && buckets.degraded.is_empty() {
+            return None;
+        }
         Some(StageDependencyReport {
             waiting_on: buckets.waiting,
             blocked_by: buckets.blocked,
@@ -2094,26 +2100,60 @@ mod tests {
         assert_eq!(report.degraded, vec![independent.clone()]);
     }
 
-    /// Meaningful only while a stage is Pending or Ready: once it starts
-    /// running there is nothing left to wait on.
+    /// `None` means "nothing to report", not "not Pending/Ready": a stage
+    /// whose dependencies are all satisfied has nothing to report the moment
+    /// they are satisfied, even before the scheduler gets around to marking
+    /// it `Ready` — and stays `None` through `Ready` and once it starts
+    /// running.
     #[test]
-    fn stage_dependency_report_is_none_once_a_stage_leaves_pending_or_ready() {
-        let mut run = new_run(fast_workflow());
+    fn stage_dependency_report_is_none_once_dependencies_are_satisfied_or_the_stage_leaves_pending_or_ready()
+     {
+        let research = id("research");
+        let synthesis = id("synthesis");
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Review,
+            vec![
+                StageDefinition::new(
+                    research.clone(),
+                    StageKind::DeepAnalysis,
+                    Role::Reviewer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    synthesis.clone(),
+                    StageKind::Synthesis,
+                    Role::Reviewer,
+                    vec![Dependency::required(research.clone())],
+                ),
+            ],
+        )
+        .unwrap();
+        let mut run = new_run(workflow);
         start_run(&mut run);
-        let stage_id = id("implementation");
-        assert!(run.stage_dependency_report(&stage_id).is_some());
 
-        run.transition_stage(&stage_id, StageTransition::MarkReady, metadata(80, 4))
-            .unwrap();
         assert!(
-            run.stage_dependency_report(&stage_id).is_some(),
-            "Ready still reports readiness"
+            run.stage_dependency_report(&synthesis).is_some(),
+            "a pending stage with an unmet dependency has something to report"
         );
 
-        run.transition_stage(&stage_id, StageTransition::Start, metadata(81, 5))
+        complete_stage(&mut run, &research, 80);
+        assert!(
+            run.stage_dependency_report(&synthesis).is_none(),
+            "a pending stage whose dependencies are all satisfied has nothing left \
+             to report, even before the scheduler marks it ready"
+        );
+
+        run.transition_stage(&synthesis, StageTransition::MarkReady, metadata(83, 7))
             .unwrap();
         assert!(
-            run.stage_dependency_report(&stage_id).is_none(),
+            run.stage_dependency_report(&synthesis).is_none(),
+            "a ready stage with satisfied dependencies has nothing left to report"
+        );
+
+        run.transition_stage(&synthesis, StageTransition::Start, metadata(84, 8))
+            .unwrap();
+        assert!(
+            run.stage_dependency_report(&synthesis).is_none(),
             "a running stage has nothing left to wait on"
         );
     }
