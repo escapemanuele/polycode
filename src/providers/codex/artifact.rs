@@ -12,7 +12,9 @@ use crate::providers::ArtifactRecord;
 
 use super::CodexProviderError;
 
-const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
+/// Ceiling for one persisted artifact, and therefore for any final message
+/// that could become one.
+pub(super) const MAX_ARTIFACT_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn persist(
     root: &Path,

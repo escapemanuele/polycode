@@ -453,17 +453,39 @@ impl<B: ProcessBackend> CodexProvider<B> {
                 // process loss after a native thread exists, and recovery
                 // knows how to resume it.
                 //
+                // Only the deaths this reasoning covers get that treatment.
+                // A death Polycode itself caused, or one its supervisor never
+                // understood, is a different fact and keeps its own answer: a
+                // stop is reported as the interruption it is without consulting
+                // any file, and `Broken` — the runner failing rather than
+                // Codex — stays the infrastructure error it has always been,
+                // because a completion mapped over it would hide the failure.
+                //
                 // Either way exactly one record is consumed in exactly one
                 // durable transaction, so a crash before the commit replays
                 // this same line against the same evidence and reaches the
                 // same decision.
-                let trusted = if process_status == ManagedProcessStatus::Exited && successful_exit {
-                    true
-                } else {
-                    let process = store.load_managed_process(commit.output().process_id())?;
-                    final_message_corroborates(&final_path, process.spec().stdout_path(), end)
+                let trusted = match process_status {
+                    ManagedProcessStatus::Exited if successful_exit => true,
+                    // Exited: a non-zero code or a signal. Missing: gone with
+                    // no evidence at all, such as a reboot or a lost server.
+                    ManagedProcessStatus::Exited | ManagedProcessStatus::Missing => {
+                        let process = store.load_managed_process(commit.output().process_id())?;
+                        final_message_corroborates(&final_path, process.spec().stdout_path(), end)
+                    }
+                    ManagedProcessStatus::Interrupted => false,
+                    _ => {
+                        return Err(CodexProviderError::Protocol(format!(
+                            "Codex emitted turn.completed but process ended as {process_status:?} without successful exit evidence"
+                        )));
+                    }
                 };
                 if !trusted {
+                    let uncorroborated = if process_status == ManagedProcessStatus::Interrupted {
+                        ""
+                    } else {
+                        ", and no final message file corroborates the turn"
+                    };
                     session
                         .interrupt(Self::now())
                         .map_err(|error| CodexProviderError::Protocol(error.to_owned()))?;
@@ -471,7 +493,7 @@ impl<B: ProcessBackend> CodexProvider<B> {
                     return Ok(ProviderPoll::Emission {
                         signals: vec![
                             ProviderSignal::Progress(format!(
-                                "Codex emitted turn.completed but process ended as {process_status:?} without successful exit evidence, and no final message file corroborates the turn"
+                                "Codex emitted turn.completed but process ended as {process_status:?} without successful exit evidence{uncorroborated}"
                             )),
                             ProviderSignal::Interrupted,
                         ],
@@ -736,8 +758,13 @@ fn read_capped_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::R
 ///
 /// A stream that carries no agent message reconstructs no final message, so it
 /// corroborates nothing and the completion is not trusted.
+///
+/// The file is read through the artifact ceiling, never past it. A file larger
+/// than an artifact may hold could not be persisted as one whatever it says, so
+/// reading the rest to find that out is work a runaway or malformed final
+/// message would get for free.
 fn final_message_corroborates(final_path: &Path, stdout_path: &Path, end: u64) -> bool {
-    let Ok(file) = std::fs::read(final_path) else {
+    let Some(file) = read_bounded(final_path, artifact::MAX_ARTIFACT_BYTES) else {
         return false;
     };
     let Some(message) = last_agent_message(stdout_path, end) else {
@@ -745,6 +772,20 @@ fn final_message_corroborates(final_path: &Path, stdout_path: &Path, end: u64) -
     };
     !file.is_empty()
         && without_trailing_newline(&file) == without_trailing_newline(message.as_bytes())
+}
+
+/// The whole file, or `None` when it cannot be read or holds more than
+/// `limit` bytes. Never buffers more than one byte past the limit, which is
+/// what tells "exactly at the limit" from "over it".
+fn read_bounded(path: &Path, limit: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let over_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    File::open(path)
+        .ok()?
+        .take(over_limit)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= limit).then_some(bytes)
 }
 
 fn without_trailing_newline(bytes: &[u8]) -> &[u8] {
@@ -1408,6 +1449,87 @@ mod tests {
                 "{message:?} became an artifact"
             );
         }
+    }
+
+    /// `Broken` is the supervisor saying it could not run or account for the
+    /// process at all, not Codex saying anything. Corroborating a completion
+    /// over it would dress an infrastructure failure up as finished work, or
+    /// as an ordinary interruption to resume; it keeps raising instead, which
+    /// is what it did before dead-process completions were trusted.
+    #[test]
+    fn a_broken_supervisor_keeps_failing_however_good_the_final_message_looks() {
+        let (_temp, _database, run_id, mut store, provider) = fixture_with(
+            FixtureBackend::new(SUCCESS_OUTPUT).with_exit(Some(ExitResult::RunnerError {
+                message: "managed runner could not wait for the child".to_owned(),
+            })),
+        );
+        let mut engine = WorkflowEngine::new(provider, "fixture task");
+        let failure = loop {
+            match engine.drive(&mut store, run_id) {
+                Ok(EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. }) => {}
+                Ok(status) => panic!("a broken supervisor must not settle: {status:?}"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            failure.to_string().contains("Broken")
+                && failure.to_string().contains("turn.completed"),
+            "the infrastructure failure must still be reported: {failure}"
+        );
+
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+        assert_eq!(session.status(), ProviderSessionStatus::Active);
+        assert!(store.list_artifacts(run_id).unwrap().is_empty());
+        assert!(
+            !store
+                .load_events(run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.event.kind(),
+                    DomainEventKind::ProviderCompleted { .. }
+                        | DomainEventKind::ProviderInterrupted { .. }
+                ))
+        );
+        // Still a failure on the next pass: nothing about it was consumed away.
+        assert!(engine.drive(&mut store, run_id).is_err());
+    }
+
+    /// A final message too large to become an artifact is rejected before it
+    /// is read, not after. Corroboration must never be a way to make the
+    /// adapter pull an unbounded file into memory — twice, counting the
+    /// artifact writer's own read.
+    #[test]
+    fn an_oversized_final_message_is_refused_without_being_read_whole() {
+        let oversized = "x".repeat(artifact::MAX_ARTIFACT_BYTES + 1);
+        let output = format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"thread.started","thread_id":"codex-thread-1"}),
+            json!({"type":"item.completed","item":{"id":"m1","type":"agent_message","text":oversized}}),
+            json!({"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":20}}),
+        );
+        let (_temp, _database, run_id, mut store, provider) = fixture_with(
+            FixtureBackend::new(&output)
+                .with_exit(None)
+                .writing_final_message(&oversized),
+        );
+        let mut engine = WorkflowEngine::new(provider, "fixture task");
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Interrupted { stages } => {
+                    assert_eq!(
+                        stages,
+                        vec![crate::domain::StageId::new("implementation").unwrap()]
+                    );
+                    break;
+                }
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("an oversized final message must not complete: {status:?}"),
+            }
+        }
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+        assert_eq!(session.status(), ProviderSessionStatus::Interrupted);
+        assert!(store.list_artifacts(run_id).unwrap().is_empty());
     }
 
     /// The same death with nothing to corroborate it: `turn.completed` is in
