@@ -5,6 +5,7 @@ Run each stage through the locally installed `claude` or `codex` executable with
 ## Sub-features
 - claude: non-interactive stream-JSON print mode, `dontAsk` permissions, prompt on immutable stdin; denied tools become typed permission attention; questions (`AskUserQuestion`) need `--response`.
 - codex: `codex exec --json` with prompt `-` on stdin, `--ask-for-approval never`, sandbox `read-only` for non-mutating stage kinds and `workspace-write` for Implementation/Fix/FollowUp; no typed attention.
+- codex-dead-process-completion: a `turn.completed` whose process then died (non-zero exit, signal, or vanished) completes only if the `--output-last-message` file equals the last agent message in the retained stream; otherwise the record is consumed and the stage becomes a recoverable interruption.
 - fake: scripted signals (start, progress, usage, attention, pause, interruption, completion, failure) without editing files; scenario `development_fake/default_success_v1`.
 - permission-continuation: `resolve` reconstructs the exact denial from retained output, converts it to a native `--allowedTools` rule, and resumes the same Claude session UUID in a new managed invocation.
 - artifacts: `~/.polycode/runs/<run-id>/artifacts/<stage-id>.md`, SHA-256 verified before use; downstream prompts get direct dependency artifacts only.
@@ -43,5 +44,6 @@ TUI: `u` opens the attention overlay; ↑/↓ choose the request, type an answer
 - A question response goes to run-private stdin, never argv or SQLite event payloads.
 - Claude reviewer stages are prompt-prohibited from editing but have no hard sandbox; Codex reviewers do (`read-only`). This asymmetry is documented, not patched.
 - Codex `thread.started` supplies the thread id; recovery resumes that exact id, never `--last`. A failed-stage retry creates a new session and thread.
+- A retained `turn.completed` is not proof the turn finished: the same bytes survive a killed CLI. Without a clean exit, the proof is the `--output-last-message` file matching the last `item.completed` agent message byte for byte (only a trailing newline may differ, since `artifact::persist` appends it). "File exists and is non-empty" is not enough — a process killed mid-write leaves a readable prefix that would become a hash-verified half-artifact. Uncorroborated means interruption, not an error: raising here re-reads and re-rejects the same record on every poll and pins the stage in `running` forever, reachable only by `retry`, which throws the finished work away. Recover with `polycode resume <run-id>`.
 - Unknown valid JSONL records become non-semantic checkpoints; an invalid complete record fails without advancing the cursor; a partial line waits.
 - Claude usage comes from the terminal result record only; per-message usage is discarded on purpose.
