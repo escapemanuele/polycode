@@ -19,7 +19,6 @@ pub(crate) use patch::{
 };
 pub(crate) use remote::{push_branch, remote_url};
 pub(crate) use worktree::{
-    WorktreeIdentity, branch_exists, branch_tip, commit_all_in_worktree,
-    create_branch_in_worktree, create_worktree, delete_owned_branch, detach_worktree,
-    inspect_worktree, remove_worktree,
+    WorktreeIdentity, branch_exists, branch_tip, commit_all_in_worktree, create_branch_in_worktree,
+    create_worktree, delete_owned_branch, detach_worktree, inspect_worktree, remove_worktree,
 };

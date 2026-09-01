@@ -430,12 +430,15 @@ impl WorkspaceManager {
         // The same gate cleanup honors: a run stranded mid-apply-recovery has
         // an operation whose outcome is not yet known, and nothing else may
         // move until apply resolves it.
-        if store.load_apply_operation(run_id)?.is_some_and(|operation| {
-            matches!(
-                operation.status(),
-                ApplyStatus::Prepared | ApplyStatus::AppliedToSource
-            )
-        }) {
+        if store
+            .load_apply_operation(run_id)?
+            .is_some_and(|operation| {
+                matches!(
+                    operation.status(),
+                    ApplyStatus::Prepared | ApplyStatus::AppliedToSource
+                )
+            })
+        {
             return Err(WorkspaceError::ApplyInProgress(run_id));
         }
         // Every pure refusal comes before the commit, so a refused publish
