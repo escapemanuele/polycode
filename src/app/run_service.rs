@@ -421,7 +421,11 @@ where
     ) -> Result<(crate::workspace::PublishReceipt, ExecutionReport), AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
-        let receipt = WorkspaceManager::new(&self.worktrees).publish(&mut store, run_id)?;
+        // The pull request is quoted from the latest editing stage's own
+        // artifact when it wrote one; the task text stands in otherwise.
+        let draft = query::pull_request_draft(&store, run_id)?;
+        let receipt =
+            WorkspaceManager::new(&self.worktrees).publish(&mut store, run_id, draft.as_ref())?;
         let report = Self::report(&mut store, run_id, before, None)?;
         Ok((receipt, report))
     }

@@ -12,6 +12,7 @@ Choose how much process a task gets: one implementation stage, a full architectu
 - reviewer-specialization: Code Quality Review judges HOW; Specification Review judges WHAT (Missing/Wrong/Unrequested).
 - change-handoff: review stages get a bounded diff and changed-file inventory of the worktree vs base commit in their first prompt.
 - bottom-line: every stage prompt asks for a `## Bottom line` section; the TUI quotes it verbatim.
+- pull-request: every editing stage prompt (Implementation, Simplification, Fix, FollowUp) asks for a closing `## Pull request` section — title line, then a description with Proposed changes / Why / Testing; `pr` quotes it (see workspace.md).
 
 ## How to get to it (user POV)
 Pick the workflow by the subcommand name. Fix is offered on any completed run that reached a decision; Polycode never reads the verdict to decide whether a fix is warranted. Continue and follow-ups exist only in the TUI. In the TUI composer (`n`), the Workflow field cycles Fast/Standard/Deep/Review with ←/→.
@@ -31,10 +32,11 @@ TUI run detail: `f` fix (or book a fix while the run is still working; press aga
 - `src/domain/role.rs` — roles (Researcher, Architect, Implementer, CodeQualityReviewer, SpecReviewer, EngineeringLead, legacy Reviewer).
 - `src/engine/scheduler.rs` — graph-driven advancement; one eligible stage at a time.
 - `src/app/run_service.rs` — `request_fix`, `request_continue`.
-- `src/providers/stage_prompt.rs` — provider-neutral role contracts, `BOTTOM_LINE`.
+- `src/providers/stage_prompt.rs` — provider-neutral role contracts, `BOTTOM_LINE`, `PULL_REQUEST`.
+- `src/domain/workflow.rs` `StageKind::edits_workspace` — the one predicate for which stage kinds edit the worktree (writable workspace, Claude read-only guard, Codex edit framing, PR contract).
 - `src/providers/change_handoff.rs` — bounded review-stage diff (1 MiB, 200 files).
 - `src/providers/continue_instruction.rs` — run-private file for the continue instruction.
-- `src/tui/follow_ups.rs`, `src/tui/bottom_line.rs`, `src/tui/section.rs` — Markdown section extraction.
+- `src/tui/follow_ups.rs`, `src/tui/bottom_line.rs`, `src/providers/section.rs` — Markdown section extraction.
 - `tests/codex_cli.rs` — `a_rejected_run_is_fixed_in_place_and_the_source_is_untouched_until_apply`, stage sandboxes per kind.
 
 ## Gotchas

@@ -1,6 +1,7 @@
-//! Shared Markdown ATX-heading matching, factored out of `bottom_line` so
-//! `follow_ups` can find a section by the same tolerant rule — any heading
-//! level, case, and punctuation — without duplicating it.
+//! Shared Markdown ATX-heading matching for every artifact-section reader —
+//! the TUI's `bottom_line` and `follow_ups`, and the publish pull-request
+//! draft — so all of them find a section by one tolerant rule (any heading
+//! level, case, and punctuation) without duplicating it.
 
 /// Text of an ATX heading, or `None` for any other line.
 pub(crate) fn heading_text(trimmed: &str) -> Option<&str> {
@@ -34,7 +35,7 @@ pub(crate) fn heading_matches(heading: &str, target: &str) -> bool {
 
 /// Everything under the first heading matching `target`, up to the next
 /// heading at any level or the end of the artifact — verbatim, not reduced
-/// to one line the way [`super::bottom_line::extract`] reduces a quote.
+/// to one line the way `tui::bottom_line::extract` reduces a quote.
 /// Fenced code is tracked so a heading quoted inside one is never mistaken
 /// for a real section boundary. `None` when no such heading exists, or the
 /// section under it carries no non-blank content.

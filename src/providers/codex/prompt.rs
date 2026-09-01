@@ -1,6 +1,5 @@
 use std::fmt::Write as _;
 
-use crate::domain::StageKind;
 use crate::engine::ProviderRequest;
 use crate::providers::change_handoff::ChangeHandoff;
 use crate::providers::{ArtifactRecord, change_handoff, stage_prompt};
@@ -48,17 +47,20 @@ pub(crate) fn compose(
     )
     .expect("String writes cannot fail");
     writeln!(prompt, "{}", stage_prompt::BOTTOM_LINE).expect("String writes cannot fail");
-    match request.stage_kind() {
-        StageKind::Implementation | StageKind::Fix | StageKind::FollowUp => writeln!(
+    if request.stage_kind().edits_workspace() {
+        writeln!(
             prompt,
             "Make required changes in managed worktree and run proportionate local validation when safe."
-        ),
-        _ => writeln!(
+        )
+        .expect("String writes cannot fail");
+        writeln!(prompt, "{}", stage_prompt::PULL_REQUEST).expect("String writes cannot fail");
+    } else {
+        writeln!(
             prompt,
             "Inspect, reason, and report only. Do not modify repository content."
-        ),
+        )
+        .expect("String writes cannot fail");
     }
-    .expect("String writes cannot fail");
 
     let dependencies = stage_prompt::direct_dependency_artifacts(request, artifacts);
     if !dependencies.is_empty() {
@@ -215,6 +217,40 @@ mod tests {
         .unwrap();
 
         assert!(prompt.contains(stage_prompt::BOTTOM_LINE));
+    }
+
+    /// Only a stage that changed the code can describe the change, so every
+    /// editing stage is asked for the pull request and no read-only stage is.
+    #[test]
+    fn editing_stages_are_asked_for_the_pull_request_and_reviews_are_not() {
+        for kind in [
+            StageKind::Implementation,
+            StageKind::Fix,
+            StageKind::FollowUp,
+        ] {
+            let prompt = compose(&request(Role::Implementer, kind), &[], None, None).unwrap();
+            assert!(prompt.contains(stage_prompt::PULL_REQUEST), "{kind:?}");
+        }
+        for (role, kind) in [
+            (Role::SpecReviewer, StageKind::SpecReview),
+            (Role::EngineeringLead, StageKind::Decision),
+            (Role::Researcher, StageKind::Research),
+        ] {
+            let prompt = compose(&request(role, kind), &[], None, None).unwrap();
+            assert!(!prompt.contains(stage_prompt::PULL_REQUEST), "{kind:?}");
+        }
+        // Simplification edits the change; it must be told to edit, not to
+        // report only, and asked to describe the result like any editor.
+        let simplification = compose(
+            &request(Role::Simplifier, StageKind::Simplification),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(simplification.contains("Make required changes in managed worktree"));
+        assert!(!simplification.contains("Do not modify repository content"));
+        assert!(simplification.contains(stage_prompt::PULL_REQUEST));
     }
 
     #[test]

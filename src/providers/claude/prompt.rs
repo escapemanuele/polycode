@@ -46,6 +46,9 @@ pub(crate) fn compose(
     )
     .expect("String writes cannot fail");
     writeln!(prompt, "{}", stage_prompt::BOTTOM_LINE).expect("String writes cannot fail");
+    if request.stage_kind().edits_workspace() {
+        writeln!(prompt, "{}", stage_prompt::PULL_REQUEST).expect("String writes cannot fail");
+    }
 
     let dependencies = stage_prompt::direct_dependency_artifacts(request, artifacts);
     if !dependencies.is_empty() {
@@ -111,6 +114,28 @@ mod tests {
         .unwrap();
 
         assert!(prompt.contains(stage_prompt::BOTTOM_LINE));
+    }
+
+    /// Only a stage that changed the code can describe the change, so every
+    /// editing stage is asked for the pull request and no read-only stage is.
+    #[test]
+    fn editing_stages_are_asked_for_the_pull_request_and_reviews_are_not() {
+        for kind in [
+            StageKind::Implementation,
+            StageKind::Fix,
+            StageKind::FollowUp,
+        ] {
+            let prompt = compose(&request(Role::Implementer, kind), &[], None, None).unwrap();
+            assert!(prompt.contains(stage_prompt::PULL_REQUEST), "{kind:?}");
+        }
+        for (role, kind) in [
+            (Role::SpecReviewer, StageKind::SpecReview),
+            (Role::EngineeringLead, StageKind::Decision),
+            (Role::Researcher, StageKind::Research),
+        ] {
+            let prompt = compose(&request(role, kind), &[], None, None).unwrap();
+            assert!(!prompt.contains(stage_prompt::PULL_REQUEST), "{kind:?}");
+        }
     }
 
     #[test]

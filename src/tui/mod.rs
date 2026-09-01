@@ -9,7 +9,7 @@ mod markdown;
 mod mascot;
 mod motion;
 mod render;
-mod section;
+
 mod state;
 mod terminal;
 mod theme;
