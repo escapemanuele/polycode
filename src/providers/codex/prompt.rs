@@ -38,13 +38,6 @@ pub(crate) fn compose(
         stage_prompt::instruction(request.role(), request.stage_kind())
     )
     .expect("String writes cannot fail");
-    // See the Claude adapter: the operator's own instruction for a continue
-    // cycle's follow-up stage, carried here through the same immutable
-    // run-private stdin path an attention response uses.
-    if let Some(instruction) = continue_instruction {
-        writeln!(prompt, "\n# Operator instruction\n{instruction}")
-            .expect("String writes cannot fail");
-    }
     writeln!(
         prompt,
         "You are executing one Polycode stage. Work only inside current managed worktree. Respect repository instructions, AGENTS.md, rules, skills, MCP configuration, and native Codex configuration discovered normally. Do not apply changes to another checkout. Do not invoke Polycode apply. Do not commit or push. Return concise Markdown describing result, evidence, and unresolved risks."
@@ -84,6 +77,18 @@ pub(crate) fn compose(
         )
         .expect("String writes cannot fail");
     }
+    // The operator's own instruction for a continue cycle's follow-up stage,
+    // carried here through the same immutable run-private stdin path an
+    // attention response uses — never argv, never a domain event. Appended
+    // after dependency artifacts (a follow-up's own dependency is the prior
+    // decision, which can approach the per-artifact cap on its own) and
+    // budgeted against whatever room is left, the same discipline the change
+    // handoff below already follows: never silently dropped, and never
+    // allowed to push the turn over Codex's hard input ceiling.
+    if let Some(instruction) = continue_instruction {
+        let room = MAX_INPUT_BYTES.saturating_sub(prompt.len());
+        prompt.push_str(&continue_instruction_within(instruction, room));
+    }
     if let Some(handoff) = handoff {
         // The change map is the one part that may legitimately dwarf the
         // input limit, and it is navigation aid, not source of truth — so it
@@ -92,6 +97,41 @@ pub(crate) fn compose(
         prompt.push_str(&change_handoff::render_within(handoff, room));
     }
     Ok(prompt)
+}
+
+/// Renders the operator-instruction section so it fits inside `max_bytes`,
+/// truncating the instruction text itself rather than silently dropping the
+/// section or letting the turn exceed Codex's hard input ceiling. Mirrors
+/// `change_handoff::render_within`'s bounded-partial-evidence pattern: the
+/// heading and an explicit INCOMPLETE marker always survive, because a
+/// provider with a hard limit should lose instruction detail, never the
+/// knowledge that detail is missing.
+fn continue_instruction_within(instruction: &str, max_bytes: usize) -> String {
+    const HEADER: &str = "\n# Operator instruction\n";
+    let full = format!("{HEADER}{instruction}\n");
+    if full.len() <= max_bytes {
+        return full;
+    }
+    // Overhead is measured on the full-length marker and padded a little
+    // further, so the marker's own digit count shrinking as `shown` drops
+    // below `instruction.len()` can never push the result past the budget.
+    let overhead =
+        HEADER.len() + incomplete_marker(instruction.len(), instruction.len()).len() + 32;
+    let mut room = max_bytes.saturating_sub(overhead).min(instruction.len());
+    while room > 0 && !instruction.is_char_boundary(room) {
+        room -= 1;
+    }
+    let mut section = String::with_capacity(max_bytes.min(instruction.len() + 256));
+    section.push_str(HEADER);
+    section.push_str(&instruction[..room]);
+    section.push_str(&incomplete_marker(room, instruction.len()));
+    section
+}
+
+fn incomplete_marker(shown: usize, total: usize) -> String {
+    format!(
+        "\nCompleteness: INCOMPLETE — the operator's instruction exceeds Codex's input limit here ({shown} of {total} instruction bytes shown). Treat this as a partial instruction; the rest was not delivered.\n"
+    )
 }
 
 pub(crate) fn continuation(request: &ProviderRequest) -> String {
@@ -218,5 +258,85 @@ mod tests {
         assert!(!without.contains("# Operator instruction"));
         assert!(with.contains("# Operator instruction"));
         assert!(with.contains("add integration tests too"));
+    }
+
+    /// Codex rejects any turn over its input limit outright, same as a giant
+    /// change map: an oversized operator instruction must arrive shortened
+    /// with an explicit marker, never verbatim and never by erroring the
+    /// stage outright.
+    #[test]
+    fn an_oversized_operator_instruction_is_truncated_with_an_explicit_incomplete_marker() {
+        let instruction = "x".repeat(MAX_INPUT_BYTES + 10_000);
+        let request = request(Role::Implementer, StageKind::FollowUp);
+
+        let prompt = compose(&request, &[], None, Some(&instruction)).unwrap();
+
+        assert!(prompt.len() <= MAX_INPUT_BYTES, "prompt: {}", prompt.len());
+        assert!(prompt.contains("Completeness: INCOMPLETE"));
+        assert!(
+            !prompt.contains(&instruction),
+            "the full instruction must not survive verbatim"
+        );
+    }
+
+    /// The reviewed scenario: a follow-up's own dependency (the prior
+    /// decision) can sit close to its own per-artifact cap on its own, and
+    /// the operator's instruction is appended after it — the combination
+    /// must still fit, by shortening the instruction, rather than exceeding
+    /// Codex's hard input ceiling.
+    #[test]
+    fn a_large_dependency_plus_a_large_instruction_still_fit_the_input_limit() {
+        use chrono::{TimeZone, Utc};
+
+        use crate::domain::{ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactStatus};
+        use crate::providers::ArtifactRecord;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let decision_id = StageId::new("decision").unwrap();
+        let content = "d".repeat(990 * 1024);
+        let path = temp.path().join("decision.md");
+        std::fs::write(&path, &content).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 21, 0, 0, 0).single().unwrap();
+        let metadata = ArtifactMetadata::new(
+            ArtifactId::new(),
+            RunId::from_u128(2),
+            decision_id.clone(),
+            ArtifactKind::Decision,
+            Role::EngineeringLead,
+            ArtifactStatus::Complete,
+            created_at,
+        );
+        let artifact = ArtifactRecord::new(
+            metadata,
+            1,
+            path,
+            "a".repeat(64),
+            content.len() as u64,
+            created_at,
+        )
+        .unwrap();
+        let request = ProviderRequest::new(
+            RunId::from_u128(2),
+            StageId::new("followup_1").unwrap(),
+            StageKind::FollowUp,
+            StageStatus::Ready,
+            Role::Implementer,
+            "immutable task".to_owned(),
+            PathBuf::from("/managed/worktree"),
+            1,
+            0,
+            Option::<ProviderSessionId>::None,
+            vec![decision_id],
+        );
+        let instruction = "y".repeat(64 * 1024);
+
+        let prompt = compose(&request, &[artifact], None, Some(&instruction)).unwrap();
+
+        assert!(prompt.len() <= MAX_INPUT_BYTES, "prompt: {}", prompt.len());
+        assert!(prompt.contains(&content), "the dependency stays intact");
+        assert!(
+            prompt.contains("Completeness: INCOMPLETE"),
+            "the instruction had to give way, and says so"
+        );
     }
 }
