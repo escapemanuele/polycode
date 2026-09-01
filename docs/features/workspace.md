@@ -7,6 +7,7 @@ Every run works in its own Git worktree; the source checkout changes only when y
 - modes: implementation workflows own a `polycode/run-<run-id>` branch; review workflows use a detached worktree.
 - apply: patch transfer from base commit to a clean source checkout; no staging, no commit.
 - pr: commit the delta on the run's branch, push to `origin`, open a PR through `gh`; source checkout untouched.
+- pr-draft: the PR title and description are quoted from the `## Pull request` section of the latest editing stage's artifact (Implementation, Simplification, Fix, FollowUp); the task's first line and text stand in when no stage wrote one.
 - discard: record `Discarded`, then remove owned worktree and branch.
 - diff-preview: the same delta apply would move, read-only (`d` in the TUI).
 - reconciliation: persisted workspace intent is validated against Git evidence before any lifecycle command.
@@ -27,6 +28,7 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, 
 - `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`.
 - `src/workspace/model.rs` — `RunWorkspace`, `WorkspaceStatus`, apply operation records.
 - `src/workspace/github.rs` — `gh pr list --head` / `gh pr create` boundary.
+- `src/workspace/pull_request.rs` — `PullRequestDraft`, `extract` of the artifact's `## Pull request` section; `src/app/query.rs` `pull_request_draft` picks the artifact.
 - `src/git/worktree.rs`, `src/git/patch.rs`, `src/git/remote.rs`, `src/git/repository.rs` — Git commands with direct argv.
 - `src/store/workspace.rs` — workspace and apply-intent persistence with CAS.
 - `src/store/path.rs` — `worktree_root`, `POLYCODE_DATA_DIR`.
@@ -38,7 +40,8 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, 
 - Apply never stages or commits; an empty diff is a successful no-op (`No workspace changes to apply.`).
 - `pr` rejects non-completed runs, detached (review) workspaces, empty deltas and repositories without an `origin` remote. PR failure (no `gh`, not authenticated) is reported in the receipt and never undoes the push.
 - `pr` never force-pushes; a diverged remote branch is an error by design. `GIT_TERMINAL_PROMPT=0` turns a credential prompt into an error instead of a hang.
-- After `pr` the run stays `Completed`, so apply, fix and discard remain available; publishing again after a fix updates the same branch and PR.
+- After `pr` the run stays `Completed`, so apply, fix and discard remain available; publishing again after a fix updates the same branch and PR. The PR body is only written on creation: a fix's fresh draft changes the commit subject but not an already-open PR's text.
+- The drafted title is cut at 72 characters; a corrupt latest editing artifact fails the publish (artifact integrity fails closed) rather than silently publishing from the task.
 - Discard commits the logical disposition before cleanup; cleanup is idempotent and retains process files. Branch deletion needs persisted ownership and an unchanged tip, otherwise the workspace turns `Broken` and the branch is kept.
 - `Broken` workspace status (moved repo, foreign path, branch collision) blocks execution; Polycode never guesses or deletes foreign data.
 - Ordinary run commits and cleanup are rejected while an apply intent is `Prepared` or `AppliedToSource`.

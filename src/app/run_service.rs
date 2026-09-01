@@ -421,7 +421,11 @@ where
     ) -> Result<(crate::workspace::PublishReceipt, ExecutionReport), AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
-        let receipt = WorkspaceManager::new(&self.worktrees).publish(&mut store, run_id)?;
+        // The pull request is quoted from the latest editing stage's own
+        // artifact when it wrote one; the task text stands in otherwise.
+        let draft = query::pull_request_draft(&store, run_id)?;
+        let receipt =
+            WorkspaceManager::new(&self.worktrees).publish(&mut store, run_id, draft.as_ref())?;
         let report = Self::report(&mut store, run_id, before, None)?;
         Ok((receipt, report))
     }
@@ -1715,6 +1719,139 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    /// The dependency information the scheduler computes and used to discard
+    /// is now queryable: a `decision` stage stalled behind an interrupted
+    /// `spec_review` reports exactly that stage as `waiting_on`, and reports
+    /// nothing for the sibling `quality_review` dependency it already has.
+    #[test]
+    fn inspect_reports_waiting_on_for_a_stage_stalled_on_an_unfinished_dependency() {
+        let fixture = Fixture::new();
+        let scenario = FakeScenario::new()
+            .stage("architecture")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("implementation")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("simplification")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("quality_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("spec_review")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::Interrupted,
+                FakeEvent::Completed,
+            ])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let interrupted = fixture
+            .scripted_service(scenario)
+            .start_run(
+                WorkflowKind::Standard,
+                "waiting reason for a stalled decision",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+
+        let decision = interrupted
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == StageId::new("decision").unwrap())
+            .expect("decision stage exists");
+        assert_eq!(decision.status, StageStatus::Pending);
+        let waiting = decision
+            .waiting
+            .as_ref()
+            .expect("a pending stage reports why it is not running");
+        assert_eq!(
+            waiting
+                .waiting_on
+                .iter()
+                .map(|dependency| dependency.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["spec_review".to_owned()],
+            "quality_review already completed, so only spec_review is outstanding"
+        );
+        assert!(waiting.blocked_by.is_empty());
+        assert!(waiting.degraded.is_empty());
+
+        // Every other stage has either finished or has nothing left to wait
+        // on, so none of them carries a waiting summary.
+        for stage in &interrupted.details.stages {
+            if stage.id != StageId::new("decision").unwrap() {
+                assert!(
+                    stage.waiting.is_none(),
+                    "stage {} unexpectedly carries a waiting summary",
+                    stage.id
+                );
+            }
+        }
+    }
+
+    /// `waiting: Some(..)` must mean "this stage is actually waiting on
+    /// something" — never "this stage is merely Pending or Ready". A stage
+    /// requesting attention halts the *whole run* (unlike an interrupted
+    /// stage, which only blocks its own branch — the engine keeps advancing
+    /// every other stage it can), so parking `quality_review` on
+    /// `NeedsUser` catches `spec_review` at exactly the moment its own
+    /// required dependencies (architecture, implementation, simplification)
+    /// are all satisfied but the scheduler has only gotten around to marking
+    /// it `Ready`, never started: `inspect_run` must report `waiting: None`.
+    #[test]
+    fn inspect_reports_no_waiting_summary_for_a_ready_stage_with_satisfied_dependencies() {
+        let fixture = Fixture::new();
+        let scenario = FakeScenario::new()
+            .stage("architecture")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("implementation")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("simplification")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("quality_review")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::needs_user(AttentionKind::Decision, "Approve the quality pass"),
+                FakeEvent::Completed,
+            ])
+            .stage("spec_review")
+            .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("decision")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let blocked = fixture
+            .scripted_service(scenario)
+            .start_run(
+                WorkflowKind::Standard,
+                "ready stage needs no waiting summary",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(blocked.details.status, RunStatus::NeedsUser);
+
+        let quality_review = blocked
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == StageId::new("quality_review").unwrap())
+            .expect("quality_review stage exists");
+        assert_eq!(quality_review.status, StageStatus::NeedsUser);
+
+        let spec_review = blocked
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == StageId::new("spec_review").unwrap())
+            .expect("spec_review stage exists");
+        assert_eq!(spec_review.status, StageStatus::Ready);
+        assert!(
+            spec_review.waiting.is_none(),
+            "a ready stage whose dependencies are all satisfied has nothing left to report"
         );
     }
 

@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use crate::domain::{
     ArtifactKind, ArtifactStatus, AttentionKind, AttentionRequestId, AttentionStatus,
-    DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus, StageId, StageKind,
-    StageStatus, WorkflowKind,
+    DependencyOutcome, DomainEventKind, EffortSetting, NativeModelUsage, Role, RunId, RunStatus,
+    StageDependencyReport, StageId, StageKind, StageStatus, WorkflowKind,
 };
 use crate::process::{ManagedProcessId, OutputStream, ProcessManager, TmuxBackend};
 use crate::providers::{InputAccounting, input_accounting};
@@ -61,6 +61,43 @@ pub struct StageSummary {
     /// stay `None` when a run's events carry no such evidence.
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// Why this stage is not running, when it's Pending or Ready. `None` for
+    /// every other status, and for a Pending/Ready stage whose dependencies
+    /// are all satisfied (the scheduler just hasn't marked it Ready yet).
+    pub waiting: Option<StageWaitingSummary>,
+}
+
+/// One dependency stage referenced from a [`StageWaitingSummary`] bucket,
+/// carrying its kind so a caller can render a human title without a second
+/// lookup against the run's stage list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageDependencyRef {
+    pub id: StageId,
+    pub kind: StageKind,
+}
+
+/// A required dependency holding a stage back, with the outcome that put it
+/// there. `outcome` distinguishes a dependency that failed outright from one
+/// that was itself skipped — rendering must say which.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedDependencyRef {
+    pub id: StageId,
+    pub kind: StageKind,
+    pub outcome: DependencyOutcome,
+}
+
+/// Dependency readiness for one Pending/Ready stage, recomputed read-only
+/// from [`crate::domain::Run::stage_dependency_report`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageWaitingSummary {
+    /// Dependencies that have not finished yet.
+    pub waiting_on: Vec<StageDependencyRef>,
+    /// Required dependencies that failed or were skipped; this stage will be
+    /// skipped in turn.
+    pub blocked_by: Vec<BlockedDependencyRef>,
+    /// Optional dependencies that failed or were skipped; this stage will
+    /// still run, without them.
+    pub degraded: Vec<StageDependencyRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,6 +460,10 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             .map(|process_id| store.load_managed_process(process_id))
             .transpose()?
             .map(|process| process.status().as_str().to_owned());
+        let waiting = loaded
+            .run
+            .stage_dependency_report(stage.id())
+            .map(|report| waiting_summary(&loaded.run, report));
         stages.push(StageSummary {
             id: stage.id().clone(),
             kind: stage.kind(),
@@ -459,6 +500,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             process_status,
             started_at,
             finished_at,
+            waiting,
         });
     }
     Ok(RunDetails {
@@ -533,6 +575,40 @@ fn run_span(events: &[SequencedEvent]) -> (Option<DateTime<Utc>>, Option<DateTim
     span
 }
 
+/// Resolves each bucket of a [`StageDependencyReport`] to the dependency
+/// stage's kind, so a caller can render a human title without a further
+/// lookup against the run's stage list.
+fn waiting_summary(run: &crate::domain::Run, report: StageDependencyReport) -> StageWaitingSummary {
+    let resolve = |ids: Vec<StageId>| {
+        ids.into_iter()
+            .filter_map(|id| {
+                run.stage(&id).map(|dependency| StageDependencyRef {
+                    kind: dependency.kind(),
+                    id,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let resolve_blocked = |blocked: Vec<crate::domain::BlockedDependency>| {
+        blocked
+            .into_iter()
+            .filter_map(|blocked| {
+                run.stage(&blocked.stage_id)
+                    .map(|dependency| BlockedDependencyRef {
+                        kind: dependency.kind(),
+                        id: blocked.stage_id,
+                        outcome: blocked.outcome,
+                    })
+            })
+            .collect::<Vec<_>>()
+    };
+    StageWaitingSummary {
+        waiting_on: resolve(report.waiting_on),
+        blocked_by: resolve_blocked(report.blocked_by),
+        degraded: resolve(report.degraded),
+    }
+}
+
 /// Folds one stage's semantic span from committed lifecycle events. Each
 /// `StageStarted` opens a fresh span, so a retried stage reports its current
 /// attempt rather than the total across attempts.
@@ -596,6 +672,46 @@ pub(crate) fn read_artifact(
         summary: artifact_summary(&artifact),
         text,
     })
+}
+
+/// The pull request the latest editing stage wrote for the run's change, if
+/// it wrote one. Fix and follow-up stages restate it, so the most recent
+/// editing artifact — by creation time, then attempt — is the one that
+/// describes what the branch carries now. Read through the same
+/// integrity-verified path as opening the artifact.
+///
+/// # Errors
+/// Returns store errors and artifact integrity failures; a corrupt artifact
+/// fails closed here as everywhere, never silently publishes from the task.
+pub(crate) fn pull_request_draft(
+    store: &SqliteStore,
+    run_id: RunId,
+) -> Result<Option<crate::workspace::PullRequestDraft>, AppError> {
+    let artifacts = store.list_artifacts(run_id)?;
+    let Some(latest) = latest_editing_artifact(&artifacts) else {
+        return Ok(None);
+    };
+    let view = read_artifact(store, run_id, latest.metadata().stage_id())?;
+    Ok(crate::workspace::extract_pull_request_draft(&view.text))
+}
+
+/// The most recent complete artifact of a stage that edits the workspace.
+fn latest_editing_artifact(
+    artifacts: &[crate::providers::ArtifactRecord],
+) -> Option<&crate::providers::ArtifactRecord> {
+    artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.metadata().status() == ArtifactStatus::Complete
+                && matches!(
+                    artifact.metadata().kind(),
+                    ArtifactKind::Implementation
+                        | ArtifactKind::Simplification
+                        | ArtifactKind::Fix
+                        | ArtifactKind::FollowUp
+                )
+        })
+        .max_by_key(|artifact| (*artifact.metadata().created_at(), artifact.attempt()))
 }
 
 pub(crate) fn process_log_tail(
@@ -983,6 +1099,91 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 21, hour, minute, second)
             .single()
             .unwrap()
+    }
+
+    fn artifact(
+        stage: &str,
+        kind: ArtifactKind,
+        status: ArtifactStatus,
+        created_at: DateTime<Utc>,
+        attempt: u32,
+    ) -> crate::providers::ArtifactRecord {
+        let metadata = crate::domain::ArtifactMetadata::new(
+            crate::domain::ArtifactId::new(),
+            RunId::from_u128(1),
+            StageId::new(stage).unwrap(),
+            kind,
+            Role::Implementer,
+            status,
+            created_at,
+        );
+        crate::providers::ArtifactRecord::new(
+            metadata,
+            attempt,
+            PathBuf::from("/artifacts").join(stage),
+            "0".repeat(64),
+            0,
+            created_at,
+        )
+        .unwrap()
+    }
+
+    /// A fix restates the pull request for the whole branch, so the newest
+    /// editing artifact wins; reviews and decisions never describe a change
+    /// they did not make, and a failed attempt never speaks for the branch.
+    #[test]
+    fn the_newest_complete_editing_artifact_drafts_the_pull_request() {
+        let artifacts = vec![
+            artifact(
+                "implementation",
+                ArtifactKind::Implementation,
+                ArtifactStatus::Complete,
+                at(1, 0, 0),
+                1,
+            ),
+            artifact(
+                "decision",
+                ArtifactKind::Decision,
+                ArtifactStatus::Complete,
+                at(2, 0, 0),
+                1,
+            ),
+            artifact(
+                "fix-1",
+                ArtifactKind::Fix,
+                ArtifactStatus::Complete,
+                at(3, 0, 0),
+                1,
+            ),
+            artifact(
+                "fix-1",
+                ArtifactKind::Fix,
+                ArtifactStatus::Complete,
+                at(3, 0, 0),
+                2,
+            ),
+            artifact(
+                "fix-2",
+                ArtifactKind::Fix,
+                ArtifactStatus::Failed,
+                at(4, 0, 0),
+                1,
+            ),
+            artifact(
+                "review",
+                ArtifactKind::CodeQualityReview,
+                ArtifactStatus::Complete,
+                at(5, 0, 0),
+                1,
+            ),
+        ];
+
+        let latest = latest_editing_artifact(&artifacts).unwrap();
+
+        assert_eq!(latest.metadata().stage_id().to_string(), "fix-1");
+        assert_eq!(latest.attempt(), 2);
+        assert!(latest_editing_artifact(&artifacts[1..2]).is_none());
+        assert!(latest_editing_artifact(&[]).is_none());
     }
 
     fn event(
