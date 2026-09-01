@@ -2753,11 +2753,23 @@ mod tests {
         SqliteStore,
         ClaudeProvider<FixtureBackend>,
     ) {
-        fixture_with_workflow(
-            backend,
-            eval_auto_approve,
-            WorkflowDefinition::built_in(WorkflowKind::Fast),
+        fixture_with_workflow(backend, eval_auto_approve, implementation_only())
+    }
+
+    /// One implementation stage and nothing after it. The built-in Fast
+    /// graph now verifies after implementing, and that stage belongs to the
+    /// `verify` provider, not to the adapter under test.
+    fn implementation_only() -> WorkflowDefinition {
+        WorkflowDefinition::new(
+            WorkflowKind::Fast,
+            vec![StageDefinition::new(
+                crate::domain::StageId::new("implementation").unwrap(),
+                StageKind::Implementation,
+                Role::Implementer,
+                vec![],
+            )],
         )
+        .unwrap()
     }
 
     /// Single read-only review stage so reviewer terminal semantics can be

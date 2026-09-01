@@ -40,6 +40,12 @@ pub enum StageKind {
     /// changes no persisted snapshot or database shape, the same way `Fix`
     /// did when reviewer specialization introduced it.
     FollowUp,
+    /// Runs the repository's own verification commands in the worktree and
+    /// records every exit code. No provider judgment is involved: the stage
+    /// completes only when every command exits zero, and a run whose
+    /// verification failed never completes, so it can never be applied.
+    /// Additive like `Simplification`: no persisted shape changes.
+    Verify,
 }
 
 impl StageKind {
@@ -203,6 +209,43 @@ impl WorkflowDefinition {
         Self::new(self.kind, stages)
     }
 
+    /// This workflow with every verification stage removed and the edges
+    /// into those stages dropped, revalidated whole.
+    ///
+    /// Evaluations use it. They measure one role's output against a fixture
+    /// through synthetic support roles, and running the fixture's own checks
+    /// is not part of that measurement — a planted bug is supposed to fail
+    /// them, and a build tree left in the worktree would show up in the
+    /// scope the scorer inspects.
+    ///
+    /// # Errors
+    /// Rejects a workflow made only of verification stages, or one the
+    /// removal leaves structurally invalid.
+    pub fn without_verification(&self) -> Result<Self, WorkflowDefinitionError> {
+        let stages = self
+            .stages
+            .iter()
+            .filter(|stage| stage.kind() != StageKind::Verify)
+            .map(|stage| {
+                StageDefinition::new(
+                    stage.id().clone(),
+                    stage.kind(),
+                    stage.role(),
+                    stage
+                        .dependencies()
+                        .iter()
+                        .filter(|dependency| {
+                            self.stage(dependency.stage_id())
+                                .is_none_or(|target| target.kind() != StageKind::Verify)
+                        })
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .collect();
+        Self::new(self.kind, stages)
+    }
+
     #[must_use]
     pub const fn kind(&self) -> WorkflowKind {
         self.kind
@@ -228,12 +271,20 @@ impl WorkflowDefinition {
 }
 
 fn fast_stages() -> Vec<StageDefinition> {
-    vec![stage(
-        "implementation",
-        StageKind::Implementation,
-        Role::Implementer,
-        vec![],
-    )]
+    vec![
+        stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            vec![],
+        ),
+        stage(
+            "verify",
+            StageKind::Verify,
+            Role::Verifier,
+            vec![required("implementation")],
+        ),
+    ]
 }
 
 fn standard_stages() -> Vec<StageDefinition> {
@@ -272,11 +323,31 @@ fn standard_stages() -> Vec<StageDefinition> {
                 required("architecture"),
             ],
         ),
+        // Verification runs after the last editing stage and beside the
+        // reviews, not after them: the reviews judge the change and the
+        // checks judge the build, and neither needs the other's answer. It
+        // is listed after them so the scheduler, which takes eligible
+        // stages in definition order, lets the reviews go first. The
+        // decision waits for all three but only *requires* the reviews:
+        // a failed verification must still reach the lead — as the
+        // artifact showing the failure — and leave the run completable,
+        // so a fix cycle can answer it. What a failed verification can
+        // never do is get applied; that gate lives in the workspace.
+        stage(
+            "verify",
+            StageKind::Verify,
+            Role::Verifier,
+            vec![required("simplification")],
+        ),
         stage(
             "decision",
             StageKind::Decision,
             Role::EngineeringLead,
-            vec![required("quality_review"), required("spec_review")],
+            vec![
+                required("quality_review"),
+                required("spec_review"),
+                optional("verify"),
+            ],
         ),
     ]
 }
@@ -318,11 +389,31 @@ fn deep_stages() -> Vec<StageDefinition> {
                 required("architecture"),
             ],
         ),
+        // Verification runs after the last editing stage and beside the
+        // reviews, not after them: the reviews judge the change and the
+        // checks judge the build, and neither needs the other's answer. It
+        // is listed after them so the scheduler, which takes eligible
+        // stages in definition order, lets the reviews go first. The
+        // decision waits for all three but only *requires* the reviews:
+        // a failed verification must still reach the lead — as the
+        // artifact showing the failure — and leave the run completable,
+        // so a fix cycle can answer it. What a failed verification can
+        // never do is get applied; that gate lives in the workspace.
+        stage(
+            "verify",
+            StageKind::Verify,
+            Role::Verifier,
+            vec![required("simplification")],
+        ),
         stage(
             "decision",
             StageKind::Decision,
             Role::EngineeringLead,
-            vec![required("quality_review"), required("spec_review")],
+            vec![
+                required("quality_review"),
+                required("spec_review"),
+                optional("verify"),
+            ],
         ),
     ]
 }
@@ -357,15 +448,17 @@ fn review_stages() -> Vec<StageDefinition> {
     ]
 }
 
-/// The stages of one remediation cycle: an implementer fix, then a fresh
-/// decision over it.
+/// The stages of one remediation cycle: an implementer fix, a verification
+/// of the result, then a fresh decision over both.
 ///
 /// The fix depends on the decision it is answering, so it cannot start before
 /// that verdict exists. The new decision depends on the fix, so no verdict is
 /// ever recorded over work that has not happened. Nothing here re-runs the
 /// reviews: the lead reads the new diff against findings it already has, and
 /// an operator who wants the full review back can say so by starting a review
-/// run over the result.
+/// run over the result. Verification is re-run, because a fix is an edit and
+/// every edit has to pass the repository's own checks before the run can
+/// complete.
 ///
 /// # Panics
 /// Panics only if `index` could produce an invalid stage identity, which it
@@ -373,6 +466,8 @@ fn review_stages() -> Vec<StageDefinition> {
 #[must_use]
 pub fn fix_cycle_stages(index: u32, after_decision: &StageId) -> Vec<StageDefinition> {
     let fix_id = StageId::new(format!("fix_{index}")).expect("fix stage ID must remain valid");
+    let verify_id =
+        StageId::new(format!("verify_{index}")).expect("verify stage ID must remain valid");
     let decision_id =
         StageId::new(format!("decision_{index}")).expect("decision stage ID must remain valid");
     vec![
@@ -383,14 +478,24 @@ pub fn fix_cycle_stages(index: u32, after_decision: &StageId) -> Vec<StageDefini
             vec![Dependency::required(after_decision.clone())],
         ),
         StageDefinition::new(
+            verify_id.clone(),
+            StageKind::Verify,
+            Role::Verifier,
+            vec![Dependency::required(fix_id.clone())],
+        ),
+        StageDefinition::new(
             decision_id,
             StageKind::Decision,
             Role::EngineeringLead,
-            // Both, and required. The fix alone does not say what it was
-            // meant to resolve, and the verdict alone does not say whether it
-            // was. A decision over one without the other is not a decision.
+            // The fix and the prior verdict are required: the fix alone
+            // does not say what it was meant to resolve, and the verdict
+            // alone does not say whether it was. Verification is optional
+            // so a fix that still fails the checks reaches a decision — and
+            // another fix — instead of a dead run; the apply gate keeps it
+            // from going anywhere until a later verification passes.
             vec![
                 Dependency::required(fix_id),
+                Dependency::optional(verify_id),
                 Dependency::required(after_decision.clone()),
             ],
         ),
@@ -405,15 +510,18 @@ fn follow_up_id(index: u32) -> StageId {
 }
 
 /// The stages of one continue cycle: an implementer follow-up stage carrying
-/// the operator's own instruction, then a fresh decision over it.
+/// the operator's own instruction, a verification of the result, then a
+/// fresh decision over both.
 ///
-/// Named and numbered independently from [`fix_cycle_stages`] — `followup_N`
-/// and `followup_decision_N` rather than `fix_N` and `decision_N` — so a run
-/// that grows both kinds of cycle, in either order, never collides two
-/// stages onto the same identity. The dependency wiring mirrors the fix
-/// cycle exactly: the follow-up depends on the decision it grows from, and
-/// the new decision requires both the follow-up and that same prior
-/// decision, so no verdict is ever recorded over work that has not happened.
+/// Named and numbered independently from [`fix_cycle_stages`] — `followup_N`,
+/// `followup_verify_N` and `followup_decision_N` rather than `fix_N`,
+/// `verify_N` and `decision_N` — so a run that grows both kinds of cycle, in
+/// either order, never collides two stages onto the same identity. The
+/// dependency wiring mirrors the fix cycle exactly: the follow-up depends on
+/// the decision it grows from, verification depends on the follow-up, and
+/// the new decision requires the follow-up, its verification and that same
+/// prior decision, so no verdict is ever recorded over work that has not
+/// happened or has not been checked.
 ///
 /// # Panics
 /// Panics only if `index` could produce an invalid stage identity, which it
@@ -421,6 +529,8 @@ fn follow_up_id(index: u32) -> StageId {
 #[must_use]
 pub fn continue_cycle_stages(index: u32, after_decision: &StageId) -> Vec<StageDefinition> {
     let follow_up_id = follow_up_id(index);
+    let verify_id = StageId::new(format!("followup_verify_{index}"))
+        .expect("follow-up verify stage ID must remain valid");
     let decision_id = StageId::new(format!("followup_decision_{index}"))
         .expect("follow-up decision stage ID must remain valid");
     vec![
@@ -431,11 +541,18 @@ pub fn continue_cycle_stages(index: u32, after_decision: &StageId) -> Vec<StageD
             vec![Dependency::required(after_decision.clone())],
         ),
         StageDefinition::new(
+            verify_id.clone(),
+            StageKind::Verify,
+            Role::Verifier,
+            vec![Dependency::required(follow_up_id.clone())],
+        ),
+        StageDefinition::new(
             decision_id,
             StageKind::Decision,
             Role::EngineeringLead,
             vec![
                 Dependency::required(follow_up_id),
+                Dependency::optional(verify_id),
                 Dependency::required(after_decision.clone()),
             ],
         ),
@@ -720,7 +837,7 @@ mod tests {
     #[test]
     fn new_built_ins_specialize_reviewers_and_direct_artifact_dependencies() {
         let fast = WorkflowDefinition::built_in(WorkflowKind::Fast);
-        assert_eq!(fast.stages().len(), 1);
+        assert_eq!(fast.stages().len(), 2);
         assert_eq!(fast.stages()[0].id(), &id("implementation"));
 
         let standard = WorkflowDefinition::built_in(WorkflowKind::Standard);
@@ -780,9 +897,144 @@ mod tests {
                 &[
                     Dependency::required(id("quality_review")),
                     Dependency::required(id("spec_review")),
+                    Dependency::optional(id("verify")),
                 ]
             );
         }
+    }
+
+    /// Verification follows the last stage that edits the worktree; the
+    /// decision waits for it but does not require it, and the reviews keep
+    /// their own dependencies and run beside it. A review run edits
+    /// nothing, so it has nothing to verify.
+    #[test]
+    fn built_ins_verify_after_the_last_editing_stage_and_before_the_decision() {
+        let fast = WorkflowDefinition::built_in(WorkflowKind::Fast);
+        let verify = fast.stage(&id("verify")).unwrap();
+        assert_eq!(verify.kind(), StageKind::Verify);
+        assert_eq!(verify.role(), Role::Verifier);
+        assert_eq!(
+            verify.dependencies(),
+            &[Dependency::required(id("implementation"))]
+        );
+
+        for kind in [WorkflowKind::Standard, WorkflowKind::Deep] {
+            let workflow = WorkflowDefinition::built_in(kind);
+            let verify = workflow.stage(&id("verify")).unwrap();
+            assert_eq!(verify.kind(), StageKind::Verify);
+            assert_eq!(verify.role(), Role::Verifier);
+            assert_eq!(
+                verify.dependencies(),
+                &[Dependency::required(id("simplification"))]
+            );
+            let decision = workflow.stage(&id("decision")).unwrap();
+            assert!(
+                decision
+                    .dependencies()
+                    .contains(&Dependency::optional(id("verify"))),
+                "the decision waits for verification but a failed one still reaches it"
+            );
+            for review in ["quality_review", "spec_review"] {
+                let review = workflow.stage(&id(review)).unwrap();
+                assert!(
+                    review
+                        .dependencies()
+                        .iter()
+                        .all(|dependency| dependency.stage_id() != &id("verify")),
+                    "reviews run beside verification, not after it"
+                );
+            }
+        }
+
+        let review = WorkflowDefinition::built_in(WorkflowKind::Review);
+        assert!(
+            review
+                .stages()
+                .iter()
+                .all(|stage| stage.kind() != StageKind::Verify)
+        );
+    }
+
+    /// Evaluations run the built-ins without their verification stages;
+    /// what remains is the pre-verification graph exactly.
+    #[test]
+    fn without_verification_drops_the_verify_stages_and_the_edges_into_them() {
+        let fast = WorkflowDefinition::built_in(WorkflowKind::Fast)
+            .without_verification()
+            .unwrap();
+        assert_eq!(fast.stages().len(), 1);
+        assert_eq!(fast.stages()[0].id(), &id("implementation"));
+
+        let standard = WorkflowDefinition::built_in(WorkflowKind::Standard)
+            .without_verification()
+            .unwrap();
+        assert!(standard.stage(&id("verify")).is_none());
+        assert_eq!(
+            standard.stage(&id("decision")).unwrap().dependencies(),
+            &[
+                Dependency::required(id("quality_review")),
+                Dependency::required(id("spec_review")),
+            ]
+        );
+
+        let review = WorkflowDefinition::built_in(WorkflowKind::Review);
+        assert_eq!(review.without_verification().unwrap(), review);
+
+        let only_verify = WorkflowDefinition::new(
+            WorkflowKind::Fast,
+            vec![StageDefinition::new(
+                id("verify"),
+                StageKind::Verify,
+                Role::Verifier,
+                vec![],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            only_verify.without_verification(),
+            Err(WorkflowDefinitionError::NoStages)
+        );
+    }
+
+    /// Additive like `Simplification` before it: the new variant round-trips
+    /// through the same inspectable snake-case shape, changing no persisted
+    /// schema.
+    #[test]
+    fn verify_stage_kind_round_trips_through_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&StageKind::Verify).unwrap(),
+            "\"verify\""
+        );
+        assert_eq!(
+            serde_json::from_str::<StageKind>("\"verify\"").unwrap(),
+            StageKind::Verify
+        );
+    }
+
+    /// A fix cycle verifies the fix before the fresh decision judges it,
+    /// and the decision is reached even when that verification fails.
+    #[test]
+    fn a_fix_cycle_verifies_the_fix_between_it_and_the_fresh_decision() {
+        let after = id("decision");
+        let stages = fix_cycle_stages(1, &after);
+
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].id(), &id("fix_1"));
+        let verify = &stages[1];
+        assert_eq!(verify.id(), &id("verify_1"));
+        assert_eq!(verify.kind(), StageKind::Verify);
+        assert_eq!(verify.role(), Role::Verifier);
+        assert_eq!(verify.dependencies(), &[Dependency::required(id("fix_1"))]);
+        let decision = &stages[2];
+        assert_eq!(decision.id(), &id("decision_1"));
+        assert_eq!(
+            decision.dependencies(),
+            &[
+                Dependency::required(id("fix_1")),
+                Dependency::optional(id("verify_1")),
+                Dependency::required(after),
+            ]
+        );
     }
 
     #[test]
@@ -881,7 +1133,7 @@ mod tests {
         let after = id("decision");
         let stages = continue_cycle_stages(1, &after);
 
-        assert_eq!(stages.len(), 2);
+        assert_eq!(stages.len(), 3);
         let follow_up = &stages[0];
         assert_eq!(follow_up.id(), &id("followup_1"));
         assert_eq!(follow_up.kind(), StageKind::FollowUp);
@@ -891,7 +1143,16 @@ mod tests {
             &[Dependency::required(after.clone())]
         );
 
-        let decision = &stages[1];
+        let verify = &stages[1];
+        assert_eq!(verify.id(), &id("followup_verify_1"));
+        assert_eq!(verify.kind(), StageKind::Verify);
+        assert_eq!(verify.role(), Role::Verifier);
+        assert_eq!(
+            verify.dependencies(),
+            &[Dependency::required(id("followup_1"))]
+        );
+
+        let decision = &stages[2];
         assert_eq!(decision.id(), &id("followup_decision_1"));
         assert_eq!(decision.kind(), StageKind::Decision);
         assert_eq!(decision.role(), Role::EngineeringLead);
@@ -899,6 +1160,7 @@ mod tests {
             decision.dependencies(),
             &[
                 Dependency::required(id("followup_1")),
+                Dependency::optional(id("followup_verify_1")),
                 Dependency::required(after),
             ]
         );

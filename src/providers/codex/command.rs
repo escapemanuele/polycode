@@ -30,7 +30,8 @@ impl CodexSandbox {
             | StageKind::IndependentReview
             | StageKind::DeepAnalysis
             | StageKind::Synthesis
-            | StageKind::Decision => Self::ReadOnly,
+            | StageKind::Decision
+            | StageKind::Verify => Self::ReadOnly,
         }
     }
 

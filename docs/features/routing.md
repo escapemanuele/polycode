@@ -8,6 +8,7 @@ Decide which native coding runtime, and optionally which model, executes each en
 - frozen-v1: runs persisted under `recommended_v1` keep decoding their original routes.
 - models: configured model is null unless the immutable config supplies one; confirmed model comes only from provider evidence.
 - status: `status` prints the Routing table (role, configured provider, configured model, reason) and per-stage configured vs actual.
+- verifier: `Role::Verifier` always resolves to provider `verify` inside the router (`VERIFY_PROVIDER_ID`); it is never written to a snapshot, never in the Routing table, never in a profile or the resource plan.
 
 ## How to get to it (user POV)
 Omit both flags for Recommended, or pass exactly one of `--provider` or `--profile`. The TUI composer's Execution field cycles Recommended / Claude only / Codex only / Fake with ←/→. Read the resolved routes in `polycode status <run-id>` under Routing.
@@ -24,7 +25,7 @@ polycode status <run-id>
 Current `recommended_v2` map with both providers ready: Researcher, Architect, CodeQualityReviewer, EngineeringLead, legacy Reviewer -> Claude; Implementer, SpecReviewer -> Codex. With one native provider ready, every role routes there with a persisted fallback reason.
 
 ## Where it lives
-- `src/app/routing.rs` — `RECOMMENDED_PROFILE_VERSION` (`recommended_v2`), `RECOMMENDED_PROFILE_VERSION_V1`, provenance tables, `resolve_config`, `RoutingPlan`, `unroutable_fix_role`.
+- `src/app/routing.rs` — `RECOMMENDED_PROFILE_VERSION` (`recommended_v2`), `RECOMMENDED_PROFILE_VERSION_V1`, provenance tables, `resolve_config`, `RoutingPlan`, `unroutable_fix_role`, `VERIFY_PROVIDER_ID`.
 - `src/app/provider_factory.rs` — `RuntimeProviderFactory`, `RoutedProvider` lazy adapter cache keyed by target and effort.
 - `src/cli/commands.rs` — `start`: flag-to-`ExecutionSelection` mapping; only `recommended` is an accepted profile name.
 - `src/store/config_snapshot.rs` — insert-only immutable config records (schema v2 routes, v3 adds resource plan).
@@ -38,3 +39,4 @@ Current `recommended_v2` map with both providers ready: Researcher, Architect, C
 - `recommended_v2` evidence is runtime-level (role_core_v3, 3 repetitions); it encodes no cost or token claims. Researcher, Architect, EngineeringLead and legacy Reviewer are inherited from v1 without evidence.
 - Codex never confirms its model; `actual` model stays `unconfirmed` for Codex stages by design.
 - Effort never changes routing; see observability-and-effort.md.
+- The verifier's stage line in `status` shows configured provider `verify` although the Routing table above it has no such row; that is the implicit route, not a missing one. Snapshots sealed before the verifier existed load unchanged and can still grow fix cycles.

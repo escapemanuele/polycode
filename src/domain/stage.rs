@@ -235,7 +235,9 @@ impl Stage {
                 self.status = StageStatus::Failed;
                 self.suspension = None;
             }
-            (StageStatus::Failed, StageTransition::Retry) => {
+            // A skipped stage is retried alongside the failure that skipped
+            // it: it never ran, so returning it to pending discards nothing.
+            (StageStatus::Failed | StageStatus::Skipped, StageTransition::Retry) => {
                 self.status = StageStatus::Pending;
             }
             _ => {
@@ -472,6 +474,7 @@ mod tests {
             (StageStatus::NeedsUser, StageTransition::Interrupt),
             (StageStatus::NeedsUser, StageTransition::Fail),
             (StageStatus::Failed, StageTransition::Retry),
+            (StageStatus::Skipped, StageTransition::Retry),
         ];
 
         for status in statuses {

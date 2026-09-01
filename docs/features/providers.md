@@ -6,6 +6,7 @@ Run each stage through the locally installed `claude` or `codex` executable with
 - claude: non-interactive stream-JSON print mode, `dontAsk` permissions, prompt on immutable stdin; denied tools become typed permission attention; questions (`AskUserQuestion`) need `--response`.
 - codex: `codex exec --json` with prompt `-` on stdin, `--ask-for-approval never`, sandbox `read-only` for non-mutating stage kinds and `workspace-write` for Implementation/Fix/FollowUp; no typed attention.
 - fake: scripted signals (start, progress, usage, attention, pause, interruption, completion, failure) without editing files; scenario `development_fake/default_success_v1`.
+- verify: provider id `verify`, a deterministic command runner serving only `Role::Verifier`; routed implicitly, never chosen by `--provider` or a profile, never a provider session (see verification.md).
 - permission-continuation: `resolve` reconstructs the exact denial from retained output, converts it to a native `--allowedTools` rule, and resumes the same Claude session UUID in a new managed invocation.
 - artifacts: `~/.polycode/runs/<run-id>/artifacts/<stage-id>.md`, SHA-256 verified before use; downstream prompts get direct dependency artifacts only.
 - doctor: reports CLI versions, auth status and suspicious credential environment variable names.
@@ -31,6 +32,7 @@ TUI: `u` opens the attention overlay; ↑/↓ choose the request, type an answer
 - `src/providers/codex/` — `detection.rs`, `command.rs` (`exec --json`, sandbox, `-c model_reasoning_effort`), `protocol.rs`, `session_meta.rs`, `mod.rs`.
 - `src/providers/session.rs`, `src/providers/checkpoint.rs`, `src/providers/artifact.rs` — provider session, atomic commit payload, immutable artifact record.
 - `src/engine/fake.rs` — Fake scenarios.
+- `src/providers/verify/` — the `verify` provider (`mod.rs` adapter, `config.rs`, `runner.rs`, `artifact.rs`).
 - `src/engine/provider.rs` — provider-neutral `ProviderRequest`/`ProviderPoll` boundary.
 - `src/store/provider.rs` — provider-session and artifact persistence.
 - `tests/routing_cli.rs` — `recommended_attention_restart_routes_response_to_same_claude_session`.
@@ -45,3 +47,4 @@ TUI: `u` opens the attention overlay; ↑/↓ choose the request, type an answer
 - Codex `thread.started` supplies the thread id; recovery resumes that exact id, never `--last`. A failed-stage retry creates a new session and thread.
 - Unknown valid JSONL records become non-semantic checkpoints; an invalid complete record fails without advancing the cursor; a partial line waits.
 - Claude usage comes from the terminal result record only; per-message usage is discarded on purpose.
+- `--provider fake` still verifies for real: the Fake provider fakes agent roles only, and the `verify` stage runs the repository's commands regardless of the selection.

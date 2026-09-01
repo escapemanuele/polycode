@@ -310,13 +310,31 @@ where
     ///
     /// # Errors
     /// Returns infrastructure, retry-safety, concurrency, or persistence failures.
+    /// Returns one failed stage to pending, together with every downstream
+    /// stage its failure skipped, in one commit: a retried implementation
+    /// whose verification stayed skipped would succeed into a run that can
+    /// never complete.
     pub fn retry_stage(
         &mut self,
         store: &mut SqliteStore,
         run_id: RunId,
         stage_id: &StageId,
     ) -> Result<EngineStatus, EngineError> {
-        self.transition_stage(store, run_id, stage_id, StageTransition::Retry)
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let skipped = loaded.run.skipped_descendants(stage_id);
+        let mut events = Vec::with_capacity(skipped.len() + 1);
+        for id in std::iter::once(stage_id).chain(skipped.iter()) {
+            let metadata = self.metadata_for(&loaded.run);
+            events.push(
+                loaded
+                    .run
+                    .transition_stage(id, StageTransition::Retry, metadata)?,
+            );
+        }
+        commit_execution(store, &loaded.run, loaded.revision, &events)?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
     }
 
     /// Reopens a completed run with one remediation cycle appended.
@@ -1010,10 +1028,14 @@ fn reduce_checkpoint(
         }
         match event.kind() {
             DomainEventKind::StageRetryScheduled => {
-                checkpoint.attempt = checkpoint
-                    .attempt
-                    .checked_add(1)
-                    .ok_or(EngineError::CheckpointOverflow)?;
+                // A stage un-skipped by an upstream retry never ran; only a
+                // stage that had a provider starts a new attempt.
+                if checkpoint.provider_id.is_some() {
+                    checkpoint.attempt = checkpoint
+                        .attempt
+                        .checked_add(1)
+                        .ok_or(EngineError::CheckpointOverflow)?;
+                }
                 checkpoint.signal_index = 0;
                 checkpoint.provider_id = None;
                 checkpoint.session_id = None;
@@ -1335,6 +1357,8 @@ mod tests {
             .events([FakeEvent::Started, FakeEvent::Completed])
             .stage("spec_review")
             .events([FakeEvent::Started, FakeEvent::Completed])
+            .stage("verify")
+            .events([FakeEvent::Started, FakeEvent::Completed])
             .stage("decision")
             .events([FakeEvent::Started, FakeEvent::Completed]);
         let provider = FakeProvider::new(scenario).unwrap();
@@ -1440,12 +1464,16 @@ mod tests {
     fn needs_user_checkpoint_survives_restart_and_continues_same_stage() {
         let mut fixture = Fixture::new(WorkflowKind::Fast, 300_000);
         let make_scenario = || {
-            FakeScenario::new().stage("implementation").events([
-                FakeEvent::Started,
-                FakeEvent::needs_user(AttentionKind::Decision, "Choose API shape"),
-                FakeEvent::progress("Applying decision"),
-                FakeEvent::Completed,
-            ])
+            FakeScenario::new()
+                .stage("implementation")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::needs_user(AttentionKind::Decision, "Choose API shape"),
+                    FakeEvent::progress("Applying decision"),
+                    FakeEvent::Completed,
+                ])
+                .stage("verify")
+                .events([FakeEvent::Started, FakeEvent::Completed])
         };
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(make_scenario()).unwrap(),
@@ -1488,13 +1516,14 @@ mod tests {
                 .count(),
             1
         );
+        // The resolved implementation started exactly once; the verify
+        // stage after it starts on its own.
+        let implementation = StageId::new("implementation").unwrap();
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(
-                    event.event.kind(),
-                    DomainEventKind::ProviderStarted { .. }
-                ))
+                .filter(|event| event.event.stage_id() == Some(&implementation)
+                    && matches!(event.event.kind(), DomainEventKind::ProviderStarted { .. }))
                 .count(),
             1
         );
@@ -1627,6 +1656,17 @@ mod tests {
             assert_eq!(run.stage(&spec).unwrap().status(), StageStatus::Completed);
             assert_eq!(run.stage(&decision).unwrap().status(), StageStatus::Pending);
 
+            // Verification became ready beside the reviews and runs after
+            // them; the decision waits for it too.
+            let verify = StageId::new("verify").unwrap();
+            assert_eq!(run.stage(&verify).unwrap().status(), StageStatus::Ready);
+            for _ in 0..4 {
+                engine.tick(&mut fixture.store, fixture.run_id).unwrap();
+            }
+            let run = fixture.store.load_run(fixture.run_id).unwrap().run;
+            assert_eq!(run.stage(&verify).unwrap().status(), StageStatus::Completed);
+            assert_eq!(run.stage(&decision).unwrap().status(), StageStatus::Pending);
+
             engine.tick(&mut fixture.store, fixture.run_id).unwrap();
             let run = fixture.store.load_run(fixture.run_id).unwrap().run;
             assert_eq!(run.stage(&decision).unwrap().status(), StageStatus::Ready);
@@ -1718,14 +1758,18 @@ mod tests {
     fn pause_interruption_and_delay_are_explicitly_controlled() {
         let mut fixture = Fixture::new(WorkflowKind::Fast, 1_000_000);
         let make_scenario = || {
-            FakeScenario::new().stage("implementation").events([
-                FakeEvent::Started,
-                FakeEvent::Paused,
-                FakeEvent::progress("resumed"),
-                FakeEvent::Interrupted,
-                FakeEvent::delay("process-ready"),
-                FakeEvent::Completed,
-            ])
+            FakeScenario::new()
+                .stage("implementation")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::Paused,
+                    FakeEvent::progress("resumed"),
+                    FakeEvent::Interrupted,
+                    FakeEvent::delay("process-ready"),
+                    FakeEvent::Completed,
+                ])
+                .stage("verify")
+                .events([FakeEvent::Started, FakeEvent::Completed])
         };
         let mut engine = WorkflowEngine::with_context(
             FakeProvider::new(make_scenario()).unwrap(),

@@ -1509,7 +1509,7 @@ mod tests {
         let report = RunService::new(
             database.clone(),
             worktrees.clone(),
-            crate::app::DevelopmentFakeProviderFactory,
+            crate::app::DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
         )
         .start_run(
             WorkflowKind::Standard,
@@ -1704,7 +1704,7 @@ mod tests {
         let report = RunService::new(
             database.clone(),
             worktrees.clone(),
-            crate::app::DevelopmentFakeProviderFactory,
+            crate::app::DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
         )
         .start_run(
             WorkflowKind::Standard,

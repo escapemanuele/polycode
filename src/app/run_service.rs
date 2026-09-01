@@ -145,13 +145,13 @@ where
 
     pub(crate) fn start_run_with_config(
         &self,
-        workflow_kind: WorkflowKind,
+        workflow: WorkflowDefinition,
         task: impl Into<String>,
         repository_path: impl AsRef<Path>,
         config: &ResolvedConfigSnapshot,
     ) -> Result<ExecutionReport, AppError> {
         self.start_run_with_config_at(
-            WorkflowDefinition::built_in(workflow_kind),
+            workflow,
             task.into(),
             repository_path.as_ref(),
             config,
@@ -913,7 +913,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::app::{DevelopmentFakeProviderFactory, ProviderFactory, UniformProvider};
+    use crate::app::{
+        DevelopmentFakeProviderFactory, ProviderFactory, RoutedProvider, UniformProvider,
+    };
     use crate::domain::{
         ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactStatus, AttentionKind,
         ConfigSnapshotId, Dependency, DomainEventKind, ProviderId, Role, StageDefinition,
@@ -930,21 +932,24 @@ mod tests {
     #[derive(Clone)]
     struct ScriptedFactory {
         scenario: FakeScenario,
+        inner: DevelopmentFakeProviderFactory,
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct RecordingFactory {
         tasks: Arc<Mutex<Vec<String>>>,
+        inner: DevelopmentFakeProviderFactory,
     }
 
     struct RecordingProvider {
-        inner: FakeProvider,
+        inner: RoutedProvider,
         tasks: Arc<Mutex<Vec<String>>>,
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct GatedFactory {
         released: Arc<AtomicBool>,
+        inner: DevelopmentFakeProviderFactory,
     }
 
     impl Provider for RecordingProvider {
@@ -981,7 +986,7 @@ mod tests {
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory
+            self.inner
                 .config_for_new_run(selection, effort, workflow, id, created_at)
         }
 
@@ -993,7 +998,7 @@ mod tests {
             events: &[SequencedEvent],
         ) -> Result<Self::Provider, AppError> {
             Ok(RecordingProvider {
-                inner: DevelopmentFakeProviderFactory.for_run(run_id, config, workflow, events)?,
+                inner: self.inner.for_run(run_id, config, workflow, events)?,
                 tasks: Arc::clone(&self.tasks),
             })
         }
@@ -1010,7 +1015,7 @@ mod tests {
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory
+            self.inner
                 .config_for_new_run(selection, effort, workflow, id, created_at)
         }
 
@@ -1021,13 +1026,17 @@ mod tests {
             workflow: &WorkflowDefinition,
             events: &[SequencedEvent],
         ) -> Result<Self::Provider, AppError> {
-            let _ = DevelopmentFakeProviderFactory.for_run(run_id, config, workflow, events)?;
-            let scenario = FakeScenario::new().stage("implementation").events([
-                FakeEvent::Started,
-                FakeEvent::progress("checkpoint before process exit"),
-                FakeEvent::delay("process-restarted"),
-                FakeEvent::Completed,
-            ]);
+            let _ = self.inner.for_run(run_id, config, workflow, events)?;
+            let scenario = FakeScenario::new()
+                .stage("implementation")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::progress("checkpoint before process exit"),
+                    FakeEvent::delay("process-restarted"),
+                    FakeEvent::Completed,
+                ])
+                .stage("verify")
+                .events([FakeEvent::Started, FakeEvent::Completed]);
             let mut provider = FakeProvider::new(scenario)?;
             if self.released.load(Ordering::SeqCst) {
                 provider.release("implementation", "process-restarted")?;
@@ -1047,7 +1056,7 @@ mod tests {
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
         ) -> Result<ResolvedConfigSnapshot, AppError> {
-            DevelopmentFakeProviderFactory
+            self.inner
                 .config_for_new_run(selection, effort, workflow, id, created_at)
         }
 
@@ -1090,11 +1099,35 @@ mod tests {
             }
         }
 
+        /// Commits a `.polycode.toml` whose `[verify]` table runs exactly
+        /// these commands, so the run's worktree — cut from `HEAD` — carries
+        /// it.
+        fn verify_with(&self, commands: &[&str]) {
+            let list = commands
+                .iter()
+                .map(|command| format!("{command:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            fs::write(
+                self.repo.join(".polycode.toml"),
+                format!("[verify]\ncommands = [{list}]\n"),
+            )
+            .unwrap();
+            git(&self.repo, &["add", ".polycode.toml"]);
+            git(&self.repo, &["commit", "-qm", "verify config"]);
+        }
+
+        /// Every fake factory writes verification artifacts under this
+        /// fixture, never under the developer's own data directory.
+        fn fake_factory(&self) -> DevelopmentFakeProviderFactory {
+            DevelopmentFakeProviderFactory::new(self.temp.path().join("runs"))
+        }
+
         fn default_service(&self) -> RunService<DevelopmentFakeProviderFactory> {
             RunService::new(
                 self.database.clone(),
                 self.worktrees.clone(),
-                DevelopmentFakeProviderFactory,
+                self.fake_factory(),
             )
         }
 
@@ -1102,7 +1135,10 @@ mod tests {
             RunService::new(
                 self.database.clone(),
                 self.worktrees.clone(),
-                ScriptedFactory { scenario },
+                ScriptedFactory {
+                    scenario,
+                    inner: self.fake_factory(),
+                },
             )
         }
     }
@@ -1141,9 +1177,207 @@ mod tests {
         assert!(git_output(&fixture.repo, &["status", "--porcelain"]).is_empty());
     }
 
+    /// The verify stage is never faked: every agent role goes to the Fake
+    /// provider, and the repository's own `[verify]` commands really run in
+    /// the worktree. Passing checks let the run complete and be applied.
+    #[test]
+    fn a_standard_run_runs_the_repositorys_verify_commands_and_can_be_applied() {
+        let fixture = Fixture::new();
+        fixture.verify_with(&["true"]);
+        let service = fixture.default_service();
+
+        let report = service
+            .start_run(
+                WorkflowKind::Standard,
+                "task with passing checks",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+
+        assert_eq!(report.details.status, RunStatus::Completed);
+        let verify = report
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.kind == StageKind::Verify)
+            .expect("standard runs verify");
+        assert_eq!(verify.id.to_string(), "verify");
+        assert_eq!(verify.status, StageStatus::Completed);
+        assert_eq!(verify.configured_provider, "verify");
+        assert_eq!(verify.actual_provider.as_deref(), Some("verify"));
+        assert!(
+            report
+                .details
+                .routes
+                .iter()
+                .all(|route| route.role != Role::Verifier),
+            "the verifier is not a persisted route"
+        );
+        let artifact = service
+            .read_artifact(report.details.id, &verify.id)
+            .unwrap();
+        assert_eq!(artifact.summary.kind, ArtifactKind::Verify);
+        assert_eq!(artifact.summary.provider.as_deref(), Some("verify"));
+        assert!(
+            artifact
+                .text
+                .contains("## Bottom line\npassed — 1 command\n")
+        );
+        assert!(artifact.text.contains("### $ true\nexit: 0\n"));
+        // The artifact lives under the fixture, never under the developer's
+        // own data directory: a fake factory must not leave `verify.md`
+        // files in `~/.polycode/runs` on every test run.
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        let records = store.list_artifacts(report.details.id).unwrap();
+        assert!(
+            records
+                .iter()
+                .all(|record| record.path().starts_with(fixture.temp.path())),
+            "{records:?}"
+        );
+        if let Ok(real_root) = crate::store::process_root() {
+            assert!(
+                !real_root.join(report.details.id.to_string()).exists(),
+                "test artifacts leaked into {}",
+                real_root.display()
+            );
+        }
+
+        let (outcome, after) = service.apply_run(report.details.id).unwrap();
+        assert_eq!(outcome, ApplyOutcome::NoChanges);
+        assert_eq!(after.details.status, RunStatus::Completed);
+    }
+
+    /// A failing check does not dead-end the run: the decision still runs
+    /// (verification is an optional edge into it), the run completes, and
+    /// both ways of moving the change out of the worktree refuse by naming
+    /// verification — while a fix cycle stays available to answer it.
+    #[test]
+    fn a_failing_verify_command_completes_the_run_apply_names_verification_and_a_fix_is_available()
+    {
+        let fixture = Fixture::new();
+        fixture.verify_with(&["true", "false"]);
+        let service = fixture.default_service();
+
+        let report = service
+            .start_run(
+                WorkflowKind::Standard,
+                "task with failing checks",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+
+        assert_eq!(report.details.status, RunStatus::Completed);
+        let stage = |kind: StageKind| {
+            report
+                .details
+                .stages
+                .iter()
+                .find(|stage| stage.kind == kind)
+                .unwrap()
+        };
+        assert_eq!(stage(StageKind::Verify).status, StageStatus::Failed);
+        assert_eq!(stage(StageKind::Decision).status, StageStatus::Completed);
+        let artifact = service
+            .read_artifact(report.details.id, &stage(StageKind::Verify).id)
+            .unwrap();
+        assert_eq!(artifact.summary.status, ArtifactStatus::Failed);
+        assert!(
+            artifact
+                .text
+                .contains("## Bottom line\nfailed — false exited 1\n")
+        );
+
+        for result in [
+            service.apply_run(report.details.id).map(|_| ()),
+            service.publish_run(report.details.id).map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    AppError::Workspace(WorkspaceError::VerificationNotPassed { stage_id, status })
+                        if stage_id.as_str() == "verify" && status == "failed"
+                ),
+                "{error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "verification did not pass: stage verify is failed"
+            );
+        }
+
+        let fixed = service.request_fix(report.details.id).unwrap();
+        assert!(
+            fixed
+                .details
+                .stages
+                .iter()
+                .any(|stage| stage.id.as_str() == "verify_1"),
+            "a fix cycle, with its own verification, was appended"
+        );
+    }
+
+    /// The loop the gate exists for: checks fail, a fix cycle runs, its own
+    /// verification passes, and only then does apply go through. The
+    /// commands read a marker file so the same `.polycode.toml` fails first
+    /// and passes after the "fix".
+    #[test]
+    fn apply_succeeds_once_a_fix_cycles_own_verification_passes() {
+        let fixture = Fixture::new();
+        let marker = fixture.temp.path().join("checks-pass");
+        fixture.verify_with(&[&format!("test -e {}", marker.display())]);
+        let service = fixture.default_service();
+
+        let first = service
+            .start_run(
+                WorkflowKind::Standard,
+                "task fixed on the second attempt",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(first.details.status, RunStatus::Completed);
+        assert!(matches!(
+            service.apply_run(first.details.id),
+            Err(AppError::Workspace(
+                WorkspaceError::VerificationNotPassed { .. }
+            ))
+        ));
+
+        fs::write(&marker, "").unwrap();
+        let fixed = service.request_fix(first.details.id).unwrap();
+        assert_eq!(fixed.details.status, RunStatus::Completed);
+        let status = |id: &str| {
+            fixed
+                .details
+                .stages
+                .iter()
+                .find(|stage| stage.id.as_str() == id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(
+            status("verify"),
+            StageStatus::Failed,
+            "the first verdict stands"
+        );
+        assert_eq!(status("verify_1"), StageStatus::Completed);
+        assert_eq!(status("decision_1"), StageStatus::Completed);
+
+        let (outcome, applied) = service.apply_run(first.details.id).unwrap();
+        assert_eq!(outcome, ApplyOutcome::NoChanges);
+        assert_eq!(applied.details.status, RunStatus::Completed);
+    }
+
     /// A completed run can be sent back with the operator's own instruction:
-    /// the run reopens, grows exactly one follow-up stage and a fresh
-    /// decision, and reaches `Completed` again.
+    /// the run reopens, grows exactly one follow-up stage, its verification
+    /// and a fresh decision, and reaches `Completed` again.
     ///
     /// `ScriptedFactory` also pins the follow-up cycle's stages to explicit,
     /// deliberately narrated scripts — belt and braces alongside
@@ -1154,7 +1388,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut scenario =
             FakeScenario::successful(&WorkflowDefinition::built_in(WorkflowKind::Standard));
-        for stage_id in ["followup_1", "followup_decision_1"] {
+        for stage_id in ["followup_1", "followup_verify_1", "followup_decision_1"] {
             scenario = scenario
                 .stage(stage_id)
                 .events([FakeEvent::Started, FakeEvent::Completed]);
@@ -1180,7 +1414,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.details.status, RunStatus::Completed);
-        assert_eq!(report.details.stages.len(), before + 2);
+        assert_eq!(report.details.stages.len(), before + 3);
         let follow_up = report
             .details
             .stages
@@ -1597,7 +1831,8 @@ mod tests {
         .unwrap();
         let run = Run::new(run_id, workflow.clone(), config_id.clone(), created_at);
         let input = RunInput::new(run_id, "legacy standard task", created_at).unwrap();
-        let config = DevelopmentFakeProviderFactory
+        let config = fixture
+            .fake_factory()
             .config_for_new_run(
                 ExecutionSelection::Uniform(UniformProvider::Fake),
                 EffortSetting::NativeDefault,
@@ -1644,6 +1879,8 @@ mod tests {
                 .stage("implementation")
                 .events([FakeEvent::Started, FakeEvent::Completed])
                 .stage("simplification")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+                .stage("verify")
                 .events([FakeEvent::Started, FakeEvent::Completed])
                 .stage("quality_review")
                 .events([FakeEvent::Started, FakeEvent::Completed])
@@ -1725,7 +1962,10 @@ mod tests {
     #[test]
     fn normalized_immutable_task_reaches_every_provider_poll_exactly() {
         let fixture = Fixture::new();
-        let factory = RecordingFactory::default();
+        let factory = RecordingFactory {
+            tasks: Arc::default(),
+            inner: fixture.fake_factory(),
+        };
         let observed = Arc::clone(&factory.tasks);
         let service = RunService::new(fixture.database.clone(), fixture.worktrees.clone(), factory);
 
@@ -1748,12 +1988,16 @@ mod tests {
     fn needs_user_survives_restart_and_requires_explicit_resolution() {
         let fixture = Fixture::new();
         let scenario = || {
-            FakeScenario::new().stage("implementation").events([
-                FakeEvent::Started,
-                FakeEvent::needs_user(AttentionKind::Decision, "Choose API shape"),
-                FakeEvent::progress("Apply choice"),
-                FakeEvent::Completed,
-            ])
+            FakeScenario::new()
+                .stage("implementation")
+                .events([
+                    FakeEvent::Started,
+                    FakeEvent::needs_user(AttentionKind::Decision, "Choose API shape"),
+                    FakeEvent::progress("Apply choice"),
+                    FakeEvent::Completed,
+                ])
+                .stage("verify")
+                .events([FakeEvent::Started, FakeEvent::Completed])
         };
         let blocked = fixture
             .scripted_service(scenario())
@@ -1788,11 +2032,11 @@ mod tests {
         for suspended in [FakeEvent::Paused, FakeEvent::Interrupted] {
             let fixture = Fixture::new();
             let scenario = || {
-                FakeScenario::new().stage("implementation").events([
-                    FakeEvent::Started,
-                    suspended.clone(),
-                    FakeEvent::Completed,
-                ])
+                FakeScenario::new()
+                    .stage("implementation")
+                    .events([FakeEvent::Started, suspended.clone(), FakeEvent::Completed])
+                    .stage("verify")
+                    .events([FakeEvent::Started, FakeEvent::Completed])
             };
             let blocked = fixture
                 .scripted_service(scenario())
@@ -2224,7 +2468,10 @@ mod tests {
     #[test]
     fn restart_continues_after_last_checkpoint_without_replay() {
         let fixture = Fixture::new();
-        let factory = GatedFactory::default();
+        let factory = GatedFactory {
+            released: Arc::default(),
+            inner: fixture.fake_factory(),
+        };
         let released = Arc::clone(&factory.released);
         let service = RunService::new(
             fixture.database.clone(),
@@ -2257,12 +2504,24 @@ mod tests {
             RunService::new(fixture.database.clone(), fixture.worktrees.clone(), factory);
         let completed = restarted.resume_run(run_id).unwrap();
         assert_eq!(completed.details.status, RunStatus::Completed);
-        assert!(!completed.committed_events.iter().any(|event| matches!(
-            &event.kind,
-            DomainEventKind::ProviderStarted { .. } | DomainEventKind::ProviderProgress { .. }
-        )));
+        // The verify stage that follows legitimately starts here; only the
+        // resumed implementation must not replay.
+        assert!(!completed.committed_events.iter().any(|event| {
+            event
+                .stage_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "implementation")
+                && matches!(
+                    &event.kind,
+                    DomainEventKind::ProviderStarted { .. }
+                        | DomainEventKind::ProviderProgress { .. }
+                )
+        }));
     }
 
+    /// The failed implementation skipped the verify stage after it; the
+    /// retry returns both to pending in one commit, so the implementation
+    /// cannot succeed into a run whose verification stays skipped.
     #[test]
     fn failed_run_requires_retry_and_empty_apply_is_successful_no_op() {
         let fixture = Fixture::new();
@@ -2270,6 +2529,8 @@ mod tests {
             FakeScenario::new()
                 .stage("implementation")
                 .events([FakeEvent::Started, FakeEvent::failed("compile failed")])
+                .stage("verify")
+                .events([FakeEvent::Started, FakeEvent::Completed])
         };
         let failed = fixture
             .scripted_service(scenario())
@@ -2295,11 +2556,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retried.details.status, RunStatus::Failed);
-        assert!(
-            retried
-                .committed_events
-                .iter()
-                .any(|event| matches!(&event.kind, DomainEventKind::StageRetryScheduled))
+        for stage in ["implementation", "verify"] {
+            assert!(
+                retried.committed_events.iter().any(|event| {
+                    event
+                        .stage_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == stage)
+                        && matches!(&event.kind, DomainEventKind::StageRetryScheduled)
+                }),
+                "{stage} was returned to pending"
+            );
+        }
+        let verify = retried
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.kind == StageKind::Verify)
+            .unwrap();
+        assert_eq!(
+            verify.status,
+            StageStatus::Skipped,
+            "skipped again by the second failure, not left over from the first"
         );
 
         let complete = fixture
@@ -2531,7 +2809,17 @@ mod tests {
         let event_count = store.load_events(run_id).unwrap().len();
         drop(store);
 
-        assert_eq!(service.list_artifacts(run_id).unwrap().len(), 1);
+        // The run's own verify stage wrote an artifact too; this one is the
+        // implementation's.
+        assert_eq!(
+            service
+                .list_artifacts(run_id)
+                .unwrap()
+                .iter()
+                .filter(|artifact| artifact.kind == ArtifactKind::Implementation)
+                .count(),
+            1
+        );
         let view = service.read_artifact(run_id, &stage_id).unwrap();
         assert_eq!(view.text, "# Verified output\n");
         let mut store = SqliteStore::open(&fixture.database).unwrap();
@@ -2613,14 +2901,23 @@ mod tests {
             )
             .unwrap();
         let run_id = report.details.id;
+        // The verifier runs commands, which have no effort dial; every agent
+        // role carries the explicit level.
+        let expected = |stage: &crate::app::StageSummary| {
+            if stage.role == Role::Verifier {
+                EffortSetting::NativeDefault
+            } else {
+                EffortSetting::HIGH
+            }
+        };
         for stage in &report.details.stages {
-            assert_eq!(stage.requested_effort, EffortSetting::HIGH);
+            assert_eq!(stage.requested_effort, expected(stage), "{}", stage.id);
         }
         // Fresh service instance: requested effort reconstructs exactly from
         // the persisted immutable snapshot, not from in-memory state.
         let reloaded = fixture.default_service().inspect_run(run_id).unwrap();
         for stage in &reloaded.stages {
-            assert_eq!(stage.requested_effort, EffortSetting::HIGH);
+            assert_eq!(stage.requested_effort, expected(stage), "{}", stage.id);
         }
     }
 

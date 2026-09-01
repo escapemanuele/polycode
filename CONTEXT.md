@@ -313,3 +313,11 @@ _Avoid_: Delete, cleanup
 **Cleanup**:
 An artifact-retention operation that may remove run resources without changing the run's lifecycle status.
 _Avoid_: Cleaned status, discard
+
+**Verify**:
+The stage that runs the repository's own verification commands in the run's worktree after the last editing stage, records every command and exit code in an artifact, and completes only when every exit code is zero. Its failure reaches the decision as evidence and blocks apply and pull request until a later verification passes; it does not fail the run.
+_Avoid_: Test stage, CI, check
+
+**Verifier**:
+The role every Verify stage carries, always served by the deterministic `verify` provider through an implicit route that no configuration snapshot names.
+_Avoid_: Tester, validator, agent

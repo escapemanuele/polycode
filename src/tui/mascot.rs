@@ -69,6 +69,8 @@ pub(crate) enum MascotActivity {
     SpecReview,
     Synthesis,
     Decision,
+    /// The repository's own checks running in a terminal.
+    Verify,
 }
 
 /// Maps canonical state to POD's mood. The selected stage wins when present;
@@ -118,6 +120,7 @@ pub(crate) const fn mascot_activity(kind: StageKind) -> MascotActivity {
             MascotActivity::QualityReview
         }
         StageKind::SpecReview => MascotActivity::SpecReview,
+        StageKind::Verify => MascotActivity::Verify,
         StageKind::Synthesis => MascotActivity::Synthesis,
         StageKind::Decision => MascotActivity::Decision,
     }
@@ -239,6 +242,7 @@ pub(crate) const fn activity_label(activity: MascotActivity) -> &'static str {
         MascotActivity::Implementation => "BUILDING",
         MascotActivity::QualityReview => "INSPECTING",
         MascotActivity::SpecReview => "CHECKING",
+        MascotActivity::Verify => "VERIFYING",
         MascotActivity::Synthesis => "WEIGHING",
         MascotActivity::Decision => "DECIDING",
     }
@@ -303,6 +307,8 @@ const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
 ///   and the screen cracks.
 /// - `QualityReview`: a magnifying glass, lens and handle; it sweeps.
 /// - `SpecReview`: a checklist with ticked boxes; the next box gets ticked.
+/// - Verify: a terminal window with a prompt; output scrolls in and a
+///   check lands at the bottom.
 /// - Synthesis: the balance scales; the pans tilt as they weigh.
 /// - Decision: the gavel resting on its block; it lifts to strike.
 const fn prop_rows(activity: MascotActivity, frame: u8) -> [&'static str; 9] {
@@ -369,6 +375,17 @@ const fn resting_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
             "WYYWDDDDW",
             "WWWWWWWWW",
             "WWWWWWWWW",
+            ".........",
+        ],
+        MascotActivity::Verify => [
+            "BBBBBBBBB",
+            "BDDDDDDDB",
+            "BDYDDDDDB",
+            "BDDDDDDDB",
+            "BDDDDDDDB",
+            "BDDDDDDDB",
+            "BDDDDDDDB",
+            "BBBBBBBBB",
             ".........",
         ],
         MascotActivity::Synthesis => [
@@ -453,6 +470,17 @@ const fn working_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
             "WYYWDDDDW",
             "WWWWWWWWW",
             "WYYWWWWWW",
+            ".........",
+        ],
+        MascotActivity::Verify => [
+            "BBBBBBBBB",
+            "BDDDDDDDB",
+            "BDYDWWWDB",
+            "BDDDDDDDB",
+            "BDWWWWDDB",
+            "BDDDDDDDB",
+            "BDDDDDYDB",
+            "BBBBBBBBB",
             ".........",
         ],
         MascotActivity::Synthesis => [
@@ -639,12 +667,13 @@ mod tests {
         MascotState::Completed,
         MascotState::Failed,
     ];
-    const ALL_ACTIVITIES: [MascotActivity; 7] = [
+    const ALL_ACTIVITIES: [MascotActivity; 8] = [
         MascotActivity::Research,
         MascotActivity::Architecture,
         MascotActivity::Implementation,
         MascotActivity::QualityReview,
         MascotActivity::SpecReview,
+        MascotActivity::Verify,
         MascotActivity::Synthesis,
         MascotActivity::Decision,
     ];

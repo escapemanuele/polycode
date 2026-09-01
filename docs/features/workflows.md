@@ -3,12 +3,13 @@
 Choose how much process a task gets: one implementation stage, a full architecture-to-decision pipeline, or a read-only review, and then extend a finished run with fix or continue cycles.
 
 ## Sub-features
-- fast: Implementation only.
-- standard: Architecture -> Implementation -> Code Quality Review + Specification Review -> Decision.
+- fast: Implementation -> Verify.
+- standard: Architecture -> Implementation -> Simplification -> Code Quality Review + Specification Review + Verify -> Decision.
 - deep: Research before Architecture, then the Standard graph.
-- review: Research -> Code Quality Review + Specification Review (optional edges) -> Synthesis -> Decision; detached, read-only workspace.
-- fix: append a Fix stage plus a fresh Decision to a `Completed` run that reached a decision.
-- continue (TUI only): append a FollowUp stage plus Decision with a free-text instruction (`c`), or with the decision's own `## Follow-ups` section (`w`).
+- review: Research -> Code Quality Review + Specification Review (optional edges) -> Synthesis -> Decision; detached, read-only workspace; no Verify.
+- verify: the repository's own checks run after the last editing stage and beside the reviews; the Decision waits for them through an optional edge, so a failed check reaches the lead and the run still completes (see verification.md).
+- fix: append a Fix stage, its Verify (`verify_<n>`) and a fresh Decision to a `Completed` run that reached a decision.
+- continue (TUI only): append a FollowUp stage, its Verify (`followup_verify_<n>`) and a Decision with a free-text instruction (`c`), or with the decision's own `## Follow-ups` section (`w`).
 - reviewer-specialization: Code Quality Review judges HOW; Specification Review judges WHAT (Missing/Wrong/Unrequested).
 - change-handoff: review stages get a bounded diff and changed-file inventory of the worktree vs base commit in their first prompt.
 - bottom-line: every stage prompt asks for a `## Bottom line` section; the TUI quotes it verbatim.
@@ -28,8 +29,8 @@ polycode fix <run-id>
 TUI run detail: `f` fix (or book a fix while the run is still working; press again to cancel the booking), `c` continue with a typed instruction (Enter submits, Esc cancels), `w` work on the decision's Follow-ups (↑/↓ toggles "in this run" / "as a new run", Enter confirms).
 
 ## Where it lives
-- `src/domain/workflow.rs` — `WorkflowKind`, `StageKind` (incl. `Fix`, `FollowUp`), built-in DAGs, `next_follow_up_stage_id`, `requires_writable_workspace`.
-- `src/domain/role.rs` — roles (Researcher, Architect, Implementer, CodeQualityReviewer, SpecReviewer, EngineeringLead, legacy Reviewer).
+- `src/domain/workflow.rs` — `WorkflowKind`, `StageKind` (incl. `Fix`, `FollowUp`, `Verify`), built-in DAGs, `fix_cycle_stages`, `continue_cycle_stages`, `next_follow_up_stage_id`, `requires_writable_workspace`, `without_verification`.
+- `src/domain/role.rs` — roles (Researcher, Architect, Implementer, Simplifier, CodeQualityReviewer, SpecReviewer, EngineeringLead, Verifier, legacy Reviewer).
 - `src/engine/scheduler.rs` — graph-driven advancement; one eligible stage at a time.
 - `src/app/run_service.rs` — `request_fix`, `request_continue`.
 - `src/providers/stage_prompt.rs` — provider-neutral role contracts, `BOTTOM_LINE`, `PULL_REQUEST`.
@@ -42,7 +43,8 @@ TUI run detail: `f` fix (or book a fix while the run is still working; press aga
 ## Gotchas
 - There is no `continue` CLI command; continue and follow-ups are TUI-only (`c`, `w`).
 - Fix and continue require `RunStatus::Completed` and a Decision stage in the graph; `fast` runs have no decision, so `f`/`c`/`w` are refused with an explanation.
-- Fix cycles never re-run the reviews; start a `review` run over the result if you want them back.
+- Fix cycles never re-run the reviews; start a `review` run over the result if you want them back. They do re-run verification (`verify_<n>`), and the fresh decision only optionally depends on it.
+- A failed Verify stage does not fail the run: the decision runs with the failure in evidence, the run completes, and `fix`/continue stay available. Only `apply`/`pr` are refused until the latest verification passes.
 - A run created before fix-cycle routing existed cannot execute a fix; `request_fix` checks this before committing anything.
 - Existing persisted runs keep their original stored graph, including legacy generic Review stages; only new runs use the current definitions.
 - The change handoff is derived evidence, not an artifact; oversized diffs are marked INCOMPLETE, never silently cut. Resume prompts do not re-inject it.

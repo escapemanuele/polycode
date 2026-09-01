@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,15 @@ use crate::domain::{
     WorkflowDefinition, fix_cycle_stages,
 };
 use crate::store::ResolvedConfigSnapshot;
+
+/// The provider identity every verifier stage resolves to.
+///
+/// Verification is deterministic command execution, not agent work, so it
+/// has no place in a routing decision: no profile chooses it, no snapshot
+/// records it, and no evidence suite ranks it. The router answers for
+/// [`Role::Verifier`] itself, which is also what lets a run sealed before the
+/// role existed keep loading and keep growing fix cycles.
+pub const VERIFY_PROVIDER_ID: &str = "verify";
 
 /// Frozen initial Recommended policy. Preserved verbatim so persisted
 /// snapshots created under it keep resolving identically; never re-emitted
@@ -255,8 +265,16 @@ impl RoutingPlan {
         &self.profile_version
     }
 
+    /// The configured destination for one role.
+    ///
+    /// [`Role::Verifier`] is answered without consulting the snapshot — see
+    /// [`VERIFY_PROVIDER_ID`] — so it is absent from [`Self::routes`], which
+    /// reports only what the snapshot actually decided.
     #[must_use]
     pub fn route(&self, role: Role) -> Option<&RoleRoute> {
+        if role == Role::Verifier {
+            return Some(verifier_route());
+        }
         self.role_routes.get(&role)
     }
 
@@ -334,8 +352,15 @@ pub struct ResourcePlan {
 
 impl ResourcePlan {
     /// Requested effort for one routed role.
+    ///
+    /// The verifier runs commands, which have no effort dial; it is always
+    /// native default and never stated in a snapshot, so a v3 plan sealed
+    /// without it is complete.
     #[must_use]
     pub fn effort(&self, role: Role) -> Option<EffortSetting> {
+        if role == Role::Verifier {
+            return Some(EffortSetting::NativeDefault);
+        }
         self.role_efforts.get(&role).copied()
     }
 
@@ -682,11 +707,31 @@ fn recommended_routes(
         .collect())
 }
 
+/// The route every verifier stage takes, built once. Static rather than a
+/// field so a snapshot decoded before the role existed carries it too.
+fn verifier_route() -> &'static RoleRoute {
+    static ROUTE: LazyLock<RoleRoute> = LazyLock::new(|| RoleRoute {
+        target: ExecutionTarget::new(
+            ProviderId::new(VERIFY_PROVIDER_ID).expect("static provider ID is valid"),
+            None,
+        ),
+        reason: "implicit_verify_provider".to_owned(),
+    });
+    &ROUTE
+}
+
+/// Whether a role's route is decided by the configuration snapshot at all.
+/// Only the verifier is not; see [`VERIFY_PROVIDER_ID`].
+const fn routed_by_snapshot(role: Role) -> bool {
+    !matches!(role, Role::Verifier)
+}
+
 fn required_roles(workflow: &WorkflowDefinition) -> HashSet<Role> {
     workflow
         .stages()
         .iter()
         .map(crate::domain::StageDefinition::role)
+        .filter(|role| routed_by_snapshot(*role))
         .collect()
 }
 
@@ -704,6 +749,7 @@ fn fix_cycle_roles(workflow: &WorkflowDefinition) -> HashSet<Role> {
             fix_cycle_stages(1, decision.id())
                 .iter()
                 .map(StageDefinition::role)
+                .filter(|role| routed_by_snapshot(*role))
                 .collect()
         })
         .unwrap_or_default()
@@ -1445,6 +1491,96 @@ mod tests {
         );
         let plan = RoutingPlan::from_snapshot(&snapshot, &workflow).unwrap();
         assert!(plan.route(Role::Implementer).is_some());
+    }
+
+    /// The verifier never appears in a snapshot and never needs to: every
+    /// selection routes it to the same deterministic provider, with native
+    /// default effort, and the persisted routes stay exactly the roles the
+    /// snapshot decided.
+    #[test]
+    fn the_verifier_routes_implicitly_to_the_verify_provider_under_every_selection() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        for selection in [
+            ExecutionSelection::Uniform(UniformProvider::Fake),
+            ExecutionSelection::Uniform(UniformProvider::Claude),
+            ExecutionSelection::Uniform(UniformProvider::Codex),
+            ExecutionSelection::Recommended,
+        ] {
+            let snapshot = resolve_config(
+                selection,
+                EffortSetting::Level(crate::domain::EffortLevel::High),
+                &workflow,
+                RecommendedAvailability {
+                    claude: true,
+                    codex: true,
+                },
+                ConfigSnapshotId::new("verifier").unwrap(),
+                std::time::SystemTime::now().into(),
+            )
+            .unwrap();
+            let plan = RoutingPlan::from_snapshot(&snapshot, &workflow).unwrap();
+            let route = plan.route(Role::Verifier).expect("verifier always routes");
+            assert_eq!(route.target().provider_id().as_str(), VERIFY_PROVIDER_ID);
+            assert_eq!(route.target().model_id(), None);
+            assert!(
+                plan.routes().all(|(role, _)| role != Role::Verifier),
+                "the verifier is not a persisted route"
+            );
+            assert!(
+                snapshot.payload()["routes"].get("verifier").is_none(),
+                "the snapshot never names the verifier"
+            );
+            assert!(
+                snapshot.payload()["resource_plan"]
+                    .get("verifier")
+                    .is_none(),
+                "the resource plan never names the verifier"
+            );
+            let efforts = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+            assert_eq!(
+                efforts.effort(Role::Verifier),
+                Some(EffortSetting::NativeDefault)
+            );
+        }
+        assert!(
+            RECOMMENDED_V2_PROVENANCE
+                .decisions
+                .iter()
+                .all(|decision| decision.role != Role::Verifier)
+        );
+    }
+
+    /// A run sealed before the verifier existed carries neither its route
+    /// nor its effort, and is never rewritten. It still loads against the
+    /// verify-bearing built-in, and the fix cycle it can grow — which now
+    /// includes a verify stage — is still fully routable.
+    #[test]
+    fn a_snapshot_sealed_before_the_verifier_existed_still_loads_and_fixes() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let sealed = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortSetting::Level(crate::domain::EffortLevel::Medium),
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("pre-verifier").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        // Today's payload already omits the verifier; a pre-verifier snapshot
+        // is byte-identical in shape, which is the whole point.
+        let plan = RoutingPlan::from_snapshot(&sealed, &workflow).unwrap();
+        assert_eq!(
+            plan.route(Role::Verifier)
+                .unwrap()
+                .target()
+                .provider_id()
+                .as_str(),
+            VERIFY_PROVIDER_ID
+        );
+        assert_eq!(unroutable_fix_role(&sealed, &workflow).unwrap(), None);
     }
 
     /// Configurations written before fix-cycle routing carry no such route, and

@@ -626,6 +626,21 @@ mod tests {
     use std::io::{Read as _, Seek as _, SeekFrom};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
+    /// One implementation stage and nothing after it. The built-in Fast
+    /// graph now verifies after implementing, and that stage belongs to the
+    /// `verify` provider, not to the adapter under test.
+    fn implementation_only() -> WorkflowDefinition {
+        WorkflowDefinition::new(
+            WorkflowKind::Fast,
+            vec![crate::domain::StageDefinition::new(
+                crate::domain::StageId::new("implementation").unwrap(),
+                StageKind::Implementation,
+                Role::Implementer,
+                vec![],
+            )],
+        )
+        .unwrap()
+    }
 
     use serde_json::json;
     use tempfile::TempDir;
@@ -1211,12 +1226,7 @@ mod tests {
         let run_id = crate::domain::RunId::new();
         let created_at = CodexProvider::<RecoveryBackend>::now();
         let config_id = ConfigSnapshotId::new(format!("m8-{run_id}")).unwrap();
-        let run = Run::new(
-            run_id,
-            WorkflowDefinition::built_in(WorkflowKind::Fast),
-            config_id.clone(),
-            created_at,
-        );
+        let run = Run::new(run_id, implementation_only(), config_id.clone(), created_at);
         let input = RunInput::new(run_id, "recover task", created_at).unwrap();
         let config = codex_config(config_id, created_at);
         let created = run.created_event(EventMetadata::new(EventId::new(), created_at));
@@ -1304,12 +1314,7 @@ mod tests {
         let run_id = crate::domain::RunId::new();
         let created_at = CodexProvider::<FixtureBackend>::now();
         let config_id = ConfigSnapshotId::new(format!("m8-{run_id}")).unwrap();
-        let run = Run::new(
-            run_id,
-            WorkflowDefinition::built_in(WorkflowKind::Fast),
-            config_id.clone(),
-            created_at,
-        );
+        let run = Run::new(run_id, implementation_only(), config_id.clone(), created_at);
         let input = RunInput::new(run_id, "fixture task", created_at).unwrap();
         let config = codex_config(config_id, created_at);
         let created = run.created_event(EventMetadata::new(EventId::new(), created_at));

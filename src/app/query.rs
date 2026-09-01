@@ -550,6 +550,8 @@ fn stage_span(
             DomainEventKind::StageCompleted
             | DomainEventKind::StageFailed
             | DomainEventKind::StageSkipped => span.1 = Some(*event.event.occurred_at()),
+            // Returned to pending, with or without ever having run.
+            DomainEventKind::StageRetryScheduled => span = (None, None),
             _ => {}
         }
     }
@@ -924,6 +926,7 @@ const fn role_order(role: Role) -> u8 {
         Role::SpecReviewer => 5,
         Role::Reviewer => 6,
         Role::EngineeringLead => 7,
+        Role::Verifier => 8,
     }
 }
 
