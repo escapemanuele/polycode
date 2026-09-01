@@ -415,10 +415,52 @@ impl<B: ProcessBackend> CodexProvider<B> {
                 if process_status.is_active() {
                     return Ok(ProviderPoll::Pending);
                 }
-                if process_status != ManagedProcessStatus::Exited || !successful_exit {
-                    return Err(CodexProviderError::Protocol(format!(
-                        "Codex emitted turn.completed but process ended as {process_status:?} without successful exit evidence"
-                    )));
+                let final_path = self.final_message_path(request, &session, session.invocation());
+                // A `turn.completed` line retained in stdout is not by itself
+                // proof that the turn finished: the same bytes are there after
+                // the CLI was killed, rebooted out from under us, or died
+                // writing its result. A clean exit is the cheap proof, and
+                // when there is one nothing below runs.
+                //
+                // When the process is gone without that proof, the
+                // `--output-last-message` file decides. The Codex CLI writes
+                // it before it exits, so it is evidence produced by the
+                // runtime itself and independent of the retained line — and
+                // it is the exact file this completion would persist as the
+                // stage artifact. Line plus file means the work exists and is
+                // reachable; trusting it here costs nothing, because the
+                // artifact still goes through the same write-once, fsync'd,
+                // hash-verified path as a clean exit. Refusing instead is what
+                // is expensive: the same retained record is re-read and
+                // re-rejected on every later poll, so the stage stays Running
+                // for good and finished work is reachable only by discarding
+                // it with a retry.
+                //
+                // Without the file there is nothing to trust, so this reports
+                // the neutral fact that the process is gone. Interruption is
+                // what the adapter already says about process loss after a
+                // native thread exists, and recovery knows how to resume it.
+                //
+                // Either way exactly one record is consumed in exactly one
+                // durable transaction, so a crash before the commit replays
+                // this same line against the same file and reaches the same
+                // decision.
+                let trusted = (process_status == ManagedProcessStatus::Exited && successful_exit)
+                    || final_message_corroborates(&final_path);
+                if !trusted {
+                    session
+                        .interrupt(Self::now())
+                        .map_err(|error| CodexProviderError::Protocol(error.to_owned()))?;
+                    commit = commit.with_session(ProviderSessionMutation::new(session, expected));
+                    return Ok(ProviderPoll::Emission {
+                        signals: vec![
+                            ProviderSignal::Progress(format!(
+                                "Codex emitted turn.completed but process ended as {process_status:?} without successful exit evidence, and no final message file corroborates the turn"
+                            )),
+                            ProviderSignal::Interrupted,
+                        ],
+                        commit,
+                    });
                 }
                 // Codex's stream never names the model or the reasoning
                 // effort it resolved. Its own session record does, and by the
@@ -430,7 +472,6 @@ impl<B: ProcessBackend> CodexProvider<B> {
                         .confirm_model(model, Self::now())
                         .map_err(|error| CodexProviderError::Protocol(error.to_owned()))?;
                 }
-                let final_path = self.final_message_path(request, &session, session.invocation());
                 let workspace = store.load_workspace(request.run_id())?.ok_or_else(|| {
                     CodexProviderError::Protocol("run workspace disappeared".to_owned())
                 })?;
@@ -606,6 +647,17 @@ impl<B: ProcessBackend> Provider for CodexProvider<B> {
     }
 }
 
+/// Whether the persisted `--output-last-message` file independently
+/// corroborates a `turn.completed` whose process is already gone.
+///
+/// The Codex CLI writes this file itself, before it exits, and it is the same
+/// file the completion persists as the stage artifact. A file that cannot be
+/// read, or that holds nothing but whitespace, corroborates nothing: it is
+/// what a process killed before or during that write leaves behind.
+fn final_message_corroborates(path: &Path) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| bytes.iter().any(|byte| !byte.is_ascii_whitespace()))
+}
+
 fn create_private_parent(path: &Path) -> Result<(), CodexProviderError> {
     let parent = path.parent().ok_or_else(|| {
         CodexProviderError::Protocol("final-message path has no parent".to_owned())
@@ -655,6 +707,14 @@ mod tests {
         started: Arc<Mutex<HashSet<ManagedProcessId>>>,
         completed: Arc<Mutex<HashSet<ManagedProcessId>>>,
         output: Arc<String>,
+        /// What the process left behind when it ended. `None` is a process
+        /// that disappeared without any evidence at all — a reboot, or a lost
+        /// tmux server — which reconciles to `Missing`.
+        exit: Option<ExitResult>,
+        /// First invocation that writes the `--output-last-message` file.
+        /// `None` never writes one, which is what a CLI killed before that
+        /// write leaves behind.
+        final_message_from_invocation: Option<u32>,
     }
 
     #[derive(Clone, Default)]
@@ -670,7 +730,19 @@ mod tests {
                 started: Arc::new(Mutex::new(HashSet::new())),
                 completed: Arc::new(Mutex::new(HashSet::new())),
                 output: Arc::new(output.to_owned()),
+                exit: Some(ExitResult::ExitCode { code: 0 }),
+                final_message_from_invocation: Some(1),
             }
+        }
+
+        fn with_exit(mut self, exit: Option<ExitResult>) -> Self {
+            self.exit = exit;
+            self
+        }
+
+        fn writing_final_message_from(mut self, invocation: Option<u32>) -> Self {
+            self.final_message_from_invocation = invocation;
+            self
         }
     }
 
@@ -697,10 +769,15 @@ mod tests {
                 .iter()
                 .position(|arg| arg == "--output-last-message")
                 .expect("fixture command has final-message option");
-            std::fs::write(
-                PathBuf::from(&args[output_index + 1]),
-                "# Codex result\nFixture\n",
-            )?;
+            if self
+                .final_message_from_invocation
+                .is_some_and(|first| process.invocation() >= first)
+            {
+                std::fs::write(
+                    PathBuf::from(&args[output_index + 1]),
+                    "# Codex result\nFixture\n",
+                )?;
+            }
             self.started.lock().unwrap().insert(process.id());
             Ok(())
         }
@@ -756,6 +833,9 @@ mod tests {
             &self,
             process: &ManagedProcess,
         ) -> Result<Option<ExitEvidence>, ProcessError> {
+            let Some(result) = self.exit.clone() else {
+                return Ok(None);
+            };
             if !self.completed.lock().unwrap().contains(&process.id()) {
                 return Ok(None);
             }
@@ -763,7 +843,7 @@ mod tests {
             Ok(Some(ExitEvidence::new(
                 process.id(),
                 process.command_fingerprint().to_owned(),
-                ExitResult::ExitCode { code: 0 },
+                result,
                 false,
                 now,
                 now,
@@ -992,6 +1072,26 @@ mod tests {
     fn turn_completion_transaction_failure_replays_batch_without_duplicate_usage() {
         let (_temp, _database, run_id, mut store, provider) = fixture(SUCCESS_OUTPUT);
         let mut engine = WorkflowEngine::new(provider, "fixture task");
+        assert_completion_survives_a_failed_transaction(&mut store, run_id, &mut engine);
+    }
+
+    /// A completion trusted on the strength of the final-message file takes the
+    /// identical transaction, so the identical crash mid-commit must cost the
+    /// run nothing: one replayed record, one artifact, one usage batch.
+    #[test]
+    fn corroborated_completion_after_failed_exit_replays_batch_without_duplicate_usage() {
+        let (_temp, _database, run_id, mut store, provider) = fixture_with(
+            FixtureBackend::new(SUCCESS_OUTPUT).with_exit(Some(ExitResult::ExitCode { code: 1 })),
+        );
+        let mut engine = WorkflowEngine::new(provider, "fixture task");
+        assert_completion_survives_a_failed_transaction(&mut store, run_id, &mut engine);
+    }
+
+    fn assert_completion_survives_a_failed_transaction(
+        store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        engine: &mut WorkflowEngine<CodexProvider<FixtureBackend>>,
+    ) {
         loop {
             let before = store.load_events(run_id).unwrap();
             let next_is_completion = before.iter().any(|event| {
@@ -1000,7 +1100,7 @@ mod tests {
             if next_is_completion {
                 break;
             }
-            let _ = engine.tick(&mut store, run_id).unwrap();
+            let _ = engine.tick(store, run_id).unwrap();
         }
         let session_before = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
         let process_id = session_before.current_process_id().unwrap();
@@ -1010,7 +1110,7 @@ mod tests {
             .cursor(OutputStream::Stdout);
         let events_before = store.load_events(run_id).unwrap();
         store.install_event_insert_failure();
-        assert!(engine.tick(&mut store, run_id).is_err());
+        assert!(engine.tick(store, run_id).is_err());
         store.remove_event_insert_failure();
 
         assert_eq!(store.load_events(run_id).unwrap(), events_before);
@@ -1028,7 +1128,7 @@ mod tests {
         assert!(store.list_artifacts(run_id).unwrap().is_empty());
 
         assert!(matches!(
-            engine.tick(&mut store, run_id).unwrap(),
+            engine.tick(store, run_id).unwrap(),
             EngineStatus::Advanced { .. }
         ));
         let events = store.load_events(run_id).unwrap();
@@ -1042,6 +1142,135 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
+    }
+
+    /// Codex finished the turn and then the process died: a non-zero exit
+    /// here, a machine rebooted out from under tmux there. The work itself is
+    /// intact — the CLI wrote its final message before going — so the
+    /// completion stands. Refusing it strands finished work behind a protocol
+    /// error that every later poll raises again.
+    #[test]
+    fn a_dead_process_completes_when_the_final_message_corroborates_the_turn() {
+        for exit in [
+            // Non-zero exit: the turn was done, the CLI's own teardown was not.
+            Some(ExitResult::ExitCode { code: 1 }),
+            // No evidence at all — reboot, or a lost tmux server: `Missing`.
+            None,
+        ] {
+            let (_temp, database, run_id, mut store, provider) =
+                fixture_with(FixtureBackend::new(SUCCESS_OUTPUT).with_exit(exit));
+            let mut engine = WorkflowEngine::new(provider, "fixture task");
+            loop {
+                match engine.drive(&mut store, run_id).unwrap() {
+                    EngineStatus::Finished {
+                        run_status: RunStatus::Completed,
+                    } => break,
+                    EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                    status => panic!("unexpected status: {status:?}"),
+                }
+            }
+
+            let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+            assert_eq!(session.status(), ProviderSessionStatus::Completed);
+            let artifacts = store.list_artifacts(run_id).unwrap();
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(
+                artifacts[0].metadata().provider_id().unwrap().as_str(),
+                "codex"
+            );
+            // The artifact is the corroborating file itself, through the same
+            // write-once path a clean exit takes.
+            assert_eq!(
+                std::fs::read_to_string(artifacts[0].path()).unwrap(),
+                "# Codex result\nFixture\n"
+            );
+            assert_eq!(
+                store
+                    .load_events(run_id)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| matches!(
+                        event.event.kind(),
+                        DomainEventKind::ProviderCompleted { .. }
+                    ))
+                    .count(),
+                1
+            );
+
+            drop(store);
+            let mut store = SqliteStore::open(database).unwrap();
+            assert_eq!(
+                store.load_run(run_id).unwrap().run.status(),
+                RunStatus::Completed
+            );
+            assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
+        }
+    }
+
+    /// The same death with nothing to corroborate it: `turn.completed` is in
+    /// the output but the CLI never left a final message, so the turn is not
+    /// trusted. It must still consume the record and report the neutral fact
+    /// that the process is gone — an error here re-reads and re-rejects the
+    /// same line on every poll, and the stage never leaves Running.
+    #[test]
+    fn a_dead_process_without_a_final_message_interrupts_and_stays_recoverable() {
+        let stage_id = crate::domain::StageId::new("implementation").unwrap();
+        let (_temp, _database, run_id, mut store, provider) = fixture_with(
+            FixtureBackend::new(SUCCESS_OUTPUT)
+                .with_exit(None)
+                .writing_final_message_from(Some(2)),
+        );
+        let mut engine = WorkflowEngine::new(provider, "fixture task");
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Interrupted { stages } => {
+                    assert_eq!(stages, vec![stage_id.clone()]);
+                    break;
+                }
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+        assert_eq!(session.status(), ProviderSessionStatus::Interrupted);
+        assert!(store.list_artifacts(run_id).unwrap().is_empty());
+        assert!(
+            store
+                .load_events(run_id)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.event.kind(),
+                    DomainEventKind::ProviderInterrupted { .. }
+                ))
+        );
+        // The record was consumed: there is nothing left for a later poll to
+        // read again and reject again.
+        assert_eq!(
+            store
+                .load_managed_process(session.current_process_id().unwrap())
+                .unwrap()
+                .cursor(OutputStream::Stdout)
+                .offset(),
+            u64::try_from(SUCCESS_OUTPUT.len()).unwrap()
+        );
+
+        // Ordinary recovery, the same one process loss has always used.
+        engine.recover_stage(&mut store, run_id, &stage_id).unwrap();
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+        assert_eq!(session.status(), ProviderSessionStatus::Completed);
+        assert_eq!(session.invocation(), 2);
         assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
     }
 
@@ -1296,6 +1525,18 @@ mod tests {
         SqliteStore,
         CodexProvider<FixtureBackend>,
     ) {
+        fixture_with(FixtureBackend::new(output))
+    }
+
+    fn fixture_with(
+        backend: FixtureBackend,
+    ) -> (
+        TempDir,
+        PathBuf,
+        crate::domain::RunId,
+        SqliteStore,
+        CodexProvider<FixtureBackend>,
+    ) {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
         init_repository(&source);
@@ -1325,7 +1566,7 @@ mod tests {
             installation: CodexInstallation::fixture(PathBuf::from("/bin/true")),
             model: None,
             effort: EffortSetting::NativeDefault,
-            manager: ProcessManager::new(&process_root, FixtureBackend::new(output)),
+            manager: ProcessManager::new(&process_root, backend),
             artifact_root: process_root,
             // Inside the test's own temp directory: the lookup runs for real
             // and finds nothing unless the test writes a rollout there, and
