@@ -10,7 +10,7 @@
 //! — still have an opening paragraph, which is quoted instead and marked as
 //! what it is. Presentation only: the persisted artifact is never rewritten.
 
-use super::format;
+use super::{format, section};
 
 /// One line lifted from an artifact, and whether it came from the contracted
 /// section or from the artifact's first paragraph.
@@ -35,8 +35,8 @@ pub(crate) fn extract(source: &str) -> Option<Opening> {
         if in_fence {
             continue;
         }
-        if let Some(heading) = heading_text(trimmed) {
-            if is_bottom_line(heading) {
+        if let Some(heading) = section::heading_text(trimmed) {
+            if section::heading_matches(heading, "bottomline") {
                 // The contracted section wins wherever it sits, even when an
                 // agent placed it after its title block.
                 if let Some(text) = paragraph(&mut lines) {
@@ -70,7 +70,7 @@ fn paragraph<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<String> {
             }
             break;
         }
-        if heading_text(trimmed).is_some() || trimmed.starts_with("```") {
+        if section::heading_text(trimmed).is_some() || trimmed.starts_with("```") {
             break;
         }
         let text = plain(trimmed);
@@ -83,29 +83,6 @@ fn paragraph<'a>(lines: &mut impl Iterator<Item = &'a str>) -> Option<String> {
         collected.push_str(&text);
     }
     (!collected.is_empty()).then_some(collected)
-}
-
-/// Text of an ATX heading, or `None` for any other line.
-fn heading_text(trimmed: &str) -> Option<&str> {
-    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
-    if hashes == 0 || hashes > 6 {
-        return None;
-    }
-    let rest = &trimmed[hashes..];
-    // `#tag` is not a heading; the space is what makes it one.
-    if rest.is_empty() || rest.starts_with(' ') {
-        Some(rest.trim())
-    } else {
-        None
-    }
-}
-
-fn is_bottom_line(heading: &str) -> bool {
-    let normalized: String = heading
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect();
-    normalized.trim().eq_ignore_ascii_case("bottom line")
 }
 
 /// Lines that carry structure rather than a statement. A quoted or listed

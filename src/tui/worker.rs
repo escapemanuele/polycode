@@ -12,6 +12,7 @@ pub(crate) enum ActionKind {
     Stop,
     Retry,
     Fix,
+    Continue,
     ResolveAttention,
     Apply,
     Discard,
@@ -25,6 +26,7 @@ impl ActionKind {
             Self::Stop => "stopping run",
             Self::Retry => "retrying stage",
             Self::Fix => "fixing run",
+            Self::Continue => "continuing run",
             Self::ResolveAttention => "resolving attention",
             Self::Apply => "applying changes",
             Self::Discard => "discarding run",
@@ -39,7 +41,12 @@ impl ActionKind {
     /// only the store and the checkout, and cost nothing to have several of.
     pub(crate) const fn drives_a_provider(self) -> bool {
         match self {
-            Self::Start | Self::Resume | Self::Retry | Self::Fix | Self::ResolveAttention => true,
+            Self::Start
+            | Self::Resume
+            | Self::Retry
+            | Self::Fix
+            | Self::Continue
+            | Self::ResolveAttention => true,
             Self::Stop | Self::Apply | Self::Discard => false,
         }
     }
@@ -67,6 +74,10 @@ pub(crate) enum WorkerCommand {
     RequestFix {
         run_id: RunId,
     },
+    RequestContinue {
+        run_id: RunId,
+        instruction: String,
+    },
     ResolveAttention {
         run_id: RunId,
         attention_id: AttentionRequestId,
@@ -88,6 +99,7 @@ impl WorkerCommand {
             Self::StopRun { .. } => ActionKind::Stop,
             Self::RetryStage { .. } => ActionKind::Retry,
             Self::RequestFix { .. } => ActionKind::Fix,
+            Self::RequestContinue { .. } => ActionKind::Continue,
             Self::ResolveAttention { .. } => ActionKind::ResolveAttention,
             Self::ApplyRun { .. } => ActionKind::Apply,
             Self::DiscardRun { .. } => ActionKind::Discard,
@@ -101,6 +113,7 @@ impl WorkerCommand {
             | Self::StopRun { run_id }
             | Self::RetryStage { run_id, .. }
             | Self::RequestFix { run_id }
+            | Self::RequestContinue { run_id, .. }
             | Self::ResolveAttention { run_id, .. }
             | Self::ApplyRun { run_id }
             | Self::DiscardRun { run_id } => Some(*run_id),
@@ -261,6 +274,12 @@ where
         WorkerCommand::RequestFix { run_id } => {
             service.request_fix(run_id).map(WorkerSuccess::Execution)
         }
+        WorkerCommand::RequestContinue {
+            run_id,
+            instruction,
+        } => service
+            .request_continue(run_id, instruction)
+            .map(WorkerSuccess::Execution),
         WorkerCommand::ResolveAttention {
             run_id,
             attention_id,

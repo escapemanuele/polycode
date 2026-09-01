@@ -756,6 +756,20 @@ mod tests {
         );
     }
 
+    /// Additive like `Fix` before it: the new variant round-trips through
+    /// the same inspectable snake-case shape, changing no persisted schema.
+    #[test]
+    fn follow_up_stage_kind_round_trips_through_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&StageKind::FollowUp).unwrap(),
+            "\"follow_up\""
+        );
+        assert_eq!(
+            serde_json::from_str::<StageKind>("\"follow_up\"").unwrap(),
+            StageKind::FollowUp
+        );
+    }
+
     #[test]
     fn every_built_in_is_a_valid_nonempty_dag() {
         for kind in [

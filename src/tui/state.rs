@@ -35,6 +35,11 @@ pub(crate) enum Overlay {
     /// Application-level software update. Deliberately the lowest-priority
     /// overlay: run attention always outranks it.
     Update,
+    /// Free-text "how should the agent continue?" prompt for `[c]`.
+    Continue,
+    /// "In this run" or "as a new run" chooser for `[w]`, once a Follow-ups
+    /// section has actually been extracted from the decision artifact.
+    FollowUps,
 }
 
 /// How many agents this interface will have working at one time.
@@ -391,6 +396,31 @@ fn can_be_fixed(details: &RunDetails) -> bool {
         })
 }
 
+/// Whether this run could actually carry out a continue cycle: same
+/// question as [`can_be_fixed`], answered against
+/// [`crate::domain::continue_cycle_stages`] instead of the fix cycle's own
+/// list, so the two checks cannot silently drift if the two remediation
+/// cycles' role shapes ever diverge — even though today they are the same
+/// two roles.
+fn can_be_continued(details: &RunDetails) -> bool {
+    let Some(decision) = details
+        .stages
+        .iter()
+        .rev()
+        .find(|stage| stage.kind == crate::domain::StageKind::Decision)
+    else {
+        return false;
+    };
+    crate::domain::continue_cycle_stages(1, &decision.id)
+        .iter()
+        .all(|added| {
+            details
+                .routes
+                .iter()
+                .any(|route| route.role == added.role() && route.requested_effort.is_some())
+        })
+}
+
 #[derive(Debug)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -425,6 +455,17 @@ pub(crate) struct TuiState {
     pub scroll: u16,
     pub attention_index: usize,
     pub attention_response: TextField,
+    /// The free-text "how should the agent continue?" field behind `[c]`.
+    pub continue_instruction: TextField,
+    /// The selected run's decision's `## Follow-ups` text, staged for the
+    /// `[w]` chooser. `None` until that key is pressed; the extraction is
+    /// I/O (it reads the artifact), so it happens once when the overlay
+    /// opens rather than on every render.
+    pub follow_ups_text: Option<String>,
+    /// Which choice the `[w]` chooser has highlighted: `false` for "in this
+    /// run", `true` for "as a new run". Mirrors the update prompt's own
+    /// two-option toggle.
+    pub follow_ups_as_new_run: bool,
     pub new_run: NewRunForm,
     /// Every dispatched action still waiting on its outcome. A list rather
     /// than a single slot: this interface can be working on several runs at
@@ -492,6 +533,9 @@ impl TuiState {
             scroll: 0,
             attention_index: 0,
             attention_response: TextField::default(),
+            continue_instruction: TextField::default(),
+            follow_ups_text: None,
+            follow_ups_as_new_run: false,
             new_run: NewRunForm::new(repository),
             in_flight: Vec::new(),
             message: None,
@@ -800,6 +844,19 @@ impl TuiState {
     pub(crate) fn fix_is_booked(&self) -> bool {
         self.selected_run
             .is_some_and(|run_id| self.fix_when_finished.contains(&run_id))
+    }
+
+    /// Whether this run can be sent back with the operator's own continue
+    /// instruction: same eligibility as `[f]` Fix — a completed run that
+    /// reached a decision, sealed with a configuration that can route and
+    /// afford the cycle it would grow. No booking exists for this one: a
+    /// continue instruction is not known in advance the way "fix what the
+    /// verdict found" is, so there is nothing sensible to book while the run
+    /// is still working.
+    pub(crate) fn run_can_be_continued(&self) -> bool {
+        self.details.as_ref().is_some_and(|details| {
+            details.status == crate::domain::RunStatus::Completed && can_be_continued(details)
+        })
     }
 
     pub(crate) fn notify(&mut self, kind: UiMessageKind, text: impl Into<String>) {

@@ -2,12 +2,14 @@
 
 mod app;
 mod bottom_line;
+mod follow_ups;
 mod format;
 mod input;
 mod markdown;
 mod mascot;
 mod motion;
 mod render;
+mod section;
 mod state;
 mod terminal;
 mod theme;
