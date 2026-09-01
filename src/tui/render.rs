@@ -381,6 +381,40 @@ fn ellipsis_budget(width: usize) -> usize {
     width.saturating_sub(1).max(1)
 }
 
+/// The strip's `RunStatus::Failed` sentence for the blocking failed stage.
+///
+/// Bounds the *composed* sentence to `width`, not just the reason: at the
+/// narrowest supported terminal (the 50-column minimum leaves the rail only
+/// about 16 columns) even the bare `"<Stage> failed: "` prefix can already
+/// exceed the available width — "Implementation failed: " alone is 23
+/// characters. Truncating only the reason to whatever budget was left after
+/// subtracting the prefix's length still let an oversized prefix push the
+/// whole line past `width` once the reason and its ellipsis were appended.
+/// When there is not even room for the prefix plus one character of reason,
+/// the reason is dropped for the reasonless generic sentence instead of a
+/// truncation that would land mid-word or mid-prefix.
+fn failed_stage_sentence(
+    stage_kind: StageKind,
+    failure_reason: Option<&str>,
+    width: u16,
+) -> String {
+    let title = stage_title(stage_kind);
+    let Some(reason) = failure_reason else {
+        return format!("{title} failed — its logs say why.");
+    };
+    let prefix = format!("{title} failed: ");
+    let composed = format!("{prefix}{reason}");
+    let width = width as usize;
+    if composed.chars().count() <= width {
+        return composed;
+    }
+    let budget = ellipsis_budget(width);
+    if prefix.chars().count() >= budget {
+        return format!("{title} failed — its logs say why.");
+    }
+    format::truncate_title(&composed, budget)
+}
+
 /// What the run is doing right now, then how far along it is. The first
 /// sentence follows the run's canonical status; the second counts stages, so
 /// both stay facts the domain already asserted. `width` bounds the failure
@@ -422,19 +456,7 @@ fn status_sentences(details: &RunDetails, now: DateTime<Utc>, width: u16) -> Vec
             .find(|stage| stage.status == StageStatus::Failed && stage.blocking)
             .map_or_else(
                 || "Run failed.".to_owned(),
-                |stage| {
-                    stage.failure_reason.as_deref().map_or_else(
-                        || format!("{} failed — its logs say why.", stage_title(stage.kind)),
-                        |reason| {
-                            let prefix = format!("{} failed: ", stage_title(stage.kind));
-                            let budget = (width as usize).saturating_sub(prefix.chars().count());
-                            format!(
-                                "{prefix}{}",
-                                format::truncate_title(reason, ellipsis_budget(budget))
-                            )
-                        },
-                    )
-                },
+                |stage| failed_stage_sentence(stage.kind, stage.failure_reason.as_deref(), width),
             ),
         RunStatus::Paused | RunStatus::Interrupted => {
             "Run suspended — resume when ready.".to_owned()
@@ -3102,6 +3124,77 @@ mod tests {
         assert_eq!(
             sentences[1], "0 of 1 stages complete, 1 failed.",
             "the stage-count sentence survives a long reason instead of being pushed out"
+        );
+    }
+
+    /// At the 50-column supported minimum the rail's inner width is only
+    /// about 16 columns — narrower than truncating just the reason ever
+    /// accounted for, since the untruncated `"<Stage> failed: "` prefix could
+    /// still push the composed line past `width`. With a short stage title
+    /// the prefix itself still fits, so the fix (bounding the whole composed
+    /// sentence) must truncate successfully rather than fall back, and the
+    /// result must never exceed the strip's width.
+    #[test]
+    fn status_strip_bounds_the_whole_composed_sentence_at_a_16_column_width() {
+        let mut failing = stage(
+            "fix",
+            StageKind::Fix,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        failing.blocking = true;
+        let run = details(RunStatus::Failed, vec![failing]);
+
+        let width = 16u16;
+        let sentences = status_sentences(&run, at(12, 13, 0), width);
+        assert!(
+            sentences[0].chars().count() <= width as usize,
+            "the composed sentence must fit the strip's width: {:?}",
+            sentences[0]
+        );
+        assert!(
+            sentences[0].starts_with("Fix failed: "),
+            "the prefix must survive intact, not be cut mid-word: {:?}",
+            sentences[0]
+        );
+        assert!(sentences[0].ends_with('…'), "the cut is visible");
+        assert_eq!(
+            sentences[1], "0 of 1 stages complete, 1 failed.",
+            "the stage-count sentence survives a bounded composed sentence"
+        );
+    }
+
+    /// The real bug this guards: `"Implementation failed: "` alone is 23
+    /// characters, already wider than the ~16-column rail at the smallest
+    /// supported terminal. No truncation of that prefix can produce anything
+    /// legible, so rather than land mid-word the strip drops the reason
+    /// entirely and falls back to the reasonless generic sentence — the same
+    /// text shown when a failed stage carries no reason at all. This
+    /// necessarily still exceeds 16 columns (an unavoidable consequence of
+    /// naming a 14-character stage at that width, present before failure
+    /// reasons existed), but the stage-count sentence must still be exactly
+    /// right — proving the fallback never corrupts anything past it.
+    #[test]
+    fn status_strip_falls_back_to_the_generic_sentence_when_even_the_prefix_cannot_fit() {
+        let mut failing = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        failing.failure_reason = Some("x".repeat(200));
+        failing.blocking = true;
+        let run = details(RunStatus::Failed, vec![failing]);
+
+        let sentences = status_sentences(&run, at(12, 13, 0), 16);
+        assert_eq!(
+            sentences[0], "Implementation failed — its logs say why.",
+            "an unfittable prefix falls back cleanly instead of a garbled truncation"
+        );
+        assert_eq!(
+            sentences[1], "0 of 1 stages complete, 1 failed.",
+            "the stage-count sentence survives even the fallback path"
         );
     }
 
