@@ -641,7 +641,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         if context.role() != Role::Implementer
             || !matches!(
                 context.stage_kind(),
-                StageKind::Implementation | StageKind::Fix
+                StageKind::Implementation | StageKind::Fix | StageKind::FollowUp
             )
         {
             return Ok(None);
