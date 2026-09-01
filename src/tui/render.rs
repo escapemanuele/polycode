@@ -879,6 +879,7 @@ const fn result_statement(kind: StageKind) -> &'static str {
         StageKind::Synthesis => "Synthesis ready",
         StageKind::Decision => "Decision reached",
         StageKind::Fix => "Fix ready",
+        StageKind::FollowUp => "Follow-up ready",
     }
 }
 
@@ -1074,6 +1075,7 @@ const fn stage_title(kind: StageKind) -> &'static str {
         StageKind::Synthesis => "Synthesis",
         StageKind::Decision => "Decision",
         StageKind::Fix => "Fix",
+        StageKind::FollowUp => "Follow-up",
     }
 }
 

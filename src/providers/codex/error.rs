@@ -31,6 +31,8 @@ pub enum CodexProviderError {
     #[error(transparent)]
     ChangeHandoff(#[from] crate::providers::change_handoff::ChangeHandoffError),
     #[error(transparent)]
+    ContinueInstruction(#[from] crate::providers::continue_instruction::ContinueInstructionError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),

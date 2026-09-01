@@ -12,6 +12,7 @@ pub(crate) fn compose(
     request: &ProviderRequest,
     artifacts: &[ArtifactRecord],
     handoff: Option<&ChangeHandoff>,
+    continue_instruction: Option<&str>,
 ) -> Result<String, ClaudeProviderError> {
     let mut prompt = String::new();
     writeln!(prompt, "# Polycode stage").expect("String writes cannot fail");
@@ -30,6 +31,15 @@ pub(crate) fn compose(
         stage_prompt::instruction(request.role(), request.stage_kind())
     )
     .expect("String writes cannot fail");
+    // The operator's own instruction for a continue cycle's follow-up stage.
+    // It reached this composition step through the same immutable run-private
+    // stdin path an attention response uses — never argv, never a domain
+    // event — so it is embedded verbatim here, in the one stdin payload every
+    // initial invocation already carries.
+    if let Some(instruction) = continue_instruction {
+        writeln!(prompt, "\n# Operator instruction\n{instruction}")
+            .expect("String writes cannot fail");
+    }
     writeln!(
         prompt,
         "Work only inside current worktree. Respect repository instructions and native Claude Code configuration. Return concise Markdown describing result, evidence, and unresolved risks."
@@ -92,7 +102,13 @@ mod tests {
     /// the artifact must not care which runtime produced it.
     #[test]
     fn every_stage_prompt_asks_for_the_bottom_line_section() {
-        let prompt = compose(&request(Role::Researcher, StageKind::Research), &[], None).unwrap();
+        let prompt = compose(
+            &request(Role::Researcher, StageKind::Research),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(prompt.contains(stage_prompt::BOTTOM_LINE));
     }
@@ -114,8 +130,8 @@ mod tests {
             true,
         );
         let request = request(Role::CodeQualityReviewer, StageKind::CodeQualityReview);
-        let without = compose(&request, &[], None).unwrap();
-        let with = compose(&request, &[], Some(&handoff)).unwrap();
+        let without = compose(&request, &[], None, None).unwrap();
+        let with = compose(&request, &[], Some(&handoff), None).unwrap();
         let section = change_handoff::render(&handoff);
 
         assert!(!without.contains("# Implementation change map"));
@@ -152,11 +168,13 @@ mod tests {
             &request(Role::CodeQualityReviewer, StageKind::CodeQualityReview),
             &[],
             None,
+            None,
         )
         .unwrap();
         let spec = compose(
             &request(Role::SpecReviewer, StageKind::SpecReview),
             &[],
+            None,
             None,
         )
         .unwrap();
@@ -166,5 +184,19 @@ mod tests {
         assert!(spec.contains("Judge WHAT behavior was delivered"));
         assert!(spec.contains("Missing, Wrong, or Unrequested"));
         assert!(spec.contains("Do not edit files"));
+    }
+
+    /// The operator's instruction is what a follow-up's initial prompt is
+    /// for. It must appear verbatim, and its absence for every other stage
+    /// must not add a section nobody asked for.
+    #[test]
+    fn the_operators_continue_instruction_is_embedded_verbatim_when_present() {
+        let request = request(Role::Implementer, StageKind::FollowUp);
+        let without = compose(&request, &[], None, None).unwrap();
+        let with = compose(&request, &[], None, Some("add integration tests too")).unwrap();
+
+        assert!(!without.contains("# Operator instruction"));
+        assert!(with.contains("# Operator instruction"));
+        assert!(with.contains("add integration tests too"));
     }
 }

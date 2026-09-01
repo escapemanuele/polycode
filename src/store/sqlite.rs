@@ -482,10 +482,12 @@ impl SqliteStore {
 ///
 /// The exception is kept as narrow as the thing it exists for. The kind cannot
 /// change, every stage that already existed must be byte-identical and in the
-/// same position, growth must be an append, and the batch must carry the
-/// `RunFixRequested` event naming exactly the stages that appeared. Anything
-/// else — a reordering, an edited definition, a silent append with no event to
-/// account for it — is still a rejected mutation of persisted identity.
+/// same position, growth must be an append, and the batch must carry a
+/// `RunFixRequested` or `RunContinueRequested` event naming exactly the
+/// stages that appeared — the two sibling remediation cycles share this one
+/// guard. Anything else — a reordering, an edited definition, a silent append
+/// with no event to account for it — is still a rejected mutation of
+/// persisted identity.
 fn validate_workflow_growth(
     current: &crate::domain::WorkflowDefinition,
     next: &crate::domain::WorkflowDefinition,
@@ -507,7 +509,8 @@ fn validate_workflow_growth(
     let declared = events
         .iter()
         .find_map(|event| match event.kind() {
-            DomainEventKind::RunFixRequested { stage_ids } => Some(stage_ids),
+            DomainEventKind::RunFixRequested { stage_ids }
+            | DomainEventKind::RunContinueRequested { stage_ids } => Some(stage_ids),
             _ => None,
         })
         .ok_or_else(changed)?;
@@ -1071,6 +1074,54 @@ mod tests {
         )]);
         assert!(matches!(
             validate_workflow_growth(&current, &shrunk, &fix_event(&["fix_1"])),
+            Err(StoreError::ImmutableRunFieldChanged("workflow"))
+        ));
+    }
+
+    /// The continue cycle's own event is the sibling account this guard also
+    /// accepts, under its own stage identities.
+    #[test]
+    fn a_stage_graph_also_grows_by_a_continue_cycle_the_sibling_event_accounts_for() {
+        use crate::domain::{RunId, WorkflowKind};
+
+        fn definition(id: &str, kind: StageKind, dependencies: Vec<Dependency>) -> StageDefinition {
+            StageDefinition::new(
+                StageId::new(id).unwrap(),
+                kind,
+                Role::Implementer,
+                dependencies,
+            )
+        }
+        fn workflow(stages: Vec<StageDefinition>) -> WorkflowDefinition {
+            WorkflowDefinition::new(WorkflowKind::Standard, stages).unwrap()
+        }
+        fn continue_event(stage_ids: &[&str]) -> Vec<DomainEvent> {
+            vec![DomainEvent::new(
+                metadata(1, 1),
+                RunId::from_u128(1),
+                None,
+                DomainEventKind::RunContinueRequested {
+                    stage_ids: stage_ids
+                        .iter()
+                        .map(|id| StageId::new(*id).unwrap())
+                        .collect(),
+                },
+            )]
+        }
+
+        let current = workflow(vec![definition("decision", StageKind::Decision, vec![])]);
+        let appended = vec![definition(
+            "followup_1",
+            StageKind::FollowUp,
+            vec![Dependency::required(StageId::new("decision").unwrap())],
+        )];
+        let grown = current.extended(appended).unwrap();
+
+        validate_workflow_growth(&current, &grown, &continue_event(&["followup_1"])).unwrap();
+        // An event that does not name what actually appeared is not an
+        // account of it, exactly like its sibling `RunFixRequested` case.
+        assert!(matches!(
+            validate_workflow_growth(&current, &grown, &continue_event(&["followup_2"])),
             Err(StoreError::ImmutableRunFieldChanged("workflow"))
         ));
     }

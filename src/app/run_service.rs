@@ -316,6 +316,56 @@ where
         Self::report(&mut store, run_id, before, Some(&status))
     }
 
+    /// Sends a completed run back with the operator's own next instruction,
+    /// then executes to quiescence.
+    ///
+    /// The sibling of [`Self::request_fix`]: the run grows a follow-up stage
+    /// and a fresh decision over it, keeping its workspace, artifacts and
+    /// identity, and shares that method's guards exactly — the roles a
+    /// continue cycle adds are the same roles a fix cycle adds, so the same
+    /// routability check answers for both. It differs only in what the new
+    /// implementer stage answers to: an operator instruction instead of the
+    /// verdict's own blocking findings. That instruction is immutable
+    /// run-private content, never a domain event field; the engine stages it
+    /// with the provider before the stage that will carry it is created, the
+    /// same ordering an attention response's text follows relative to the
+    /// resolution it answers.
+    ///
+    /// # Errors
+    /// Returns identity, lifecycle, guard, persistence, or provider errors.
+    /// A blank instruction, a run that is not completed, whose workspace is
+    /// gone, or whose apply is under way is refused without being modified.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "owned operator input at the public service boundary, mirroring how callers already own the text they read from a TUI field or CLI argument"
+    )]
+    pub fn request_continue(
+        &self,
+        run_id: RunId,
+        instruction: String,
+    ) -> Result<ExecutionReport, AppError> {
+        let instruction = instruction.trim().to_owned();
+        if instruction.is_empty() {
+            return Err(AppError::EmptyContinueInstruction(run_id));
+        }
+        let mut store = SqliteStore::open(&self.database)?;
+        let before = last_sequence(&store, run_id)?;
+        self.reconcile(&mut store, run_id)?;
+        let loaded = store.load_run(run_id)?;
+        if let Some(role) =
+            crate::app::unroutable_fix_role(&loaded.config_snapshot, loaded.run.workflow())?
+        {
+            return Err(AppError::UnroutableContinueCycle { run_id, role });
+        }
+        // See request_fix: this is the request that starts producing changes
+        // over a review's detached workspace, so it earns its branch here.
+        WorkspaceManager::new(&self.worktrees).adopt_branch_for_fix(&mut store, run_id)?;
+        let mut engine = self.engine(&mut store, run_id)?;
+        engine.request_continue(&mut store, run_id, &instruction)?;
+        let status = drive_attached(&mut engine, &mut store, run_id)?;
+        Self::report(&mut store, run_id, before, Some(&status))
+    }
+
     /// Applies completed workspace changes to source checkout.
     ///
     /// # Errors
@@ -1042,6 +1092,111 @@ mod tests {
         assert_eq!(service.list_runs().unwrap().len(), 4);
         assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), head);
         assert!(git_output(&fixture.repo, &["status", "--porcelain"]).is_empty());
+    }
+
+    /// A completed run can be sent back with the operator's own instruction:
+    /// the run reopens, grows exactly one follow-up stage and a fresh
+    /// decision, and reaches `Completed` again.
+    ///
+    /// `ScriptedFactory` scripts the follow-up cycle's stages up front
+    /// because `DevelopmentFakeProviderFactory` only scripts a workflow's
+    /// stages as they exist when its provider is constructed — the same
+    /// snapshot-at-construction limit that makes production routing
+    /// role-based rather than stage-scripted.
+    #[test]
+    fn a_completed_run_grows_a_continue_cycle_and_completes_again() {
+        let fixture = Fixture::new();
+        let mut scenario =
+            FakeScenario::successful(&WorkflowDefinition::built_in(WorkflowKind::Standard));
+        for stage_id in ["followup_1", "followup_decision_1"] {
+            scenario = scenario
+                .stage(stage_id)
+                .events([FakeEvent::Started, FakeEvent::Completed]);
+        }
+        let service = fixture.scripted_service(scenario);
+        let started = service
+            .start_run(
+                WorkflowKind::Standard,
+                "task for continue",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(started.details.status, RunStatus::Completed);
+        let before = started.details.stages.len();
+
+        let report = service
+            .request_continue(
+                started.details.id,
+                "  add tests for the edge case  ".to_owned(),
+            )
+            .unwrap();
+
+        assert_eq!(report.details.status, RunStatus::Completed);
+        assert_eq!(report.details.stages.len(), before + 2);
+        let follow_up = report
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.kind == StageKind::FollowUp)
+            .expect("a follow-up stage was appended");
+        assert_eq!(follow_up.status, StageStatus::Completed);
+        assert_eq!(follow_up.id.to_string(), "followup_1");
+    }
+
+    #[test]
+    fn request_continue_refuses_a_blank_instruction_without_touching_the_run() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let started = service
+            .start_run(
+                WorkflowKind::Standard,
+                "task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+
+        for blank in ["", "   ", "\n\t"] {
+            let error = service
+                .request_continue(started.details.id, blank.to_owned())
+                .unwrap_err();
+            assert!(
+                matches!(error, AppError::EmptyContinueInstruction(id) if id == started.details.id)
+            );
+        }
+        // A refused request never reopened the run.
+        let after = service.inspect_run(started.details.id).unwrap();
+        assert_eq!(after.stages.len(), started.details.stages.len());
+    }
+
+    /// Same guard as `request_fix`, reused rather than duplicated: a
+    /// workflow with no decision has no verdict to continue past.
+    #[test]
+    fn request_continue_refuses_a_run_that_never_reached_a_decision() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let started = service
+            .start_run(
+                WorkflowKind::Fast,
+                "task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+
+        let error = service
+            .request_continue(started.details.id, "keep going".to_owned())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::Engine(crate::engine::EngineError::Fix(
+                crate::domain::RunFixError::NoDecisionToAnswer
+            ))
+        ));
     }
 
     /// The managed worktree is built from committed HEAD, so a dirty source

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     AttentionRequest, AttentionRequestId, AttentionStatus, DomainEvent, DomainEventKind, EventId,
-    EventMetadata, ProviderId, ProviderSessionId, Run, RunId, RunStageError, RunStatus,
+    EventMetadata, ProviderId, ProviderSessionId, Role, Run, RunId, RunStageError, RunStatus,
     RunTransition, RunTransitionError, StageId, StageStatus, StageTransition,
 };
 use crate::store::{LoadedRun, RunRevision, SequencedEvent, SqliteStore};
@@ -335,6 +335,44 @@ where
         let (mut loaded, _) = load_execution_boundary(store, run_id)?;
         let metadata = self.metadata_for(&loaded.run);
         let event = loaded.run.request_fix(metadata)?;
+        commit_execution(store, &loaded.run, loaded.revision, &[event])?;
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
+    /// Reopens a completed run with one continue cycle appended, carrying the
+    /// operator's own instruction rather than answering blocking findings.
+    ///
+    /// Same execution boundary as [`Self::request_fix`], for the same reason:
+    /// a run whose workspace is gone or whose apply is already under way is
+    /// refused here rather than discovered halfway through the cycle. Stages
+    /// the instruction with the provider — under the exact stage identity the
+    /// cycle is about to use — before the domain commit that creates that
+    /// stage, mirroring [`Self::resolve_attention_with_response`]'s ordering
+    /// one step earlier: nothing here can create a stage whose agent finds no
+    /// instruction waiting for it.
+    ///
+    /// # Errors
+    /// Returns boundary, provider, lifecycle, or persistence failures.
+    pub fn request_continue(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        instruction: &str,
+    ) -> Result<EngineStatus, EngineError> {
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        if let Some(stage_id) = crate::domain::next_follow_up_stage_id(loaded.run.workflow()) {
+            self.provider.stage_continue_instruction(
+                store,
+                run_id,
+                &stage_id,
+                Role::Implementer,
+                instruction,
+            )?;
+        }
+        let metadata = self.metadata_for(&loaded.run);
+        let event = loaded.run.request_continue(metadata)?;
         commit_execution(store, &loaded.run, loaded.revision, &[event])?;
         Ok(EngineStatus::Advanced {
             run_status: loaded.run.status(),

@@ -34,5 +34,6 @@ pub use run::{
 pub use stage::{Stage, StageRehydrationError, StageStatus, StageTransition, StageTransitionError};
 pub use workflow::{
     Dependency, DependencyKind, StageDefinition, StageKind, WorkflowDefinition,
-    WorkflowDefinitionError, WorkflowKind, fix_cycle_stages,
+    WorkflowDefinitionError, WorkflowKind, continue_cycle_stages, fix_cycle_stages,
+    next_follow_up_stage_id,
 };

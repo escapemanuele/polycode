@@ -40,6 +40,9 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
         (Role::Implementer, StageKind::Fix) => {
             "Resolve the blocking findings in the decision that sent this work back, and only those. The implementation already exists in this workspace; correct it rather than rewriting it, and leave findings the decision did not treat as blocking alone. Where you disagree with a finding, say so in the artifact and leave the code as it is rather than silently declining. Run proportionate verification. Return Markdown with # Fix and one section per finding stating what changed or why nothing did."
         }
+        (Role::Implementer, StageKind::FollowUp) => {
+            "Continue the work in this workspace as the operator instructs below. The previous decision artifact is context, not a boundary. Run proportionate verification. Return Markdown with # Follow-up and one section per instruction item stating what changed."
+        }
         (Role::Implementer, _) => "Implement requested change and run proportionate verification.",
         (Role::CodeQualityReviewer, _) => {
             "Assess implementation quality independently. Inspect actual repository state and do not edit files."
@@ -92,6 +95,21 @@ mod tests {
         );
         // Disagreeing with a finding is allowed; silently ignoring it is not.
         assert!(fix.contains("say so in the artifact"));
+    }
+
+    /// Unlike a fix, a follow-up carries no findings of its own to bound it —
+    /// the operator's instruction is the whole scope, and the contract must
+    /// say the prior decision is context rather than a limit on it.
+    #[test]
+    fn the_follow_up_contract_treats_the_operators_instruction_as_the_scope() {
+        let follow_up = instruction(Role::Implementer, StageKind::FollowUp);
+        let fix = instruction(Role::Implementer, StageKind::Fix);
+        let implementation = instruction(Role::Implementer, StageKind::Implementation);
+        assert_ne!(follow_up, fix);
+        assert_ne!(follow_up, implementation);
+        assert!(follow_up.contains("as the operator instructs below"));
+        assert!(follow_up.contains("context, not a boundary"));
+        assert!(follow_up.contains("# Follow-up"));
     }
 
     #[test]

@@ -116,5 +116,6 @@ const fn kind(stage: StageKind) -> ArtifactKind {
         StageKind::Synthesis => ArtifactKind::Synthesis,
         StageKind::Decision => ArtifactKind::Decision,
         StageKind::Fix => ArtifactKind::Fix,
+        StageKind::FollowUp => ArtifactKind::FollowUp,
     }
 }

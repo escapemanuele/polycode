@@ -19,6 +19,7 @@ pub(crate) fn compose(
     request: &ProviderRequest,
     artifacts: &[ArtifactRecord],
     handoff: Option<&ChangeHandoff>,
+    continue_instruction: Option<&str>,
 ) -> Result<String, CodexProviderError> {
     let mut prompt = String::new();
     writeln!(prompt, "# Polycode stage").expect("String writes cannot fail");
@@ -37,6 +38,13 @@ pub(crate) fn compose(
         stage_prompt::instruction(request.role(), request.stage_kind())
     )
     .expect("String writes cannot fail");
+    // See the Claude adapter: the operator's own instruction for a continue
+    // cycle's follow-up stage, carried here through the same immutable
+    // run-private stdin path an attention response uses.
+    if let Some(instruction) = continue_instruction {
+        writeln!(prompt, "\n# Operator instruction\n{instruction}")
+            .expect("String writes cannot fail");
+    }
     writeln!(
         prompt,
         "You are executing one Polycode stage. Work only inside current managed worktree. Respect repository instructions, AGENTS.md, rules, skills, MCP configuration, and native Codex configuration discovered normally. Do not apply changes to another checkout. Do not invoke Polycode apply. Do not commit or push. Return concise Markdown describing result, evidence, and unresolved risks."
@@ -44,7 +52,7 @@ pub(crate) fn compose(
     .expect("String writes cannot fail");
     writeln!(prompt, "{}", stage_prompt::BOTTOM_LINE).expect("String writes cannot fail");
     match request.stage_kind() {
-        StageKind::Implementation | StageKind::Fix => writeln!(
+        StageKind::Implementation | StageKind::Fix | StageKind::FollowUp => writeln!(
             prompt,
             "Make required changes in managed worktree and run proportionate local validation when safe."
         ),
@@ -137,7 +145,13 @@ mod tests {
 
     #[test]
     fn every_stage_prompt_asks_for_the_bottom_line_section() {
-        let prompt = compose(&request(Role::Researcher, StageKind::Research), &[], None).unwrap();
+        let prompt = compose(
+            &request(Role::Researcher, StageKind::Research),
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(prompt.contains(stage_prompt::BOTTOM_LINE));
     }
@@ -146,8 +160,8 @@ mod tests {
     fn reviewer_prompt_embeds_shared_change_handoff_verbatim_and_grows_by_it() {
         let handoff = handoff();
         let request = request(Role::SpecReviewer, StageKind::SpecReview);
-        let without = compose(&request, &[], None).unwrap();
-        let with = compose(&request, &[], Some(&handoff)).unwrap();
+        let without = compose(&request, &[], None, None).unwrap();
+        let with = compose(&request, &[], Some(&handoff), None).unwrap();
         let section = change_handoff::render(&handoff);
 
         assert!(!without.contains("# Implementation change map"));
@@ -178,7 +192,7 @@ mod tests {
         );
         assert!(change_handoff::render(&giant).len() > MAX_INPUT_BYTES);
         let request = request(Role::SpecReviewer, StageKind::SpecReview);
-        let prompt = compose(&request, &[], Some(&giant)).unwrap();
+        let prompt = compose(&request, &[], Some(&giant), None).unwrap();
 
         assert!(prompt.len() <= MAX_INPUT_BYTES);
         assert!(prompt.contains("Completeness: INCOMPLETE"));
@@ -191,5 +205,18 @@ mod tests {
             StageKind::CodeQualityReview,
         ));
         assert!(!text.contains("# Implementation change map"));
+    }
+
+    /// See the Claude adapter's equivalent test: the operator's instruction
+    /// must be embedded verbatim for a follow-up stage and absent otherwise.
+    #[test]
+    fn the_operators_continue_instruction_is_embedded_verbatim_when_present() {
+        let request = request(Role::Implementer, StageKind::FollowUp);
+        let without = compose(&request, &[], None, None).unwrap();
+        let with = compose(&request, &[], None, Some("add integration tests too")).unwrap();
+
+        assert!(!without.contains("# Operator instruction"));
+        assert!(with.contains("# Operator instruction"));
+        assert!(with.contains("add integration tests too"));
     }
 }

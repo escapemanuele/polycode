@@ -204,8 +204,14 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         } else {
             let artifacts = store.list_artifacts(request.run_id())?;
             let handoff = change_handoff::for_request(store, request)?;
+            let continue_instruction = self.continue_instruction(request)?;
             command::initial(
-                &prompt::compose(request, &artifacts, handoff.as_ref())?,
+                &prompt::compose(
+                    request,
+                    &artifacts,
+                    handoff.as_ref(),
+                    continue_instruction.as_deref(),
+                )?,
                 self.model.as_ref(),
                 self.effort,
             )
@@ -690,6 +696,24 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         Ok(Some(worktree))
     }
 
+    /// A follow-up stage's operator instruction, persisted by
+    /// [`crate::app::RunService::request_continue`] under the shared process
+    /// root before this stage's initial invocation ever runs. `None` for
+    /// every other stage kind, which never had one to write.
+    fn continue_instruction(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<Option<String>, ClaudeProviderError> {
+        if request.stage_kind() != StageKind::FollowUp {
+            return Ok(None);
+        }
+        Ok(crate::providers::continue_instruction::read(
+            &self.artifact_root,
+            request.run_id(),
+            request.stage_id(),
+        )?)
+    }
+
     fn response_path(
         &self,
         session_id: ProviderSessionRecordId,
@@ -768,6 +792,23 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
 
     fn keep_attached_for(&self, _request: &ProviderRequest) -> Result<bool, ProviderError> {
         Ok(true)
+    }
+
+    fn stage_continue_instruction(
+        &mut self,
+        _store: &mut SqliteStore,
+        run_id: crate::domain::RunId,
+        stage_id: &crate::domain::StageId,
+        _role: Role,
+        instruction: &str,
+    ) -> Result<(), ProviderError> {
+        crate::providers::continue_instruction::write_once(
+            &self.artifact_root,
+            run_id,
+            stage_id,
+            instruction,
+        )
+        .map_err(|error| ProviderError::new(error.to_string()))
     }
 
     fn stage_attention_response(

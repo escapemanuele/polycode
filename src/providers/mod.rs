@@ -5,6 +5,7 @@ pub(crate) mod change_handoff;
 mod checkpoint;
 pub mod claude;
 pub mod codex;
+pub(crate) mod continue_instruction;
 mod session;
 mod stage_prompt;
 

@@ -16,6 +16,7 @@ pub enum ArtifactKind {
     Decision,
     Fix,
     Synthesis,
+    FollowUp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
