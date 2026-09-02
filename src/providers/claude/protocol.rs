@@ -138,6 +138,7 @@ impl PermissionDenial {
     }
 
     pub(crate) fn exact_rule(&self) -> Result<String, ClaudeProviderError> {
+        let mut unsafe_bash = None;
         let target = match self.tool_name.as_str() {
             "Write" | "Edit" => self
                 .tool_input
@@ -156,7 +157,20 @@ impl PermissionDenial {
                 .get("command")
                 .and_then(Value::as_str)
                 .filter(|command| safe_rule_value(command) && !compound_shell(command))
-                .map(|command| format!("Bash({command})")),
+                .map(|command| format!("Bash({command})"))
+                .or_else(|| {
+                    // Surface the command itself: the user sees *which* Bash
+                    // call cannot be granted exactly, not a bare tool name.
+                    let command = self
+                        .tool_input
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing command>");
+                    unsafe_bash = Some(format!(
+                        "Bash command cannot be granted as an exact rule (compound or unsafe shell); type a response to continue without granting it, or stop the run: {command}"
+                    ));
+                    None
+                }),
             "WebFetch" => self
                 .tool_input
                 .get("url")
@@ -165,7 +179,11 @@ impl PermissionDenial {
                 .map(|domain| format!("WebFetch(domain:{domain})")),
             _ => None,
         };
-        target.ok_or_else(|| ClaudeProviderError::UnsafePermission(self.tool_name.clone()))
+        target.ok_or_else(|| {
+            ClaudeProviderError::UnsafePermission(
+                unsafe_bash.unwrap_or_else(|| self.tool_name.clone()),
+            )
+        })
     }
 }
 

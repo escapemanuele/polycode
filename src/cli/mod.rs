@@ -76,7 +76,8 @@ pub enum Command {
     Resolve {
         run_id: RunId,
         attention_id: AttentionRequestId,
-        /// Answer for a provider question. Omit when approving a permission request.
+        /// Answer for a provider question. For a permission request, omit to
+        /// approve it, or give an instruction to continue without granting it.
         #[arg(long)]
         response: Option<String>,
     },

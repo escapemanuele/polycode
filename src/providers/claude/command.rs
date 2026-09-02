@@ -5,6 +5,7 @@ use crate::domain::{EffortLevel, EffortSetting, ModelId, ProviderSessionId};
 
 use super::{ClaudeProviderError, PermissionDenial};
 
+#[derive(Debug)]
 pub(crate) struct ClaudeCommand {
     pub argv: Vec<OsString>,
     pub stdin: Vec<u8>,
@@ -28,16 +29,50 @@ pub(crate) fn resume(
     model: Option<&ModelId>,
     effort: EffortSetting,
 ) -> Result<ClaudeCommand, ClaudeProviderError> {
-    if denials
-        .iter()
-        .any(|denial| denial.tool_name == "AskUserQuestion")
-        && response.is_none_or(|response| response.trim().is_empty())
-    {
-        return Err(ClaudeProviderError::QuestionResponseRequired);
-    }
+    let rules = grant_rules(denials, response)?;
     let mut argv = base(model, effort);
     argv.push(OsString::from("--resume"));
     argv.push(OsString::from(session_id.as_str()));
+    if !rules.is_empty() {
+        argv.push(OsString::from("--allowedTools"));
+        argv.extend(rules.into_iter().map(OsString::from));
+    }
+    let stdin = response.unwrap_or(
+        "User approved the exact pending permission request. Continue the same task and session.",
+    );
+    Ok(ClaudeCommand {
+        argv,
+        stdin: stdin.as_bytes().to_vec(),
+    })
+}
+
+/// Exact `--allowedTools` rules that replay one approved attention, or the
+/// reason it cannot be replayed at all.
+///
+/// This is the single gate for "can this approval be honoured": resolution
+/// must run it *before* committing, so an unreplayable denial (compound Bash)
+/// is refused to the user instead of committing a resolution every later
+/// drive fails on.
+///
+/// An operator response is also an answer to a permission request: when no
+/// denial can be granted exactly, a non-empty response still resumes the
+/// session with that text and grants nothing, so the operator can say
+/// "skip it, do X instead" rather than only stop the run.
+///
+/// # Errors
+/// `QuestionResponseRequired` when a pending question has no response;
+/// `UnsafePermission` when no denial can be granted as an exact rule and
+/// there is no response to continue on.
+pub(crate) fn grant_rules(
+    denials: &[PermissionDenial],
+    response: Option<&str>,
+) -> Result<BTreeSet<String>, ClaudeProviderError> {
+    let has_question = denials
+        .iter()
+        .any(|denial| denial.tool_name == "AskUserQuestion");
+    if has_question && response.is_none_or(|response| response.trim().is_empty()) {
+        return Err(ClaudeProviderError::QuestionResponseRequired);
+    }
     let mut rules = BTreeSet::new();
     let mut unsafe_permission = None;
     for denial in denials
@@ -51,26 +86,15 @@ pub(crate) fn resume(
             Err(error) => unsafe_permission = Some(error),
         }
     }
-    if rules.is_empty()
-        && !denials
-            .iter()
-            .any(|denial| denial.tool_name == "AskUserQuestion")
-    {
+    let has_response = response.is_some_and(|response| !response.trim().is_empty());
+    if rules.is_empty() && !has_question && !has_response {
         return Err(unsafe_permission.unwrap_or_else(|| {
             ClaudeProviderError::UnsafePermission("empty denial set".to_owned())
         }));
     }
-    if !rules.is_empty() {
-        argv.push(OsString::from("--allowedTools"));
-        argv.extend(rules.into_iter().map(OsString::from));
-    }
-    let stdin = response.unwrap_or(
-        "User approved the exact pending permission request. Continue the same task and session.",
-    );
-    Ok(ClaudeCommand {
-        argv,
-        stdin: stdin.as_bytes().to_vec(),
-    })
+    // With nothing grantable but an operator answer present, the session
+    // resumes on that answer alone: "continue without it". Nothing is granted.
+    Ok(rules)
 }
 
 fn base(model: Option<&ModelId>, effort: EffortSetting) -> Vec<OsString> {
@@ -220,6 +244,48 @@ mod tests {
             !args
                 .iter()
                 .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn unreplayable_permission_resumes_on_operator_response_without_granting() {
+        let denials = vec![PermissionDenial {
+            tool_name: "Bash".to_owned(),
+            tool_input: json!({"command": "yarn install 2>&1 | tail -20"}),
+            tool_use_id: None,
+        }];
+        let session = ProviderSessionId::new("s").unwrap();
+        let refused = resume(&session, &denials, None, None, EffortSetting::NativeDefault)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("yarn install"), "{refused}");
+        let command = resume(
+            &session,
+            &denials,
+            Some("Skip the install; the tests will run in CI."),
+            None,
+            EffortSetting::NativeDefault,
+        )
+        .unwrap();
+        assert!(
+            !command.argv.iter().any(|arg| arg == "--allowedTools"),
+            "nothing granted: {:?}",
+            command.argv
+        );
+        assert_eq!(
+            command.stdin,
+            b"Skip the install; the tests will run in CI."
+        );
+        assert!(
+            resume(
+                &session,
+                &denials,
+                Some("  "),
+                None,
+                EffortSetting::NativeDefault
+            )
+            .is_err(),
+            "blank response is not an answer"
         );
     }
 

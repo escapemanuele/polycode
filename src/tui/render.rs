@@ -2086,11 +2086,15 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .map(|attention| attention.kind);
     if selected_kind == Some(AttentionKind::Permission) {
         lines.push(Line::from(Span::styled(
-            "Permission request — no text response required",
+            "Permission request — Enter approves; a typed response continues without granting",
             Style::default().add_modifier(Modifier::BOLD),
         )));
+        lines.push(Line::from(format!(
+            "Response (optional): {}",
+            field_display(&state.attention_response, true)
+        )));
         lines.push(Line::from(Span::styled(
-            "↑/↓ select request · Enter approve/resolve · Esc cancel",
+            "↑/↓ select request · Enter approve/resolve · type to answer instead · Esc cancel",
             theme::muted(),
         )));
     } else {
@@ -4223,9 +4227,12 @@ mod tests {
         }];
         state.overlay = Some(Overlay::Attention);
         let text = render_text(&state, 120, 30);
-        assert!(text.contains("Permission request — no text response required"));
+        assert!(text.contains("Permission request"));
         assert!(text.contains("Enter approve/resolve"));
-        assert!(!text.contains("Response:"), "no implied response field");
+        assert!(
+            text.contains("Response (optional):"),
+            "permission offers an answer that continues without granting"
+        );
 
         state.details.as_mut().unwrap().attention[0].kind = AttentionKind::Question;
         let text = render_text(&state, 120, 30);
