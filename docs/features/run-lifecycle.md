@@ -42,7 +42,7 @@ TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selec
 - `src/domain/attention.rs` — attention request lifecycle.
 - `src/app/query.rs` — `RunDetails`, `StageSummary`, `AttentionSummary` DTOs behind `status`; `failure_reason`, `blocking`, `StageWaitingSummary`, `StageDependencyRef`, `BlockedDependencyRef`.
 - `src/cli/commands.rs` — `waiting_line`, `dependency_ids`, `blocked_ids`, `outcome_word`: the one extra indented line per stage.
-- `src/tui/render.rs` — `status_sentences`, `failed_stage_sentence`, `hero_activity_text`, `activity_message`, `waiting_message`, `blocked_message`: the same diagnosis as prose in the activity strip.
+- `src/tui/render.rs` — `status_sentences`, `failed_stage_sentence`, `failed_stage_reason`, `activity_message`, `waiting_message`, `blocked_message`: the same diagnosis as prose in the activity strip.
 - `tests/cli.rs` — restart survival, default profile, read-only `runs`/`status`.
 - `tests/codex_cli.rs` — `stop_interrupts_a_live_run_while_its_driver_is_still_attached`, detach + resume consuming retained output, retry creating a new native thread.
 

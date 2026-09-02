@@ -675,6 +675,32 @@ impl TuiState {
             .map(|stage| stage.id.clone());
     }
 
+    /// Lands the stage selection on the blocking failed stage of a failed
+    /// run, so opening it shows the failure — and its reason — in the hero
+    /// instead of whichever stage happened to be first. Used when a run is
+    /// opened, never while the user is already moving through it: a
+    /// refresh must not yank the selection away from where they put it.
+    /// A run that is not failed, or whose failure has no blocking stage,
+    /// keeps its selection.
+    pub(crate) fn focus_blocking_failure(&mut self) {
+        let Some(details) = self.details.as_ref() else {
+            return;
+        };
+        if details.status != crate::domain::RunStatus::Failed {
+            return;
+        }
+        let Some(index) = details
+            .stages
+            .iter()
+            .position(|stage| stage.status == crate::domain::StageStatus::Failed && stage.blocking)
+        else {
+            return;
+        };
+        self.selected_stage_index = index;
+        self.selected_stage = details.stages.get(index).map(|stage| stage.id.clone());
+        self.note_mascot(Instant::now());
+    }
+
     pub(crate) fn selected_attention_id(&self) -> Option<AttentionRequestId> {
         self.details
             .as_ref()
