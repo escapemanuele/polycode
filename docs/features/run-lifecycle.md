@@ -11,6 +11,7 @@ Start one task as a run, watch it move through its stages, and get it moving aga
 - retry: returns one `Failed` stage to `Pending`, together with every downstream stage its failure skipped, only while every other downstream stage is still `Pending` or `Ready`.
 - attention: `NeedsUser` holds one or more attention requests (permission, decision, question) that `resolve` answers.
 - inspect: `runs` lists runs; `status` prints routing, per-stage evidence, attention and usage.
+- diagnosis: every stage that stopped or has not started says why. A failed stage prints `reason: <provider text>`; a Pending/Ready stage prints `waiting on: <ids>` (plus `(degraded: <ids>)` for satisfied optional edges) or `blocked by: <id> (failed|skipped)`. The run-level reason is the blocking stage's, and the TUI's activity strip says the same in prose.
 
 ## How to get to it (user POV)
 From a Git checkout, run one workflow command with the task text. The command prints committed events and the run's details, then exits when the run is quiescent (completed, needs you, paused, interrupted, failed, or waiting for a provider). Use `polycode runs` to find the run id and `polycode status <run-id>` to inspect it. In the TUI the same actions are `r` (resume/recover), `s` (stop), `t` (retry the selected failed stage) and `u` (resolve attention) on the run detail screen.
@@ -22,7 +23,7 @@ polycode standard "<task>" [same flags]
 polycode deep "<task>" [same flags]
 polycode review "<task>" [same flags]
 polycode runs
-polycode status <run-id>
+polycode status <run-id>              # failed stages add `reason:`; pending ones add `waiting on:` / `blocked by:`
 polycode resume <run-id>
 polycode stop <run-id>
 polycode retry <run-id> <stage-id>
@@ -39,7 +40,9 @@ TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selec
 - `src/engine/scheduler.rs` — `retry_stage` returns the skipped descendants to `Pending` in the same commit.
 - `src/domain/stage.rs` — stage state machine.
 - `src/domain/attention.rs` — attention request lifecycle.
-- `src/app/query.rs` — `RunDetails`, `StageSummary`, `AttentionSummary` DTOs behind `status`.
+- `src/app/query.rs` — `RunDetails`, `StageSummary`, `AttentionSummary` DTOs behind `status`; `failure_reason`, `blocking`, `StageWaitingSummary`, `StageDependencyRef`, `BlockedDependencyRef`.
+- `src/cli/commands.rs` — `waiting_line`, `dependency_ids`, `blocked_ids`, `outcome_word`: the one extra indented line per stage.
+- `src/tui/render.rs` — `status_sentences`, `failed_stage_sentence`, `hero_activity_text`, `activity_message`, `waiting_message`, `blocked_message`: the same diagnosis as prose in the activity strip.
 - `tests/cli.rs` — restart survival, default profile, read-only `runs`/`status`.
 - `tests/codex_cli.rs` — `stop_interrupts_a_live_run_while_its_driver_is_still_attached`, detach + resume consuming retained output, retry creating a new native thread.
 
@@ -53,3 +56,6 @@ TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selec
 - A run reading `Running` whose processes all ended and nothing touched for 30 s is settled by a read (`runs`, `status`, TUI refresh) through `ResumeAction::Observe`; a read never resumes provider work.
 - Pre-M5 runs are inspectable but cannot resume when immutable input or execution config is absent (`<legacy input unavailable>` in `status`).
 - Routes are resolved once at creation; provider loss after creation fails the stage with configured-provider-unavailable, never reroutes.
+- The run-level failure reason is the *blocking* stage's, not the first failed one in workflow order. A failed optional dependency that nothing required (a review beside `synthesis`) never becomes the run's reason; `StageSummary::blocking` marks the one that does.
+- `blocked by` states each dependency's own outcome: a dependency that was skipped is reported as skipped, never as failed.
+- `waiting on` is printed only for a `Pending` or `Ready` stage. A stage whose dependencies are all satisfied prints nothing extra, even in the moment before the scheduler marks it Ready.

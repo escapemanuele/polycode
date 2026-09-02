@@ -26,7 +26,7 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 
 When code under a feature's "Where it lives" paths changes, update that feature file in the same PR. Add a new file and a table row when a new user-facing feature lands; delete both when one is removed.
 
-`cargo test --test feature_map` runs in CI and checks the mechanical part: every cited path exists, every `polycode ...` line in a `Driving it` block is a command with flags the binary accepts, every key named in control-room.md is bound in `src/tui/input.rs`. A rename or a removed flag turns the map red instead of stale.
+`cargo test --test feature_map` runs in CI and checks the mechanical part, both ways round. What the map claims must be true: every cited path exists, every `polycode ...` line in a `Driving it` block is a command with flags the binary accepts, every key named in control-room.md is bound in `src/tui/input.rs`. And what the binary offers must be claimed: every command in `polycode --help`, at every level, is mentioned by some feature file, and every key `src/tui/input.rs` binds is named in control-room.md. So a rename turns the map red, and so does a new command or key nobody wrote a line for.
 
 The semantic part is a reading job. At the end of every milestone, an agent runs this pass:
 
@@ -42,3 +42,4 @@ A stale entry looks like one of these:
 - A status name, default value, profile version or suite version that the code no longer uses.
 - A gotcha describing a bug that has been fixed.
 - A sub-feature that exists in code but has no line here.
+- New behaviour on an existing command or screen — an extra line in its output, a new sentence in the TUI — with no line in its feature file. The test cannot see this one: nothing was renamed and nothing is missing, the map is simply saying less than the code does. It is the drift the milestone pass exists for.
