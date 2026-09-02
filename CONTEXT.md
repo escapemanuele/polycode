@@ -62,6 +62,10 @@ _Avoid_: Needs-you signal, prompt
 An explicit decision that returns a failed stage to pending. Retry remains available while every downstream stage is pending or ready; recovery never silently retries failed work.
 _Avoid_: Resume, recover
 
+**Route override**:
+An operator's explicit choice, made when retrying one failed stage, of which provider (and optionally model) runs that stage from then on. It lives on the stage, never in the configuration snapshot, and never spreads to other stages.
+_Avoid_: Reroute, fallback, provider switch
+
 **Required dependency**:
 A predecessor whose successful completion is necessary before a stage is ready.
 _Avoid_: Hard dependency

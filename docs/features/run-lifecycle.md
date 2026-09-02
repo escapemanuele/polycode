@@ -8,13 +8,13 @@ Start one task as a run, watch it move through its stages, and get it moving aga
 - ready-boundary: `Ready` is a persisted atomic boundary; configuration and workspace succeeded but nothing executed yet.
 - resume-vs-recover: `Paused` (user asked) takes Resume; `Interrupted` (process or runtime lost) takes Recover. One command, `resume`, does both.
 - stop: interrupts live managed processes, then commits a run-level `Interrupted`; nothing is discarded.
-- retry: returns one `Failed` stage to `Pending`, together with every downstream stage its failure skipped, only while every other downstream stage is still `Pending` or `Ready`.
+- retry: returns one `Failed` stage to `Pending`, together with every downstream stage its failure skipped, only while every other downstream stage is still `Pending` or `Ready`. `--provider` (TUI: the `t` chooser) sends that one stage to another provider first; see routing.md `retry-override`.
 - attention: `NeedsUser` holds one or more attention requests (permission, decision, question) that `resolve` answers.
 - inspect: `runs` lists runs; `status` prints routing, per-stage evidence, attention and usage.
 - diagnosis: every stage that stopped or has not started says why. A failed stage prints `reason: <provider text>`; a Pending/Ready stage prints `waiting on: <ids>` (plus `(degraded: <ids>)` for satisfied optional edges) or `blocked by: <id> (failed|skipped)`. The run-level reason is the blocking stage's, and the TUI's activity strip says the same in prose.
 
 ## How to get to it (user POV)
-From a Git checkout, run one workflow command with the task text. The command prints committed events and the run's details, then exits when the run is quiescent (completed, needs you, paused, interrupted, failed, or waiting for a provider). Use `polycode runs` to find the run id and `polycode status <run-id>` to inspect it. In the TUI the same actions are `r` (resume/recover), `s` (stop), `t` (retry the selected failed stage) and `u` (resolve attention) on the run detail screen.
+From a Git checkout, run one workflow command with the task text. The command prints committed events and the run's details, then exits when the run is quiescent (completed, needs you, paused, interrupted, failed, or waiting for a provider). Use `polycode runs` to find the run id and `polycode status <run-id>` to inspect it. In the TUI the same actions are `r` (resume/recover), `s` (stop), `t` (retry the selected failed stage, after choosing which provider runs it) and `u` (resolve attention) on the run detail screen.
 
 ## Driving it
 ```bash
@@ -27,17 +27,18 @@ polycode status <run-id>              # failed stages add `reason:`; pending one
 polycode resume <run-id>
 polycode stop <run-id>
 polycode retry <run-id> <stage-id>
+polycode retry <run-id> <stage-id> --provider claude [--model <id>]   # retry this stage on another provider
 polycode resolve <run-id> <attention-id>                    # approve a permission request
 polycode resolve <run-id> <attention-id> --response "<answer>"   # answer a question
 ```
-TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage, `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves).
+TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage (↑/↓ pick Configured provider / Claude / Codex, Enter retries), `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves).
 
 ## Where it lives
 - `src/cli/mod.rs` — clap definitions (`RunArgs`, `Command::{Runs,Status,Resume,Stop,Retry,Resolve}`).
 - `src/cli/commands.rs` — `start`, `parse_effort`, `print_report`, `print_details`; `QuiescentState` hints printed after each report.
 - `src/app/run_service.rs` — `start_run`, `resume_run`, `stop_run`, `retry_stage`, `resolve_attention_with_response`, `inspect_run`, `list_runs`; `ABANDONED_AFTER` 30 s observe pass.
 - `src/domain/run.rs` — `Run` aggregate, `RunTransition`, `ensure_retry_safe` (`RetryWouldInvalidate`), `skipped_descendants`.
-- `src/engine/scheduler.rs` — `retry_stage` returns the skipped descendants to `Pending` in the same commit.
+- `src/engine/scheduler.rs` — `retry_stage` returns the skipped descendants to `Pending` in the same commit, and commits the route override (when given) in that commit too.
 - `src/domain/stage.rs` — stage state machine.
 - `src/domain/attention.rs` — attention request lifecycle.
 - `src/app/query.rs` — `RunDetails`, `StageSummary`, `AttentionSummary` DTOs behind `status`; `failure_reason`, `blocking`, `StageWaitingSummary`, `StageDependencyRef`, `BlockedDependencyRef`.

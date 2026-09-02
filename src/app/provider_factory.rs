@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use crate::domain::{ConfigSnapshotId, EffortSetting, ProviderId, Role, RunId, WorkflowDefinition};
+use crate::domain::{
+    ConfigSnapshotId, EffortSetting, ProviderId, Role, RunId, StageRouteOverride,
+    WorkflowDefinition,
+};
 use crate::engine::{
     FakeProvider, FakeScenario, Provider, ProviderAttentionContext, ProviderError, ProviderPoll,
     ProviderRequest,
@@ -46,10 +49,24 @@ pub trait ProviderFactory {
         workflow: &WorkflowDefinition,
         events: &[SequencedEvent],
     ) -> Result<Self::Provider, AppError>;
+
+    /// Confirms one provider can take a stage right now, before a retry is
+    /// committed to it. Same bar as `--provider` at creation: installed and
+    /// authenticated, or refused before any state changes.
+    ///
+    /// # Errors
+    /// Rejects providers this factory cannot run or that are not ready.
+    fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError>;
 }
 
 pub trait ProviderResolver {
     type Provider: Provider;
+
+    /// See [`ProviderFactory::require_provider`].
+    ///
+    /// # Errors
+    /// Rejects providers this resolver cannot run or that are not ready.
+    fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError>;
 
     /// Reconstructs provider behavior from one validated immutable configuration.
     ///
@@ -75,6 +92,10 @@ impl<T: ProviderFactory> ProviderResolver for T {
         events: &[SequencedEvent],
     ) -> Result<Self::Provider, AppError> {
         ProviderFactory::for_run(self, run_id, config, workflow, events)
+    }
+
+    fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
+        ProviderFactory::require_provider(self, provider)
     }
 }
 
@@ -146,6 +167,14 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
         let resource_plan = ResourcePlan::from_snapshot(config, workflow)?;
         Ok(RoutedProvider::new(plan, resource_plan, workflow.clone())
             .with_artifact_root(self.artifact_root.clone()))
+    }
+
+    fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
+        if provider == UniformProvider::Fake {
+            Ok(())
+        } else {
+            Err(AppError::UnsupportedProvider(provider.as_str().to_owned()))
+        }
     }
 }
 
@@ -347,6 +376,26 @@ impl RoutedProvider {
             .ok_or_else(|| ProviderError::new(format!("configured route missing for {role:?}")))
     }
 
+    /// The stage's operator-chosen destination when it has one, else the
+    /// role's configured route. The override wins outright, model included:
+    /// an operator who sends a stage to Claude without naming a model gets
+    /// Claude's native default, not the model the snapshot pinned for Codex.
+    fn target_for(
+        &self,
+        route_override: Option<&StageRouteOverride>,
+        role: Role,
+    ) -> Result<ExecutionTarget, ProviderError> {
+        route_override.map_or_else(
+            || self.target_for_role(role),
+            |route| {
+                Ok(ExecutionTarget::new(
+                    route.provider_id().clone(),
+                    route.model_id().cloned(),
+                ))
+            },
+        )
+    }
+
     /// Requested effort resolved once from the immutable resource plan.
     fn effort_for_role(&self, role: Role) -> Result<EffortSetting, ProviderError> {
         self.resource_plan
@@ -447,7 +496,10 @@ impl RoutedProvider {
 
 impl Provider for RoutedProvider {
     fn provider_id_for(&self, request: &ProviderRequest) -> Result<ProviderId, ProviderError> {
-        Ok(self.target_for_role(request.role())?.provider_id().clone())
+        Ok(self
+            .target_for(request.route_override(), request.role())?
+            .provider_id()
+            .clone())
     }
 
     fn supports_role(&self, role: crate::domain::Role) -> bool {
@@ -455,7 +507,7 @@ impl Provider for RoutedProvider {
     }
 
     fn keep_attached_for(&self, request: &ProviderRequest) -> Result<bool, ProviderError> {
-        let target = self.target_for_role(request.role())?;
+        let target = self.target_for(request.route_override(), request.role())?;
         let effort = self.effort_for_role(request.role())?;
         self.runtimes
             .get(&(target, effort))
@@ -469,7 +521,7 @@ impl Provider for RoutedProvider {
         context: &ProviderAttentionContext,
         response: Option<&str>,
     ) -> Result<(), ProviderError> {
-        let target = self.target_for_role(context.role())?;
+        let target = self.target_for(context.route_override(), context.role())?;
         let session = store
             .list_provider_sessions(context.run_id())
             .map_err(|error| ProviderError::new(error.to_string()))?
@@ -498,7 +550,7 @@ impl Provider for RoutedProvider {
         store: &mut SqliteStore,
         context: &ProviderAttentionContext,
     ) -> Result<bool, ProviderError> {
-        let target = self.target_for_role(context.role())?;
+        let target = self.target_for(context.route_override(), context.role())?;
         let session = store
             .list_provider_sessions(context.run_id())
             .map_err(|error| ProviderError::new(error.to_string()))?
@@ -557,7 +609,7 @@ impl Provider for RoutedProvider {
         store: &mut SqliteStore,
         request: &ProviderRequest,
     ) -> Result<ProviderPoll, ProviderError> {
-        let target = self.target_for_role(request.role())?;
+        let target = self.target_for(request.route_override(), request.role())?;
         let effort = self.effort_for_role(request.role())?;
         let runtime = self.runtime_for(&target, effort)?;
         if runtime.provider_id_for(request)? != *target.provider_id() {
@@ -623,6 +675,10 @@ impl ProviderFactory for RuntimeProviderFactory {
         })?;
         let resource_plan = ResourcePlan::from_snapshot(config, workflow)?;
         Ok(RoutedProvider::new(plan, resource_plan, workflow.clone()))
+    }
+
+    fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
+        require_explicit_provider(provider)
     }
 }
 

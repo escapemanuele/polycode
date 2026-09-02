@@ -31,7 +31,10 @@ pub use run::{
     RunAttentionError, RunFixError, RunInvariantError, RunProviderEventError, RunRehydrationError,
     RunStageError, RunStatus, RunTransition, RunTransitionError, StageDependencyReport,
 };
-pub use stage::{Stage, StageRehydrationError, StageStatus, StageTransition, StageTransitionError};
+pub use stage::{
+    Stage, StageRehydrationError, StageRouteOverride, StageStatus, StageTransition,
+    StageTransitionError,
+};
 pub use workflow::{
     Dependency, DependencyKind, StageDefinition, StageKind, WorkflowDefinition,
     WorkflowDefinitionError, WorkflowKind, continue_cycle_stages, fix_cycle_stages,

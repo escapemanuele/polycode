@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::app::{
     AppError, ExecutionTarget, ProviderResolver, QuiescentState, ResourcePlan, RoutedProvider,
-    RoutingPlan, RunService,
+    RoutingPlan, RunService, UniformProvider,
 };
 use crate::domain::{ConfigSnapshotId, ModelId, ProviderId, RunId, StageId, WorkflowDefinition};
 use crate::store::{ResolvedConfigSnapshot, SequencedEvent};
@@ -338,6 +338,13 @@ struct EvalProviderResolver {
 
 impl ProviderResolver for EvalProviderResolver {
     type Provider = RoutedProvider;
+
+    fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
+        Err(AppError::UnsupportedProvider(format!(
+            "{}: evaluation runs never reroute a stage",
+            provider.as_str()
+        )))
+    }
 
     fn resolve_for_run(
         &self,

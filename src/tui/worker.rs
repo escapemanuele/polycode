@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use crate::app::{ApplyOutcome, ExecutionReport, ExecutionSelection, ProviderFactory, RunService};
+use crate::app::{
+    ApplyOutcome, ExecutionReport, ExecutionSelection, ProviderFactory, RetryRoute, RunService,
+};
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
 use crate::workspace::PublishReceipt;
 
@@ -73,6 +75,9 @@ pub(crate) enum WorkerCommand {
     RetryStage {
         run_id: RunId,
         stage_id: StageId,
+        /// Where to send the stage instead of its configured provider, when
+        /// the operator chose one.
+        route: Option<RetryRoute>,
     },
     RequestFix {
         run_id: RunId,
@@ -279,8 +284,12 @@ where
             service.resume_run(run_id).map(WorkerSuccess::Execution)
         }
         WorkerCommand::StopRun { run_id } => service.stop_run(run_id).map(WorkerSuccess::Execution),
-        WorkerCommand::RetryStage { run_id, stage_id } => service
-            .retry_stage(run_id, &stage_id)
+        WorkerCommand::RetryStage {
+            run_id,
+            stage_id,
+            route,
+        } => service
+            .retry_stage(run_id, &stage_id, route)
             .map(WorkerSuccess::Execution),
         WorkerCommand::RequestFix { run_id } => {
             service.request_fix(run_id).map(WorkerSuccess::Execution)

@@ -21,7 +21,7 @@ polycode
 polycode tui
 ```
 Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home`/`End` top/bottom in viewers, `Enter` open/confirm, `Esc` back/close, `n` new run, `R` runs screen, `x` dismiss notification, `?` help, `q` or `Ctrl-C` quit/detach.
-Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage, `u` attention overlay, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `P` pull request (Enter confirms), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `i` technical details.
+Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage (chooser: Configured provider / Claude / Codex, Enter retries), `u` attention overlay, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `P` pull request (Enter confirms), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `i` technical details.
 Runs list: `h` hide/unhide selected run, `H` show/hide hidden runs.
 Artifact viewer: `m` toggle raw/rendered Markdown.
 Composer: `Tab`/`Shift-Tab` move fields, `←`/`→` cycle Workflow, Execution and Effort, typing/paste edits Task and Repository, `Enter` submits, `Esc` back.

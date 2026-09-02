@@ -14,8 +14,9 @@ use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 
 use super::provider_factory::{ProviderFactory, ProviderResolver};
 use super::{
-    AppError, ArtifactSummary, ArtifactView, CommittedEvent, ExecutionSelection, ProcessLogView,
-    RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, query,
+    AppError, ArtifactSummary, ArtifactView, CommittedEvent, ExecutionSelection,
+    OPERATOR_OVERRIDE_REASON, ProcessLogView, RetryRoute, RunDetails, RunDiffPreview, RunListItem,
+    StageExecutionEvidence, query,
 };
 
 const DIFF_PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
@@ -263,16 +264,30 @@ where
     ///
     /// # Errors
     /// Returns identity, retry-safety, guard, persistence, or provider errors.
+    ///
+    /// With `route`, the stage is sent to that provider first. The provider is
+    /// checked for readiness before anything is committed, so a retry aimed at
+    /// a CLI that is not installed or logged in fails here with the stage
+    /// untouched, not halfway through with the stage rerouted and pending.
     pub fn retry_stage(
         &self,
         run_id: RunId,
         stage_id: &StageId,
+        route: Option<RetryRoute>,
     ) -> Result<ExecutionReport, AppError> {
+        if let Some(route) = route.as_ref() {
+            self.provider_factory.require_provider(route.provider())?;
+        }
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
         self.reconcile(&mut store, run_id)?;
         let mut engine = self.engine(&mut store, run_id)?;
-        engine.retry_stage(&mut store, run_id, stage_id)?;
+        engine.retry_stage(
+            &mut store,
+            run_id,
+            stage_id,
+            route.map(|route| (route.into_override(), OPERATOR_OVERRIDE_REASON)),
+        )?;
         let status = drive_attached(&mut engine, &mut store, run_id)?;
         Self::report(&mut store, run_id, before, Some(&status))
     }
@@ -978,6 +993,12 @@ mod tests {
     impl ProviderFactory for RecordingFactory {
         type Provider = RecordingProvider;
 
+        fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
+            (provider == UniformProvider::Fake)
+                .then_some(())
+                .ok_or_else(|| AppError::UnsupportedProvider(provider.as_str().to_owned()))
+        }
+
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
@@ -1006,6 +1027,12 @@ mod tests {
 
     impl ProviderFactory for GatedFactory {
         type Provider = FakeProvider;
+
+        fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
+            (provider == UniformProvider::Fake)
+                .then_some(())
+                .ok_or_else(|| AppError::UnsupportedProvider(provider.as_str().to_owned()))
+        }
 
         fn config_for_new_run(
             &self,
@@ -1047,6 +1074,12 @@ mod tests {
 
     impl ProviderFactory for ScriptedFactory {
         type Provider = FakeProvider;
+
+        fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
+            (provider == UniformProvider::Fake)
+                .then_some(())
+                .ok_or_else(|| AppError::UnsupportedProvider(provider.as_str().to_owned()))
+        }
 
         fn config_for_new_run(
             &self,
@@ -2819,6 +2852,7 @@ mod tests {
             .retry_stage(
                 failed.details.id,
                 &crate::domain::StageId::new("implementation").unwrap(),
+                None,
             )
             .unwrap();
         assert_eq!(retried.details.status, RunStatus::Failed);
@@ -3326,5 +3360,125 @@ mod tests {
             write!(hash, "{byte:02x}").expect("writing to String cannot fail");
         }
         hash
+    }
+
+    /// Sending a failed stage elsewhere is recorded on the stage and shown
+    /// as its configured target from then on; the snapshot's own routing
+    /// table never changes.
+    #[test]
+    fn retry_with_a_route_records_the_override_and_reports_it_as_configured() {
+        let fixture = Fixture::new();
+        let scenario = || {
+            FakeScenario::new()
+                .stage("implementation")
+                .events([FakeEvent::Started, FakeEvent::failed("compile failed")])
+                .stage("verify")
+                .events([FakeEvent::Started, FakeEvent::Completed])
+        };
+        let failed = fixture
+            .scripted_service(scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "failing task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        assert_eq!(failed.details.status, RunStatus::Failed);
+        let implementation = crate::domain::StageId::new("implementation").unwrap();
+        let retried = fixture
+            .scripted_service(scenario())
+            .retry_stage(
+                failed.details.id,
+                &implementation,
+                Some(RetryRoute::new(
+                    UniformProvider::Fake,
+                    Some(crate::domain::ModelId::new("fake-large").unwrap()),
+                )),
+            )
+            .unwrap();
+        let overridden = retried
+            .committed_events
+            .iter()
+            .find(|event| matches!(event.kind, DomainEventKind::StageRouteOverridden { .. }))
+            .expect("the override is committed with the retry");
+        assert_eq!(overridden.stage_id.as_ref(), Some(&implementation));
+        assert_eq!(
+            overridden.kind,
+            DomainEventKind::StageRouteOverridden {
+                provider_id: crate::domain::ProviderId::new("fake").unwrap(),
+                model_id: Some(crate::domain::ModelId::new("fake-large").unwrap()),
+                reason: OPERATOR_OVERRIDE_REASON.to_owned(),
+            }
+        );
+        let stage = retried
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.id == implementation)
+            .unwrap();
+        assert!(stage.route_overridden);
+        assert_eq!(stage.configured_provider, "fake");
+        assert_eq!(stage.configured_model.as_deref(), Some("fake-large"));
+        let verify = retried
+            .details
+            .stages
+            .iter()
+            .find(|stage| stage.kind == StageKind::Verify)
+            .unwrap();
+        assert!(!verify.route_overridden, "only the retried stage moves");
+        assert!(
+            retried
+                .details
+                .routes
+                .iter()
+                .all(|route| route.configured_model.is_none()),
+            "the snapshot's routing table is untouched"
+        );
+    }
+
+    /// A provider that cannot take the stage is refused before anything is
+    /// committed: the stage stays failed on its original route, retryable.
+    #[test]
+    fn retry_to_an_unavailable_provider_commits_nothing() {
+        let fixture = Fixture::new();
+        let scenario = || {
+            FakeScenario::new()
+                .stage("implementation")
+                .events([FakeEvent::Started, FakeEvent::failed("compile failed")])
+        };
+        let failed = fixture
+            .scripted_service(scenario())
+            .start_run(
+                WorkflowKind::Fast,
+                "failing task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+            )
+            .unwrap();
+        let implementation = crate::domain::StageId::new("implementation").unwrap();
+        let error = fixture
+            .scripted_service(scenario())
+            .retry_stage(
+                failed.details.id,
+                &implementation,
+                Some(RetryRoute::new(UniformProvider::Claude, None)),
+            )
+            .unwrap_err();
+        assert!(matches!(error, AppError::UnsupportedProvider(_)), "{error}");
+        let details = fixture
+            .scripted_service(scenario())
+            .inspect_run(failed.details.id)
+            .unwrap();
+        assert_eq!(details.status, RunStatus::Failed);
+        let stage = details
+            .stages
+            .iter()
+            .find(|stage| stage.id == implementation)
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Failed);
+        assert!(!stage.route_overridden);
     }
 }
