@@ -30,7 +30,7 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, 
 - `src/workspace/error.rs` — `WorkspaceError`, incl. `VerificationNotPassed`.
 - `src/workspace/model.rs` — `RunWorkspace`, `WorkspaceStatus`, apply operation records.
 - `src/workspace/github.rs` — `gh pr list --head` / `gh pr create` boundary.
-- `src/workspace/pull_request.rs` — `PullRequestDraft`, `extract` of the artifact's `## Pull request` section; `src/app/query.rs` `pull_request_draft` picks the artifact.
+- `src/workspace/pull_request.rs` — `PullRequestDraft`, `extract` of the artifact's `## Pull request` section; `src/app/query.rs` `pull_request_draft` walks the editing artifacts newest first and takes the first that wrote the section. When none did, `publish_title`/`publish_body` in `manager.rs` name the run from the task with its links dropped, falling back to the linked issue.
 - `src/git/worktree.rs`, `src/git/patch.rs`, `src/git/remote.rs`, `src/git/repository.rs` — Git commands with direct argv.
 - `src/store/workspace.rs` — workspace and apply-intent persistence with CAS.
 - `src/store/path.rs` — `worktree_root`, `POLYCODE_DATA_DIR`.

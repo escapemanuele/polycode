@@ -1030,13 +1030,80 @@ impl FaultPoint {
 
 /// One line naming the work when no editing stage drafted a title: the
 /// task's first line, for the commit subject and pull-request title.
+///
+/// A task is written to an agent, not to a reviewer, so its first line is
+/// often a link and little else — `Work on <issue url>` names nothing in a
+/// list of pull requests. Links are dropped, and when what remains is too
+/// thin to be a title the issue behind the link supplies one.
 fn publish_title(task: Option<&str>, run_id: RunId) -> String {
-    let first_line = task
+    let Some(first_line) = task
         .map(str::trim)
         .and_then(|task| task.lines().next())
         .map(str::trim)
-        .filter(|line| !line.is_empty());
-    first_line.map_or_else(|| format!("Polycode run {run_id}"), bounded_title)
+        .filter(|line| !line.is_empty())
+    else {
+        return format!("Polycode run {run_id}");
+    };
+    let words = without_urls(first_line);
+    if words.split_whitespace().count() >= 3 {
+        return bounded_title(&words);
+    }
+    if let Some(headline) = issue_headline(first_line) {
+        return bounded_title(&headline);
+    }
+    if words.is_empty() {
+        format!("Polycode run {run_id}")
+    } else {
+        bounded_title(&words)
+    }
+}
+
+/// The line without its URL tokens, with the punctuation a dropped link left
+/// hanging trimmed off each end.
+fn without_urls(line: &str) -> String {
+    let kept: Vec<&str> = line
+        .split_whitespace()
+        .filter(|word| !word.contains("://"))
+        .collect();
+    kept.join(" ")
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '-' | ',' | '.' | ';'))
+        .to_owned()
+}
+
+/// A title read out of the first issue link in the line: `DOTCOM-17972:
+/// stepper transfer waits` from a Linear URL, `wp-calypso#114037` from a
+/// GitHub one. `None` when the line links to no issue.
+fn issue_headline(line: &str) -> Option<String> {
+    for word in line.split_whitespace() {
+        let word = word.trim_end_matches(['.', ',', ';', ')', '>']);
+        if let Some(rest) = word.split_once("linear.app/").map(|(_, rest)| rest) {
+            let mut parts = rest.split('/');
+            let _org = parts.next();
+            if parts.next() != Some("issue") {
+                continue;
+            }
+            let Some(key) = parts.next().filter(|key| !key.is_empty()) else {
+                continue;
+            };
+            let key = key.to_ascii_uppercase();
+            return Some(match parts.next().filter(|slug| !slug.is_empty()) {
+                Some(slug) => format!("{key}: {}", slug.replace('-', " ")),
+                None => key,
+            });
+        }
+        if let Some(rest) = word.split_once("github.com/").map(|(_, rest)| rest) {
+            let parts: Vec<&str> = rest.split('/').collect();
+            if let [_owner, repo, kind, number, ..] = parts.as_slice() {
+                if matches!(*kind, "issues" | "pull")
+                    && !number.is_empty()
+                    && number.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Some(format!("{repo}#{number}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// A title cut to the length Git and GitHub show in full.
@@ -1051,12 +1118,29 @@ fn bounded_title(line: &str) -> String {
     }
 }
 
+/// The description when no editing stage drafted one: the task verbatim, led
+/// by a `Fixes` line when the task links an issue so the pull request still
+/// closes it, and closed by the run footer.
 fn publish_body(task: Option<&str>, run_id: RunId) -> String {
     let footer = format!("Opened by Polycode from run {run_id}.");
-    match task.map(str::trim).filter(|task| !task.is_empty()) {
-        Some(task) => format!("{task}\n\n---\n{footer}"),
-        None => footer,
+    let Some(task) = task.map(str::trim).filter(|task| !task.is_empty()) else {
+        return footer;
+    };
+    match issue_url(task) {
+        Some(url) => format!("Fixes {url}\n\n{task}\n\n---\n{footer}"),
+        None => format!("{task}\n\n---\n{footer}"),
     }
+}
+
+/// The first issue link in the task, as written.
+fn issue_url(task: &str) -> Option<&str> {
+    task.split_whitespace()
+        .map(|word| word.trim_end_matches(['.', ',', ';', ')', '>']))
+        .find(|word| {
+            word.contains("://")
+                && (word.contains("linear.app/") || word.contains("github.com/"))
+                && issue_headline(word).is_some()
+        })
 }
 
 /// Refuses to move a run's changes anywhere unless its latest verification
@@ -2819,6 +2903,50 @@ mod tests {
             format!("Opened by Polycode from run {run_id}.")
         );
         assert!(publish_body(Some("task text"), run_id).starts_with("task text\n\n---\n"));
+    }
+
+    /// The common task shape: an instruction word and a link. The link says
+    /// everything about the work and nothing a pull request list can read,
+    /// so the title comes from the issue it points at and the description
+    /// opens with the `Fixes` line that closes it.
+    #[test]
+    fn a_task_that_is_mostly_a_link_titles_the_pull_request_from_its_issue() {
+        let run_id = RunId::from_u128(9);
+        let linear = "Work on https://linear.app/a8c/issue/DOTCOM-17972/stepper-transfer-waits";
+        assert_eq!(
+            publish_title(Some(linear), run_id),
+            "DOTCOM-17972: stepper transfer waits"
+        );
+        assert_eq!(
+            publish_body(Some(linear), run_id),
+            format!(
+                "Fixes https://linear.app/a8c/issue/DOTCOM-17972/stepper-transfer-waits\n\n{linear}\n\n---\nOpened by Polycode from run {run_id}."
+            )
+        );
+        assert_eq!(
+            publish_title(
+                Some("https://github.com/Automattic/wp-calypso/issues/114037"),
+                run_id
+            ),
+            "wp-calypso#114037"
+        );
+        // A task that says something of its own keeps saying it, without the
+        // link it happens to carry.
+        assert_eq!(
+            publish_title(
+                Some("Fix the flaky transfer test https://linear.app/a8c/issue/DOTCOM-1/x"),
+                run_id
+            ),
+            "Fix the flaky transfer test"
+        );
+        // No issue link, nothing but a link: the run names itself as before.
+        assert_eq!(
+            publish_title(Some("https://example.invalid/notes"), run_id),
+            format!("Polycode run {run_id}")
+        );
+        assert!(
+            !publish_body(Some("See https://example.invalid/notes"), run_id).starts_with("Fixes ")
+        );
     }
 
     fn init_repository(path: &Path) {
