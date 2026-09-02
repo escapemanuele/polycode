@@ -320,25 +320,34 @@ impl TuiApp {
             Intent::Delete => self.state.attention_response.delete(),
             Intent::Character(character) => self.state.attention_response.insert(character),
             Intent::Enter => {
-                let Some(run_id) = self.state.selected_run else {
-                    return;
-                };
-                let Some(attention_id) = self.state.selected_attention_id() else {
-                    self.state
-                        .set_error("No pending attention request selected");
-                    return;
-                };
                 let response = (!self.state.attention_response.text().is_empty())
                     .then(|| self.state.attention_response.text().to_owned());
-                self.dispatch(WorkerCommand::ResolveAttention {
-                    run_id,
-                    attention_id,
-                    response,
-                });
-                self.state.overlay = None;
+                self.submit_attention(response);
+            }
+            Intent::Skip => {
+                self.submit_attention(Some(crate::app::SKIP_ATTENTION_RESPONSE.to_owned()));
             }
             _ => {}
         }
+    }
+
+    /// Resolves the selected attention with `response` (`None` approves a
+    /// permission as asked) and closes the overlay.
+    fn submit_attention(&mut self, response: Option<String>) {
+        let Some(run_id) = self.state.selected_run else {
+            return;
+        };
+        let Some(attention_id) = self.state.selected_attention_id() else {
+            self.state
+                .set_error("No pending attention request selected");
+            return;
+        };
+        self.dispatch(WorkerCommand::ResolveAttention {
+            run_id,
+            attention_id,
+            response,
+        });
+        self.state.overlay = None;
     }
 
     fn handle_new_run_intent(&mut self, intent: Intent) {
@@ -1260,6 +1269,33 @@ mod tests {
 
     /// A `TuiApp` wired to an empty temporary store: enough to drive intents
     /// without touching the user's data directory or any provider.
+    /// Ctrl-S in the attention overlay is one keypress: it resolves the
+    /// selected permission with the canned decline and closes the overlay,
+    /// with nothing typed.
+    #[test]
+    fn ctrl_s_in_the_attention_overlay_skips_the_selected_permission() {
+        let mut run = details(RunStatus::NeedsUser, WorkflowKind::Deep);
+        run.attention = vec![crate::app::AttentionSummary {
+            id: crate::domain::AttentionRequestId::from_u128(1),
+            stage_id: StageId::new("implementation").unwrap(),
+            kind: crate::domain::AttentionKind::Permission,
+            summary: "Claude Code requests permission for: Bash".to_owned(),
+        }];
+        let (mut app, _fixture) = app_with(run);
+        app.state.overlay = Some(Overlay::Attention);
+        app.handle_intent(Intent::Skip);
+        assert_eq!(app.state.overlay, None);
+        assert!(
+            app.state
+                .in_flight
+                .iter()
+                .any(|action| action.action == ActionKind::ResolveAttention),
+            "skip must dispatch a resolution: {:?}",
+            app.state.in_flight
+        );
+        assert!(app.state.attention_response.text().is_empty());
+    }
+
     fn app_with(details: RunDetails) -> (TuiApp, TempDir) {
         let fixture = TempDir::new().unwrap();
         let database = fixture.path().join("polycode.db");

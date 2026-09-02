@@ -39,6 +39,8 @@ pub(crate) enum Intent {
     TechnicalDetails,
     Help,
     Character(char),
+    /// Decline the selected permission request and let the task continue.
+    Skip,
     Ignore,
 }
 
@@ -93,8 +95,12 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
 }
 
 pub(crate) fn map_text_key(event: KeyEvent) -> Intent {
-    if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
-        return Intent::Quit;
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        match event.code {
+            KeyCode::Char('c') => return Intent::Quit,
+            KeyCode::Char('s') => return Intent::Skip,
+            _ => {}
+        }
     }
     match event.code {
         KeyCode::Up => Intent::Up,
@@ -121,6 +127,22 @@ pub(crate) fn map_text_key(event: KeyEvent) -> Intent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_mode_ctrl_s_skips_and_plain_s_still_types() {
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Intent::Skip
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Intent::Character('s')
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Intent::Quit
+        );
+    }
 
     #[test]
     fn maps_ctrl_c_and_context_keys() {

@@ -75,6 +75,10 @@ pub enum QuiescentState {
     Active { run_status: RunStatus },
 }
 
+/// What the provider hears when the operator skips a permission request:
+/// the call stays denied and the task continues on what is already allowed.
+pub const SKIP_ATTENTION_RESPONSE: &str = "The operator declined this permission request. Do not retry it or work around it. Continue the task without it, and state plainly in your result what you could not do or verify because of it.";
+
 pub struct RunService<F> {
     database: PathBuf,
     worktrees: PathBuf,
@@ -229,6 +233,19 @@ where
         request_id: AttentionRequestId,
     ) -> Result<ExecutionReport, AppError> {
         self.resolve_attention_with_response(run_id, request_id, None)
+    }
+
+    /// Resolves a permission request by declining it and telling the provider
+    /// to carry on without it. One keypress in the TUI, `--skip` on the CLI.
+    ///
+    /// # Errors
+    /// Returns identity, guard, lifecycle, persistence, or provider errors.
+    pub fn skip_attention(
+        &self,
+        run_id: RunId,
+        request_id: AttentionRequestId,
+    ) -> Result<ExecutionReport, AppError> {
+        self.resolve_attention_with_response(run_id, request_id, Some(SKIP_ATTENTION_RESPONSE))
     }
 
     /// Resolves one attention request with optional provider-native response text.

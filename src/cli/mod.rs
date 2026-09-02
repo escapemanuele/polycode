@@ -85,8 +85,11 @@ pub enum Command {
         attention_id: AttentionRequestId,
         /// Answer for a provider question. For a permission request, omit to
         /// approve it, or give an instruction to continue without granting it.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "skip")]
         response: Option<String>,
+        /// Decline the permission request and continue the task without it.
+        #[arg(long)]
+        skip: bool,
     },
     /// Send a completed run back to fix its own result, then decide again.
     Fix { run_id: RunId },

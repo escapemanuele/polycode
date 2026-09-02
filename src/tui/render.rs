@@ -1866,7 +1866,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -2086,7 +2086,7 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .map(|attention| attention.kind);
     if selected_kind == Some(AttentionKind::Permission) {
         lines.push(Line::from(Span::styled(
-            "Permission request — Enter approves; a typed response continues without granting",
+            "Permission request — Enter approves · Ctrl-S skips it · a typed response continues without granting",
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(format!(
@@ -2094,7 +2094,7 @@ fn render_attention(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             field_display(&state.attention_response, true)
         )));
         lines.push(Line::from(Span::styled(
-            "↑/↓ select request · Enter approve/resolve · type to answer instead · Esc cancel",
+            "↑/↓ select request · Enter approve · Ctrl-S skip · type to answer instead · Esc cancel",
             theme::muted(),
         )));
     } else {
@@ -4229,7 +4229,8 @@ mod tests {
         state.overlay = Some(Overlay::Attention);
         let text = render_text(&state, 120, 30);
         assert!(text.contains("Permission request"));
-        assert!(text.contains("Enter approve/resolve"));
+        assert!(text.contains("Enter approve"));
+        assert!(text.contains("Ctrl-S skip"), "skip must be discoverable");
         assert!(
             text.contains("Response (optional):"),
             "permission offers an answer that continues without granting"

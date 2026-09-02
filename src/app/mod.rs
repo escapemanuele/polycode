@@ -28,4 +28,6 @@ pub use routing::{
     UniformProvider, VERIFY_PROVIDER_ID, recommended_effort, recommended_provenance,
     resolve_config_with_image, unroutable_fix_role,
 };
-pub use run_service::{ApplyOutcome, ExecutionReport, QuiescentState, RunService};
+pub use run_service::{
+    ApplyOutcome, ExecutionReport, QuiescentState, RunService, SKIP_ATTENTION_RESPONSE,
+};
