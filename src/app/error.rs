@@ -81,6 +81,15 @@ continue-cycle routing existed and has no route for {role:?}. Start a new run in
     ProcessLogNotFound { run_id: RunId, stage_id: StageId },
     #[error("run {run_id} has no stage {stage_id}")]
     StageNotFound { run_id: RunId, stage_id: StageId },
+    #[error(
+        "run {run_id} was NOT stopped: managed process {process_id} never recorded the runtime \
+evidence a signal needs within {waited_ms}ms. The process may still be running; try stopping again."
+    )]
+    StopRuntimeEvidenceUnavailable {
+        run_id: RunId,
+        process_id: crate::process::ManagedProcessId,
+        waited_ms: u128,
+    },
 }
 
 impl AppError {
@@ -106,6 +115,30 @@ impl AppError {
             _ => false,
         }
     }
+
+    /// Whether this stop failed only because a managed process had not yet
+    /// recorded its runtime evidence. Repeating the stop is safe — every step
+    /// of it is idempotent — and the evidence is imminent whenever the runner
+    /// is alive, so the stop path waits rather than telling a user who pressed
+    /// stop moments after starting a run that it cannot be stopped.
+    #[must_use]
+    pub const fn is_pending_runtime_evidence(&self) -> bool {
+        match self {
+            Self::Process(error) => error.is_missing_runtime_evidence(),
+            _ => false,
+        }
+    }
+
+    /// The managed process a pending-runtime-evidence failure refers to.
+    #[must_use]
+    pub const fn pending_runtime_evidence_process(
+        &self,
+    ) -> Option<crate::process::ManagedProcessId> {
+        match self {
+            Self::Process(ProcessError::MissingRuntimeEvidence(process_id)) => Some(*process_id),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +152,33 @@ mod tests {
     // aborting mid-way and reporting a revision number to the user, so the
     // classification is pinned here rather than only through the racy
     // end-to-end fixture.
+    // Missing runtime evidence is not a lost race and must never be treated
+    // as one: the two have separate retry budgets in the stop path, and
+    // collapsing them would let a burst of one exhaust the other.
+    #[test]
+    fn pending_runtime_evidence_is_its_own_retryable_condition() {
+        let process_id = ManagedProcessId::new();
+        let error = AppError::Process(ProcessError::MissingRuntimeEvidence(process_id));
+        assert!(error.is_pending_runtime_evidence());
+        assert!(!error.is_concurrent_modification());
+        assert_eq!(error.pending_runtime_evidence_process(), Some(process_id));
+
+        let race = AppError::Process(ProcessError::ConcurrentModification {
+            process_id,
+            expected: 3,
+        });
+        assert!(!race.is_pending_runtime_evidence());
+        assert_eq!(race.pending_runtime_evidence_process(), None);
+
+        // A process that failed to start for a permanent reason is not
+        // something a stop should sit and wait on.
+        assert!(
+            !AppError::Process(ProcessError::InterruptTimeout(process_id))
+                .is_pending_runtime_evidence()
+        );
+        assert!(!AppError::DirtySourceRepository.is_pending_runtime_evidence());
+    }
+
     #[test]
     fn only_lost_revision_races_are_retryable() {
         assert!(

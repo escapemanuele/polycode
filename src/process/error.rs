@@ -101,4 +101,20 @@ impl ProcessError {
             _ => false,
         }
     }
+
+    /// Whether this is the startup window in which a managed process is
+    /// running but has not yet recorded the PIDs a signal needs. The runner
+    /// spawns its child before writing `runtime.json`, so between those two
+    /// points signalling has nothing honest to aim at. Refusing is right —
+    /// guessing a PID would be worse — but the condition is transient, and
+    /// the layer that knows a user is waiting on a stop can wait it out.
+    ///
+    /// The same error also carries permanent conditions: corrupt or foreign
+    /// evidence, a runner whose pane PID no longer matches. Nothing here can
+    /// tell those apart, which is why the caller's tolerance is bounded and
+    /// ends in a failure rather than in silence.
+    #[must_use]
+    pub const fn is_missing_runtime_evidence(&self) -> bool {
+        matches!(self, Self::MissingRuntimeEvidence(_))
+    }
 }

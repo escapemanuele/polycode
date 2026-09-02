@@ -517,6 +517,62 @@ fn interrupt_records_evidence_leaves_no_session_and_cleanup_is_idempotent() {
     assert!(process.spec().stderr_path().exists());
 }
 
+/// Reproduces the startup window deterministically instead of racing it.
+///
+/// The runner spawns its child before writing `runtime.json`, so between those
+/// two points a managed process is running and cannot be signalled. That window
+/// is timing-dependent and does not reproduce on demand, but its observable
+/// state does: a live runner whose runtime evidence is not on disk. Removing
+/// the file after the fact puts the backend in exactly that state.
+///
+/// The primitive must keep refusing. Signalling without knowing which PIDs to
+/// aim at would be worse than failing, and swallowing the wait inside
+/// `interrupt` would hide a genuine failure to start behind a delay. The
+/// tolerance belongs in the stop path, which knows a user is waiting — see
+/// `retry_stop` in the app layer.
+#[test]
+fn interrupt_refuses_while_runtime_evidence_is_absent() {
+    let fixture = Fixture::new();
+    let process = fixture.prepare(&["wait-interrupt"]);
+    let manager = fixture.manager();
+    let mut store = fixture.store();
+    manager.start(&mut store, process.id()).unwrap();
+    wait_for_output(&manager, &store, process.id(), OutputStream::Stdout);
+    wait_for_runtime_evidence(&process);
+
+    let evidence = process
+        .spec()
+        .stdout_path()
+        .parent()
+        .expect("stdout path has a parent")
+        .join("runtime.json");
+    let recorded = std::fs::read(&evidence).unwrap();
+    std::fs::remove_file(&evidence).unwrap();
+
+    let error = manager
+        .interrupt(&mut store, process.id())
+        .expect_err("a process that cannot be named must not be reported as signalled");
+    assert!(
+        matches!(error, ProcessError::MissingRuntimeEvidence(id) if id == process.id()),
+        "unexpected error: {error}"
+    );
+
+    // The refusal is not a stop: the child is still running, which is exactly
+    // why the failure must never be reported as success.
+    let inspection = manager.inspect(&mut store, process.id()).unwrap();
+    assert!(inspection.process.status().is_active());
+
+    // Restoring the evidence is enough for the same call to succeed, which is
+    // what makes waiting the right answer in the layer above — and it leaves
+    // no detached tmux session behind.
+    std::fs::write(&evidence, recorded).unwrap();
+    let interrupted = manager.interrupt(&mut store, process.id()).unwrap();
+    assert_eq!(
+        interrupted.process.status(),
+        ManagedProcessStatus::Interrupted
+    );
+}
+
 #[test]
 fn foreign_session_collision_is_not_reused_or_killed() {
     let fixture = Fixture::new();
