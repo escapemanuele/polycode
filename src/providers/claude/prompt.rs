@@ -178,6 +178,7 @@ mod tests {
             &session,
             &[denial],
             None,
+            &std::collections::BTreeSet::new(),
             None,
             crate::domain::EffortSetting::NativeDefault,
             None,

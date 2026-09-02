@@ -4,6 +4,7 @@ Run each stage through the locally installed `claude` or `codex` executable with
 
 ## Sub-features
 - claude: non-interactive stream-JSON print mode, `dontAsk` permissions, prompt on immutable stdin; denied tools become typed permission attention; questions (`AskUserQuestion`) need `--response`.
+- claude-repo-allowlist: the `[permissions] allow` table of `<worktree>/.polycode.toml` becomes `--allowedTools` on every Claude invocation, initial and resumed, beside anything a resolved attention granted. Rules are native Claude Code rules, passed through verbatim; a rule that grants every tool (`*`, `Bash(*)`) or an empty one fails the stage.
 - codex: `codex exec --json` with prompt `-` on stdin, `--ask-for-approval never`, sandbox `read-only` for non-mutating stage kinds and `workspace-write` for Implementation/Fix/FollowUp; no typed attention.
 - codex-dead-process-completion: a `turn.completed` whose process then died (non-zero exit, signal, or vanished) completes only if the `--output-last-message` file equals the last agent message in the retained stream; otherwise the record is consumed and the stage becomes a recoverable interruption. A requested stop reports interruption without consulting the file, and a `broken` supervisor still fails the poll.
 - fake: scripted signals (start, progress, usage, attention, pause, interruption, completion, failure) without editing files; scenario `development_fake/default_success_v1`.
@@ -29,7 +30,7 @@ POLYCODE_REAL_CODEX=1 cargo test --test codex_real -- --ignored --nocapture
 TUI: `u` opens the attention overlay; ↑/↓ choose the request, type an answer if it is a question, Enter resolves.
 
 ## Where it lives
-- `src/providers/claude/` — `detection.rs` (install/auth discovery), `command.rs` (argv, `--resume`, `--allowedTools`, `--effort`), `protocol.rs` (JSONL decoder, `PermissionDenial`, terminal-attention rules), `prompt.rs`, `artifact.rs`, `mod.rs` (adapter).
+- `src/providers/claude/` — `detection.rs` (install/auth discovery), `command.rs` (argv, `--resume`, `--allowedTools`, `--effort`), `permissions.rs` (`.polycode.toml` `[permissions]` reader), `protocol.rs` (JSONL decoder, `PermissionDenial`, terminal-attention rules), `prompt.rs`, `artifact.rs`, `mod.rs` (adapter).
 - `src/providers/codex/` — `detection.rs`, `command.rs` (`exec --json`, sandbox, `-c model_reasoning_effort`), `protocol.rs`, `session_meta.rs`, `mod.rs`.
 - `src/providers/session.rs`, `src/providers/checkpoint.rs`, `src/providers/artifact.rs` — provider session, atomic commit payload, immutable artifact record.
 - `src/engine/fake.rs` — Fake scenarios.
@@ -42,6 +43,8 @@ TUI: `u` opens the attention overlay; ↑/↓ choose the request, type an answer
 ## Gotchas
 - `permission_denials` in a Claude result is per-process, not per-session: every retry after a `--resume` gets a new `tool_use_id`. A list that looks cumulative across the resume boundary is not; treating it as residual history misclassifies a fresh attempt. Split by `tool_use_id` (`PermissionDenial::same_request`).
 - "Safe to auto-approve" and "denial blocks completion" are two different policies (`exact_rule` vs `requires_terminal_attention`); when they were one function, successful results were marked infrastructure failures or `NeedsUser`. Only Edit/Write/MultiEdit/NotebookEdit, AskUserQuestion and unknown tools are terminal; a denied Bash/Read/Glob/Grep/LS/WebFetch never ran, so it is not terminal.
+- `grant_rules` decides whether an approval is worth committing and runs at `resolve`, before anything is persisted; building the resume command never refuses again (except an unanswered question). Both gates refusing is what stranded runs: a resolution committed before the gate existed leaves a session whose every later drive fails building the command, and the stage sits `running` for good with no process behind it, reachable only by a `retry` that throws the work away. A resume that can grant nothing says so in its prompt and continues; a session with no denials at all — a stopped stage picking back up — resumes plainly.
+- `resume` retries a lost revision race the way `stop` does. Resuming a run something else is still driving is normal, not exceptional: the driver commits on every provider signal it observes, so the resume collides on rows it touched first and used to surface a bare revision number to the user.
 - Polycode never adds `--dangerously-skip-permissions`, `--yolo`, `danger-full-access`, `--ephemeral` or any Git/config bypass. Wildcard or ambiguous permission rules fail closed at `resolve`.
 - A question response goes to run-private stdin, never argv or SQLite event payloads.
 - Claude reviewer stages are prompt-prohibited from editing but have no hard sandbox; Codex reviewers do (`read-only`). This asymmetry is documented, not patched.

@@ -15,6 +15,8 @@ pub enum ClaudeProviderError {
     NotAuthenticated,
     #[error("Claude Code emitted invalid stream JSON: {0}")]
     Protocol(String),
+    #[error("{0}")]
+    PermissionsConfig(String),
     #[error("Claude Code permission cannot be resumed safely: {0}")]
     UnsafePermission(String),
     #[error("Claude Code question requires a non-empty `--response`")]

@@ -365,7 +365,14 @@ Resolution order:
 2. `$XDG_CONFIG_HOME/polycode/config.toml`
 3. `$HOME/.config/polycode/config.toml`
 
-Repository settings live at `<repo>/.polycode.toml`; today only its `[verify]` table is read (see Verification above). The user configuration file is resolved but never read or created, so the update opt-out below is an environment variable rather than a configuration key.
+Repository settings live at `<repo>/.polycode.toml`: its `[verify]` table (see Verification above) and its `[permissions]` table, which lists the native Claude Code rules every run in that repository may use without stopping to ask:
+
+```toml
+[permissions]
+allow = ["Bash(yarn jest:*)", "Bash(yarn lint:css:*)", "mcp__linear-server"]
+```
+
+A rule that would grant every tool is refused. The user configuration file is resolved but never read or created, so the update opt-out below is an environment variable rather than a configuration key.
 
 ### Appearance
 
