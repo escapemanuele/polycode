@@ -15,8 +15,8 @@ use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 use super::provider_factory::{ProviderFactory, ProviderResolver};
 use super::{
     AppError, ArtifactSummary, ArtifactView, CommittedEvent, EffortRequest, ExecutionSelection,
-    OPERATOR_OVERRIDE_REASON, ProcessLogView, RetryRoute, RunDetails, RunDiffPreview, RunListItem,
-    StageExecutionEvidence, query,
+    ImageGenerationPlan, OPERATOR_OVERRIDE_REASON, ProcessLogView, RetryRoute, RunDetails,
+    RunDiffPreview, RunListItem, StageExecutionEvidence, query,
 };
 
 const DIFF_PREVIEW_LIMIT: usize = 2 * 1024 * 1024;
@@ -130,6 +130,7 @@ where
         repository_path: impl AsRef<Path>,
         selection: Option<ExecutionSelection>,
         effort: impl Into<EffortRequest>,
+        image: &ImageGenerationPlan,
     ) -> Result<ExecutionReport, AppError>
     where
         F: ProviderFactory,
@@ -139,9 +140,10 @@ where
         let run_id = RunId::new();
         let config_id = ConfigSnapshotId::new(format!("config-{run_id}"))?;
         let selection = selection.ok_or(AppError::NoProductionProvider)?;
-        let config = self.provider_factory.config_for_new_run(
+        let config = self.provider_factory.config_for_new_run_with_image(
             selection,
             effort.into(),
+            image,
             &workflow,
             config_id.clone(),
             created_at,
@@ -1244,6 +1246,21 @@ mod tests {
                 .ok_or_else(|| AppError::UnsupportedProvider(provider.as_str().to_owned()))
         }
 
+        /// Seals the grant like the development factory does; the image
+        /// tests then play the broker's part by hand against the worktree.
+        fn config_for_new_run_with_image(
+            &self,
+            selection: ExecutionSelection,
+            effort: EffortRequest,
+            image: &ImageGenerationPlan,
+            workflow: &WorkflowDefinition,
+            id: ConfigSnapshotId,
+            created_at: DateTime<Utc>,
+        ) -> Result<ResolvedConfigSnapshot, AppError> {
+            self.inner
+                .config_for_new_run_with_image(selection, effort, image, workflow, id, created_at)
+        }
+
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
@@ -1357,6 +1374,7 @@ mod tests {
                     &fixture.repo,
                     Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                     EffortSetting::NativeDefault,
+                    &ImageGenerationPlan::disabled(),
                 )
                 .unwrap();
             assert_eq!(report.details.status, RunStatus::Completed);
@@ -1389,6 +1407,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
 
@@ -1464,6 +1483,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
 
@@ -1536,6 +1556,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(first.details.status, RunStatus::Completed);
@@ -1597,6 +1618,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(started.details.status, RunStatus::Completed);
@@ -1641,6 +1663,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(started.details.status, RunStatus::Completed);
@@ -1670,6 +1693,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(started.details.status, RunStatus::Completed);
@@ -1698,6 +1722,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
 
@@ -1727,6 +1752,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
 
@@ -1767,6 +1793,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(started.details.status, RunStatus::NeedsUser);
@@ -1824,6 +1851,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(started.details.status, RunStatus::NeedsUser);
@@ -1869,6 +1897,7 @@ mod tests {
                     &fixture.repo,
                     Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                     EffortSetting::NativeDefault,
+                    &ImageGenerationPlan::disabled(),
                 )
                 .unwrap_err();
             assert!(
@@ -1915,6 +1944,7 @@ mod tests {
                     &fixture.repo,
                     Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                     EffortSetting::NativeDefault,
+                    &ImageGenerationPlan::disabled(),
                 )
                 .unwrap_err();
             assert!(matches!(error, AppError::DirtySourceRepository), "{kind:?}");
@@ -1937,6 +1967,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(report.details.status, RunStatus::Completed);
@@ -1955,6 +1986,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = report.details.id;
@@ -1974,6 +2006,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = report.details.id;
@@ -2097,6 +2130,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = interrupted.details.id;
@@ -2189,6 +2223,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
 
@@ -2265,6 +2300,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(blocked.details.status, RunStatus::NeedsUser);
@@ -2307,6 +2343,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
 
@@ -2338,6 +2375,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(blocked.details.status, RunStatus::NeedsUser);
@@ -2377,6 +2415,7 @@ mod tests {
                     &fixture.repo,
                     Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                     EffortSetting::NativeDefault,
+                    &ImageGenerationPlan::disabled(),
                 )
                 .unwrap();
             assert_eq!(blocked.details.status, RunStatus::Running);
@@ -2408,6 +2447,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = running.details.id;
@@ -2453,6 +2493,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = started.details.id;
@@ -2544,6 +2585,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = started.details.id;
@@ -2581,6 +2623,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = started.details.id;
@@ -2612,6 +2655,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = started.details.id;
@@ -2710,6 +2754,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = started.details.id;
@@ -2739,6 +2784,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = completed.details.id;
@@ -2778,6 +2824,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert!(matches!(
@@ -2816,6 +2863,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert!(matches!(
@@ -2871,6 +2919,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(failed.details.status, RunStatus::Failed);
@@ -2949,6 +2998,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(failed.details.status, RunStatus::Failed);
@@ -3002,6 +3052,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(failed.details.status, RunStatus::Failed);
@@ -3051,6 +3102,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let (outcome, applied) = fixture
@@ -3081,6 +3133,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -3120,6 +3173,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -3211,6 +3265,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let store = SqliteStore::open(&fixture.database).unwrap();
@@ -3239,6 +3294,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -3308,6 +3364,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = complete.details.id;
@@ -3361,6 +3418,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::HIGH,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let run_id = report.details.id;
@@ -3395,6 +3453,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         for stage in &report.details.stages {
@@ -3414,6 +3473,7 @@ mod tests {
                 &fixture.repo,
                 None,
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap_err();
         assert!(matches!(error, AppError::NoProductionProvider));
@@ -3491,6 +3551,313 @@ mod tests {
         ));
     }
 
+    /// The image tool's whole lifecycle claim in one place: a PNG the tool
+    /// writes during an Implementer stage is an ordinary worktree change.
+    /// The source checkout stays byte-identical until apply, the preview
+    /// lists it as a binary file, apply installs the exact bytes, a restart
+    /// in between regenerates nothing, and discard leaves the source alone.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one lifecycle, asserted end to end")]
+    fn a_generated_image_is_an_ordinary_worktree_change_through_apply_and_restart() {
+        use crate::image::{FakeImageGenerator, ImageToolCall, ImageToolScope, ImageToolService};
+
+        let fixture = Fixture::new();
+        let scenario = FakeScenario::new()
+            .stage("implementation")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::needs_user(AttentionKind::Decision, "image placed; continue?"),
+                FakeEvent::Completed,
+            ])
+            .stage("verify")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let inner = fixture.fake_factory();
+        let service = RunService::new(
+            fixture.database.clone(),
+            fixture.worktrees.clone(),
+            ScriptedFactory {
+                scenario,
+                inner: inner.clone(),
+            },
+        );
+        let head_before = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
+        let started = service
+            .start_run(
+                WorkflowKind::Fast,
+                "landing page with hero image",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::implementer_only(),
+            )
+            .unwrap();
+        assert_eq!(started.details.status, RunStatus::NeedsUser);
+        let run_id = started.details.id;
+        let request = started.details.attention[0].id;
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        let snapshot = store.load_run(run_id).unwrap().config_snapshot;
+        assert_eq!(
+            snapshot.schema_version(),
+            4,
+            "authorization is sealed in the snapshot"
+        );
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+
+        // What the broker does when the agent calls the tool mid-stage.
+        let generator = Arc::new(FakeImageGenerator::new());
+        let tool = ImageToolService::new(
+            fixture.temp.path().join("runs"),
+            Some(generator.clone()),
+            vec![Role::Implementer],
+            4,
+        );
+        let scope = ImageToolScope {
+            run_id,
+            stage_id: StageId::new("implementation").unwrap(),
+            attempt: 1,
+            role: Role::Implementer,
+            worktree: worktree.clone(),
+            database: fixture.database.clone(),
+        };
+        let success = tool
+            .generate(
+                &scope,
+                &ImageToolCall {
+                    prompt: "hero".to_owned(),
+                    output_path: "assets/hero.png".to_owned(),
+                    size: None,
+                    quality: Some("high".to_owned()),
+                    transparent_background: None,
+                },
+            )
+            .unwrap();
+        let expected = FakeImageGenerator::png_for("hero");
+        assert_eq!(
+            fs::read(worktree.join("assets/hero.png")).unwrap(),
+            expected
+        );
+        assert!(
+            !fixture.repo.join("assets").exists(),
+            "the source checkout must not see the image before apply"
+        );
+        assert_eq!(git_output(&fixture.repo, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git_output(&fixture.repo, &["rev-parse", "HEAD"]),
+            head_before
+        );
+
+        // The ordinary preview sees an untracked binary file.
+        let preview = service.preview_run_diff(run_id).unwrap();
+        assert_eq!(
+            preview.changed_files,
+            vec![crate::app::ChangedFileSummary {
+                path: "assets/hero.png".to_owned(),
+                binary: true,
+            }]
+        );
+
+        // A restarted service resumes without touching the image: same
+        // bytes, same single evidence row, no second backend call.
+        let restarted = RunService::new(
+            fixture.database.clone(),
+            fixture.worktrees.clone(),
+            ScriptedFactory {
+                scenario: FakeScenario::new()
+                    .stage("implementation")
+                    .events([
+                        FakeEvent::Started,
+                        FakeEvent::needs_user(AttentionKind::Decision, "image placed; continue?"),
+                        FakeEvent::Completed,
+                    ])
+                    .stage("verify")
+                    .events([FakeEvent::Started, FakeEvent::Completed]),
+                inner,
+            },
+        );
+        let still_waiting = restarted.resume_run(run_id).unwrap();
+        assert_eq!(still_waiting.details.status, RunStatus::NeedsUser);
+        let completed = restarted.resolve_attention(run_id, request).unwrap();
+        assert_eq!(completed.details.status, RunStatus::Completed);
+        assert_eq!(
+            fs::read(worktree.join("assets/hero.png")).unwrap(),
+            expected
+        );
+        assert_eq!(generator.requests().len(), 1);
+        let records = store.list_image_generations(run_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].output_sha256, success.sha256);
+        assert_eq!(completed.details.image_generations.len(), 1);
+        assert_eq!(
+            completed.details.image_generations[0].output_path,
+            "assets/hero.png"
+        );
+        assert_eq!(
+            completed.details.image_generations[0].output_sha256,
+            success.sha256
+        );
+        let loaded = store.load_run(run_id).unwrap();
+        assert_eq!(
+            ImageGenerationPlan::from_snapshot(&loaded.config_snapshot, loaded.run.workflow())
+                .unwrap(),
+            ImageGenerationPlan::implementer_only(),
+            "resume reads authorization from the snapshot, not from flags"
+        );
+
+        // Apply installs the exact bytes, unstaged, like any other change.
+        let (outcome, applied) = restarted.apply_run(run_id).unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(applied.details.status, RunStatus::Applied);
+        assert_eq!(
+            fs::read(fixture.repo.join("assets/hero.png")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            git_output(&fixture.repo, &["status", "--porcelain"]).trim(),
+            "?? assets/"
+        );
+        assert_eq!(
+            git_output(&fixture.repo, &["rev-parse", "HEAD"]),
+            head_before
+        );
+    }
+
+    /// The discard half of the same claim: the image dies with the worktree
+    /// and the source checkout never had it.
+    #[test]
+    fn discarding_a_run_removes_its_generated_image_with_the_worktree() {
+        use crate::image::{FakeImageGenerator, ImageToolCall, ImageToolScope, ImageToolService};
+
+        let fixture = Fixture::new();
+        let scenario = FakeScenario::new()
+            .stage("implementation")
+            .events([
+                FakeEvent::Started,
+                FakeEvent::needs_user(AttentionKind::Decision, "image placed; continue?"),
+                FakeEvent::Completed,
+            ])
+            .stage("verify")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        let service = fixture.scripted_service(scenario);
+        let started = service
+            .start_run(
+                WorkflowKind::Fast,
+                "landing page with hero image",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::implementer_only(),
+            )
+            .unwrap();
+        let run_id = started.details.id;
+        let request = started.details.attention[0].id;
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        let tool = ImageToolService::new(
+            fixture.temp.path().join("runs"),
+            Some(Arc::new(FakeImageGenerator::new())),
+            vec![Role::Implementer],
+            4,
+        );
+        tool.generate(
+            &ImageToolScope {
+                run_id,
+                stage_id: StageId::new("implementation").unwrap(),
+                attempt: 1,
+                role: Role::Implementer,
+                worktree: worktree.clone(),
+                database: fixture.database.clone(),
+            },
+            &ImageToolCall {
+                prompt: "hero".to_owned(),
+                output_path: "assets/hero.png".to_owned(),
+                size: None,
+                quality: None,
+                transparent_background: None,
+            },
+        )
+        .unwrap();
+        assert!(worktree.join("assets/hero.png").exists());
+        let completed = service.resolve_attention(run_id, request).unwrap();
+        assert_eq!(completed.details.status, RunStatus::Completed);
+
+        let discarded = service.discard_run(run_id).unwrap();
+        assert_eq!(discarded.details.status, RunStatus::Discarded);
+        assert!(
+            !worktree.exists(),
+            "discard removes the worktree and the image with it"
+        );
+        assert!(!fixture.repo.join("assets").exists());
+        assert_eq!(git_output(&fixture.repo, &["status", "--porcelain"]), "");
+        // Evidence outlives the file: the row still says what was generated.
+        assert_eq!(store.list_image_generations(run_id).unwrap().len(), 1);
+    }
+
+    /// A factory that cannot host the tool refuses the grant before anything
+    /// is persisted, and a run without the grant is untouched by its existence.
+    #[test]
+    fn an_image_grant_is_refused_by_factories_that_cannot_host_it_and_absent_otherwise() {
+        let fixture = Fixture::new();
+        let recording = RunService::new(
+            fixture.database.clone(),
+            fixture.worktrees.clone(),
+            RecordingFactory {
+                tasks: Arc::new(Mutex::new(Vec::new())),
+                inner: fixture.fake_factory(),
+            },
+        );
+        let error = recording
+            .start_run(
+                WorkflowKind::Fast,
+                "task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::implementer_only(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::ImageGenerationUnsupported(_)),
+            "{error}"
+        );
+        assert!(
+            recording.list_runs().unwrap().is_empty(),
+            "nothing persisted"
+        );
+
+        let plain = fixture.default_service();
+        let report = plain
+            .start_run(
+                WorkflowKind::Fast,
+                "task",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+        assert_eq!(report.details.status, RunStatus::Completed);
+        assert!(report.details.image_generations.is_empty());
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        assert_eq!(
+            store
+                .load_run(report.details.id)
+                .unwrap()
+                .config_snapshot
+                .schema_version(),
+            2
+        );
+    }
+
     fn git(path: &Path, args: &[&str]) {
         let output = Command::new("git")
             .args(args)
@@ -3546,6 +3913,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         assert_eq!(failed.details.status, RunStatus::Failed);
@@ -3619,6 +3987,7 @@ mod tests {
                 &fixture.repo,
                 Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
                 EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
             )
             .unwrap();
         let implementation = crate::domain::StageId::new("implementation").unwrap();

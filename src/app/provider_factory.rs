@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -11,6 +12,9 @@ use crate::engine::{
     FakeProvider, FakeScenario, Provider, ProviderAttentionContext, ProviderError, ProviderPoll,
     ProviderRequest,
 };
+use crate::image::{
+    CodexImageGenerator, FakeImageGenerator, ImageGenerator, ImageToolHost, ImageToolService,
+};
 use crate::providers::claude::{ClaudeInstallation, ClaudeProvider, ClaudeProviderError};
 use crate::providers::codex::{CodexInstallation, CodexProvider, CodexProviderError};
 use crate::providers::verify::VerifyProvider;
@@ -18,8 +22,9 @@ use crate::store::{ResolvedConfigSnapshot, SequencedEvent, SqliteStore};
 
 use super::AppError;
 use super::routing::{
-    EffortRequest, ExecutionSelection, ExecutionTarget, RecommendedAvailability, ResourcePlan,
-    RoutingPlan, UniformProvider, VERIFY_PROVIDER_ID, resolve_config,
+    EffortRequest, ExecutionSelection, ExecutionTarget, ImageGenerationPlan,
+    RecommendedAvailability, ResourcePlan, RoutingPlan, UniformProvider, VERIFY_PROVIDER_ID,
+    resolve_config, resolve_config_with_image,
 };
 
 pub trait ProviderFactory {
@@ -37,6 +42,30 @@ pub trait ProviderFactory {
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
     ) -> Result<ResolvedConfigSnapshot, AppError>;
+
+    /// [`Self::config_for_new_run`] with an image-generation grant. A factory
+    /// that does not host the image tool refuses an enabled grant here, before
+    /// anything is persisted, instead of sealing an authorization it cannot
+    /// honor.
+    ///
+    /// # Errors
+    /// Rejects an enabled grant unless the factory overrides this.
+    fn config_for_new_run_with_image(
+        &self,
+        selection: ExecutionSelection,
+        effort: EffortRequest,
+        image: &ImageGenerationPlan,
+        workflow: &WorkflowDefinition,
+        id: ConfigSnapshotId,
+        created_at: DateTime<Utc>,
+    ) -> Result<ResolvedConfigSnapshot, AppError> {
+        if image.is_enabled() {
+            return Err(AppError::ImageGenerationUnsupported(
+                "this provider factory does not host the image tool".to_owned(),
+            ));
+        }
+        self.config_for_new_run(selection, effort, workflow, id, created_at)
+    }
 
     /// Reconstructs provider behavior from durable configuration and events.
     ///
@@ -103,15 +132,39 @@ impl<T: ProviderFactory> ProviderResolver for T {
 /// artifacts under an explicit root rather than the developer's data
 /// directory — every in-process test would otherwise leave a `verify.md`
 /// in `~/.polycode/runs`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DevelopmentFakeProviderFactory {
     artifact_root: PathBuf,
+    /// Backend the image tool uses when a run is authorized; the
+    /// deterministic fake unless a test injects its own.
+    image_generator: Arc<dyn ImageGenerator>,
+}
+
+impl std::fmt::Debug for DevelopmentFakeProviderFactory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DevelopmentFakeProviderFactory")
+            .field("artifact_root", &self.artifact_root)
+            .field("image_backend", &self.image_generator.backend())
+            .finish()
+    }
 }
 
 impl DevelopmentFakeProviderFactory {
     #[must_use]
     pub fn new(artifact_root: PathBuf) -> Self {
-        Self { artifact_root }
+        Self {
+            artifact_root,
+            image_generator: Arc::new(FakeImageGenerator::new()),
+        }
+    }
+
+    /// The same factory with an explicit image backend, so a test can count
+    /// or fail vendor calls.
+    #[must_use]
+    pub fn with_image_generator(mut self, generator: Arc<dyn ImageGenerator>) -> Self {
+        self.image_generator = generator;
+        self
     }
 }
 
@@ -142,6 +195,29 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
         )?)
     }
 
+    fn config_for_new_run_with_image(
+        &self,
+        selection: ExecutionSelection,
+        effort: EffortRequest,
+        image: &ImageGenerationPlan,
+        workflow: &WorkflowDefinition,
+        id: ConfigSnapshotId,
+        created_at: DateTime<Utc>,
+    ) -> Result<ResolvedConfigSnapshot, AppError> {
+        if selection != ExecutionSelection::Uniform(UniformProvider::Fake) {
+            return Err(AppError::UnsupportedProvider(format!("{selection:?}")));
+        }
+        Ok(resolve_config_with_image(
+            selection,
+            effort,
+            image,
+            workflow,
+            RecommendedAvailability::default(),
+            id,
+            created_at,
+        )?)
+    }
+
     fn for_run(
         &self,
         run_id: RunId,
@@ -165,8 +241,19 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
             ));
         }
         let resource_plan = ResourcePlan::from_snapshot(config, workflow)?;
-        Ok(RoutedProvider::new(plan, resource_plan, workflow.clone())
-            .with_artifact_root(self.artifact_root.clone()))
+        let image_plan = ImageGenerationPlan::from_snapshot(config, workflow)?;
+        let provider = RoutedProvider::new(plan, resource_plan, workflow.clone())
+            .with_artifact_root(self.artifact_root.clone());
+        if !image_plan.is_enabled() {
+            return Ok(provider);
+        }
+        let host = start_image_host(
+            run_id,
+            &image_plan,
+            Some(Arc::clone(&self.image_generator)),
+            self.artifact_root.clone(),
+        )?;
+        Ok(provider.with_image_tool(image_plan, host))
     }
 
     fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
@@ -300,8 +387,17 @@ impl Provider for RuntimeProvider {
 pub struct RoutedProvider {
     plan: RoutingPlan,
     resource_plan: ResourcePlan,
+    /// Which roles may call the image tool. Disabled unless the snapshot
+    /// says otherwise; never consulted for routing or effort.
+    image_plan: ImageGenerationPlan,
+    /// The live tool host for this process, present exactly when the plan
+    /// is enabled and the factory could bind the run's socket.
+    image_host: Option<Arc<ImageToolHost>>,
     workflow: WorkflowDefinition,
-    runtimes: HashMap<(ExecutionTarget, EffortSetting), RuntimeProvider>,
+    /// Keyed by target, effort, and whether the image tool is granted, so a
+    /// reviewer routed to the same target as the Implementer never inherits
+    /// the Implementer's tool.
+    runtimes: HashMap<(ExecutionTarget, EffortSetting, bool), RuntimeProvider>,
     isolated_runtime: Option<(PathBuf, PathBuf)>,
     /// Where the verify provider writes its artifacts when not the
     /// configured data directory: the eval runtime root, or a test fixture.
@@ -319,11 +415,38 @@ impl RoutedProvider {
         Self {
             plan,
             resource_plan,
+            image_plan: ImageGenerationPlan::disabled(),
+            image_host: None,
             workflow,
             runtimes: HashMap::new(),
             isolated_runtime: None,
             artifact_root: None,
             eval_auto_approve: false,
+        }
+    }
+
+    /// The same provider with the image tool granted to `plan`'s roles and
+    /// served by `host`.
+    #[must_use]
+    pub fn with_image_tool(mut self, plan: ImageGenerationPlan, host: Arc<ImageToolHost>) -> Self {
+        self.image_plan = plan;
+        self.image_host = Some(host);
+        self
+    }
+
+    /// The immutable image-generation grant this provider runs under.
+    #[must_use]
+    pub const fn image_plan(&self) -> &ImageGenerationPlan {
+        &self.image_plan
+    }
+
+    /// The tool host a role's adapter should carry: only when the plan
+    /// grants the role and this process hosts the tool.
+    fn image_tool_for_role(&self, role: Role) -> Option<Arc<ImageToolHost>> {
+        if self.image_plan.allows(role) {
+            self.image_host.clone()
+        } else {
+            None
         }
     }
 
@@ -356,6 +479,8 @@ impl RoutedProvider {
         Self {
             plan,
             resource_plan,
+            image_plan: ImageGenerationPlan::disabled(),
+            image_host: None,
             workflow,
             runtimes: HashMap::new(),
             artifact_root: Some(process_root.clone()),
@@ -407,8 +532,18 @@ impl RoutedProvider {
         &mut self,
         target: &ExecutionTarget,
         effort: EffortSetting,
+        role: Role,
     ) -> Result<&mut RuntimeProvider, ProviderError> {
-        let key = (target.clone(), effort);
+        let image_tool = self.image_tool_for_role(role);
+        // A granted role whose tool this process could not host is a
+        // configuration the run was sealed with but cannot be honored here;
+        // that is a typed refusal, never a silent run without the tool.
+        if self.image_plan.allows(role) && image_tool.is_none() {
+            return Err(ProviderError::new(format!(
+                "image generation is granted to {role:?} but no image tool host is available in this process"
+            )));
+        }
+        let key = (target.clone(), effort, image_tool.is_some());
         if !self.runtimes.contains_key(&key) {
             let runtime = match target.provider_id().as_str() {
                 "fake" => RuntimeProvider::Fake(
@@ -417,7 +552,11 @@ impl RoutedProvider {
                 ),
                 "claude" => RuntimeProvider::Claude(
                     self.claude_provider(target.model_id().cloned())
-                        .map(|provider| provider.with_effort(effort))
+                        .map(|provider| {
+                            provider
+                                .with_effort(effort)
+                                .with_image_tool(image_tool.clone())
+                        })
                         .map_err(|error| {
                             ProviderError::new(format!(
                                 "configured provider unavailable for claude target: {error}"
@@ -426,7 +565,11 @@ impl RoutedProvider {
                 ),
                 "codex" => RuntimeProvider::Codex(
                     self.codex_provider(target.model_id().cloned())
-                        .map(|provider| provider.with_effort(effort))
+                        .map(|provider| {
+                            provider
+                                .with_effort(effort)
+                                .with_image_tool(image_tool.clone())
+                        })
                         .map_err(|error| {
                             ProviderError::new(format!(
                                 "configured provider unavailable for codex target: {error}"
@@ -509,8 +652,9 @@ impl Provider for RoutedProvider {
     fn keep_attached_for(&self, request: &ProviderRequest) -> Result<bool, ProviderError> {
         let target = self.target_for(request.route_override(), request.role())?;
         let effort = self.effort_for_role(request.role())?;
+        let granted = self.image_tool_for_role(request.role()).is_some();
         self.runtimes
-            .get(&(target, effort))
+            .get(&(target, effort, granted))
             .ok_or_else(|| ProviderError::new("waiting provider was not instantiated"))?
             .keep_attached_for(request)
     }
@@ -541,7 +685,7 @@ impl Provider for RoutedProvider {
             )));
         }
         let effort = self.effort_for_role(context.role())?;
-        self.runtime_for(&target, effort)?
+        self.runtime_for(&target, effort, context.role())?
             .stage_attention_response(store, context, response)
     }
 
@@ -566,7 +710,7 @@ impl Provider for RoutedProvider {
             return Ok(false);
         }
         let effort = self.effort_for_role(context.role())?;
-        self.runtime_for(&target, effort)?
+        self.runtime_for(&target, effort, context.role())?
             .can_auto_resolve_attention(store, context)
     }
 
@@ -585,7 +729,7 @@ impl Provider for RoutedProvider {
     ) -> Result<(), ProviderError> {
         let target = self.target_for_role(role)?;
         let effort = self.effort_for_role(role)?;
-        self.runtime_for(&target, effort)?
+        self.runtime_for(&target, effort, role)?
             .stage_continue_instruction(store, run_id, stage_id, role, instruction)
     }
 
@@ -600,7 +744,7 @@ impl Provider for RoutedProvider {
     ) -> Result<(), ProviderError> {
         let target = self.target_for_role(Role::Implementer)?;
         let effort = self.effort_for_role(Role::Implementer)?;
-        self.runtime_for(&target, effort)?
+        self.runtime_for(&target, effort, Role::Implementer)?
             .discard_continue_instruction(store, run_id, stage_id)
     }
 
@@ -611,7 +755,7 @@ impl Provider for RoutedProvider {
     ) -> Result<ProviderPoll, ProviderError> {
         let target = self.target_for(request.route_override(), request.role())?;
         let effort = self.effort_for_role(request.role())?;
-        let runtime = self.runtime_for(&target, effort)?;
+        let runtime = self.runtime_for(&target, effort, request.role())?;
         if runtime.provider_id_for(request)? != *target.provider_id() {
             return Err(ProviderError::new(
                 "resolved leaf provider identity mismatch",
@@ -659,6 +803,40 @@ impl ProviderFactory for RuntimeProviderFactory {
         )?)
     }
 
+    fn config_for_new_run_with_image(
+        &self,
+        selection: ExecutionSelection,
+        effort: EffortRequest,
+        image: &ImageGenerationPlan,
+        workflow: &WorkflowDefinition,
+        id: ConfigSnapshotId,
+        created_at: DateTime<Utc>,
+    ) -> Result<ResolvedConfigSnapshot, AppError> {
+        // Same bar as a provider: the backend must be usable now, or the run
+        // is refused before any state exists. The backend is the user's own
+        // Codex CLI, installed and natively authenticated.
+        if image.is_enabled() {
+            CodexImageGenerator::from_environment()
+                .map_err(|error| AppError::ImageGenerationUnavailable(error.to_string()))?;
+        }
+        let availability = match selection {
+            ExecutionSelection::Uniform(provider) => {
+                require_explicit_provider(provider)?;
+                RecommendedAvailability::default()
+            }
+            ExecutionSelection::Recommended => probe_recommended_availability()?,
+        };
+        Ok(resolve_config_with_image(
+            selection,
+            effort,
+            image,
+            workflow,
+            availability,
+            id,
+            created_at,
+        )?)
+    }
+
     fn for_run(
         &self,
         run_id: RunId,
@@ -674,12 +852,51 @@ impl ProviderFactory for RuntimeProviderFactory {
             }
         })?;
         let resource_plan = ResourcePlan::from_snapshot(config, workflow)?;
-        Ok(RoutedProvider::new(plan, resource_plan, workflow.clone()))
+        let image_plan = ImageGenerationPlan::from_snapshot(config, workflow)?;
+        let provider = RoutedProvider::new(plan, resource_plan, workflow.clone());
+        if !image_plan.is_enabled() {
+            return Ok(provider);
+        }
+        // A resumed run in a process where Codex is no longer usable still
+        // hosts the tool: calls then fail typed (`backend_not_configured`)
+        // instead of the run failing or the grant silently vanishing.
+        let generator: Option<Arc<dyn ImageGenerator>> = CodexImageGenerator::from_environment()
+            .ok()
+            .map(|generator| Arc::new(generator) as Arc<dyn ImageGenerator>);
+        let host = start_image_host(
+            run_id,
+            &image_plan,
+            generator,
+            crate::store::process_root()?,
+        )?;
+        Ok(provider.with_image_tool(image_plan, host))
     }
 
     fn require_provider(&self, provider: UniformProvider) -> Result<(), AppError> {
         require_explicit_provider(provider)
     }
+}
+
+/// Binds the run's tool socket in this process. Evidence (prompt files)
+/// goes under `evidence_root/<run>/image-generations/`; the database is
+/// learned from the store at activation time.
+fn start_image_host(
+    run_id: RunId,
+    plan: &ImageGenerationPlan,
+    generator: Option<Arc<dyn ImageGenerator>>,
+    evidence_root: PathBuf,
+) -> Result<Arc<ImageToolHost>, AppError> {
+    let service = ImageToolService::new(
+        evidence_root,
+        generator,
+        plan.roles().collect(),
+        plan.max_generations(),
+    );
+    ImageToolHost::start(service, run_id).map_err(|error| {
+        AppError::ImageGenerationUnavailable(format!(
+            "image tool socket could not be bound: {error}"
+        ))
+    })
 }
 
 fn require_explicit_provider(provider: UniformProvider) -> Result<(), AppError> {

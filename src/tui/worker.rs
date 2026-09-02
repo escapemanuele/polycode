@@ -279,7 +279,14 @@ where
             selection,
             effort,
         } => service
-            .start_run(workflow, task, repository, Some(selection), effort)
+            .start_run(
+                workflow,
+                task,
+                repository,
+                Some(selection),
+                effort,
+                &crate::app::ImageGenerationPlan::disabled(),
+            )
             .map(WorkerSuccess::Execution),
         WorkerCommand::ResumeRun { run_id } => {
             service.resume_run(run_id).map(WorkerSuccess::Execution)

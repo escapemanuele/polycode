@@ -2,7 +2,7 @@
 
 ## Status
 
-Current work is Milestone 13d3 (TUI visual polish). On top of Milestone 11's local role-specific evaluation and `recommended_v2` routing evidence, the code carries M13a resource observability (usage, latency, invocation count, injected prompt bytes), M13a.5 change handoff for review stages, M13b effort policy (`--effort`, per-role `ResourcePlan`, config schema v3, `recommended_v3` effort column with `xhigh`), M13e self-update (`polycode update`, install receipts), plus stop, fix/continue cycles, and pull-request publishing. Ratatui control room, frozen M9 `recommended_v1` (still decoded for persisted runs), reviewer specialization, native provider semantics, durable recovery, and explicit apply/discard remain unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly. Gemini, runtime failover, custom routing DSL, LLM judging, cloud benchmark service, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain deliberately absent.
+Current work is Milestone 13d3 (TUI visual polish). On top of Milestone 11's local role-specific evaluation and `recommended_v2` routing evidence, the code carries M13a resource observability (usage, latency, invocation count, injected prompt bytes), M13a.5 change handoff for review stages, M13b effort policy (`--effort`, per-role `ResourcePlan`, config schema v3, `recommended_v3` effort column with `xhigh`), M13e self-update (`polycode update`, install receipts), the opt-in ImageGeneration tool (config schema v4, local Codex CLI backend), plus stop, fix/continue cycles, and pull-request publishing. Ratatui control room, frozen M9 `recommended_v1` (still decoded for persisted runs), reviewer specialization, native provider semantics, durable recovery, and explicit apply/discard remain unchanged. Native authentication/configuration remains authoritative; no vendor API is called directly — the opt-in ImageGeneration tool keeps to that rule by driving the local Codex CLI, confined to `src/image/` and never modelled as a provider. Gemini, runtime failover, custom routing DSL, LLM judging, cloud benchmark service, async runtime, native process backend, daemon mode, Advisor, and direct provider chat remain deliberately absent.
 
 Legacy `agents-v3.0.0` was inspected after bootstrap. [LEGACY_BEHAVIOR.md](LEGACY_BEHAVIOR.md) records its behavioral contract, recovery edge cases, and intentional architectural departures.
 
@@ -133,6 +133,29 @@ Resource telemetry is observation only: no token/context/usage value influences 
 ### M13b effort policy boundary
 
 `EffortSetting` (`NativeDefault | Level(Low|Medium|High|XHigh)`) is provider-neutral resource intent in the domain layer; `ResourcePlan` is the validated immutable per-role map reconstructed from the config snapshot, following the same validated-plan philosophy as `RoutingPlan` and kept strictly separate from it — routing answers destination, the resource plan answers requested effort. Effort is requested through `EffortRequest` (`ProfileDefault | Uniform | PerRole`): the profile's own per-role levels (only Recommended has any; a uniform provider stays native), one level for every role, or some roles named with the rest from the profile. Persistence: any explicit level emits config schema v3 (`resource_plan` keyed by role, string-encoded settings, exact required-role coverage enforced); every role native keeps emitting the byte-identical pre-M13b schema v2 payload, which is what `--effort native` and every `--provider` run without the flag still do. Schema v1/v2 snapshots decode to `NativeDefault` for every role — explicitly not `Medium`, because `NativeDefault` means "preserve the runtime's native configured behavior exactly" and the two meanings must never collapse. Unknown settings, missing roles, or a resource plan smuggled into v2 fail closed. Execution boundary: `RoutedProvider` resolves effort once per role from the immutable plan and keys its lazy runtime cache by `(ExecutionTarget, EffortSetting)`; adapters receive their effort at construction via `with_effort` and own the native mapping (`claude --effort <level>`; `codex -c model_reasoning_effort="<level>"`), so no adapter performs config lookups and `ProviderRequest` stays a scheduler-owned transport unchanged by effort. `NativeDefault` omits the native flags entirely. Requested effort is persisted evidence (status/TUI per stage, additive `requested_effort` in eval results with old JSON decoding as absent); applied-effort confirmation is not invented — neither native CLI reports one. Effort is deterministic immutable intent: M13a telemetry never feeds it dynamically, no escalation exists, and workflow kinds imply no effort defaults — the profile does, per role, and the operator overrides it explicitly. The Architect contract asks for an executable plan (`## Plan`, `## Verification`, `## Out of scope`, `## Assumptions`) and the Implementer confirms the assumptions before editing, so the lower implementer level rests on removed uncertainty rather than on hope. Retry-with-higher-effort is deferred to M13b.1 as an explicit persisted per-stage override, the effort twin of `StageRouteOverride`.
+
+### ImageGeneration tool boundary
+
+The first capability that is neither a coding provider nor a role: the Implementer may *use* image generation, it does not *become* an image role. Routing still answers who and where, `ResourcePlan` how much effort, and the new `ImageGenerationPlan` answers only what additional tool a role may call and how often. It is not a `CapabilityPlan`; it is one grant, kept narrow until a second tool proves what the general shape should be.
+
+```text
+Implementer stage (Claude or Codex, native CLI)
+  --stdio MCP-->  polycode __image-tool --socket S      (shim, child of the CLI, no secrets)
+  --unix socket S (0600, one JSON line each way)-->  ImageToolHost inside the Polycode process
+                                                       ImageToolService: role · bound · path · PNG check · atomic write · evidence
+                                                       ImageGenerator: Codex CLI built-in image_gen (`codex exec --json`) | Fake
+  <-- PNG lands in the managed worktree; the ordinary diff/apply/discard machinery sees it
+```
+
+No vendor API is called and no API key exists: the backend is the user's own Codex CLI under its native authentication, driven exactly like a provider invocation (read-only sandbox, no approvals, stdin request, JSON events) but outside any run/stage record, and the PNG is collected from the thread directory Codex creates (`$CODEX_HOME/generated_images/<thread>/`), never from a path the model typed. Codex is a backend here, not a provider: it performs no role, holds no route, and its image model is not exposed, so evidence records `codex/image_gen`.
+
+Authorization is immutable run configuration. `--allow-image-generation` seals config schema v4 with an `image_generation` block (`roles`, `max_generations`); a run without it keeps the byte-identical v2/v3 payload. Schema v1–v3 decode disabled; a v4 payload without the block, a block under an older schema, an unknown or duplicate role, or a bound outside `1..=32` fails closed. Resume, retry, fix and continue reconstruct the plan from the snapshot and never from current CLI flags. The bound is four generations per run, counted from the insert-only `image_generations` table (database schema v7), so a restart cannot reset it and call N+1 is a typed tool error. Authorization is never unlimited authorization.
+
+The boundary is structural. Backend readiness (Codex installed and authenticated) is checked at run creation (fail fast) and at host construction; the stage CLI's environment, argv, stdin, MCP config, process spec, snapshot and evidence carry nothing new. The MCP shim the CLI launches is the Polycode executable itself with a socket path; the host that answers it lives in the Polycode process and is the only thing that runs the backend. Polycode neither injects nor strips anything in the stage's environment. Both native CLIs accept a run-scoped server without touching global configuration — Claude through `--mcp-config` plus one exact `--allowedTools` rule under `dontAsk`, Codex through `-c mcp_servers.<name>.*` root overrides — so v1 is provider-neutral. The runtime cache is keyed by `(target, effort, granted)` so a reviewer routed to the Implementer's target never inherits its tool, and a granted role whose host could not be bound is a typed refusal, not a silent run without the tool.
+
+Placement treats `output_path` as untrusted: relative, plain components, not under `.git`, lowercase `.png`, containment checked against the canonical worktree through the deepest existing ancestor (defeating symlink escapes) before the vendor is called, re-checked after parents are created, and written temp-file → fsync → hard-link so an existing project file is never replaced. Failures are typed tool errors returned to the agent (`not_authorized`, `backend_not_configured`, `limit_reached`, `invalid_argument`, `invalid_output_path`, `output_exists`, `backend_rejected`, `backend_unreachable`, `invalid_image`, `write_failed`); none touches run or stage state, and the prompt tells the agent to continue without the image. A Polycode process that exited leaves the agent running in tmux with a dead socket: calls fail `backend_unreachable` until a resumed process rebinds the deterministic per-run path and re-arms the stage on its next poll.
+
+Evidence answers who, when, which stage, which backend and model, where, and what bytes: one row per image with stage, attempt, ordinal, backend, model, worktree-relative path, SHA-256, size, prompt hash, request id and timestamps, plus a run-private prompt file beside the process logs. The PNG itself has no parallel artifact lifecycle: it is an untracked binary in the managed worktree, listed as binary by the preview, named by path in the review handoff, moved by apply with exact bytes, and removed by discard. Nothing has inspected its pixels; reviewers know an image changed, not what it shows, and no surface claims otherwise.
 
 ### M13a.5 change handoff boundary
 
@@ -526,12 +549,22 @@ src/
 │   ├── snapshot.rs  RunSnapshotV1/V2 migration and codec
 │   ├── migrations.rs SQLite schema lifecycle
 │   ├── config_snapshot.rs immutable config and canonical hash
+│   ├── image.rs     insert-only image-generation evidence rows
 │   ├── run_input.rs immutable normalized task input
 │   ├── process.rs   process lifecycle and output-cursor CAS persistence
 │   ├── provider.rs  provider-session/artifact persistence and atomic commits
 │   ├── workspace.rs workspace/apply intent persistence and CAS
 │   ├── path.rs      data and worktree path resolution
 │   └── error.rs     typed persistence failures
+├── image/
+│   ├── mod.rs        ImageGenerator trait and backend-neutral request/result types
+│   ├── codex.rs      backend on the local Codex CLI built-in image_gen tool
+│   ├── fake.rs       deterministic test backend
+│   ├── service.rs    authorization, bound, placement, evidence for one call
+│   ├── path.rs       untrusted output_path validation and no-overwrite atomic write
+│   ├── host.rs       per-run unix-socket host inside the Polycode process
+│   ├── mcp.rs        stdio MCP shim the native CLI launches (`__image-tool`)
+│   └── png.rs        PNG header validation and deterministic synthesis
 ├── git/
 │   ├── command.rs    native Git command runner
 │   ├── repository.rs canonical repository identity

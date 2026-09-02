@@ -6,6 +6,7 @@ pub mod domain;
 pub mod engine;
 pub mod eval;
 pub mod git;
+pub mod image;
 pub mod process;
 pub mod providers;
 pub mod store;

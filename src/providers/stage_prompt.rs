@@ -38,6 +38,17 @@ pub(crate) const PULL_REQUEST: &str = "Close the returned Markdown with a `## Pu
 
 /// Provider-neutral semantic contract for one engineering responsibility.
 /// Native adapters add transport and safety framing around this text.
+/// Provider-neutral note appended to an initial prompt only when the stage's
+/// role holds an image-generation grant. It states the tool, its bound and
+/// its limits in the agent's own terms; the tool schema carries the rest.
+/// Every other stage's prompt is byte-identical to before the tool existed.
+#[must_use]
+pub(crate) fn image_tool_section(tool_name: &str, max_generations: u32, remaining: u32) -> String {
+    format!(
+        "\n# Image generation\nThis run authorizes you to generate original PNG images with the `{tool_name}` tool (an MCP tool Polycode provides). Use it only when the task genuinely benefits from a new image asset, and place the file where the project keeps assets. At most {max_generations} generations are allowed in this run and {remaining} remain; each call returns how many are left. Existing files are never overwritten. If a call fails you receive a typed error: continue the task without the image and say so in your report. The image is an ordinary file in the worktree; describe it in your report but do not claim anyone has visually reviewed it.\n"
+    )
+}
+
 pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
     match (role, kind) {
         (Role::CodeQualityReviewer, StageKind::CodeQualityReview) => {

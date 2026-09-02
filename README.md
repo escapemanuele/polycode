@@ -230,6 +230,12 @@ New runs accept `--effort native|low|medium|high|xhigh` for every role, or `--ef
 
 Effort persists as a per-role ResourcePlan inside the immutable config snapshot (schema v3; omitted effort keeps emitting the pre-M13b schema v2 payload). Old v1/v2 snapshots decode to `NativeDefault` for every role — no old run changes native runtime behavior — and unknown or malformed effort values fail closed instead of degrading to a default. Effort never rewrites routing: `--profile recommended` resolves the same `recommended_v3` routes regardless of effort, and M13a telemetry never feeds back into effort dynamically. The profile's effort rows are `Provisional` (stated from the role contracts, not measured) until an effort sweep with `eval run --effort` replaces them. Review stages receive identical change-handoff evidence at every effort level so effort comparisons measure runtime reasoning, not supplied evidence.
 
+## Image generation (opt-in tool, not a provider)
+
+`--allow-image-generation` lets the Implementer create original PNG images inside the run's worktree through a Polycode-owned tool whose backend is your own Codex CLI and its built-in `image_gen` tool (native ChatGPT auth, no API key, no vendor API). It is the first non-coding capability and deliberately the narrowest possible one: Claude or Codex remains the Implementer, image generation is something it is permitted to use. Routing, effort and workflow semantics are untouched.
+
+The coding agent reaches the tool through a run-scoped MCP server (`polycode __image-tool`) that relays to a socket inside the Polycode process, which runs one `codex exec` per image and collects the PNG Codex wrote; nothing is written to `~/.claude`, `~/.codex` configuration, or the project. Authorization is sealed in the immutable run configuration (schema v4), old snapshots decode disabled, and at most four images may be generated per run. The PNG is an ordinary untracked binary in the worktree: it shows in the diff preview, apply installs its exact bytes, discard removes it. Reviewers are told an image file changed; nobody has looked at its pixels. See `docs/features/image-generation.md`.
+
 ## Implementation change map for review stages
 
 Review stages (CodeQualityReviewer, SpecReviewer, and the legacy Reviewer role) and the Simplifier — for which the run delta is the boundary of what it may touch — receive a deterministic bounded implementation-change map in their initial prompt: the changed-file inventory (with change kind and binary markers) plus a bounded textual diff of the managed worktree relative to the immutable run base — the exact delta semantics used by apply and diff preview, including untracked files. The handoff is navigation evidence, not the source of truth: reviewers retain full access to the real worktree and must inspect code as needed. Binary contents are never injected. Oversized diffs are explicitly marked INCOMPLETE with the shown/total byte counts — never silently truncated — and the changed-file inventory is always complete even when the diff is bounded. The handoff is provider-neutral (one shared section, byte-identical across Claude and Codex) and removes redundant mechanical change discovery, especially for future runtimes launched with restricted read-only tool sets that cannot run `git diff` themselves. Researcher, Architect, Implementer, and Decision stages do not receive it; resume/continuation prompts stay compact and never re-inject it. Its prompt cost is visible through the existing injected-prompt-bytes telemetry.
@@ -251,6 +257,7 @@ polycode review "Review the error boundary" --provider claude
 polycode fast "Fix the parser" --provider codex
 polycode standard "Refactor parser" --profile recommended --effort high
 polycode deep "Redesign authentication" --effort architect=xhigh,implementer=medium
+polycode standard "Landing page with an original hero image" --provider claude --allow-image-generation
 polycode standard "Add export support" --repo /path/to/repo --provider codex
 polycode deep "Redesign authentication" --provider codex
 polycode review "Review the error boundary" --provider codex

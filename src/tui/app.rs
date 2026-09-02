@@ -1344,6 +1344,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            image_generations: Vec::new(),
         }
     }
 
@@ -1563,6 +1564,7 @@ mod tests {
                 crate::app::UniformProvider::Fake,
             )),
             EffortSetting::NativeDefault,
+            &crate::app::ImageGenerationPlan::disabled(),
         )
         .unwrap();
         assert_eq!(report.details.status, RunStatus::Completed);
@@ -1758,6 +1760,7 @@ mod tests {
                 crate::app::UniformProvider::Fake,
             )),
             EffortSetting::NativeDefault,
+            &crate::app::ImageGenerationPlan::disabled(),
         )
         .unwrap();
         assert_eq!(report.details.status, RunStatus::Completed);

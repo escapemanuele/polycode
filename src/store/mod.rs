@@ -2,6 +2,7 @@
 
 mod config_snapshot;
 mod error;
+mod image;
 mod migrations;
 mod path;
 mod process;
@@ -13,6 +14,7 @@ mod workspace;
 
 pub use config_snapshot::ResolvedConfigSnapshot;
 pub use error::StoreError;
+pub use image::ImageGenerationRecord;
 pub use migrations::DATABASE_SCHEMA_VERSION;
 pub use path::{
     database_file, install_receipt_file, process_root, update_cache_file, worktree_root,
