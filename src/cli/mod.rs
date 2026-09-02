@@ -134,6 +134,10 @@ pub struct EvalRunArgs {
     /// Explicit acknowledgement that native evaluation may consume provider usage.
     #[arg(long)]
     pub allow_native_usage: bool,
+    /// Requested native-runtime effort for the candidate role
+    /// (`native|low|medium|high|xhigh`); omitted means native.
+    #[arg(long)]
+    pub effort: Option<String>,
     /// Evidence output directory. Defaults under ~/.polycode/evals.
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -154,8 +158,11 @@ pub struct RunArgs {
     /// selection flag is given.
     #[arg(long, conflicts_with = "provider")]
     pub profile: Option<String>,
-    /// Requested native-runtime effort (`native`, `low`, `medium`, `high`).
-    /// Omitted or `native` preserves each runtime's own configured default.
+    /// Requested native-runtime effort. One level for every role
+    /// (`native|low|medium|high|xhigh`), or `role=level[,role=level]` to
+    /// name some roles and leave the rest to the routing profile. Omitted
+    /// means the profile's own per-role policy under Recommended, and native
+    /// under `--provider`; `native` opts every role out.
     #[arg(long)]
     pub effort: Option<String>,
 }

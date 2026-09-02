@@ -30,7 +30,7 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 ## Where it lives
 - `src/tui/input.rs` — `map_key` / `map_text_key`: the only key-to-intent tables.
 - `src/tui/app.rs` — `handle_intent`, overlay handlers, composer submit, eligibility messages (`stop_unavailable_reason`, `fix_unavailable_reason`, `continue_unavailable_reason`).
-- `src/tui/state.rs` — `Screen`, `Overlay`, `NewRunForm`, `ExecutionChoice`, `EffortChoice`, `CONCURRENT_AGENTS` (4).
+- `src/tui/state.rs` — `Screen`, `Overlay`, `NewRunForm`, `ExecutionChoice`, `EFFORT_CHOICES`/`effort_label`, `CONCURRENT_AGENTS` (4).
 - `src/tui/render.rs` — rendering incl. the help overlay text; `status_sentences`, `waiting_message`, `blocked_message` compose the activity strip; `failed_stage_reason` / `failure_reason_lines` render the failure block in the hero and the Runs overview.
 - `src/tui/state.rs` — `focus_blocking_failure` moves the selection onto the blocking failed stage when a run is opened from the Runs screen.
 - `src/tui/worker.rs` — `WorkerCommand` enum; one standard thread serializes all mutations.

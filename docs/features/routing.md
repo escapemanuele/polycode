@@ -4,8 +4,8 @@ Decide which native coding runtime, and optionally which model, executes each en
 
 ## Sub-features
 - uniform: `--provider claude|codex|fake` maps every role in the workflow to that provider.
-- recommended: `--profile recommended` (the default when neither flag is given) resolves the current versioned profile, `recommended_v2`, and persists explicit per-role routes.
-- frozen-v1: runs persisted under `recommended_v1` keep decoding their original routes.
+- recommended: `--profile recommended` (the default when neither flag is given) resolves the current versioned profile, `recommended_v3`, and persists explicit per-role routes plus a requested effort per role (see observability-and-effort.md).
+- frozen: runs persisted under `recommended_v1` or `recommended_v2` keep decoding their original routes and native-default effort.
 - models: configured model is null unless the immutable config supplies one; confirmed model comes only from provider evidence.
 - status: `status` prints the Routing table (role, configured provider, configured model, reason) and per-stage configured vs actual.
 - verifier: `Role::Verifier` always resolves to provider `verify` inside the router (`VERIFY_PROVIDER_ID`); it is never written to a snapshot, never in the Routing table, never in a profile or the resource plan.
@@ -18,7 +18,7 @@ When a stage fails because its provider is gone or out of quota, retry it somewh
 
 ## Driving it
 ```bash
-polycode standard "<task>"                          # recommended_v2
+polycode standard "<task>"                          # recommended_v3
 polycode standard "<task>" --profile recommended
 polycode standard "<task>" --provider claude
 polycode standard "<task>" --provider codex
@@ -27,10 +27,10 @@ polycode status <run-id>
 polycode retry <run-id> <stage-id> --provider claude            # this stage only, native default model
 polycode retry <run-id> <stage-id> --provider codex --model o3   # --model needs --provider
 ```
-Current `recommended_v2` map with both providers ready: Researcher, Architect, CodeQualityReviewer, EngineeringLead, legacy Reviewer -> Claude; Implementer, SpecReviewer -> Codex. With one native provider ready, every role routes there with a persisted fallback reason.
+Current `recommended_v3` map with both providers ready (routes inherited unchanged from `recommended_v2`): Researcher, Architect, Simplifier, CodeQualityReviewer, EngineeringLead, legacy Reviewer -> Claude; Implementer, SpecReviewer -> Codex. Effort column: Researcher, Architect, CodeQualityReviewer, SpecReviewer, EngineeringLead `high`; Implementer `medium`; Simplifier `low`. With one native provider ready, every role routes there with a persisted fallback reason and keeps its level.
 
 ## Where it lives
-- `src/app/routing.rs` — `RECOMMENDED_PROFILE_VERSION` (`recommended_v2`), `RECOMMENDED_PROFILE_VERSION_V1`, provenance tables, `resolve_config`, `RoutingPlan`, `unroutable_fix_role`, `VERIFY_PROVIDER_ID`, `RetryRoute`, `OPERATOR_OVERRIDE_REASON`.
+- `src/app/routing.rs` — `RECOMMENDED_PROFILE_VERSION` (`recommended_v3`), `RECOMMENDED_PROFILE_VERSION_V2`, `RECOMMENDED_PROFILE_VERSION_V1`, provenance tables (`decisions` for routes, `efforts` for levels), `recommended_effort`, `resolve_config`, `RoutingPlan`, `unroutable_fix_role`, `VERIFY_PROVIDER_ID`, `RetryRoute`, `OPERATOR_OVERRIDE_REASON`.
 - `src/app/provider_factory.rs` — `RuntimeProviderFactory`, `RoutedProvider` lazy adapter cache keyed by target and effort; `RoutedProvider::target_for` consults the request's override before the role's route; `ProviderFactory::require_provider` is the readiness check a retry override passes before anything is committed.
 - `src/domain/stage.rs` — `StageRouteOverride`, `Stage::route_override`, `Stage::override_route` (failed stages only); `src/domain/run.rs` — `Run::override_stage_route` (same retry-safety guard as retry); `src/engine/scheduler.rs` — `retry_stage` commits the override and the retry together; `src/store/snapshot.rs` — run snapshot v3 carries it.
 - `src/app/query.rs` — `configured_target`: `StageSummary::route_overridden`, `StageExecutionEvidence::route_overridden`.
@@ -46,7 +46,7 @@ Current `recommended_v2` map with both providers ready: Researcher, Architect, C
 - Routes are resolved only at creation; resume, retry, recovery and attention never re-run Recommended. Provider loss afterwards is a clear failure, not a reroute: the only way a stage changes provider is an operator's explicit `retry --provider` (TUI `t` chooser), and that moves one stage, never the run.
 - A retry override is refused before any commit when the provider is not installed or authenticated (`require_provider`, same bar as `--provider` at creation), so a refused override leaves the stage failed and retryable on its original route. `--model` without `--provider` is a clap error. Evaluation runs never accept an override.
 - The override replaces the whole target, model included. `retry --provider claude` on a stage whose snapshot route pinned a Codex model runs Claude's native default; name `--model` if a specific one is wanted.
-- `recommended_v2` evidence is runtime-level (role_core_v3, 3 repetitions); it encodes no cost or token claims. Researcher, Architect, EngineeringLead and legacy Reviewer are inherited from v1 without evidence.
+- `recommended_v2` evidence is runtime-level (role_core_v3, 3 repetitions) and was taken at native-default effort; it encodes no cost or token claims. `recommended_v3` restates every route as `Inherited` for that reason, and every effort row is `Provisional` (benchmark kind `expert_provisional`) until an effort sweep with `eval run --effort` replaces it.
 - Codex never confirms its model; `actual` model stays `unconfirmed` for Codex stages by design.
 - Effort never changes routing; see observability-and-effort.md.
 - The verifier's stage line in `status` shows configured provider `verify` although the Routing table above it has no such row; that is the implicit route, not a missing one. Snapshots sealed before the verifier existed load unchanged and can still grow fix cycles.

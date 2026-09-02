@@ -18,8 +18,8 @@ use crate::store::{ResolvedConfigSnapshot, SequencedEvent, SqliteStore};
 
 use super::AppError;
 use super::routing::{
-    ExecutionSelection, ExecutionTarget, RecommendedAvailability, ResourcePlan, RoutingPlan,
-    UniformProvider, VERIFY_PROVIDER_ID, resolve_config,
+    EffortRequest, ExecutionSelection, ExecutionTarget, RecommendedAvailability, ResourcePlan,
+    RoutingPlan, UniformProvider, VERIFY_PROVIDER_ID, resolve_config,
 };
 
 pub trait ProviderFactory {
@@ -32,7 +32,7 @@ pub trait ProviderFactory {
     fn config_for_new_run(
         &self,
         selection: ExecutionSelection,
-        effort: EffortSetting,
+        effort: EffortRequest,
         workflow: &WorkflowDefinition,
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
@@ -124,7 +124,7 @@ impl ProviderFactory for DevelopmentFakeProviderFactory {
     fn config_for_new_run(
         &self,
         selection: ExecutionSelection,
-        effort: EffortSetting,
+        effort: EffortRequest,
         workflow: &WorkflowDefinition,
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
@@ -637,7 +637,7 @@ impl ProviderFactory for RuntimeProviderFactory {
     fn config_for_new_run(
         &self,
         selection: ExecutionSelection,
-        effort: EffortSetting,
+        effort: EffortRequest,
         workflow: &WorkflowDefinition,
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,

@@ -152,19 +152,53 @@ fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// CLI effort words. `native` (or omission) preserves the runtime's own
-/// configured default; anything unknown fails closed.
-fn parse_effort(value: Option<&str>) -> Result<crate::domain::EffortSetting> {
-    use crate::domain::EffortSetting;
-    match value {
-        None | Some("native") => Ok(EffortSetting::NativeDefault),
-        Some("low") => Ok(EffortSetting::LOW),
-        Some("medium") => Ok(EffortSetting::MEDIUM),
-        Some("high") => Ok(EffortSetting::HIGH),
-        Some(other) => {
-            anyhow::bail!("unsupported effort {other:?}; supported: native, low, medium, high")
+/// The `--effort` grammar. Omitted is the routing profile's own policy; one
+/// level applies to every role; `role=level[,role=level]` names some roles
+/// and leaves the rest to the profile. Anything unknown fails closed.
+fn parse_effort(value: Option<&str>) -> Result<crate::app::EffortRequest> {
+    use crate::app::EffortRequest;
+    let Some(value) = value else {
+        return Ok(EffortRequest::ProfileDefault);
+    };
+    if !value.contains('=') {
+        return Ok(EffortRequest::Uniform(parse_effort_level(value)?));
+    }
+    let mut roles = std::collections::HashMap::new();
+    for pair in value.split(',') {
+        let (role_word, level) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("malformed effort {pair:?}; expected role=level"))?;
+        let role_word = role_word.trim();
+        let role = parse_role(role_word)?;
+        if roles
+            .insert(role, parse_effort_level(level.trim())?)
+            .is_some()
+        {
+            anyhow::bail!("effort names {role_word:?} twice");
         }
     }
+    Ok(EffortRequest::PerRole(roles))
+}
+
+/// One effort word. `native` preserves the runtime's own configured default;
+/// the levels are the domain's own spellings.
+fn parse_effort_level(word: &str) -> Result<crate::domain::EffortSetting> {
+    if word == "native" {
+        return Ok(crate::domain::EffortSetting::NativeDefault);
+    }
+    word.parse().map_err(|_| {
+        anyhow::anyhow!("unsupported effort {word:?}; supported: native, low, medium, high, xhigh")
+    })
+}
+
+/// A role by the `snake_case` name `status` prints for it, so the flag and
+/// the report agree without a second spelling.
+fn parse_role(word: &str) -> Result<crate::domain::Role> {
+    serde_json::from_value(serde_json::Value::String(word.to_owned())).map_err(|_| {
+        anyhow::anyhow!(
+            "unknown role {word:?}; supported: researcher, architect, implementer, simplifier, code_quality_reviewer, spec_reviewer, engineering_lead"
+        )
+    })
 }
 
 /// Bootstrap hook: records an installed executable as officially managed so
@@ -489,6 +523,7 @@ fn run_eval(args: &EvalRunArgs) -> Result<()> {
     let suite = crate::eval::EvalSuite::load(&args.suite)?;
     let runner = crate::eval::EvalRunner::new(crate::eval::EvalRunOptions {
         target,
+        effort: parse_effort_level(args.effort.as_deref().unwrap_or("native"))?,
         repeat: args.repeat,
         allow_native_usage: args.allow_native_usage,
         output: args.out.clone(),
@@ -637,14 +672,17 @@ fn print_details(details: &RunDetails) {
     println!("Routing");
     for route in &details.routes {
         println!(
-            "{}  {}  {}  {}",
+            "{}  {}  {}  {}  effort={}",
             enum_text(route.role),
             route.configured_provider,
             route
                 .configured_model
                 .as_deref()
                 .unwrap_or("native default"),
-            route.reason
+            route.reason,
+            route
+                .requested_effort
+                .map_or("unstated", crate::domain::EffortSetting::label)
         );
     }
     println!();
@@ -944,5 +982,76 @@ mod tests {
             "CLI update commands must call check_now, not cached_status"
         );
         assert!(code.contains("service.check_now(now)"));
+    }
+}
+
+#[cfg(test)]
+mod effort_flag_tests {
+    use std::collections::HashMap;
+
+    use super::{parse_effort, parse_effort_level, parse_role};
+    use crate::app::EffortRequest;
+    use crate::domain::{EffortSetting, Role};
+
+    #[test]
+    fn omitted_is_the_profiles_policy_and_a_word_is_every_role() {
+        assert_eq!(parse_effort(None).unwrap(), EffortRequest::ProfileDefault);
+        assert_eq!(
+            parse_effort(Some("native")).unwrap(),
+            EffortRequest::Uniform(EffortSetting::NativeDefault)
+        );
+        for (word, setting) in [
+            ("low", EffortSetting::LOW),
+            ("medium", EffortSetting::MEDIUM),
+            ("high", EffortSetting::HIGH),
+            ("xhigh", EffortSetting::XHIGH),
+        ] {
+            assert_eq!(
+                parse_effort(Some(word)).unwrap(),
+                EffortRequest::Uniform(setting),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_pairs_name_some_roles_in_status_spelling() {
+        let request =
+            parse_effort(Some("architect=xhigh, implementer=low,simplifier=native")).unwrap();
+        assert_eq!(
+            request,
+            EffortRequest::PerRole(HashMap::from([
+                (Role::Architect, EffortSetting::XHIGH),
+                (Role::Implementer, EffortSetting::LOW),
+                (Role::Simplifier, EffortSetting::NativeDefault),
+            ]))
+        );
+        assert_eq!(
+            parse_role("code_quality_reviewer").unwrap(),
+            Role::CodeQualityReviewer
+        );
+        assert_eq!(
+            parse_role("engineering_lead").unwrap(),
+            Role::EngineeringLead
+        );
+    }
+
+    /// Unknown words fail closed, in both positions, and a role named twice
+    /// is a contradiction rather than a last-one-wins.
+    #[test]
+    fn unknown_levels_roles_and_repeats_are_refused() {
+        assert!(parse_effort_level("max").is_err());
+        assert!(parse_effort_level("Medium").is_err());
+        assert!(parse_effort(Some("turbo")).is_err());
+        assert!(parse_effort(Some("Architect=high")).is_err());
+        assert!(parse_effort(Some("planner=high")).is_err());
+        assert!(parse_effort(Some("architect=turbo")).is_err());
+        assert!(parse_effort(Some("architect=high,architect=low")).is_err());
+        assert!(
+            parse_effort(Some("architect")).is_err(),
+            "a bare word must be a level"
+        );
+        assert!(parse_effort(Some("architect=")).is_err());
+        assert!(parse_effort(Some("=high")).is_err());
     }
 }

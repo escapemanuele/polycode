@@ -11,6 +11,7 @@ Choose how much process a task gets: one implementation stage, a full architectu
 - fix: append a Fix stage, its Verify (`verify_<n>`) and a fresh Decision to a `Completed` run that reached a decision.
 - continue (TUI only): append a FollowUp stage, its Verify (`followup_verify_<n>`) and a Decision with a free-text instruction (`c`), or with the decision's own `## Follow-ups` section (`w`).
 - reviewer-specialization: Code Quality Review judges HOW; Specification Review judges WHAT (Missing/Wrong/Unrequested).
+- architecture-plan: the Architect artifact carries `## Plan` (numbered, one step per file), `## Verification` (exact commands), `## Out of scope` and `## Assumptions` (facts checkable in one place). The Implementer confirms the assumptions before editing and records any that fail under `## Plan deviations`; this is what lets the implementer run at a lower effort than the planner (see observability-and-effort.md).
 - change-handoff: review stages get a bounded diff and changed-file inventory of the worktree vs base commit in their first prompt.
 - bottom-line: every stage prompt asks for a `## Bottom line` section; the TUI quotes it verbatim.
 - pull-request: every editing stage prompt (Implementation, Simplification, Fix, FollowUp) asks for a closing `## Pull request` section — title line, then a description with Proposed changes / Why / Testing; `pr` quotes it (see workspace.md).

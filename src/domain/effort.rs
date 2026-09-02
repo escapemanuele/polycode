@@ -10,11 +10,15 @@ use serde::{Deserialize, Serialize};
 
 /// Explicit requested effort level. Adapters translate these; domain code
 /// never encodes provider- or model-specific aliases.
+///
+/// Ordered: `Low < Medium < High < XHigh`, so a raise is a comparison, not a
+/// table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EffortLevel {
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 /// Requested native-runtime effort for one responsibility.
@@ -34,6 +38,7 @@ impl EffortSetting {
     pub const LOW: Self = Self::Level(EffortLevel::Low);
     pub const MEDIUM: Self = Self::Level(EffortLevel::Medium);
     pub const HIGH: Self = Self::Level(EffortLevel::High);
+    pub const XHIGH: Self = Self::Level(EffortLevel::XHigh);
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -42,6 +47,7 @@ impl EffortSetting {
             Self::Level(EffortLevel::Low) => "low",
             Self::Level(EffortLevel::Medium) => "medium",
             Self::Level(EffortLevel::High) => "high",
+            Self::Level(EffortLevel::XHigh) => "xhigh",
         }
     }
 
@@ -53,6 +59,7 @@ impl EffortSetting {
             Self::Level(EffortLevel::Low) => "low",
             Self::Level(EffortLevel::Medium) => "medium",
             Self::Level(EffortLevel::High) => "high",
+            Self::Level(EffortLevel::XHigh) => "xhigh",
         }
     }
 }
@@ -60,7 +67,7 @@ impl EffortSetting {
 /// Malformed or unknown effort encoding. Unknown future settings fail closed;
 /// they never silently degrade to `NativeDefault` or `Medium`.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-#[error("unknown effort setting {0:?}; supported: native_default, low, medium, high")]
+#[error("unknown effort setting {0:?}; supported: native_default, low, medium, high, xhigh")]
 pub struct EffortParseError(String);
 
 impl std::str::FromStr for EffortSetting {
@@ -72,6 +79,7 @@ impl std::str::FromStr for EffortSetting {
             "low" => Ok(Self::LOW),
             "medium" => Ok(Self::MEDIUM),
             "high" => Ok(Self::HIGH),
+            "xhigh" => Ok(Self::XHIGH),
             other => Err(EffortParseError(other.to_owned())),
         }
     }
@@ -107,6 +115,7 @@ mod tests {
             EffortSetting::LOW,
             EffortSetting::MEDIUM,
             EffortSetting::HIGH,
+            EffortSetting::XHIGH,
         ] {
             let encoded = serde_json::to_string(&setting).unwrap();
             let decoded: EffortSetting = serde_json::from_str(&encoded).unwrap();
@@ -120,6 +129,19 @@ mod tests {
             serde_json::to_string(&EffortSetting::HIGH).unwrap(),
             "\"high\""
         );
+        assert_eq!(
+            serde_json::to_string(&EffortSetting::XHIGH).unwrap(),
+            "\"xhigh\""
+        );
+    }
+
+    /// A raise is a comparison on the level, so the declaration order is the
+    /// contract.
+    #[test]
+    fn levels_are_ordered_low_to_xhigh() {
+        assert!(EffortLevel::Low < EffortLevel::Medium);
+        assert!(EffortLevel::Medium < EffortLevel::High);
+        assert!(EffortLevel::High < EffortLevel::XHigh);
     }
 
     #[test]
@@ -135,6 +157,10 @@ mod tests {
         let error = serde_json::from_str::<EffortSetting>("\"native default\"");
         assert!(error.is_err());
         let error = serde_json::from_str::<EffortSetting>("\"Medium\"");
+        assert!(error.is_err());
+        // Claude Code also accepts `max`; Codex does not, and Polycode states
+        // no level it cannot hand to every native runtime.
+        let error = serde_json::from_str::<EffortSetting>("\"max\"");
         assert!(error.is_err());
     }
 }

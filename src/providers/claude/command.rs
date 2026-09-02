@@ -102,6 +102,7 @@ pub(crate) const fn native_effort_value(level: EffortLevel) -> &'static str {
         EffortLevel::Low => "low",
         EffortLevel::Medium => "medium",
         EffortLevel::High => "high",
+        EffortLevel::XHigh => "xhigh",
     }
 }
 
@@ -140,6 +141,7 @@ mod tests {
             EffortSetting::LOW,
             EffortSetting::MEDIUM,
             EffortSetting::HIGH,
+            EffortSetting::XHIGH,
         ] {
             let command = initial(prompt, None, setting);
             assert_eq!(command.stdin, baseline.stdin);
@@ -153,6 +155,7 @@ mod tests {
             (EffortSetting::LOW, "low"),
             (EffortSetting::MEDIUM, "medium"),
             (EffortSetting::HIGH, "high"),
+            (EffortSetting::XHIGH, "xhigh"),
         ] {
             let command = initial("prompt", None, setting);
             let args = command

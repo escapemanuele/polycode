@@ -47,14 +47,18 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
             "Inspect the actual repository code and relevant diff against the immutable user task and available architecture or design evidence. Judge WHAT behavior was delivered. Classify findings as Missing, Wrong, or Unrequested. Treat RunInput as primary intent; architecture refines implementation but cannot silently override it. Treat code and repository state as observed result, Implementation artifacts as supporting context, repository-native authoritative specifications as additional evidence, and tests as evidence rather than product truth. Useful unrequested behavior remains a scope issue. Do not spend the review on style unless it causes a requirement failure. Do not edit files. Return Markdown with # Specification Review and optional ## Missing, ## Wrong, ## Unrequested, and ## Good sections; do not invent findings."
         }
         (Role::Researcher, _) => "Inspect repository and gather evidence. Do not invent facts.",
-        (Role::Architect, _) => "Design smallest coherent change. Name constraints and tradeoffs.",
+        (Role::Architect, _) => {
+            "Design the smallest coherent change and name its constraints and tradeoffs. Write the design so an implementer can execute it without re-deriving it. Return Markdown with # Architecture and these sections. ## Plan: numbered steps, one per file, each naming the file, the symbols to add or change, and what in that file must not change. ## Verification: the exact commands that prove the change, as this repository runs them. ## Out of scope: what the change deliberately leaves alone. ## Assumptions: the facts about the repository the plan depends on, each checkable by reading one place, such as a file existing, a function having a signature, or a test covering a path; state none you did not check yourself."
+        }
         (Role::Implementer, StageKind::Fix) => {
             "Resolve the blocking findings in the decision that sent this work back, and only those. The implementation already exists in this workspace; correct it rather than rewriting it, and leave findings the decision did not treat as blocking alone. Where you disagree with a finding, say so in the artifact and leave the code as it is rather than silently declining. Run proportionate verification. Return Markdown with # Fix and one section per finding stating what changed or why nothing did."
         }
         (Role::Implementer, StageKind::FollowUp) => {
             "Continue the work in this workspace as the operator instructs below. The previous decision artifact is context, not a boundary. Run proportionate verification. Return Markdown with # Follow-up and one section per instruction item stating what changed."
         }
-        (Role::Implementer, _) => "Implement requested change and run proportionate verification.",
+        (Role::Implementer, _) => {
+            "Implement the requested change and run proportionate verification. When an architecture artifact is among your dependencies, confirm its ## Assumptions against the repository before editing. Record any that do not hold under a ## Plan deviations section, each with the smallest correct reading you took instead, and follow the plan everywhere else."
+        }
         (Role::Simplifier, StageKind::Simplification) => {
             "Simplify the implementation change in this workspace by removing accidental complexity, and touch nothing outside the changed lines and what they directly force. Reduce, never improve: delete comments that restate code, inline abstractions with one caller, remove speculative generality, dead branches, needless defensive layers, and configuration nothing requests. Preserve observable behavior exactly; when a simplification would change behavior, leave the code alone and note it. Run proportionate verification after editing. Return Markdown with # Simplification and one section per simplification stating what was removed and why, or a single ## No changes section when the implementation is already minimal; never invent work to justify the stage."
         }
@@ -149,6 +153,50 @@ mod tests {
         assert!(follow_up.contains("as the operator instructs below"));
         assert!(follow_up.contains("context, not a boundary"));
         assert!(follow_up.contains("# Follow-up"));
+    }
+
+    /// The architect's output is what makes lower-effort execution safe: a
+    /// plan an implementer can follow without re-deriving it, verification
+    /// it can run, a fence it can respect, and assumptions it can check.
+    #[test]
+    fn the_architecture_contract_asks_for_an_executable_plan() {
+        let architecture = instruction(Role::Architect, StageKind::Architecture);
+        for section in [
+            "## Plan",
+            "## Verification",
+            "## Out of scope",
+            "## Assumptions",
+        ] {
+            assert!(architecture.contains(section), "{section}");
+        }
+        assert!(architecture.contains("one per file"));
+        assert!(architecture.contains("exact commands"));
+        assert!(architecture.contains("checkable by reading one place"));
+        assert!(
+            architecture.contains("state none you did not check yourself"),
+            "an unchecked assumption is a guess dressed as a fact"
+        );
+        // The original charge survives the added shape.
+        assert!(architecture.contains("smallest coherent change"));
+        assert!(architecture.contains("constraints and tradeoffs"));
+    }
+
+    /// The implementer's first act is a check, not a judgment: the plan's
+    /// assumptions are confirmed before any edit, and a miss is recorded
+    /// rather than silently improvised around. Fix and follow-up keep their
+    /// own bounded contracts.
+    #[test]
+    fn the_implementation_contract_checks_the_plans_assumptions_before_editing() {
+        let implementation = instruction(Role::Implementer, StageKind::Implementation);
+        assert!(implementation.contains("## Assumptions"));
+        assert!(implementation.contains("before editing"));
+        assert!(implementation.contains("## Plan deviations"));
+        assert!(implementation.contains("follow the plan everywhere else"));
+        assert!(implementation.contains("proportionate verification"));
+        assert!(!instruction(Role::Implementer, StageKind::Fix).contains("## Plan deviations"));
+        assert!(
+            !instruction(Role::Implementer, StageKind::FollowUp).contains("## Plan deviations")
+        );
     }
 
     #[test]

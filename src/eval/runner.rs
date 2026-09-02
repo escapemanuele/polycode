@@ -30,6 +30,10 @@ const MAX_EVAL_AUTO_CONTINUATIONS: u32 = 8;
 #[derive(Clone, Debug)]
 pub struct EvalRunOptions {
     pub target: EvalTarget,
+    /// Requested effort for the candidate role; the Fake support roles have
+    /// no dial. Recorded on every result so evidence at different levels is
+    /// never mistaken for the same measurement.
+    pub effort: crate::domain::EffortSetting,
     pub repeat: u32,
     pub allow_native_usage: bool,
     pub output: Option<PathBuf>,
@@ -147,7 +151,7 @@ impl EvalRunner {
         };
         write_evidence(&repetition_root, &evidence)?;
         let result = EvalResultV1 {
-            requested_effort: Some(crate::domain::EffortSetting::NativeDefault),
+            requested_effort: Some(self.options.effort),
             schema_version: EVAL_RESULT_SCHEMA_VERSION,
             suite: suite.name().to_owned(),
             suite_version: suite.version().to_owned(),
@@ -213,6 +217,7 @@ impl EvalRunner {
         let config = crate::app::resolve_eval_config(
             case.target_role,
             &target,
+            self.options.effort,
             &workflow,
             ConfigSnapshotId::new(format!("eval-config-{}", ulid::Ulid::new()))
                 .map_err(|error| infrastructure(error.to_string()))?,

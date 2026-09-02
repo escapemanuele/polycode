@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AttentionRequestId, ConfigSnapshotId, EffortSetting, EventId, EventMetadata, Run, RunId,
-    RunStatus, RunTransition, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
+    AttentionRequestId, ConfigSnapshotId, EventId, EventMetadata, Run, RunId, RunStatus,
+    RunTransition, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
 };
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
@@ -14,7 +14,7 @@ use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 
 use super::provider_factory::{ProviderFactory, ProviderResolver};
 use super::{
-    AppError, ArtifactSummary, ArtifactView, CommittedEvent, ExecutionSelection,
+    AppError, ArtifactSummary, ArtifactView, CommittedEvent, EffortRequest, ExecutionSelection,
     OPERATOR_OVERRIDE_REASON, ProcessLogView, RetryRoute, RunDetails, RunDiffPreview, RunListItem,
     StageExecutionEvidence, query,
 };
@@ -117,7 +117,7 @@ where
         task: impl Into<String>,
         repository_path: impl AsRef<Path>,
         selection: Option<ExecutionSelection>,
-        effort: EffortSetting,
+        effort: impl Into<EffortRequest>,
     ) -> Result<ExecutionReport, AppError>
     where
         F: ProviderFactory,
@@ -129,7 +129,7 @@ where
         let selection = selection.ok_or(AppError::NoProductionProvider)?;
         let config = self.provider_factory.config_for_new_run(
             selection,
-            effort,
+            effort.into(),
             &workflow,
             config_id.clone(),
             created_at,
@@ -933,8 +933,8 @@ mod tests {
     };
     use crate::domain::{
         ArtifactId, ArtifactKind, ArtifactMetadata, ArtifactStatus, AttentionKind,
-        ConfigSnapshotId, Dependency, DomainEventKind, ProviderId, Role, StageDefinition,
-        StageKind,
+        ConfigSnapshotId, Dependency, DomainEventKind, EffortSetting, ProviderId, Role,
+        StageDefinition, StageKind,
     };
     use crate::engine::{
         FakeEvent, FakeProvider, FakeScenario, Provider, ProviderError, ProviderPoll,
@@ -1002,7 +1002,7 @@ mod tests {
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
-            effort: EffortSetting,
+            effort: EffortRequest,
             workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
@@ -1037,7 +1037,7 @@ mod tests {
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
-            effort: EffortSetting,
+            effort: EffortRequest,
             workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
@@ -1084,7 +1084,7 @@ mod tests {
         fn config_for_new_run(
             &self,
             selection: ExecutionSelection,
-            effort: EffortSetting,
+            effort: EffortRequest,
             workflow: &WorkflowDefinition,
             id: ConfigSnapshotId,
             created_at: DateTime<Utc>,
@@ -1868,7 +1868,7 @@ mod tests {
             .fake_factory()
             .config_for_new_run(
                 ExecutionSelection::Uniform(UniformProvider::Fake),
-                EffortSetting::NativeDefault,
+                EffortSetting::NativeDefault.into(),
                 &workflow,
                 config_id,
                 created_at,

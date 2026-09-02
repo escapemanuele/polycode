@@ -25,8 +25,12 @@ pub const VERIFY_PROVIDER_ID: &str = "verify";
 /// snapshots created under it keep resolving identically; never re-emitted
 /// for new runs.
 pub const RECOMMENDED_PROFILE_VERSION_V1: &str = "recommended_v1";
+/// Frozen second Recommended policy: the routes `recommended_v3` inherits,
+/// under native-default effort. Snapshots created under it keep resolving
+/// identically; never re-emitted for new runs.
+pub const RECOMMENDED_PROFILE_VERSION_V2: &str = "recommended_v2";
 /// Current Recommended policy emitted for new `--profile recommended` runs.
-pub const RECOMMENDED_PROFILE_VERSION: &str = "recommended_v2";
+pub const RECOMMENDED_PROFILE_VERSION: &str = "recommended_v3";
 const UNIFORM_PROFILE_VERSION: &str = "uniform_v1";
 pub(crate) const EVAL_PROFILE_VERSION: &str = "eval_v1";
 
@@ -43,6 +47,9 @@ pub enum DecisionBasis {
     Measured(DecisionConfidence),
     /// Carried over from the previous profile; no current benchmark evidence.
     Inherited,
+    /// Expert policy stated ahead of benchmark evidence, to be replaced by a
+    /// measured decision or withdrawn once the evidence is in.
+    Provisional,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,12 +68,31 @@ pub struct RecommendedDecision {
     pub rationale: &'static str,
 }
 
+/// One immutable per-role requested-effort decision inside a Recommended
+/// profile.
+///
+/// Stated for the provider the same profile routes the role to. A fallback
+/// route (only one native provider ready at creation) still runs at this
+/// level, on the other runtime's own scale: the two scales are not
+/// comparable, and the profile does not pretend they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecommendedEffort {
+    pub role: Role,
+    pub effort: EffortSetting,
+    pub basis: DecisionBasis,
+    /// Factual machine-readable rationale; never a monetary/token-cost claim.
+    pub rationale: &'static str,
+}
+
 /// Immutable provenance for one versioned Recommended profile.
 ///
 /// `benchmark_kind: "native_runtime"` means targets were whole native
 /// runtimes (`provider / native_default`) which may orchestrate multiple
 /// models/subagents internally — not single-model comparisons. Latency
 /// evidence is runtime-level (suite median), not per-role isolated.
+///
+/// `efforts` is empty for the profiles that predate effort policy: they
+/// state no level, so every role runs at the runtime's native default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecommendedProvenance {
     pub profile_version: &'static str,
@@ -76,6 +102,7 @@ pub struct RecommendedProvenance {
     pub targets: &'static [&'static str],
     pub benchmark_kind: &'static str,
     pub decisions: &'static [RecommendedDecision],
+    pub efforts: &'static [RecommendedEffort],
 }
 
 const RECOMMENDED_V1_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
@@ -129,10 +156,11 @@ const RECOMMENDED_V1_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
             rationale: "initial_provisional_policy",
         },
     ],
+    efforts: &[],
 };
 
 const RECOMMENDED_V2_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
-    profile_version: RECOMMENDED_PROFILE_VERSION,
+    profile_version: RECOMMENDED_PROFILE_VERSION_V2,
     evidence_suite: Some(RECOMMENDED_V2_EVIDENCE_SUITE),
     evidence_fingerprint: Some(RECOMMENDED_V2_EVIDENCE_FINGERPRINT),
     repetitions_per_case: Some(3),
@@ -188,6 +216,126 @@ const RECOMMENDED_V2_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
             rationale: "new_role_no_measured_evidence_provisional_policy",
         },
     ],
+    efforts: &[],
+};
+
+/// The first profile to state effort per role: routes inherited from
+/// `recommended_v2` unchanged, plus a requested level for every role, so
+/// reasoning roles think at `high`, the implementer executes an explicit
+/// plan at `medium`, and the simplifier reduces at `low`.
+///
+/// Every effort row is `Provisional`: stated ahead of an effort sweep, on
+/// the strength of the role contracts rather than measured evidence. The
+/// route rows are `Inherited` rather than restated as measured, because the
+/// v2 measurements were taken at native-default effort and this profile no
+/// longer runs the implementer there.
+const RECOMMENDED_V3_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
+    profile_version: RECOMMENDED_PROFILE_VERSION,
+    evidence_suite: None,
+    evidence_fingerprint: None,
+    repetitions_per_case: None,
+    targets: &[],
+    benchmark_kind: "expert_provisional",
+    decisions: &[
+        RecommendedDecision {
+            role: Role::Implementer,
+            provider: "codex",
+            basis: DecisionBasis::Inherited,
+            rationale: "route_inherited_from_recommended_v2_measured_at_native_default_effort",
+        },
+        RecommendedDecision {
+            role: Role::CodeQualityReviewer,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "route_inherited_from_recommended_v2_measured_at_native_default_effort",
+        },
+        RecommendedDecision {
+            role: Role::SpecReviewer,
+            provider: "codex",
+            basis: DecisionBasis::Inherited,
+            rationale: "route_inherited_from_recommended_v2_measured_at_native_default_effort",
+        },
+        RecommendedDecision {
+            role: Role::Researcher,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "route_inherited_from_recommended_v2",
+        },
+        RecommendedDecision {
+            role: Role::Architect,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "route_inherited_from_recommended_v2",
+        },
+        RecommendedDecision {
+            role: Role::EngineeringLead,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "route_inherited_from_recommended_v2",
+        },
+        RecommendedDecision {
+            role: Role::Reviewer,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "legacy_compatibility_route_inherited_from_recommended_v2",
+        },
+        RecommendedDecision {
+            role: Role::Simplifier,
+            provider: "claude",
+            basis: DecisionBasis::Inherited,
+            rationale: "route_inherited_from_recommended_v2",
+        },
+    ],
+    efforts: &[
+        RecommendedEffort {
+            role: Role::Researcher,
+            effort: EffortSetting::HIGH,
+            basis: DecisionBasis::Provisional,
+            rationale: "reasoning_role_inspects_the_repository_ahead_of_design",
+        },
+        RecommendedEffort {
+            role: Role::Architect,
+            effort: EffortSetting::HIGH,
+            basis: DecisionBasis::Provisional,
+            rationale: "planning_role_removes_uncertainty_ahead_of_lower_effort_execution",
+        },
+        RecommendedEffort {
+            role: Role::Implementer,
+            effort: EffortSetting::MEDIUM,
+            basis: DecisionBasis::Provisional,
+            rationale: "executes_an_explicit_plan_pending_effort_sweep",
+        },
+        RecommendedEffort {
+            role: Role::Simplifier,
+            effort: EffortSetting::LOW,
+            basis: DecisionBasis::Provisional,
+            rationale: "contract_only_reduces_within_the_diff_and_never_improves",
+        },
+        RecommendedEffort {
+            role: Role::CodeQualityReviewer,
+            effort: EffortSetting::HIGH,
+            basis: DecisionBasis::Provisional,
+            rationale: "independent_review_guards_lower_effort_execution",
+        },
+        RecommendedEffort {
+            role: Role::SpecReviewer,
+            effort: EffortSetting::HIGH,
+            basis: DecisionBasis::Provisional,
+            rationale: "independent_review_guards_lower_effort_execution",
+        },
+        RecommendedEffort {
+            role: Role::EngineeringLead,
+            effort: EffortSetting::HIGH,
+            basis: DecisionBasis::Provisional,
+            rationale: "decides_over_conflicting_review_evidence",
+        },
+        RecommendedEffort {
+            role: Role::Reviewer,
+            effort: EffortSetting::HIGH,
+            basis: DecisionBasis::Provisional,
+            rationale: "legacy_review_role_held_to_the_reviewer_level",
+        },
+    ],
 };
 
 /// Immutable provenance for a known Recommended profile version.
@@ -195,9 +343,21 @@ const RECOMMENDED_V2_PROVENANCE: RecommendedProvenance = RecommendedProvenance {
 pub fn recommended_provenance(profile_version: &str) -> Option<&'static RecommendedProvenance> {
     match profile_version {
         RECOMMENDED_PROFILE_VERSION_V1 => Some(&RECOMMENDED_V1_PROVENANCE),
-        RECOMMENDED_PROFILE_VERSION => Some(&RECOMMENDED_V2_PROVENANCE),
+        RECOMMENDED_PROFILE_VERSION_V2 => Some(&RECOMMENDED_V2_PROVENANCE),
+        RECOMMENDED_PROFILE_VERSION => Some(&RECOMMENDED_V3_PROVENANCE),
         _ => None,
     }
+}
+
+/// The current Recommended profile's requested effort for one role:
+/// `NativeDefault` for any role the profile states nothing about.
+#[must_use]
+pub fn recommended_effort(role: Role) -> EffortSetting {
+    RECOMMENDED_V3_PROVENANCE
+        .efforts
+        .iter()
+        .find(|decision| decision.role == role)
+        .map_or(EffortSetting::NativeDefault, |decision| decision.effort)
 }
 
 /// One immutable provider/model destination selected for a role.
@@ -557,24 +717,56 @@ pub enum ExecutionSelection {
     Recommended,
 }
 
+/// How a new run asks for effort, before its per-role plan is sealed.
+///
+/// `ProfileDefault` takes each role's level from the routing profile: the
+/// current Recommended profile states one per role, and a uniform
+/// `--provider` run has no profile policy, so it stays native. `Uniform` is
+/// the operator overriding every role with one level — `NativeDefault`
+/// included, which is how a Recommended run opts out of the profile's
+/// policy. `PerRole` names some roles and leaves the rest to the profile.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum EffortRequest {
+    #[default]
+    ProfileDefault,
+    Uniform(EffortSetting),
+    PerRole(HashMap<Role, EffortSetting>),
+}
+
+impl From<EffortSetting> for EffortRequest {
+    fn from(setting: EffortSetting) -> Self {
+        Self::Uniform(setting)
+    }
+}
+
+/// `None` is the profile's own policy; `Some` overrides every role.
+impl From<Option<EffortSetting>> for EffortRequest {
+    fn from(setting: Option<EffortSetting>) -> Self {
+        setting.map_or(Self::ProfileDefault, Self::Uniform)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecommendedAvailability {
     pub claude: bool,
     pub codex: bool,
 }
 
-/// Resolves a selection to explicit routes and encodes immutable config schema v2.
+/// Resolves a selection to explicit routes and seals requested effort per
+/// role, encoding immutable config schema v2 (every role native) or v3.
 ///
 /// # Errors
-/// Rejects unavailable Recommended or invalid identifiers/configuration.
+/// Rejects unavailable Recommended, invalid identifiers/configuration, or an
+/// effort request naming a role the workflow cannot route.
 pub fn resolve_config(
     selection: ExecutionSelection,
-    effort: EffortSetting,
+    effort: impl Into<EffortRequest>,
     workflow: &WorkflowDefinition,
     availability: RecommendedAvailability,
     id: ConfigSnapshotId,
     created_at: DateTime<Utc>,
 ) -> Result<ResolvedConfigSnapshot, RoutingError> {
+    let effort = effort.into();
     let roles = routable_roles(workflow);
     let (profile, profile_version, routes) = match selection {
         ExecutionSelection::Uniform(provider) => {
@@ -606,21 +798,50 @@ pub fn resolve_config(
         .into_iter()
         .map(|provider| Ok((provider.to_owned(), provider_config_dto(provider)?)))
         .collect::<Result<HashMap<_, _>, RoutingError>>()?;
-    // NativeDefault keeps the exact pre-effort schema-v2 payload; explicit
-    // effort persists a per-role resource plan under schema v3. Old payloads
-    // are never rewritten either way.
-    let (schema_version, resource_plan) = match effort {
-        EffortSetting::NativeDefault => (2, None),
-        explicit @ EffortSetting::Level(_) => (
-            3,
-            Some(
-                routes
-                    .keys()
-                    .copied()
-                    .map(|role| (role, explicit))
-                    .collect::<HashMap<_, _>>(),
-            ),
-        ),
+    // A profile states effort only under Recommended; a uniform provider has
+    // no policy of its own and stays native unless the operator says
+    // otherwise.
+    let profile_effort = |role: Role| match selection {
+        ExecutionSelection::Recommended => recommended_effort(role),
+        ExecutionSelection::Uniform(_) => EffortSetting::NativeDefault,
+    };
+    let efforts = match &effort {
+        EffortRequest::ProfileDefault => routes
+            .keys()
+            .map(|role| (*role, profile_effort(*role)))
+            .collect::<HashMap<_, _>>(),
+        EffortRequest::Uniform(setting) => routes
+            .keys()
+            .map(|role| (*role, *setting))
+            .collect::<HashMap<_, _>>(),
+        EffortRequest::PerRole(named) => {
+            if let Some(alien) = named.keys().find(|role| !routes.contains_key(role)) {
+                return Err(RoutingError::EffortRoleUnroutable(*alien));
+            }
+            routes
+                .keys()
+                .map(|role| {
+                    (
+                        *role,
+                        named
+                            .get(role)
+                            .copied()
+                            .unwrap_or_else(|| profile_effort(*role)),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        }
+    };
+    // Every role native keeps the exact pre-effort schema-v2 payload; any
+    // explicit level persists the whole per-role resource plan under schema
+    // v3. Old payloads are never rewritten either way.
+    let (schema_version, resource_plan) = if efforts
+        .values()
+        .all(|setting| *setting == EffortSetting::NativeDefault)
+    {
+        (2, None)
+    } else {
+        (3, Some(efforts))
     };
     let payload = RoutingPayloadV2 {
         schema_version,
@@ -648,6 +869,7 @@ pub fn resolve_config(
 pub(crate) fn resolve_eval_config(
     target_role: Role,
     target: &ExecutionTarget,
+    effort: EffortSetting,
     workflow: &WorkflowDefinition,
     id: ConfigSnapshotId,
     created_at: DateTime<Utc>,
@@ -656,6 +878,21 @@ pub(crate) fn resolve_eval_config(
     if !roles.contains(&target_role) {
         return Err(RoutingError::EvaluationRoleAbsent(target_role));
     }
+    // The candidate is measured at the requested level; the Fake support
+    // roles have no dial, but a v3 plan must still cover every required
+    // role, so they carry the same setting.
+    let (schema_version, resource_plan) = match effort {
+        EffortSetting::NativeDefault => (2, None),
+        explicit @ EffortSetting::Level(_) => (
+            3,
+            Some(
+                roles
+                    .iter()
+                    .map(|role| (*role, explicit))
+                    .collect::<HashMap<_, _>>(),
+            ),
+        ),
+    };
     let routes = roles
         .into_iter()
         .map(|role| {
@@ -688,16 +925,22 @@ pub(crate) fn resolve_eval_config(
         .map(|provider| Ok((provider.to_owned(), provider_config_dto(provider)?)))
         .collect::<Result<HashMap<_, _>, RoutingError>>()?;
     let payload = RoutingPayloadV2 {
-        schema_version: 2,
+        schema_version,
         profile: "eval".to_owned(),
         profile_version: EVAL_PROFILE_VERSION.to_owned(),
         routes,
         providers,
-        resource_plan: None,
+        resource_plan,
     };
-    let snapshot = ResolvedConfigSnapshot::new(id, 2, serde_json::to_value(payload)?, created_at)
-        .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
+    let snapshot = ResolvedConfigSnapshot::new(
+        id,
+        schema_version,
+        serde_json::to_value(payload)?,
+        created_at,
+    )
+    .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
     RoutingPlan::from_snapshot(&snapshot, workflow)?;
+    ResourcePlan::from_snapshot(&snapshot, workflow)?;
     Ok(snapshot)
 }
 
@@ -732,11 +975,11 @@ fn recommended_routes(
                     "fallback_preferred_provider_unavailable_at_run_creation",
                 )
             } else {
-                let decision = RECOMMENDED_V2_PROVENANCE
+                let decision = RECOMMENDED_V3_PROVENANCE
                     .decisions
                     .iter()
                     .find(|decision| decision.role == role)
-                    .expect("recommended_v2 provenance covers every role");
+                    .expect("recommended_v3 provenance covers every role");
                 (decision.provider, decision.rationale)
             };
             (
@@ -878,6 +1121,23 @@ struct ProviderConfigDto {
     scenario: Option<String>,
 }
 
+/// Every profile identity a v2/v3 payload may carry: the frozen Recommended
+/// versions decode alongside the current one, so no sealed run ever stops
+/// loading when the policy moves on.
+fn known_profile(profile: &str, version: &str) -> bool {
+    matches!(
+        (profile, version),
+        ("uniform", UNIFORM_PROFILE_VERSION)
+            | (
+                "recommended",
+                RECOMMENDED_PROFILE_VERSION_V1
+                    | RECOMMENDED_PROFILE_VERSION_V2
+                    | RECOMMENDED_PROFILE_VERSION
+            )
+            | ("eval", EVAL_PROFILE_VERSION)
+    )
+}
+
 fn decode_v2(
     snapshot: &ResolvedConfigSnapshot,
     workflow: &WorkflowDefinition,
@@ -889,11 +1149,8 @@ fn decode_v2(
         ));
     }
     validate_resource_plan_shape(&payload, workflow)?;
-    match (payload.profile.as_str(), payload.profile_version.as_str()) {
-        ("uniform", UNIFORM_PROFILE_VERSION)
-        | ("recommended", RECOMMENDED_PROFILE_VERSION_V1 | RECOMMENDED_PROFILE_VERSION)
-        | ("eval", EVAL_PROFILE_VERSION) => {}
-        _ => return Err(RoutingError::InvalidProfileMetadata),
+    if !known_profile(&payload.profile, &payload.profile_version) {
+        return Err(RoutingError::InvalidProfileMetadata);
     }
     let mut provider_configs = HashMap::new();
     for (provider, config) in payload.providers {
@@ -1154,6 +1411,8 @@ pub enum RoutingError {
     RecommendedUnavailable,
     #[error("evaluation target role {0:?} is absent from workflow")]
     EvaluationRoleAbsent(Role),
+    #[error("effort names role {0:?}, which this workflow cannot route")]
+    EffortRoleUnroutable(Role),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -1225,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn recommended_v2_maps_roles_exactly_and_pins_no_models() {
+    fn recommended_v3_maps_roles_exactly_and_pins_no_models() {
         let plan = snapshot(
             ExecutionSelection::Recommended,
             RecommendedAvailability {
@@ -1234,7 +1493,7 @@ mod tests {
             },
         );
         assert_eq!(plan.profile_version(), RECOMMENDED_PROFILE_VERSION);
-        assert_eq!(plan.profile_version(), "recommended_v2");
+        assert_eq!(plan.profile_version(), "recommended_v3");
         for (role, provider) in [
             (Role::Architect, "claude"),
             (Role::Implementer, "codex"),
@@ -1353,7 +1612,7 @@ mod tests {
 
     #[test]
     fn recommended_v2_provenance_records_measured_and_inherited_evidence() {
-        let provenance = recommended_provenance(RECOMMENDED_PROFILE_VERSION).unwrap();
+        let provenance = recommended_provenance(RECOMMENDED_PROFILE_VERSION_V2).unwrap();
         assert_eq!(provenance.evidence_suite, Some("role_core_v3"));
         assert_eq!(
             provenance.evidence_fingerprint,
@@ -1412,6 +1671,235 @@ mod tests {
                 .all(|decision| decision.basis == DecisionBasis::Inherited)
         );
         assert!(recommended_provenance("recommended_v999").is_none());
+    }
+
+    /// The current profile changes no route: every v3 destination is the v2
+    /// one, restated as inherited because the v2 measurements were taken at
+    /// native-default effort. What v3 adds is a requested level per role,
+    /// every one of them provisional until an effort sweep replaces it.
+    #[test]
+    fn recommended_v3_inherits_every_v2_route_and_states_a_provisional_effort_per_role() {
+        let v2 = recommended_provenance(RECOMMENDED_PROFILE_VERSION_V2).unwrap();
+        let v3 = recommended_provenance(RECOMMENDED_PROFILE_VERSION).unwrap();
+        assert_eq!(v3.profile_version, "recommended_v3");
+        assert_eq!(v3.benchmark_kind, "expert_provisional");
+        assert_eq!(v3.evidence_suite, None);
+        assert!(v2.efforts.is_empty(), "v2 predates effort policy");
+        assert_eq!(v3.decisions.len(), v2.decisions.len());
+        for decision in v3.decisions {
+            let inherited = v2
+                .decisions
+                .iter()
+                .find(|candidate| candidate.role == decision.role)
+                .unwrap_or_else(|| panic!("{:?} is new in v3", decision.role));
+            assert_eq!(decision.provider, inherited.provider, "{:?}", decision.role);
+            assert_eq!(
+                decision.basis,
+                DecisionBasis::Inherited,
+                "{:?}",
+                decision.role
+            );
+        }
+        // One effort row per routed role, no more and no fewer.
+        assert_eq!(v3.efforts.len(), v3.decisions.len());
+        for decision in v3.decisions {
+            let effort = v3
+                .efforts
+                .iter()
+                .find(|candidate| candidate.role == decision.role)
+                .unwrap_or_else(|| panic!("{:?} has a route but no effort", decision.role));
+            assert_eq!(
+                effort.basis,
+                DecisionBasis::Provisional,
+                "{:?}",
+                decision.role
+            );
+            assert_ne!(
+                effort.effort,
+                EffortSetting::NativeDefault,
+                "{:?}: a stated policy is a level, never the runtime's default",
+                decision.role
+            );
+        }
+        // The shape of the policy: reasoning roles high, the implementer at
+        // medium, the simplifier at low.
+        assert_eq!(recommended_effort(Role::Architect), EffortSetting::HIGH);
+        assert_eq!(recommended_effort(Role::Researcher), EffortSetting::HIGH);
+        assert_eq!(
+            recommended_effort(Role::CodeQualityReviewer),
+            EffortSetting::HIGH
+        );
+        assert_eq!(recommended_effort(Role::SpecReviewer), EffortSetting::HIGH);
+        assert_eq!(
+            recommended_effort(Role::EngineeringLead),
+            EffortSetting::HIGH
+        );
+        assert_eq!(recommended_effort(Role::Implementer), EffortSetting::MEDIUM);
+        assert_eq!(recommended_effort(Role::Simplifier), EffortSetting::LOW);
+        assert_eq!(
+            recommended_effort(Role::Verifier),
+            EffortSetting::NativeDefault,
+            "no dial, no row"
+        );
+        // No monetary/token-cost claims in any rationale, route or effort.
+        for rationale in v3
+            .decisions
+            .iter()
+            .map(|decision| decision.rationale)
+            .chain(v3.efforts.iter().map(|effort| effort.rationale))
+        {
+            for term in ["cost", "cheap", "token", "price", "usd", "%"] {
+                assert!(
+                    !rationale.contains(term),
+                    "{rationale} encodes a cost claim"
+                );
+            }
+        }
+    }
+
+    /// The default run now carries the profile's own effort per role, and
+    /// carries it sealed: the same snapshot decodes the same plan whatever
+    /// the current profile later says.
+    #[test]
+    fn profile_default_under_recommended_seals_the_v3_effort_column() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let snapshot = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortRequest::ProfileDefault,
+            &workflow,
+            RecommendedAvailability {
+                claude: true,
+                codex: true,
+            },
+            ConfigSnapshotId::new("profile-default").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.schema_version(), 3);
+        let plan = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(plan.effort(Role::Architect), Some(EffortSetting::HIGH));
+        assert_eq!(plan.effort(Role::Implementer), Some(EffortSetting::MEDIUM));
+        assert_eq!(plan.effort(Role::Simplifier), Some(EffortSetting::LOW));
+        assert_eq!(
+            plan.effort(Role::CodeQualityReviewer),
+            Some(EffortSetting::HIGH)
+        );
+        assert_eq!(plan.effort(Role::SpecReviewer), Some(EffortSetting::HIGH));
+        assert_eq!(
+            plan.effort(Role::EngineeringLead),
+            Some(EffortSetting::HIGH)
+        );
+        assert_eq!(
+            plan.effort(Role::Verifier),
+            Some(EffortSetting::NativeDefault)
+        );
+        // The routes are untouched by the effort column.
+        let routing = RoutingPlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(
+            routing
+                .route(Role::Implementer)
+                .unwrap()
+                .target()
+                .provider_id()
+                .as_str(),
+            "codex"
+        );
+    }
+
+    /// A uniform provider has no profile policy: omitting effort keeps every
+    /// native invocation byte-identical to what it was, under schema v2.
+    #[test]
+    fn profile_default_under_a_uniform_provider_stays_native_and_schema_v2() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        for provider in [
+            UniformProvider::Claude,
+            UniformProvider::Codex,
+            UniformProvider::Fake,
+        ] {
+            let snapshot = resolve_config(
+                ExecutionSelection::Uniform(provider),
+                EffortRequest::ProfileDefault,
+                &workflow,
+                RecommendedAvailability::default(),
+                ConfigSnapshotId::new("uniform-default").unwrap(),
+                std::time::SystemTime::now().into(),
+            )
+            .unwrap();
+            assert_eq!(snapshot.schema_version(), 2, "{provider:?}");
+            assert!(snapshot.payload().get("resource_plan").is_none());
+            let plan = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+            for (_, effort) in plan.efforts() {
+                assert_eq!(effort, EffortSetting::NativeDefault, "{provider:?}");
+            }
+        }
+    }
+
+    /// Naming some roles leaves the rest to the profile; naming a role the
+    /// workflow cannot route is refused before anything is sealed.
+    #[test]
+    fn per_role_effort_fills_unnamed_roles_from_the_profile_and_rejects_alien_roles() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let available = RecommendedAvailability {
+            claude: true,
+            codex: true,
+        };
+        let snapshot = resolve_config(
+            ExecutionSelection::Recommended,
+            EffortRequest::PerRole(HashMap::from([
+                (Role::Architect, EffortSetting::XHIGH),
+                (Role::Implementer, EffortSetting::LOW),
+            ])),
+            &workflow,
+            available,
+            ConfigSnapshotId::new("per-role").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        let plan = ResourcePlan::from_snapshot(&snapshot, &workflow).unwrap();
+        assert_eq!(plan.effort(Role::Architect), Some(EffortSetting::XHIGH));
+        assert_eq!(plan.effort(Role::Implementer), Some(EffortSetting::LOW));
+        assert_eq!(
+            plan.effort(Role::Simplifier),
+            Some(EffortSetting::LOW),
+            "unnamed roles keep the profile's level"
+        );
+        assert_eq!(plan.effort(Role::SpecReviewer), Some(EffortSetting::HIGH));
+
+        // Under a uniform provider the unnamed roles have no profile to fall
+        // back on and stay native.
+        let uniform = resolve_config(
+            ExecutionSelection::Uniform(UniformProvider::Codex),
+            EffortRequest::PerRole(HashMap::from([(Role::Implementer, EffortSetting::HIGH)])),
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("per-role-uniform").unwrap(),
+            std::time::SystemTime::now().into(),
+        )
+        .unwrap();
+        assert_eq!(uniform.schema_version(), 3);
+        let plan = ResourcePlan::from_snapshot(&uniform, &workflow).unwrap();
+        assert_eq!(plan.effort(Role::Implementer), Some(EffortSetting::HIGH));
+        assert_eq!(
+            plan.effort(Role::Architect),
+            Some(EffortSetting::NativeDefault)
+        );
+
+        // Fast has no architect and the verifier is never in a plan.
+        let fast = WorkflowDefinition::built_in(WorkflowKind::Fast);
+        for (role, name) in [(Role::Architect, "architect"), (Role::Verifier, "verifier")] {
+            let refused = resolve_config(
+                ExecutionSelection::Recommended,
+                EffortRequest::PerRole(HashMap::from([(role, EffortSetting::HIGH)])),
+                &fast,
+                available,
+                ConfigSnapshotId::new(format!("alien-{name}")).unwrap(),
+                std::time::SystemTime::now().into(),
+            );
+            assert!(
+                matches!(refused, Err(RoutingError::EffortRoleUnroutable(refused)) if refused == role),
+                "{name}: {refused:?}"
+            );
+        }
     }
 
     #[test]
@@ -1816,8 +2304,11 @@ mod tests {
         );
     }
 
+    /// `--effort native` is the opt-out from the profile's policy: every
+    /// role native, and the payload exactly what it was before effort policy
+    /// existed.
     #[test]
-    fn omitted_effort_keeps_schema_v2_payload_identical_to_pre_effort_encoding() {
+    fn native_effort_keeps_schema_v2_payload_identical_to_pre_effort_encoding() {
         let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
         let snapshot = resolve_config(
             ExecutionSelection::Recommended,
@@ -1833,7 +2324,7 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.schema_version(), 2);
         assert!(snapshot.payload().get("resource_plan").is_none());
-        // Bare recommended remains recommended_v2; no recommended_v3 semantics.
+        // Opting out of the effort column does not change the profile.
         assert_eq!(
             snapshot.payload().get("profile_version").unwrap(),
             RECOMMENDED_PROFILE_VERSION
@@ -2091,6 +2582,7 @@ mod tests {
         let snapshot = resolve_eval_config(
             Role::SpecReviewer,
             &target,
+            EffortSetting::NativeDefault,
             &workflow,
             ConfigSnapshotId::new("eval-routing").unwrap(),
             std::time::SystemTime::now().into(),
@@ -2113,6 +2605,7 @@ mod tests {
                     && route.reason() == "eval_support")
         }));
         assert_eq!(RECOMMENDED_PROFILE_VERSION_V1, "recommended_v1");
-        assert_eq!(RECOMMENDED_PROFILE_VERSION, "recommended_v2");
+        assert_eq!(RECOMMENDED_PROFILE_VERSION_V2, "recommended_v2");
+        assert_eq!(RECOMMENDED_PROFILE_VERSION, "recommended_v3");
     }
 }

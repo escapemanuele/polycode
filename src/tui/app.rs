@@ -396,7 +396,7 @@ impl TuiApp {
             task,
             repository: PathBuf::from(repository),
             selection: self.state.new_run.execution.selection(),
-            effort: self.state.new_run.effort.setting(),
+            effort: self.state.new_run.effort.into(),
         }) {
             // The task belongs to the run that was just dispatched; leaving it
             // in the composer makes the next run open on another run's words.
@@ -2075,7 +2075,7 @@ mod tests {
             task: "a second piece of work".to_owned(),
             repository: std::path::PathBuf::from("/repo"),
             selection: crate::app::ExecutionSelection::Uniform(crate::app::UniformProvider::Fake),
-            effort: EffortSetting::NativeDefault,
+            effort: crate::app::EffortRequest::ProfileDefault,
         }
     }
 
@@ -2105,7 +2105,7 @@ mod tests {
     /// not fall through to the text editor that ignores it.
     #[test]
     fn arrow_keys_cycle_the_composer_effort_field() {
-        use crate::tui::state::EffortChoice;
+        use crate::tui::state::EFFORT_CHOICES;
         let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
         app.state.screen = Screen::NewRun;
         app.state.new_run.focus = 4;
@@ -2115,9 +2115,9 @@ mod tests {
         assert_ne!(next, start, "Right must move Effort to another choice");
         assert_eq!(
             next,
-            EffortChoice::ALL[(EffortChoice::ALL.iter().position(|c| *c == start).unwrap() + 1)
-                % EffortChoice::ALL.len()],
-            "Right steps forward through EffortChoice::ALL"
+            EFFORT_CHOICES[(EFFORT_CHOICES.iter().position(|c| *c == start).unwrap() + 1)
+                % EFFORT_CHOICES.len()],
+            "Right steps forward through EFFORT_CHOICES"
         );
         app.handle_intent(Intent::Left);
         assert_eq!(

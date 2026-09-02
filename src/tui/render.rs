@@ -1632,7 +1632,11 @@ fn render_new_run(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ("WORKFLOW", workflow.as_str(), form.focus == 1),
         ("REPOSITORY", repository.as_str(), form.focus == 2),
         ("EXECUTION", form.execution.label(), form.focus == 3),
-        ("EFFORT", form.effort.label(), form.focus == 4),
+        (
+            "EFFORT",
+            super::state::effort_label(form.effort),
+            form.focus == 4,
+        ),
     ] {
         lines.push(Line::from(""));
         lines.push(theme::section(label));

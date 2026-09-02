@@ -265,35 +265,21 @@ impl ExecutionChoice {
     }
 }
 
-/// Requested native-runtime effort choice for the new-run composer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EffortChoice {
-    NativeDefault,
-    Low,
-    Medium,
-    High,
-}
+/// The composer's Effort choices, in cycling order. `None` is the routing
+/// profile's own per-role policy; `Some` overrides every role with one
+/// level, `NativeDefault` being the opt-out.
+pub(crate) const EFFORT_CHOICES: [Option<EffortSetting>; 6] = [
+    None,
+    Some(EffortSetting::NativeDefault),
+    Some(EffortSetting::LOW),
+    Some(EffortSetting::MEDIUM),
+    Some(EffortSetting::HIGH),
+    Some(EffortSetting::XHIGH),
+];
 
-impl EffortChoice {
-    pub(crate) const ALL: [Self; 4] = [Self::NativeDefault, Self::Low, Self::Medium, Self::High];
-
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::NativeDefault => "Native default",
-            Self::Low => "Low",
-            Self::Medium => "Medium",
-            Self::High => "High",
-        }
-    }
-
-    pub(crate) const fn setting(self) -> EffortSetting {
-        match self {
-            Self::NativeDefault => EffortSetting::NativeDefault,
-            Self::Low => EffortSetting::LOW,
-            Self::Medium => EffortSetting::MEDIUM,
-            Self::High => EffortSetting::HIGH,
-        }
-    }
+/// Composer label for one Effort choice, in the same words `status` uses.
+pub(crate) fn effort_label(choice: Option<EffortSetting>) -> &'static str {
+    choice.map_or("profile default", EffortSetting::label)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,7 +288,7 @@ pub(crate) struct NewRunForm {
     pub repository: TextField,
     pub workflow: WorkflowKind,
     pub execution: ExecutionChoice,
-    pub effort: EffortChoice,
+    pub effort: Option<EffortSetting>,
     pub focus: usize,
 }
 
@@ -313,7 +299,7 @@ impl NewRunForm {
             repository: TextField::new(repository.display().to_string()),
             workflow: WorkflowKind::Standard,
             execution: ExecutionChoice::Recommended,
-            effort: EffortChoice::NativeDefault,
+            effort: None,
             focus: 0,
         }
     }
@@ -351,11 +337,11 @@ impl NewRunForm {
                     ExecutionChoice::ALL[cycle(index, ExecutionChoice::ALL.len(), forward)];
             }
             4 => {
-                let index = EffortChoice::ALL
+                let index = EFFORT_CHOICES
                     .iter()
                     .position(|choice| *choice == self.effort)
                     .unwrap_or(0);
-                self.effort = EffortChoice::ALL[cycle(index, EffortChoice::ALL.len(), forward)];
+                self.effort = EFFORT_CHOICES[cycle(index, EFFORT_CHOICES.len(), forward)];
             }
             _ => {}
         }
