@@ -12,7 +12,7 @@ use super::bottom_line;
 use super::input::{Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
-use super::state::{Overlay, Screen, StageHeadline, TuiState, UiMessageKind};
+use super::state::{Overlay, RetryRouteChoice, Screen, StageHeadline, TuiState, UiMessageKind};
 use super::terminal::TerminalSession;
 use super::worker::{Worker, WorkerCommand, WorkerResult, WorkerSuccess};
 
@@ -214,6 +214,7 @@ impl TuiApp {
             Overlay::Attention => self.handle_attention_intent(intent),
             Overlay::Continue => self.handle_continue_intent(intent),
             Overlay::FollowUps => self.handle_follow_ups_intent(intent),
+            Overlay::RetryRoute => self.handle_retry_route_intent(intent),
             Overlay::ApplyConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
                     self.dispatch(WorkerCommand::ApplyRun { run_id });
@@ -456,10 +457,15 @@ impl TuiApp {
         self.dispatch(WorkerCommand::StopRun { run_id });
     }
 
+    /// Opens the `[t]` chooser for the selected failed stage. Retrying is
+    /// two keys rather than one because the question "where?" is the one
+    /// worth asking when a provider just ran out of quota: the stage's
+    /// configured provider is the first row, so Enter alone keeps today's
+    /// behaviour.
     fn retry(&mut self) {
-        let Some(run_id) = self.state.selected_run else {
+        if self.state.selected_run.is_none() {
             return;
-        };
+        }
         let Some(details) = self.state.details.as_ref() else {
             return;
         };
@@ -470,10 +476,42 @@ impl TuiApp {
             self.state.set_error("Selected stage is not failed");
             return;
         }
-        self.dispatch(WorkerCommand::RetryStage {
-            run_id,
-            stage_id: stage.id.clone(),
-        });
+        self.state.retry_route_choice = RetryRouteChoice::Configured;
+        self.state.overlay = Some(Overlay::RetryRoute);
+    }
+
+    fn handle_retry_route_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::Down => {
+                self.state.retry_route_choice = self.state.retry_route_choice.next();
+            }
+            Intent::Up => {
+                self.state.retry_route_choice = self.state.retry_route_choice.previous();
+            }
+            Intent::Enter => {
+                let Some(run_id) = self.state.selected_run else {
+                    self.state.overlay = None;
+                    return;
+                };
+                let Some(stage_id) = self
+                    .state
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.stages.get(self.state.selected_stage_index))
+                    .map(|stage| stage.id.clone())
+                else {
+                    self.state.overlay = None;
+                    return;
+                };
+                self.dispatch(WorkerCommand::RetryStage {
+                    run_id,
+                    stage_id,
+                    route: self.state.retry_route_choice.route(),
+                });
+                self.state.overlay = None;
+            }
+            _ => {}
+        }
     }
 
     /// Sends a completed run back for one remediation cycle.
@@ -1288,6 +1326,7 @@ mod tests {
                 requested_effort: EffortSetting::NativeDefault,
                 observed_effort: None,
                 configured_model: None,
+                route_overridden: false,
                 actual_provider: None,
                 actual_model: None,
                 provider_session_record: None,
@@ -2473,5 +2512,55 @@ mod tests {
             1,
             "an orphan is resumed exactly once"
         );
+    }
+
+    /// `t` asks where the failed stage goes before retrying it. The first
+    /// row is the configured provider, so Enter alone is the plain retry;
+    /// the other rows record an override for this stage only.
+    #[test]
+    fn retry_opens_the_route_chooser_and_dispatches_the_chosen_provider() {
+        let mut failed = details(RunStatus::Failed, WorkflowKind::Fast);
+        failed.stages[0].status = StageStatus::Failed;
+        let (mut app, _fixture) = app_with(failed);
+
+        app.handle_intent(Intent::Retry);
+        assert_eq!(app.state.overlay, Some(Overlay::RetryRoute));
+        assert_eq!(app.state.retry_route_choice, RetryRouteChoice::Configured);
+        assert!(
+            app.state.in_flight.is_empty(),
+            "choosing dispatches nothing"
+        );
+
+        app.handle_intent(Intent::Down);
+        assert_eq!(app.state.retry_route_choice, RetryRouteChoice::Claude);
+        assert_eq!(
+            app.state.retry_route_choice.route(),
+            Some(crate::app::RetryRoute::new(
+                crate::app::UniformProvider::Claude,
+                None
+            ))
+        );
+        app.handle_intent(Intent::Up);
+        assert_eq!(app.state.retry_route_choice, RetryRouteChoice::Configured);
+        assert_eq!(app.state.retry_route_choice.route(), None);
+        app.handle_intent(Intent::Up);
+        assert_eq!(app.state.retry_route_choice, RetryRouteChoice::Codex);
+
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        assert!(
+            app.state
+                .in_flight
+                .iter()
+                .any(|action| action.action == super::super::worker::ActionKind::Retry),
+            "Enter dispatches the retry"
+        );
+
+        // A stage that is not failed has nothing to retry, so no chooser.
+        let mut running = details(RunStatus::Running, WorkflowKind::Fast);
+        running.stages[0].status = StageStatus::Running;
+        let (mut app, _fixture) = app_with(running);
+        app.handle_intent(Intent::Retry);
+        assert_eq!(app.state.overlay, None);
     }
 }

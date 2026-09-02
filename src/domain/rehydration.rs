@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 
 use super::{
-    AttentionRequest, ConfigSnapshotId, RunId, RunStatus, StageDefinition, StageId, StageStatus,
-    WorkflowKind,
+    AttentionRequest, ConfigSnapshotId, RunId, RunStatus, StageDefinition, StageId,
+    StageRouteOverride, StageStatus, WorkflowKind,
 };
 
 /// Lifecycle state restored after a run-level pause or interruption.
@@ -33,6 +33,7 @@ pub struct StageRehydrationData {
     pub status: StageStatus,
     pub suspension_owner: Option<StageSuspensionOwner>,
     pub resume_to: Option<StageResumeStatus>,
+    pub route_override: Option<StageRouteOverride>,
 }
 
 /// Persistence-neutral reconstruction state for one run aggregate.

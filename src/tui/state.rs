@@ -6,8 +6,8 @@ use super::mascot::{self, MascotState};
 use super::motion::{self, MotionFrame};
 use super::worker::{ActionKind, WorkerCommand};
 use crate::app::{
-    ArtifactSummary, ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RunDetails,
-    RunDiffPreview, RunListItem, StageExecutionEvidence, UniformProvider,
+    ArtifactSummary, ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RetryRoute,
+    RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, UniformProvider,
 };
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
 
@@ -41,6 +41,49 @@ pub(crate) enum Overlay {
     /// "In this run" or "as a new run" chooser for `[w]`, once a Follow-ups
     /// section has actually been extracted from the decision artifact.
     FollowUps,
+    /// Where to send the selected failed stage for `[t]`: the provider it was
+    /// configured with, or one of the others. Retry is never automatic about
+    /// this; the operator picks, then confirms.
+    RetryRoute,
+}
+
+/// One row of the `[t]` chooser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetryRouteChoice {
+    /// Retry where the stage was configured to run, no override recorded.
+    Configured,
+    Claude,
+    Codex,
+}
+
+impl RetryRouteChoice {
+    pub(crate) const ALL: [Self; 3] = [Self::Configured, Self::Claude, Self::Codex];
+
+    /// The override to record, if this choice is one; `Configured` records
+    /// nothing so a plain retry stays a plain retry.
+    pub(crate) fn route(self) -> Option<RetryRoute> {
+        match self {
+            Self::Configured => None,
+            Self::Claude => Some(RetryRoute::new(UniformProvider::Claude, None)),
+            Self::Codex => Some(RetryRoute::new(UniformProvider::Codex, None)),
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub(crate) fn previous(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|choice| *choice == self)
+            .unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 /// How many agents this interface will have working at one time.
@@ -471,6 +514,8 @@ pub(crate) struct TuiState {
     /// run", `true` for "as a new run". Mirrors the update prompt's own
     /// two-option toggle.
     pub follow_ups_as_new_run: bool,
+    /// Which row the `[t]` chooser has highlighted.
+    pub retry_route_choice: RetryRouteChoice,
     pub new_run: NewRunForm,
     /// Every dispatched action still waiting on its outcome. A list rather
     /// than a single slot: this interface can be working on several runs at
@@ -541,6 +586,7 @@ impl TuiState {
             continue_instruction: TextField::default(),
             follow_ups_text: None,
             follow_ups_as_new_run: false,
+            retry_route_choice: RetryRouteChoice::Configured,
             new_run: NewRunForm::new(repository),
             in_flight: Vec::new(),
             message: None,

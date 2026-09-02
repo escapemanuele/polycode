@@ -113,6 +113,16 @@ pub enum DomainEventKind {
     StageSkipped,
     StageFailed,
     StageRetryScheduled,
+    /// An operator sent one failed stage to a different provider (and
+    /// optionally model) than its role was configured with, ahead of retrying
+    /// it. The configuration snapshot is untouched; this records the
+    /// exception and why it was made.
+    StageRouteOverridden {
+        provider_id: ProviderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_id: Option<ModelId>,
+        reason: String,
+    },
     NeedsUser {
         attention_request_id: AttentionRequestId,
         kind: AttentionKind,

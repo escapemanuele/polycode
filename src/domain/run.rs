@@ -7,9 +7,9 @@ use thiserror::Error;
 use super::{
     AttentionError, AttentionRequest, AttentionRequestId, AttentionStatus, ConfigSnapshotId,
     DependencyKind, DomainEvent, DomainEventKind, EventMetadata, RunId, RunRehydrationData,
-    RunResumeStatus, Stage, StageId, StageKind, StageRehydrationError, StageStatus,
-    StageTransition, StageTransitionError, WorkflowDefinition, WorkflowDefinitionError,
-    WorkflowKind,
+    RunResumeStatus, Stage, StageId, StageKind, StageRehydrationError, StageRouteOverride,
+    StageStatus, StageTransition, StageTransitionError, WorkflowDefinition,
+    WorkflowDefinitionError, WorkflowKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -473,6 +473,51 @@ impl Run {
             StageTransition::Fail => DomainEventKind::StageFailed,
             StageTransition::Retry => DomainEventKind::StageRetryScheduled,
         };
+        Ok(DomainEvent::new(
+            metadata,
+            self.id,
+            Some(stage_id.clone()),
+            kind,
+        ))
+    }
+
+    /// Sends one failed stage to a different provider before it is retried.
+    ///
+    /// The route the role was given at creation stays in the immutable
+    /// snapshot; the exception lives on the stage and is recorded as its own
+    /// event with the operator's reason. It is only ever an operator's act:
+    /// Polycode never reroutes on its own, so a provider that went away is a
+    /// clear failure until someone decides where the work goes next.
+    ///
+    /// The same guard as retry applies: a stage whose dependents already
+    /// advanced cannot be sent anywhere, because retrying it there would
+    /// invalidate them.
+    ///
+    /// # Errors
+    /// Rejects runs that are not failed or active, unknown stages, stages
+    /// that are not failed, and stages whose dependents have advanced.
+    pub fn override_stage_route(
+        &mut self,
+        stage_id: &StageId,
+        route: StageRouteOverride,
+        reason: impl Into<String>,
+        metadata: EventMetadata,
+    ) -> Result<DomainEvent, RunStageError> {
+        if !matches!(
+            self.status,
+            RunStatus::Running | RunStatus::NeedsUser | RunStatus::Failed
+        ) {
+            return Err(RunStageError::RunNotActive(self.status));
+        }
+        let index = self.stage_index(stage_id)?;
+        self.ensure_retry_safe(stage_id)?;
+        let kind = DomainEventKind::StageRouteOverridden {
+            provider_id: route.provider_id().clone(),
+            model_id: route.model_id().cloned(),
+            reason: reason.into(),
+        };
+        self.stages[index].override_route(route)?;
+        self.updated_at = metadata.occurred_at();
         Ok(DomainEvent::new(
             metadata,
             self.id,
@@ -1385,6 +1430,7 @@ mod tests {
         AttentionKind, AttentionRequestId, Dependency, EventId, Role, StageDefinition, StageKind,
         WorkflowDefinitionError,
     };
+    use crate::domain::{ModelId, ProviderId};
 
     fn at(second: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 14, 8, 0, second)
@@ -2633,5 +2679,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A route override is the operator's answer to "where does this failed
+    /// stage go now?", so it is only ever recorded on a failed stage, and it
+    /// is part of the stage's state: a snapshot round trip keeps it.
+    #[test]
+    fn route_override_only_on_a_failed_stage_and_survives_rehydration() {
+        let mut run = new_run(fast_workflow());
+        start_run(&mut run);
+        let implementation = id("implementation");
+        let route = StageRouteOverride::new(
+            ProviderId::new("claude").unwrap(),
+            Some(ModelId::new("opus").unwrap()),
+        );
+        run.transition_stage(&implementation, StageTransition::MarkReady, metadata(1, 1))
+            .unwrap();
+        run.transition_stage(&implementation, StageTransition::Start, metadata(2, 2))
+            .unwrap();
+        assert!(matches!(
+            run.override_stage_route(&implementation, route.clone(), "why", metadata(3, 3)),
+            Err(RunStageError::Stage(
+                StageTransitionError::RouteOverrideNotAllowed {
+                    from: StageStatus::Running
+                }
+            ))
+        ));
+        assert!(
+            run.stage(&implementation)
+                .unwrap()
+                .route_override()
+                .is_none()
+        );
+
+        run.transition_stage(&implementation, StageTransition::Fail, metadata(4, 4))
+            .unwrap();
+        let event = run
+            .override_stage_route(
+                &implementation,
+                route.clone(),
+                "operator_override",
+                metadata(5, 5),
+            )
+            .unwrap();
+        assert_eq!(event.stage_id(), Some(&implementation));
+        assert_eq!(
+            event.kind(),
+            &DomainEventKind::StageRouteOverridden {
+                provider_id: ProviderId::new("claude").unwrap(),
+                model_id: Some(ModelId::new("opus").unwrap()),
+                reason: "operator_override".to_owned(),
+            }
+        );
+        assert_eq!(
+            run.stage(&implementation).unwrap().route_override(),
+            Some(&route)
+        );
+
+        let rehydrated = Run::rehydrate(run.rehydration_data()).unwrap();
+        assert_eq!(rehydrated, run);
+        assert_eq!(
+            rehydrated.stage(&implementation).unwrap().route_override(),
+            Some(&route)
+        );
+        // Retrying keeps the override: the stage is pending again, but
+        // where it runs has already been decided.
+        run.transition_stage(&implementation, StageTransition::Retry, metadata(6, 6))
+            .unwrap();
+        assert_eq!(
+            run.stage(&implementation).unwrap().route_override(),
+            Some(&route)
+        );
     }
 }

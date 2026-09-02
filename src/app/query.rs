@@ -48,6 +48,9 @@ pub struct StageSummary {
     /// recorded nothing; it never means "the same as requested".
     pub observed_effort: Option<String>,
     pub configured_model: Option<String>,
+    /// `configured_provider`/`configured_model` come from an operator's
+    /// retry-time override rather than the role's snapshot route.
+    pub route_overridden: bool,
     pub actual_provider: Option<String>,
     pub actual_model: Option<String>,
     pub provider_session_record: Option<String>,
@@ -368,6 +371,8 @@ pub struct StageExecutionEvidence {
     pub stage_id: StageId,
     pub configured_provider: String,
     pub configured_model: Option<String>,
+    /// See [`StageSummary::route_overridden`].
+    pub route_overridden: bool,
     pub actual_provider: Option<String>,
     pub confirmed_model: Option<String>,
     /// The runtime's own reasoning-effort value for this stage, verbatim.
@@ -456,6 +461,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
     for stage in loaded.run.stages() {
         let (started_at, finished_at) = stage_span(&events, stage.id());
         let route = plan.as_ref().and_then(|plan| plan.route(stage.role()));
+        let configured = configured_target(stage, route);
         let session = sessions
             .iter()
             .filter(|session| session.stage_id() == stage.id())
@@ -508,17 +514,15 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
             kind: stage.kind(),
             role: stage.role(),
             status: stage.status(),
-            configured_provider: route.map_or_else(
-                || "unavailable".to_owned(),
-                |route| route.target().provider_id().to_string(),
-            ),
+            configured_provider: configured
+                .provider
+                .unwrap_or_else(|| "unavailable".to_owned()),
             requested_effort: resource_plan
                 .as_ref()
                 .and_then(|plan| plan.effort(stage.role()))
                 .unwrap_or_default(),
-            configured_model: route
-                .and_then(|route| route.target().model_id())
-                .map(ToString::to_string),
+            configured_model: configured.model,
+            route_overridden: configured.overridden,
             actual_provider: session
                 .map(|session| session.provider_id().to_string())
                 .or_else(|| started.as_ref().map(|(provider, _)| provider.clone())),
@@ -1013,6 +1017,7 @@ pub(crate) fn stage_execution_evidence(
     let route = plan
         .route(stage.role())
         .ok_or(super::RoutingError::MissingRoleRoute(stage.role()))?;
+    let configured = configured_target(stage, Some(route));
     let events = store.load_events(run_id)?;
     let mut observed_model: Option<String> = None;
     let mut native_effort: Option<String> = None;
@@ -1081,8 +1086,11 @@ pub(crate) fn stage_execution_evidence(
         .max_by_key(crate::providers::ProviderSessionRecord::attempt);
     Ok(StageExecutionEvidence {
         stage_id: stage_id.clone(),
-        configured_provider: route.target().provider_id().to_string(),
-        configured_model: route.target().model_id().map(ToString::to_string),
+        configured_provider: configured
+            .provider
+            .expect("a resolved role route always names a provider"),
+        configured_model: configured.model,
+        route_overridden: configured.overridden,
         actual_provider: session
             .as_ref()
             .map(|session| session.provider_id().to_string())
@@ -1256,6 +1264,35 @@ fn run_usage(events: &[SequencedEvent]) -> RunUsage {
         }
         usage
     })
+}
+
+/// What the stage is configured to run on: the operator's override when one
+/// was recorded, else the role's snapshot route. The override replaces the
+/// whole target, model included.
+struct ConfiguredTarget {
+    provider: Option<String>,
+    model: Option<String>,
+    overridden: bool,
+}
+
+fn configured_target(
+    stage: &crate::domain::Stage,
+    route: Option<&super::RoleRoute>,
+) -> ConfiguredTarget {
+    stage.route_override().map_or_else(
+        || ConfiguredTarget {
+            provider: route.map(|route| route.target().provider_id().to_string()),
+            model: route
+                .and_then(|route| route.target().model_id())
+                .map(ToString::to_string),
+            overridden: false,
+        },
+        |route| ConfiguredTarget {
+            provider: Some(route.provider_id().to_string()),
+            model: route.model_id().map(ToString::to_string),
+            overridden: true,
+        },
+    )
 }
 
 #[cfg(test)]

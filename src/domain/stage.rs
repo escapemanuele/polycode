@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    Dependency, Role, RunId, StageDefinition, StageId, StageKind, StageRehydrationData,
-    StageResumeStatus, StageSuspensionOwner,
+    Dependency, ModelId, ProviderId, Role, RunId, StageDefinition, StageId, StageKind,
+    StageRehydrationData, StageResumeStatus, StageSuspensionOwner,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -86,6 +86,40 @@ struct Suspension {
     resume_to: ResumableStageStatus,
 }
 
+/// An operator's explicit destination for one stage, replacing the route its
+/// role was given at creation.
+///
+/// The configuration snapshot stays immutable: this is stage state, recorded
+/// when a failed stage is retried somewhere else, and it outlives that retry
+/// so a second retry of the same stage does not silently fall back to the
+/// route that failed. It never spreads to other stages.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StageRouteOverride {
+    provider_id: ProviderId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_id: Option<ModelId>,
+}
+
+impl StageRouteOverride {
+    #[must_use]
+    pub const fn new(provider_id: ProviderId, model_id: Option<ModelId>) -> Self {
+        Self {
+            provider_id,
+            model_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    #[must_use]
+    pub const fn model_id(&self) -> Option<&ModelId> {
+        self.model_id.as_ref()
+    }
+}
+
 /// One run-bound stage with encapsulated lifecycle state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Stage {
@@ -96,6 +130,7 @@ pub struct Stage {
     dependencies: Vec<Dependency>,
     status: StageStatus,
     suspension: Option<Suspension>,
+    route_override: Option<StageRouteOverride>,
 }
 
 impl Stage {
@@ -108,6 +143,7 @@ impl Stage {
             dependencies: definition.dependencies().to_vec(),
             status: StageStatus::Pending,
             suspension: None,
+            route_override: None,
         }
     }
 
@@ -143,6 +179,7 @@ impl Stage {
             dependencies: definition.dependencies().to_vec(),
             status: data.status,
             suspension,
+            route_override: data.route_override.clone(),
         })
     }
 
@@ -164,6 +201,7 @@ impl Stage {
             status: self.status,
             suspension_owner,
             resume_to,
+            route_override: self.route_override.clone(),
         }
     }
 
@@ -201,6 +239,29 @@ impl Stage {
     #[must_use]
     pub const fn status(&self) -> StageStatus {
         self.status
+    }
+
+    /// The operator's explicit destination for this stage, when one was
+    /// recorded; `None` means the role's configured route applies.
+    #[must_use]
+    pub const fn route_override(&self) -> Option<&StageRouteOverride> {
+        self.route_override.as_ref()
+    }
+
+    /// Records where this stage runs from now on. Only a failed stage can be
+    /// sent somewhere else: a running one has a provider session that would
+    /// be orphaned, and a finished one has nothing left to run.
+    pub(crate) fn override_route(
+        &mut self,
+        route: StageRouteOverride,
+    ) -> Result<(), StageTransitionError> {
+        match self.status {
+            StageStatus::Failed => {
+                self.route_override = Some(route);
+                Ok(())
+            }
+            from => Err(StageTransitionError::RouteOverrideNotAllowed { from }),
+        }
     }
 
     pub(crate) fn transition(
@@ -358,6 +419,8 @@ pub enum StageTransitionError {
     },
     #[error("stage cannot request attention from {from:?}")]
     AttentionNotAllowed { from: StageStatus },
+    #[error("only a failed stage can be sent to another provider; this one is {from:?}")]
+    RouteOverrideNotAllowed { from: StageStatus },
     #[error("stage cannot suspend from {from:?}")]
     InvalidSuspensionSource { from: StageStatus },
     #[error("stage suspension context is missing")]

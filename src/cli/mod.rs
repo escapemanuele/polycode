@@ -60,7 +60,18 @@ pub enum Command {
     /// Stop execution, keeping the run, workspace, and results resumable.
     Stop { run_id: RunId },
     /// Retry one failed stage explicitly.
-    Retry { run_id: RunId, stage_id: StageId },
+    Retry {
+        run_id: RunId,
+        stage_id: StageId,
+        /// Send this stage to another provider (claude|codex|fake) instead of
+        /// the one its role was configured with. Only this stage moves.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model for the provider named by --provider; omit for its native
+        /// default.
+        #[arg(long, requires = "provider")]
+        model: Option<String>,
+    },
     /// Resolve one pending attention request and continue.
     Resolve {
         run_id: RunId,

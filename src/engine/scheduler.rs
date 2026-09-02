@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use crate::domain::{
     AttentionRequest, AttentionRequestId, AttentionStatus, DomainEvent, DomainEventKind, EventId,
     EventMetadata, ProviderId, ProviderSessionId, Role, Run, RunId, RunStageError, RunStatus,
-    RunTransition, RunTransitionError, StageId, StageStatus, StageTransition,
+    RunTransition, RunTransitionError, StageId, StageRouteOverride, StageStatus, StageTransition,
 };
 use crate::store::{LoadedRun, RunRevision, SequencedEvent, SqliteStore};
 use crate::workspace::{ApplyStatus, RunWorkspace, WorkspaceStatus};
@@ -209,7 +209,8 @@ where
             stage.kind(),
             stage.role(),
             request_id,
-        );
+        )
+        .with_route_override(stage.route_override().cloned());
         self.provider
             .can_auto_resolve_attention(store, &context)
             .map_err(EngineError::from)
@@ -245,7 +246,8 @@ where
             stage.kind(),
             stage.role(),
             request_id,
-        );
+        )
+        .with_route_override(stage.route_override().cloned());
         self.provider
             .stage_attention_response(store, &context, response)?;
         let metadata = self.metadata_for(&loaded.run);
@@ -314,15 +316,30 @@ where
     /// stage its failure skipped, in one commit: a retried implementation
     /// whose verification stayed skipped would succeed into a run that can
     /// never complete.
+    ///
+    /// With `route`, the stage is first sent to that provider and model; the
+    /// override is committed in the same transaction as the retry, so a
+    /// crash between the two cannot leave a stage rerouted but not retried.
+    /// Only the retried stage moves: the descendants it un-skips keep the
+    /// routes their roles were configured with.
     pub fn retry_stage(
         &mut self,
         store: &mut SqliteStore,
         run_id: RunId,
         stage_id: &StageId,
+        route: Option<(StageRouteOverride, &str)>,
     ) -> Result<EngineStatus, EngineError> {
         let (mut loaded, _) = load_execution_boundary(store, run_id)?;
         let skipped = loaded.run.skipped_descendants(stage_id);
-        let mut events = Vec::with_capacity(skipped.len() + 1);
+        let mut events = Vec::with_capacity(skipped.len() + 2);
+        if let Some((route, reason)) = route {
+            let metadata = self.metadata_for(&loaded.run);
+            events.push(
+                loaded
+                    .run
+                    .override_stage_route(stage_id, route, reason, metadata)?,
+            );
+        }
         for id in std::iter::once(stage_id).chain(skipped.iter()) {
             let metadata = self.metadata_for(&loaded.run);
             events.push(
@@ -592,7 +609,8 @@ where
                 .iter()
                 .map(|dependency| dependency.stage_id().clone())
                 .collect(),
-        );
+        )
+        .with_route_override(stage.route_override().cloned());
         // A stop pass observes; it must never become a reason to resume.
         let request = if self.observe_only {
             request.observing()

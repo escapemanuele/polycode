@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use crate::app::{BlockedDependencyRef, RunDetails, StageDependencyRef, StageSummary};
 use crate::domain::{AttentionKind, DependencyOutcome, RunStatus, StageKind, StageStatus};
 
-use super::state::{Overlay, Screen, TuiState, UiMessageKind};
+use super::state::{Overlay, RetryRouteChoice, Screen, TuiState, UiMessageKind};
 use super::{format, markdown, mascot, theme};
 
 const MIN_WIDTH: u16 = 50;
@@ -946,12 +946,17 @@ fn failure_reason_lines(reason: &str) -> Vec<Line<'static>> {
 /// Configured and actual targets are only both shown when they disagree.
 fn runtime_summary(stage: &StageSummary) -> String {
     let configured = format!(
-        "{} · {}",
+        "{} · {}{}",
         stage.configured_provider,
         stage
             .configured_model
             .as_deref()
-            .unwrap_or("native default")
+            .unwrap_or("native default"),
+        if stage.route_overridden {
+            " (override)"
+        } else {
+            ""
+        }
     );
     let effort = stage.requested_effort.label();
     // Drift is only meaningful when the runtime departed from an explicit
@@ -1856,7 +1861,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -1868,7 +1873,69 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::DiscardConfirm => render_confirmation(frame, popup, state, Confirmation::Discard),
         Overlay::Continue => render_continue(frame, popup, state),
         Overlay::FollowUps => render_follow_ups(frame, popup, state),
+        Overlay::RetryRoute => render_retry_route(frame, popup, state),
     }
+}
+
+fn render_retry_route(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let selected = state
+        .details
+        .as_ref()
+        .and_then(|details| details.stages.get(state.selected_stage_index));
+    let mut lines = vec![
+        Line::from(theme::chip("RETRY", theme::attention())),
+        Line::from(""),
+    ];
+    if let Some(stage) = selected {
+        lines.push(Line::from(vec![
+            Span::styled(stage_title_for(stage.id.as_str()), theme::text()),
+            Span::styled(
+                format!(" · configured {}", stage.configured_provider),
+                theme::muted(),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+    for choice in RetryRouteChoice::ALL {
+        let highlighted = state.retry_route_choice == choice;
+        let label = match choice {
+            RetryRouteChoice::Configured => selected.map_or_else(
+                || "Configured provider".to_owned(),
+                |stage| format!("Configured provider ({})", stage.configured_provider),
+            ),
+            RetryRouteChoice::Claude => "Claude (native default model)".to_owned(),
+            RetryRouteChoice::Codex => "Codex (native default model)".to_owned(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if highlighted { "  → " } else { "    " },
+                Style::default().fg(theme::attention()),
+            ),
+            Span::styled(
+                label,
+                if highlighted {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::muted()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Only this stage moves; the run's routing stays as configured.",
+        theme::muted(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ choose · Enter retry · Esc cancel",
+        theme::muted(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" Retry stage ", theme::attention())),
+        area,
+    );
 }
 
 /// Overlays are the one place a full border earns its keep: they float over
@@ -2507,6 +2574,7 @@ mod tests {
             requested_effort: EffortSetting::NativeDefault,
             observed_effort: None,
             configured_model: None,
+            route_overridden: false,
             actual_provider: Some("codex".to_owned()),
             actual_model: None,
             provider_session_record: Some("session-record".to_owned()),
@@ -4313,5 +4381,31 @@ mod tests {
         assert!(render_text(&state, 120, 30).contains("Enter confirms apply"));
         state.overlay = Some(Overlay::DiscardConfirm);
         assert!(render_text(&state, 120, 30).contains("Enter confirms discard"));
+    }
+
+    #[test]
+    fn retry_route_chooser_lists_the_configured_provider_first() {
+        let mut state = completed_state();
+        state.retry_route_choice = RetryRouteChoice::Claude;
+        state.overlay = Some(Overlay::RetryRoute);
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("Retry stage"), "{text}");
+        assert!(text.contains("Configured provider ("), "{text}");
+        assert!(text.contains("→ Claude (native default model)"), "{text}");
+        assert!(text.contains("Codex (native default model)"), "{text}");
+        assert!(text.contains("Only this stage moves"), "{text}");
+    }
+
+    #[test]
+    fn runtime_summary_marks_an_operator_override() {
+        let mut overridden = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Pending,
+        );
+        overridden.configured_provider = "claude".to_owned();
+        overridden.route_overridden = true;
+        assert!(runtime_summary(&overridden).starts_with("claude · native default (override)"));
     }
 }

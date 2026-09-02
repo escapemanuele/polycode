@@ -2,15 +2,19 @@ use anyhow::Result;
 use clap::CommandFactory;
 
 use crate::app::{
-    ApplyOutcome, BlockedDependencyRef, ExecutionReport, ExecutionSelection, QuiescentState,
-    RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef, StageWaitingSummary,
-    UniformProvider,
+    AppError, ApplyOutcome, BlockedDependencyRef, ExecutionReport, ExecutionSelection,
+    QuiescentState, RetryRoute, RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef,
+    StageWaitingSummary, UniformProvider,
 };
-use crate::domain::{DependencyOutcome, DomainEventKind, StageStatus, WorkflowKind};
+use crate::domain::{DependencyOutcome, DomainEventKind, ModelId, StageStatus, WorkflowKind};
 use crate::process::ProcessBackend;
 
 use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs, UpdateArgs};
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dispatch table, one arm per subcommand"
+)]
 pub fn execute(command: Option<&Command>) -> Result<()> {
     match command {
         Some(Command::RunProcess { manifest }) => {
@@ -50,8 +54,14 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             print_report(&report);
             Ok(())
         }
-        Some(Command::Retry { run_id, stage_id }) => {
-            print_report(&service()?.retry_stage(*run_id, stage_id)?);
+        Some(Command::Retry {
+            run_id,
+            stage_id,
+            provider,
+            model,
+        }) => {
+            let route = retry_route(provider.as_deref(), model.as_deref())?;
+            print_report(&service()?.retry_stage(*run_id, stage_id, route)?);
             Ok(())
         }
         Some(Command::Resolve {
@@ -641,7 +651,7 @@ fn print_details(details: &RunDetails) {
     println!("Stages");
     for stage in &details.stages {
         println!(
-            "{} {} ({}) · role={} · configured={}/{} · effort={} · actual={}/{} · session={} · native={} · conversation={} · process={}",
+            "{} {} ({}) · role={} · configured={}/{}{} · effort={} · actual={}/{} · session={} · native={} · conversation={} · process={}",
             stage_mark(stage.status),
             stage.id,
             enum_text(stage.status),
@@ -651,6 +661,11 @@ fn print_details(details: &RunDetails) {
                 .configured_model
                 .as_deref()
                 .unwrap_or("native default"),
+            if stage.route_overridden {
+                " (operator override)"
+            } else {
+                ""
+            },
             stage.observed_effort.as_ref().map_or_else(
                 || format!("{} requested", stage.requested_effort.label()),
                 |observed| {
@@ -816,6 +831,20 @@ fn enum_text(value: impl serde::Serialize) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// `--provider` alone sends the stage to that provider's native default
+/// model; `--model` without `--provider` is refused by clap before this.
+fn retry_route(provider: Option<&str>, model: Option<&str>) -> Result<Option<RetryRoute>> {
+    provider
+        .map(|provider| {
+            Ok::<_, AppError>(RetryRoute::new(
+                UniformProvider::try_from(provider)?,
+                model.map(ModelId::new).transpose()?,
+            ))
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
 fn event_name(kind: &DomainEventKind) -> &'static str {
     match kind {
         DomainEventKind::RunCreated { .. } => "run created",
@@ -842,6 +871,7 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
         DomainEventKind::StageSkipped => "skipped",
         DomainEventKind::StageFailed => "failed",
         DomainEventKind::StageRetryScheduled => "retry scheduled",
+        DomainEventKind::StageRouteOverridden { .. } => "route overridden",
         DomainEventKind::NeedsUser { .. } => "attention requested",
         DomainEventKind::AttentionResolved { .. } => "attention resolved",
         DomainEventKind::AttentionCancelled { .. } => "attention cancelled",

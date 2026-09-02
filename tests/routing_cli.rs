@@ -345,6 +345,98 @@ fn completed_codex_can_disappear_before_restarted_claude_decision() {
     }));
 }
 
+/// A stage whose provider ran out of quota is retried somewhere else with
+/// one flag, and only that stage moves: the run's own routing table, the
+/// snapshot it came from and every other stage keep the provider they had.
+#[test]
+fn retry_with_provider_sends_only_the_failed_stage_to_the_other_provider() {
+    let fixture = Fixture::new();
+    let failed = fixture.polycode_fail_once(&[
+        "fast",
+        "Reroute the failed stage",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--provider",
+        "codex",
+    ]);
+    assert_success(&failed);
+    let failed = String::from_utf8(failed.stdout).unwrap();
+    assert!(failed.contains("Status     failed"), "{failed}");
+    let run_id = failed
+        .lines()
+        .find_map(|line| line.strip_prefix("Run        "))
+        .unwrap();
+
+    let retried = fixture.polycode(&["retry", run_id, "implementation", "--provider", "claude"]);
+    assert_success(&retried);
+    let retried = String::from_utf8(retried.stdout).unwrap();
+    assert!(retried.contains("Status     completed"), "{retried}");
+    assert!(
+        retried.contains("implementation: route overridden"),
+        "{retried}"
+    );
+    assert!(
+        retried.contains("implementation (completed) · role=implementer · configured=claude/native default (operator override)"),
+        "{retried}"
+    );
+    assert!(
+        retried.contains("implementer  codex"),
+        "the routing table still says what the snapshot decided: {retried}"
+    );
+    assert!(
+        !retried.contains("verify (completed) · role=verifier · configured=verify/native default (operator override)"),
+        "the un-skipped verify stage keeps its own route: {retried}"
+    );
+
+    let run_id: RunId = run_id.parse().unwrap();
+    let mut store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
+    let sessions = store.list_provider_sessions(run_id).unwrap();
+    let implementation = sessions
+        .iter()
+        .filter(|session| session.stage_id().as_str() == "implementation")
+        .map(|session| (session.attempt(), session.provider_id().as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(implementation, vec![(1, "codex"), (2, "claude")]);
+    let loaded = store.load_run(run_id).unwrap();
+    let stage = loaded
+        .run
+        .stage(&"implementation".parse().unwrap())
+        .unwrap();
+    assert_eq!(
+        stage
+            .route_override()
+            .map(|route| route.provider_id().as_str()),
+        Some("claude"),
+        "the override is stage state and survives reload"
+    );
+    assert_eq!(loaded.config_snapshot.schema_version(), 2);
+
+    // A provider the machine cannot run is refused before anything changes.
+    let mut second = Fixture::new();
+    second.remove_claude();
+    let failed = second.polycode_fail_once(&[
+        "fast",
+        "Refuse the missing provider",
+        "--repo",
+        second.repo.to_str().unwrap(),
+        "--provider",
+        "codex",
+    ]);
+    assert_success(&failed);
+    let failed = String::from_utf8(failed.stdout).unwrap();
+    let run_id = failed
+        .lines()
+        .find_map(|line| line.strip_prefix("Run        "))
+        .unwrap();
+    let refused = second.polycode(&["retry", run_id, "implementation", "--provider", "claude"]);
+    assert!(!refused.status.success());
+    let status = second.polycode(&["status", run_id]);
+    assert_success(&status);
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(status.contains("Status     failed"), "{status}");
+    assert!(!status.contains("operator override"), "{status}");
+}
+
 struct Fixture {
     _temp: TempDir,
     repo: PathBuf,
@@ -406,9 +498,23 @@ impl Fixture {
         self.polycode_with_env(args, false)
     }
 
+    fn remove_claude(&mut self) {
+        fs::remove_file(self.fake_bin.join("claude")).unwrap();
+    }
+
     fn polycode_write(&self, args: &[&str]) -> Output {
         let mut command = self.command(args);
         command.env("POLYCODE_FAKE_CODEX_WRITE", "1");
+        command.output().unwrap()
+    }
+
+    /// The fake Codex fails each stage's first attempt and succeeds after.
+    fn polycode_fail_once(&self, args: &[&str]) -> Output {
+        let mut command = self.command(args);
+        command.env(
+            "POLYCODE_FAKE_CODEX_FAIL_ONCE_DIR",
+            self.capture.join("fail-once"),
+        );
         command.output().unwrap()
     }
 

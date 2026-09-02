@@ -3,13 +3,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     AttentionRequest, ConfigSnapshotId, Run, RunId, RunRehydrationData, RunResumeStatus, RunStatus,
-    StageDefinition, StageId, StageRehydrationData, StageResumeStatus, StageStatus,
-    StageSuspensionOwner, WorkflowKind,
+    StageDefinition, StageId, StageRehydrationData, StageResumeStatus, StageRouteOverride,
+    StageStatus, StageSuspensionOwner, WorkflowKind,
 };
 
 use super::StoreError;
 
-pub const RUN_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const RUN_SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RunSnapshotV1 {
@@ -42,11 +42,48 @@ struct RunSnapshotV2 {
     updated_at: DateTime<Utc>,
 }
 
+/// v3 adds the per-stage route override. A v2 reader would silently drop it,
+/// so the version moves rather than the field being optional in place.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunSnapshotV3 {
+    schema_version: u32,
+    id: RunId,
+    workflow_kind: WorkflowKind,
+    stage_definitions: Vec<StageDefinition>,
+    config_snapshot_id: ConfigSnapshotId,
+    status: RunStatus,
+    suspended_from: Option<RunResumeStatusV1>,
+    stages: Vec<StageSnapshotV2>,
+    attention_requests: Vec<AttentionRequest>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StageSnapshotV1 {
     id: StageId,
     status: StageStatus,
     suspension: Option<StageSuspensionV1>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StageSnapshotV2 {
+    id: StageId,
+    status: StageStatus,
+    suspension: Option<StageSuspensionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_override: Option<StageRouteOverride>,
+}
+
+impl From<StageSnapshotV1> for StageSnapshotV2 {
+    fn from(stage: StageSnapshotV1) -> Self {
+        Self {
+            id: stage.id,
+            status: stage.status,
+            suspension: stage.suspension,
+            route_override: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -78,7 +115,7 @@ enum StageResumeStatusV1 {
 
 pub(crate) fn encode_run(run: &Run) -> Result<String, StoreError> {
     let data = run.rehydration_data();
-    let snapshot = RunSnapshotV2 {
+    let snapshot = RunSnapshotV3 {
         schema_version: RUN_SNAPSHOT_SCHEMA_VERSION,
         id: data.id,
         workflow_kind: data.workflow_kind,
@@ -107,10 +144,11 @@ pub(crate) fn encode_run(run: &Run) -> Result<String, StoreError> {
                     (None, None) => None,
                     _ => unreachable!("validated stage always has complete suspension context"),
                 };
-                StageSnapshotV1 {
+                StageSnapshotV2 {
                     id: stage.id,
                     status: stage.status,
                     suspension,
+                    route_override: stage.route_override,
                 }
             })
             .collect(),
@@ -145,7 +183,7 @@ pub(crate) fn decode_run(snapshot_json: &str, column_version: u32) -> Result<Run
                 snapshot.config_snapshot_id,
                 snapshot.status,
                 snapshot.suspended_from,
-                snapshot.stages,
+                snapshot.stages.into_iter().map(Into::into).collect(),
                 snapshot.attention_requests,
                 snapshot.created_at,
                 snapshot.updated_at,
@@ -153,6 +191,21 @@ pub(crate) fn decode_run(snapshot_json: &str, column_version: u32) -> Result<Run
         }
         2 => {
             let snapshot: RunSnapshotV2 = serde_json::from_value(envelope)?;
+            snapshot_data(
+                snapshot.id,
+                snapshot.workflow_kind,
+                snapshot.stage_definitions,
+                snapshot.config_snapshot_id,
+                snapshot.status,
+                snapshot.suspended_from,
+                snapshot.stages.into_iter().map(Into::into).collect(),
+                snapshot.attention_requests,
+                snapshot.created_at,
+                snapshot.updated_at,
+            )
+        }
+        3 => {
+            let snapshot: RunSnapshotV3 = serde_json::from_value(envelope)?;
             snapshot_data(
                 snapshot.id,
                 snapshot.workflow_kind,
@@ -179,7 +232,7 @@ fn snapshot_data(
     config_snapshot_id: ConfigSnapshotId,
     status: RunStatus,
     suspended_from: Option<RunResumeStatusV1>,
-    stages: Vec<StageSnapshotV1>,
+    stages: Vec<StageSnapshotV2>,
     attention_requests: Vec<AttentionRequest>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -214,6 +267,7 @@ fn snapshot_data(
                     status: stage.status,
                     suspension_owner,
                     resume_to,
+                    route_override: stage.route_override,
                 }
             })
             .collect(),

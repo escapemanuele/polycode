@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::domain::{
     ConfigSnapshotId, EffortSetting, ModelId, ProviderId, Role, StageDefinition, StageKind,
-    WorkflowDefinition, fix_cycle_stages,
+    StageRouteOverride, WorkflowDefinition, fix_cycle_stages,
 };
 use crate::store::ResolvedConfigSnapshot;
 
@@ -484,6 +484,13 @@ pub enum UniformProvider {
 }
 
 impl UniformProvider {
+    /// The identity leaf runtimes and events use for this provider.
+    #[must_use]
+    pub fn provider_id(self) -> ProviderId {
+        // Every variant's name is a non-empty, whitespace-free literal.
+        ProviderId::new(self.as_str()).unwrap_or_else(|_| unreachable!())
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -504,6 +511,43 @@ impl TryFrom<&str> for UniformProvider {
             "fake" => Ok(Self::Fake),
             other => Err(RoutingError::UnsupportedProvider(other.to_owned())),
         }
+    }
+}
+
+/// Reason recorded on every operator-chosen route override.
+pub const OPERATOR_OVERRIDE_REASON: &str = "operator_override";
+
+/// Where an operator sends one failed stage on retry.
+///
+/// Distinct from [`ExecutionSelection`], which decides a whole run once at
+/// creation: this names one provider for one stage, after the fact, and
+/// leaves the snapshot alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetryRoute {
+    provider: UniformProvider,
+    model: Option<ModelId>,
+}
+
+impl RetryRoute {
+    #[must_use]
+    pub const fn new(provider: UniformProvider, model: Option<ModelId>) -> Self {
+        Self { provider, model }
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> UniformProvider {
+        self.provider
+    }
+
+    #[must_use]
+    pub const fn model(&self) -> Option<&ModelId> {
+        self.model.as_ref()
+    }
+
+    /// The stage-level record of this choice.
+    #[must_use]
+    pub fn into_override(self) -> StageRouteOverride {
+        StageRouteOverride::new(self.provider.provider_id(), self.model)
     }
 }
 

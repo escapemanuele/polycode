@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::{
     AttentionKind, AttentionRequestId, ModelId, NativeModelUsage, ProviderId, ProviderSessionId,
-    Role, RunId, StageId, StageKind, StageStatus,
+    Role, RunId, StageId, StageKind, StageRouteOverride, StageStatus,
 };
 use crate::providers::ProviderCommit;
 use crate::store::SqliteStore;
@@ -99,6 +99,7 @@ pub struct ProviderRequest {
     session_id: Option<ProviderSessionId>,
     dependency_stage_ids: Vec<StageId>,
     observe_only: bool,
+    route_override: Option<StageRouteOverride>,
 }
 
 /// Persisted stage context used to route one human-attention continuation.
@@ -109,6 +110,7 @@ pub struct ProviderAttentionContext {
     stage_kind: StageKind,
     role: Role,
     request_id: AttentionRequestId,
+    route_override: Option<StageRouteOverride>,
 }
 
 impl ProviderAttentionContext {
@@ -126,7 +128,22 @@ impl ProviderAttentionContext {
             stage_kind,
             role,
             request_id,
+            route_override: None,
         }
+    }
+
+    /// Carries the stage's operator-chosen destination, when it has one, so
+    /// the attention continuation reaches the runtime that actually holds
+    /// the session rather than the one the role was configured with.
+    #[must_use]
+    pub fn with_route_override(mut self, route_override: Option<StageRouteOverride>) -> Self {
+        self.route_override = route_override;
+        self
+    }
+
+    #[must_use]
+    pub const fn route_override(&self) -> Option<&StageRouteOverride> {
+        self.route_override.as_ref()
     }
 
     #[must_use]
@@ -179,7 +196,22 @@ impl ProviderRequest {
             session_id,
             dependency_stage_ids,
             observe_only: false,
+            route_override: None,
         }
+    }
+
+    /// Carries the stage's operator-chosen destination, when it has one. The
+    /// routed provider consults it before the role's configured route; leaf
+    /// runtimes never read it.
+    #[must_use]
+    pub fn with_route_override(mut self, route_override: Option<StageRouteOverride>) -> Self {
+        self.route_override = route_override;
+        self
+    }
+
+    #[must_use]
+    pub const fn route_override(&self) -> Option<&StageRouteOverride> {
+        self.route_override.as_ref()
     }
 
     /// Marks this poll as observation only.
