@@ -28,16 +28,44 @@ pub(crate) fn resume(
     model: Option<&ModelId>,
     effort: EffortSetting,
 ) -> Result<ClaudeCommand, ClaudeProviderError> {
-    if denials
-        .iter()
-        .any(|denial| denial.tool_name == "AskUserQuestion")
-        && response.is_none_or(|response| response.trim().is_empty())
-    {
-        return Err(ClaudeProviderError::QuestionResponseRequired);
-    }
+    let rules = grant_rules(denials, response)?;
     let mut argv = base(model, effort);
     argv.push(OsString::from("--resume"));
     argv.push(OsString::from(session_id.as_str()));
+    if !rules.is_empty() {
+        argv.push(OsString::from("--allowedTools"));
+        argv.extend(rules.into_iter().map(OsString::from));
+    }
+    let stdin = response.unwrap_or(
+        "User approved the exact pending permission request. Continue the same task and session.",
+    );
+    Ok(ClaudeCommand {
+        argv,
+        stdin: stdin.as_bytes().to_vec(),
+    })
+}
+
+/// Exact `--allowedTools` rules that replay one approved attention, or the
+/// reason it cannot be replayed at all.
+///
+/// This is the single gate for "can this approval be honoured": resolution
+/// must run it *before* committing, so an unreplayable denial (compound Bash)
+/// is refused to the user instead of committing a resolution every later
+/// drive fails on.
+///
+/// # Errors
+/// `QuestionResponseRequired` when a pending question has no response;
+/// `UnsafePermission` when no denial can be granted as an exact rule.
+pub(crate) fn grant_rules(
+    denials: &[PermissionDenial],
+    response: Option<&str>,
+) -> Result<BTreeSet<String>, ClaudeProviderError> {
+    let has_question = denials
+        .iter()
+        .any(|denial| denial.tool_name == "AskUserQuestion");
+    if has_question && response.is_none_or(|response| response.trim().is_empty()) {
+        return Err(ClaudeProviderError::QuestionResponseRequired);
+    }
     let mut rules = BTreeSet::new();
     let mut unsafe_permission = None;
     for denial in denials
@@ -51,26 +79,12 @@ pub(crate) fn resume(
             Err(error) => unsafe_permission = Some(error),
         }
     }
-    if rules.is_empty()
-        && !denials
-            .iter()
-            .any(|denial| denial.tool_name == "AskUserQuestion")
-    {
+    if rules.is_empty() && !has_question {
         return Err(unsafe_permission.unwrap_or_else(|| {
             ClaudeProviderError::UnsafePermission("empty denial set".to_owned())
         }));
     }
-    if !rules.is_empty() {
-        argv.push(OsString::from("--allowedTools"));
-        argv.extend(rules.into_iter().map(OsString::from));
-    }
-    let stdin = response.unwrap_or(
-        "User approved the exact pending permission request. Continue the same task and session.",
-    );
-    Ok(ClaudeCommand {
-        argv,
-        stdin: stdin.as_bytes().to_vec(),
-    })
+    Ok(rules)
 }
 
 fn base(model: Option<&ModelId>, effort: EffortSetting) -> Vec<OsString> {

@@ -855,6 +855,12 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
                     "eval permission is not an exact in-worktree Edit/Write".to_owned(),
                 ));
             }
+            // Prove the approval can be replayed as exact rules *before* the
+            // domain commits the resolution. Otherwise a compound Bash denial
+            // gets "approved", the resolution is committed, and every later
+            // drive fails building the resume command — the stage sits
+            // `running` forever with no process behind it.
+            command::grant_rules(&denials, response)?;
             if denials
                 .iter()
                 .any(|denial| denial.tool_name == "AskUserQuestion")
@@ -1479,6 +1485,72 @@ mod tests {
         }
         assert_eq!(store.list_artifacts(run_id).unwrap().len(), 1);
         drop(temp);
+    }
+
+    /// Regression: the real run 01M1F4S6V33DQHETQVRAHPQG1E. Claude asked for
+    /// two compound Bash commands, the operator approved, the resolution was
+    /// committed, and the resume command could never be built — the stage
+    /// read `running` for an hour with no process. Approval of an
+    /// unreplayable denial must fail *before* anything is committed, and the
+    /// run must still be answerable (stop/retry) afterwards.
+    #[test]
+    fn approving_compound_bash_denial_fails_before_committing_resolution() {
+        let backend = FixtureBackend::with_first_result(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "Blocked on permission.",
+                "session_id": "native-session-1",
+                "permission_denials": [
+                    {"tool_name":"Bash","tool_input":{"command":"ls /repo | head -30; ls -d /repo/node_modules"}},
+                    {"tool_name":"Bash","tool_input":{"command":"yarn install 2>&1 | tail -20","run_in_background":true}}
+                ]
+            })
+            .to_string(),
+        );
+        let (_temp, _database, run_id, mut store, provider) = fixture_with_backend(backend, false);
+        let mut engine = WorkflowEngine::new(provider, "compound bash approval");
+        let request = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        let processes_before = store.list_managed_processes(run_id).unwrap().len();
+        let sequence_before = store.load_run(run_id).unwrap().revision;
+
+        let error = engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("cannot be granted as an exact rule") && error.contains("yarn install"),
+            "operator must see which command was refused: {error}"
+        );
+
+        // Nothing committed: run still needs the user, attention still open.
+        let loaded = store.load_run(run_id).unwrap();
+        assert_eq!(loaded.revision, sequence_before);
+        assert_eq!(loaded.run.status(), RunStatus::NeedsUser);
+        assert!(
+            loaded
+                .run
+                .attention_requests()
+                .iter()
+                .any(|attention| attention.id() == request && attention.status().is_pending()),
+            "attention must stay pending"
+        );
+        // And a later drive still reports NeedsUser instead of spawning.
+        assert!(matches!(
+            engine.drive(&mut store, run_id).unwrap(),
+            EngineStatus::NeedsUser { .. }
+        ));
+        assert_eq!(
+            store.list_managed_processes(run_id).unwrap().len(),
+            processes_before
+        );
     }
 
     #[test]
