@@ -1,5 +1,6 @@
 //! Crash-reconcilable Git workspace lifecycle orchestration.
 
+mod branch_name;
 mod error;
 mod github;
 mod manager;
