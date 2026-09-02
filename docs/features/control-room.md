@@ -5,6 +5,7 @@ Watch and drive every run from one terminal screen without touching the database
 ## Sub-features
 - runs-screen: list of runs; hide/unhide runs; Enter opens detail.
 - run-detail: stage timeline, routes, attention, usage; `i` toggles the technical (evidence) view.
+- activity-strip: one prose sentence for what is happening now — a failed stage's own reason ("Implementation failed: compile failed"), or why a stage has not started ("Waiting on: Architecture", "Blocked: Quality review failed, Spec review was skipped", "Waiting on you", "Stage suspended", "Stage skipped by the workflow").
 - viewers: artifact (`o`/Enter, `m` raw/rendered), raw process logs (`l`), workspace diff (`d`).
 - composer: `n` opens the new-run form (Task, Workflow, Repository, Execution, Effort).
 - actions: resume, stop, retry, attention, apply, publish, fix, continue, follow-ups, discard, all through one serialized worker.
@@ -30,7 +31,7 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 - `src/tui/input.rs` — `map_key` / `map_text_key`: the only key-to-intent tables.
 - `src/tui/app.rs` — `handle_intent`, overlay handlers, composer submit, eligibility messages (`stop_unavailable_reason`, `fix_unavailable_reason`, `continue_unavailable_reason`).
 - `src/tui/state.rs` — `Screen`, `Overlay`, `NewRunForm`, `ExecutionChoice`, `EffortChoice`, `CONCURRENT_AGENTS` (4).
-- `src/tui/render.rs` — rendering incl. the help overlay text.
+- `src/tui/render.rs` — rendering incl. the help overlay text; `status_sentences`, `hero_activity_text`, `waiting_message`, `blocked_message` compose the activity strip.
 - `src/tui/worker.rs` — `WorkerCommand` enum; one standard thread serializes all mutations.
 - `src/tui/terminal.rs` — raw mode / alternate screen RAII and panic restore.
 - `src/tui/theme.rs`, `src/tui/motion.rs` — appearance (see configuration.md).
@@ -43,4 +44,5 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 - Read paths are side-effect free except the 30 s abandoned-run observe pass; they never acknowledge provider output or create apply intent.
 - The TUI caps concurrently working agents at 4 (`CONCURRENT_AGENTS`); a booked fix that cannot start yet stays booked silently. The CLI has no such cap.
 - Attention overlays outrank the update overlay; the update prompt is shown at most once per process.
+- The activity strip is width-bounded: a long provider reason is cut with an ellipsis, and the prefix naming the stage always survives the cut. Read the full text in the stage's logs (`l`) or with `polycode status`.
 - Stop dispatches without confirmation; apply, publish and discard require Enter in a confirmation overlay.

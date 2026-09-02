@@ -3,7 +3,10 @@
 //! The Feature Map promises that every path it cites exists, every command
 //! and flag in its `Driving it` blocks is accepted by the binary, and every
 //! key it names is one the TUI actually maps. These tests hold that promise
-//! so a rename or a removed flag turns the map red instead of stale.
+//! so a rename or a removed flag turns the map red instead of stale. Two of
+//! them read the other way round: a command the binary offers or a key the
+//! TUI binds that no feature file mentions is a coverage hole, and holes are
+//! how a map goes quietly out of date while every line in it stays true.
 //! Semantic drift (a gotcha that no longer applies, a missing sub-feature)
 //! is still a reading job; see `docs/features/README.md`.
 
@@ -166,6 +169,94 @@ fn every_driving_command_and_flag_is_accepted_by_the_binary() {
     );
 }
 
+/// The one printable character a `` `x` `` token names, if it names one.
+fn single_key(token: &str) -> Option<char> {
+    let mut chars = token.chars();
+    match (chars.next(), chars.next()) {
+        (Some(key), None) if key.is_ascii_graphic() => Some(key),
+        _ => None,
+    }
+}
+
+/// Subcommand names the binary offers under `path`, read from its own help.
+/// Continuation lines of a wrapped description are indented past the name
+/// column, so only lines indented exactly two spaces carry a name.
+fn subcommands_of(path: &[String]) -> Vec<String> {
+    let Some(help) = help_text(path) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut inside = false;
+    for line in help.lines() {
+        if line.starts_with("Commands:") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if !line.starts_with("  ") || line.starts_with("   ") {
+            break;
+        }
+        match line.split_whitespace().next() {
+            Some("help") | None => {}
+            Some(name) => names.push(name.to_owned()),
+        }
+    }
+    names
+}
+
+/// The map is only as good as its coverage: a command the binary offers and
+/// the map never mentions is drift the other tests cannot see, because they
+/// only check that what the map says is true.
+#[test]
+fn every_command_the_binary_offers_appears_in_the_map() {
+    let files = feature_files();
+    let mut missing = Vec::new();
+    let mut pending = vec![Vec::<String>::new()];
+    while let Some(path) = pending.pop() {
+        for name in subcommands_of(&path) {
+            let mut child = path.clone();
+            child.push(name);
+            let invocation = format!("polycode {}", child.join(" "));
+            if !files.iter().any(|(_, text)| text.contains(&invocation)) {
+                missing.push(invocation);
+            }
+            pending.push(child);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "commands the binary offers that no feature file mentions:\n{}",
+        missing.join("\n")
+    );
+}
+
+/// Same coverage rule for the control room: a key the TUI binds and the map
+/// never names is a feature an agent cannot reach.
+#[test]
+fn every_key_the_tui_binds_appears_in_the_control_room_map() {
+    let root = repo_root();
+    let input = fs::read_to_string(root.join("src/tui/input.rs")).expect("input.rs exists");
+    let bindings = input.split("#[cfg(test)]").next().unwrap_or_default();
+    let doc = fs::read_to_string(root.join("docs/features/control-room.md"))
+        .expect("control-room.md exists");
+    let documented: BTreeSet<char> = backtick_tokens(&doc).filter_map(single_key).collect();
+    let mut undocumented = BTreeSet::new();
+    for binding in bindings.split("KeyCode::Char('").skip(1) {
+        let Some(key) = binding.chars().next() else {
+            continue;
+        };
+        if key.is_ascii_graphic() && !documented.contains(&key) {
+            undocumented.insert(key);
+        }
+    }
+    assert!(
+        undocumented.is_empty(),
+        "src/tui/input.rs binds keys control-room.md never names: {undocumented:?}"
+    );
+}
+
 #[test]
 fn every_key_in_the_control_room_map_is_bound() {
     let root = repo_root();
@@ -173,14 +264,7 @@ fn every_key_in_the_control_room_map_is_bound() {
         .expect("control-room.md exists");
     let input = fs::read_to_string(root.join("src/tui/input.rs")).expect("input.rs exists");
     let mut unbound = BTreeSet::new();
-    for token in backtick_tokens(&doc) {
-        let mut chars = token.chars();
-        let (Some(key), None) = (chars.next(), chars.next()) else {
-            continue;
-        };
-        if !key.is_ascii_graphic() {
-            continue;
-        }
+    for key in backtick_tokens(&doc).filter_map(single_key) {
         if !input.contains(&format!("KeyCode::Char('{key}')")) {
             unbound.insert(key);
         }
