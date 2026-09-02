@@ -36,6 +36,11 @@ pub(crate) fn remote_url(git: &Git, path: &Path, remote: &str) -> Result<Option<
 /// push with no usable credentials would hang a publish thread forever under
 /// the raw-mode interface. `GIT_TERMINAL_PROMPT=0` turns that hang into an
 /// error the operator can read.
+///
+/// `--no-verify` skips the repository's `pre-push` hook. A managed worktree
+/// never installs the project's dependencies, so a hook runner that lives in
+/// them — husky's `.husky/_/husky.sh`, for one — is simply absent, and the
+/// hook then fails every publish for reasons unrelated to the branch.
 pub(crate) fn push_branch(
     git: &Git,
     path: &Path,
@@ -47,6 +52,7 @@ pub(crate) fn push_branch(
         path,
         &[
             os("push"),
+            os("--no-verify"),
             os("--set-upstream"),
             os(remote),
             os(format!("{reference}:{reference}")),
@@ -139,6 +145,38 @@ mod tests {
         fs::write(repo.join("work.txt"), "two\n").unwrap();
         git_cmd(&repo, &["add", "-A"]);
         git_cmd(&repo, &["commit", "-m", "two"]);
+        push_branch(&git, &repo, "origin", "polycode/run-1").unwrap();
+        assert_eq!(
+            git_cmd(&origin, &["rev-parse", "refs/heads/polycode/run-1"]),
+            git_cmd(&repo, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[test]
+    fn a_failing_pre_push_hook_does_not_block_publishing() {
+        let (_temp, repo, origin) = fixture();
+        git_cmd(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_cmd(&repo, &["checkout", "-b", "polycode/run-1"]);
+        // What a managed worktree of a husky repository looks like: the hook is
+        // checked in, the runner it sources lives in uninstalled dependencies.
+        let hooks = repo.join(".husky");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-push");
+        fs::write(&hook, "#!/bin/sh\n. .husky/_/husky.sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git_cmd(&repo, &["config", "core.hooksPath", ".husky"]);
+        fs::write(repo.join("work.txt"), "one\n").unwrap();
+        git_cmd(&repo, &["add", "-A"]);
+        git_cmd(&repo, &["commit", "-m", "one"]);
+        let git = Git::default();
+
         push_branch(&git, &repo, "origin", "polycode/run-1").unwrap();
         assert_eq!(
             git_cmd(&origin, &["rev-parse", "refs/heads/polycode/run-1"]),
