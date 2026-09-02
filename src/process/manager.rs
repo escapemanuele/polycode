@@ -402,17 +402,32 @@ impl<B: ProcessBackend> ProcessManager<B> {
         ) {
             return Ok(inspection);
         }
-        if inspection.process.status() != ManagedProcessStatus::Running {
-            return Err(ProcessError::InvalidTransition {
-                from: inspection.process.status(),
-                to: ManagedProcessStatus::Interrupting,
-            });
-        }
-        let expected = inspection.process.revision();
-        inspection
-            .process
-            .transition(ManagedProcessStatus::Interrupting, now(), None, None)?;
-        let process = store.update_managed_process(&inspection.process, expected, false)?;
+        // Intent is persisted before the signal, so a failure to signal leaves
+        // the process in Interrupting with nothing having been sent. Asking
+        // again has to be allowed to finish that job: the runtime evidence a
+        // signal needs may simply not have been written yet when the first
+        // attempt ran, and the caller retrying is the thing that resolves it.
+        // Rejecting the second attempt as an invalid transition would strand
+        // the process — marked as being interrupted, never actually signalled.
+        let process = match inspection.process.status() {
+            ManagedProcessStatus::Running => {
+                let expected = inspection.process.revision();
+                inspection.process.transition(
+                    ManagedProcessStatus::Interrupting,
+                    now(),
+                    None,
+                    None,
+                )?;
+                store.update_managed_process(&inspection.process, expected, false)?
+            }
+            ManagedProcessStatus::Interrupting => inspection.process.clone(),
+            status => {
+                return Err(ProcessError::InvalidTransition {
+                    from: status,
+                    to: ManagedProcessStatus::Interrupting,
+                });
+            }
+        };
         self.backend.interrupt(&process)?;
 
         for _ in 0..INTERRUPT_POLLS {

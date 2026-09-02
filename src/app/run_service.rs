@@ -28,6 +28,18 @@ const PROCESS_LOG_TAIL_LIMIT: usize = 256 * 1024;
 /// total: the driver is being interrupted, so contention ends quickly.
 const STOP_CONCURRENCY_ATTEMPTS: u32 = 12;
 const STOP_CONCURRENCY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
+/// How many times a stop retries while a managed process has started but has
+/// not yet recorded the runtime evidence a signal needs. The runner spawns its
+/// child before writing `runtime.json`, so a user who presses stop in the first
+/// moments of a run can arrive inside that window. The evidence is imminent
+/// whenever the runner is alive, so waiting it out is right; the bound exists
+/// because the same error also carries permanent conditions — corrupt or
+/// foreign evidence — which must surface as a failure rather than as an
+/// unbounded wait. Roughly three seconds in total, and exhausting it returns
+/// `StopRuntimeEvidenceUnavailable`: never a stop that reports success while
+/// the process keeps running.
+const STOP_EVIDENCE_ATTEMPTS: u32 = 75;
+const STOP_EVIDENCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
 /// How long a run must sit untouched before a read is allowed to settle it.
 ///
 /// Reading a run must never race the process driving it. A driver commits on
@@ -472,19 +484,7 @@ where
         // interrupted stage. Retry the whole stop instead: every step is
         // idempotent, so a later attempt observes the newer revisions and
         // commits the run-level interruption the user asked for.
-        let mut attempt = 0;
-        loop {
-            match self.stop_run_once(run_id) {
-                Err(error) if error.is_concurrent_modification() => {
-                    attempt += 1;
-                    if attempt >= STOP_CONCURRENCY_ATTEMPTS {
-                        return Err(error);
-                    }
-                    std::thread::sleep(STOP_CONCURRENCY_BACKOFF);
-                }
-                outcome => return outcome,
-            }
-        }
+        retry_stop(run_id, || self.stop_run_once(run_id), std::thread::sleep)
     }
 
     fn stop_run_once(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
@@ -882,6 +882,55 @@ fn resume_suspended_stages<P: crate::engine::Provider>(
     Ok(())
 }
 
+/// Runs one stop attempt repeatedly while it fails for a reason repeating can
+/// resolve, with a separate budget per reason.
+///
+/// Two transient conditions reach a stop, and they are not the same shape. A
+/// lost revision race means another driver committed first and the work must
+/// simply be redone against newer rows. Missing runtime evidence means the
+/// target process exists but cannot yet be named, and the wait is on a file the
+/// runner is about to write. Counting them together would let a burst of one
+/// consume the tolerance the other needs.
+///
+/// `sleep` is injected so the policy can be exercised without wall-clock time.
+/// Exhausting either budget returns an error: a stop that gives up says so, and
+/// never reports success over a process that is still running.
+fn retry_stop<T, F, S>(run_id: RunId, mut attempt: F, mut sleep: S) -> Result<T, AppError>
+where
+    F: FnMut() -> Result<T, AppError>,
+    S: FnMut(std::time::Duration),
+{
+    let started = std::time::Instant::now();
+    let mut concurrency_attempts = 0;
+    let mut evidence_attempts = 0;
+    loop {
+        match attempt() {
+            Err(error) if error.is_concurrent_modification() => {
+                concurrency_attempts += 1;
+                if concurrency_attempts >= STOP_CONCURRENCY_ATTEMPTS {
+                    return Err(error);
+                }
+                sleep(STOP_CONCURRENCY_BACKOFF);
+            }
+            Err(error) if error.is_pending_runtime_evidence() => {
+                evidence_attempts += 1;
+                if evidence_attempts >= STOP_EVIDENCE_ATTEMPTS {
+                    let Some(process_id) = error.pending_runtime_evidence_process() else {
+                        return Err(error);
+                    };
+                    return Err(AppError::StopRuntimeEvidenceUnavailable {
+                        run_id,
+                        process_id,
+                        waited_ms: started.elapsed().as_millis(),
+                    });
+                }
+                sleep(STOP_EVIDENCE_BACKOFF);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 fn last_sequence(store: &SqliteStore, run_id: RunId) -> Result<u64, AppError> {
     Ok(store
         .load_events(run_id)?
@@ -943,6 +992,120 @@ mod tests {
     use crate::process::{OutputStream, ProcessManager, TmuxBackend};
     use crate::providers::ArtifactRecord;
     use crate::store::{ResolvedConfigSnapshot, SequencedEvent, StoreError};
+
+    use crate::process::{ManagedProcessId, ProcessError};
+
+    fn missing_evidence(process_id: ManagedProcessId) -> AppError {
+        AppError::Process(ProcessError::MissingRuntimeEvidence(process_id))
+    }
+
+    // The window this covers: the runner spawns its child before writing
+    // `runtime.json`, so a stop issued in the first moments of a run finds a
+    // live process it cannot yet name. Waiting is the whole point — the file
+    // is imminent — so the stop must survive the window rather than telling
+    // the user the run cannot be stopped while it keeps running.
+    #[test]
+    fn stop_waits_out_the_runtime_evidence_window() {
+        let process_id = ManagedProcessId::new();
+        let mut remaining = STOP_EVIDENCE_ATTEMPTS - 1;
+        let mut slept = 0_u32;
+        let outcome = retry_stop(
+            RunId::new(),
+            || {
+                if remaining > 0 {
+                    remaining -= 1;
+                    Err(missing_evidence(process_id))
+                } else {
+                    Ok(7_u32)
+                }
+            },
+            |_| slept += 1,
+        );
+        assert_eq!(outcome.unwrap(), 7);
+        assert_eq!(slept, STOP_EVIDENCE_ATTEMPTS - 1);
+    }
+
+    // The failure mode the fix must not produce is a stop that reports
+    // success over a process that is still running. Evidence that never
+    // arrives is a real condition — corrupt or foreign evidence looks
+    // identical — so the bounded wait ends in an error that says the run was
+    // not stopped, not in an Ok.
+    #[test]
+    fn stop_gives_up_loudly_when_runtime_evidence_never_arrives() {
+        let process_id = ManagedProcessId::new();
+        let run_id = RunId::new();
+        let mut attempts = 0_u32;
+        let error = retry_stop::<u32, _, _>(
+            run_id,
+            || {
+                attempts += 1;
+                Err(missing_evidence(process_id))
+            },
+            |_| {},
+        )
+        .expect_err("a stop that never finds its target must fail");
+        assert_eq!(attempts, STOP_EVIDENCE_ATTEMPTS);
+        assert!(matches!(
+            error,
+            AppError::StopRuntimeEvidenceUnavailable {
+                run_id: reported_run,
+                process_id: reported_process,
+                ..
+            } if reported_run == run_id && reported_process == process_id
+        ));
+        let message = error.to_string();
+        assert!(message.contains("NOT stopped"), "{message}");
+        assert!(message.contains("may still be running"), "{message}");
+    }
+
+    // The two transient conditions have separate budgets on purpose: a burst
+    // of lost revision races must not consume the tolerance the startup
+    // window needs, and vice versa. Interleaving them here pins that, since a
+    // shared counter would exhaust well before this attempt count.
+    #[test]
+    fn concurrency_and_evidence_budgets_are_independent() {
+        let process_id = ManagedProcessId::new();
+        let mut races = STOP_CONCURRENCY_ATTEMPTS - 1;
+        let mut windows = STOP_EVIDENCE_ATTEMPTS - 1;
+        let outcome = retry_stop(
+            RunId::new(),
+            || {
+                // Alternate while both budgets still have room, so neither is
+                // spent in one uninterrupted burst.
+                if races > 0 && (windows == 0 || races % 2 == 1) {
+                    races -= 1;
+                    return Err(AppError::Store(StoreError::ConcurrentModification {
+                        run_id: RunId::new(),
+                        expected: 3,
+                    }));
+                }
+                if windows > 0 {
+                    windows -= 1;
+                    return Err(missing_evidence(process_id));
+                }
+                Ok(1_u32)
+            },
+            |_| {},
+        );
+        assert_eq!(outcome.unwrap(), 1);
+    }
+
+    // A permanent failure must not be delayed by either budget.
+    #[test]
+    fn non_retryable_failures_are_returned_at_once() {
+        let mut attempts = 0_u32;
+        let error = retry_stop::<u32, _, _>(
+            RunId::new(),
+            || {
+                attempts += 1;
+                Err(AppError::DirtySourceRepository)
+            },
+            |_| panic!("a permanent failure must not sleep"),
+        )
+        .expect_err("permanent failures surface");
+        assert_eq!(attempts, 1);
+        assert!(matches!(error, AppError::DirtySourceRepository));
+    }
 
     #[derive(Clone)]
     struct ScriptedFactory {
