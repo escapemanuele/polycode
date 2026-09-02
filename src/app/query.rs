@@ -296,6 +296,25 @@ pub struct RunDetails {
     /// unless `status` is `RunStatus::Failed`, and `None` even then when the
     /// failed stage carries no reason.
     pub failure_reason: Option<String>,
+    /// Every image the image-generation tool wrote for this run, in order.
+    /// Empty for every run that never held the grant.
+    pub image_generations: Vec<ImageGenerationSummary>,
+}
+
+/// One image-generation evidence row as the operator sees it. Says which
+/// stage asked, what backend/model answered, where the bytes went and what
+/// they hash to. It does not say what the image shows: nobody has looked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageGenerationSummary {
+    pub ordinal: u32,
+    pub stage_id: StageId,
+    pub attempt: u32,
+    pub backend: String,
+    pub model: String,
+    pub output_path: String,
+    pub output_sha256: String,
+    pub output_size: u64,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -613,6 +632,21 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         started_at: run_span.0,
         finished_at: run_span.1,
         failure_reason,
+        image_generations: store
+            .list_image_generations(run_id)?
+            .into_iter()
+            .map(|record| ImageGenerationSummary {
+                ordinal: record.ordinal,
+                stage_id: record.stage_id,
+                attempt: record.attempt,
+                backend: record.backend,
+                model: record.model,
+                output_path: record.output_path,
+                output_sha256: record.output_sha256,
+                output_size: record.output_size,
+                completed_at: record.completed_at,
+            })
+            .collect(),
     })
 }
 

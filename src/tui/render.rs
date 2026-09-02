@@ -2680,6 +2680,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             failure_reason: None,
+            image_generations: Vec::new(),
         }
     }
 

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -129,6 +129,15 @@ impl SqliteStore {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         migrations::migrate(&connection)?;
         Ok(Self { connection })
+    }
+
+    /// The file behind this store, or `None` for an in-memory database.
+    #[must_use]
+    pub fn database_path(&self) -> Option<PathBuf> {
+        self.connection
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
     }
 
     /// Returns applied `SQLite` schema version.

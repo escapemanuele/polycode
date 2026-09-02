@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
@@ -496,7 +496,7 @@ impl RoutingPlan {
     ) -> Result<Self, RoutingError> {
         match snapshot.schema_version() {
             1 => decode_legacy(snapshot, workflow),
-            2 | 3 => decode_v2(snapshot, workflow),
+            2..=4 => decode_v2(snapshot, workflow),
             version => Err(RoutingError::UnsupportedSchema(version)),
         }
     }
@@ -561,8 +561,149 @@ impl ResourcePlan {
                 })?;
                 Ok(Self { role_efforts })
             }
+            // Schema v4 exists for image generation, not effort: a resource
+            // plan is present exactly when effort was explicit, and its
+            // absence means NativeDefault just as v2 did.
+            4 => {
+                let payload: RoutingPayloadV2 = serde_json::from_value(snapshot.payload().clone())?;
+                validate_resource_plan_shape(&payload, workflow)?;
+                Ok(Self {
+                    role_efforts: payload.resource_plan.unwrap_or_else(|| {
+                        routable_roles(workflow)
+                            .into_iter()
+                            .map(|role| (role, EffortSetting::NativeDefault))
+                            .collect()
+                    }),
+                })
+            }
             version => Err(RoutingError::UnsupportedSchema(version)),
         }
+    }
+}
+
+/// Default per-run image generation bound. Four is enough for a hero image
+/// plus a retry or two of it, and small enough that an agent looping on a
+/// prompt cannot run up a bill: authorization is never unlimited.
+pub const DEFAULT_MAX_IMAGE_GENERATIONS: u32 = 4;
+/// Hard ceiling any persisted plan may declare.
+pub const MAX_IMAGE_GENERATIONS_CEILING: u32 = 32;
+
+/// Validated immutable image-generation authorization reconstructed from one
+/// configuration snapshot: which roles may call the tool and how many times
+/// the run may generate. Separate from `RoutingPlan` (destination) and
+/// `ResourcePlan` (effort): this plan answers what additional tool a role may
+/// use. It names no backend and no model; the backend owns those.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageGenerationPlan {
+    roles: BTreeSet<Role>,
+    max_generations: u32,
+}
+
+impl ImageGenerationPlan {
+    /// No role may generate images. What every run gets unless asked.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            roles: BTreeSet::new(),
+            max_generations: 0,
+        }
+    }
+
+    /// The v1 grant: the Implementer alone, with the default bound.
+    #[must_use]
+    pub fn implementer_only() -> Self {
+        Self {
+            roles: BTreeSet::from([Role::Implementer]),
+            max_generations: DEFAULT_MAX_IMAGE_GENERATIONS,
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.roles.is_empty()
+    }
+
+    #[must_use]
+    pub fn allows(&self, role: Role) -> bool {
+        self.roles.contains(&role)
+    }
+
+    #[must_use]
+    pub const fn max_generations(&self) -> u32 {
+        self.max_generations
+    }
+
+    pub fn roles(&self) -> impl Iterator<Item = Role> + '_ {
+        self.roles.iter().copied()
+    }
+
+    /// Reconstructs the immutable plan from a persisted snapshot.
+    ///
+    /// Schema v1–v3 predate the tool and always decode disabled. Schema v4
+    /// requires an explicit `image_generation` block; a block under an older
+    /// schema, an unknown role, a role outside the workflow, or a bound
+    /// outside `1..=MAX_IMAGE_GENERATIONS_CEILING` fails closed. Resume never
+    /// consults the current CLI flags.
+    ///
+    /// # Errors
+    /// Rejects malformed or out-of-range image generation configuration.
+    pub fn from_snapshot(
+        snapshot: &ResolvedConfigSnapshot,
+        workflow: &WorkflowDefinition,
+    ) -> Result<Self, RoutingError> {
+        match snapshot.schema_version() {
+            1 => Ok(Self::disabled()),
+            2..=4 => {
+                let payload: RoutingPayloadV2 = serde_json::from_value(snapshot.payload().clone())?;
+                validate_image_generation_shape(&payload, workflow)?;
+                Ok(payload
+                    .image_generation
+                    .map_or_else(Self::disabled, |dto| Self {
+                        roles: dto.roles.into_iter().collect(),
+                        max_generations: dto.max_generations,
+                    }))
+            }
+            version => Err(RoutingError::UnsupportedSchema(version)),
+        }
+    }
+}
+
+/// Structural image-generation rules shared by every decoder: nothing
+/// before v4 may carry the block, v4 must, and what it carries must be a
+/// non-empty set of the workflow's routable roles with a sane bound.
+fn validate_image_generation_shape(
+    payload: &RoutingPayloadV2,
+    workflow: &WorkflowDefinition,
+) -> Result<(), RoutingError> {
+    match (payload.schema_version, payload.image_generation.as_ref()) {
+        (1..=3, None) => Ok(()),
+        (1..=3, Some(_)) => Err(RoutingError::InvalidConfig(
+            "image generation requires config schema 4".to_owned(),
+        )),
+        (4, None) => Err(RoutingError::InvalidConfig(
+            "schema v4 requires an image generation block".to_owned(),
+        )),
+        (4, Some(dto)) => {
+            let routable = routable_roles(workflow);
+            let distinct = dto.roles.iter().collect::<BTreeSet<_>>();
+            if dto.roles.is_empty()
+                || distinct.len() != dto.roles.len()
+                || !dto.roles.iter().all(|role| routable.contains(role))
+            {
+                return Err(RoutingError::InvalidConfig(
+                    "image generation roles must be distinct routable workflow roles".to_owned(),
+                ));
+            }
+            if !(1..=MAX_IMAGE_GENERATIONS_CEILING).contains(&dto.max_generations) {
+                return Err(RoutingError::InvalidConfig(format!(
+                    "image generation bound must be within 1..={MAX_IMAGE_GENERATIONS_CEILING}"
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(RoutingError::InvalidConfig(
+            "unsupported payload schema for image generation".to_owned(),
+        )),
     }
 }
 
@@ -580,7 +721,7 @@ fn validate_resource_plan_shape(
     workflow: &WorkflowDefinition,
 ) -> Result<(), RoutingError> {
     match (payload.schema_version, payload.resource_plan.as_ref()) {
-        (1 | 2, None) => Ok(()),
+        (1 | 2 | 4, None) => Ok(()),
         (2, Some(_)) => Err(RoutingError::InvalidConfig(
             "resource plan requires config schema 3".to_owned(),
         )),
@@ -600,6 +741,19 @@ fn validate_resource_plan_shape(
         (3, None) => Err(RoutingError::InvalidConfig(
             "schema v3 requires a resource plan".to_owned(),
         )),
+        (4, Some(plan)) => {
+            let required = required_roles(workflow);
+            let routable = routable_roles(workflow);
+            if !required.iter().all(|role| plan.contains_key(role))
+                || !plan.keys().all(|role| routable.contains(role))
+            {
+                return Err(RoutingError::InvalidConfig(
+                    "resource plan must cover the workflow's required roles and stay within its routable roles"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
         _ => Err(RoutingError::InvalidConfig(
             "unsupported payload schema for resource plan".to_owned(),
         )),
@@ -766,6 +920,33 @@ pub fn resolve_config(
     id: ConfigSnapshotId,
     created_at: DateTime<Utc>,
 ) -> Result<ResolvedConfigSnapshot, RoutingError> {
+    resolve_config_with_image(
+        selection,
+        effort,
+        &ImageGenerationPlan::disabled(),
+        workflow,
+        availability,
+        id,
+        created_at,
+    )
+}
+
+/// [`resolve_config`] plus an image-generation grant. A disabled grant emits
+/// the byte-identical v2/v3 payload; an enabled one seals schema v4.
+///
+/// # Errors
+/// Rejects unavailable Recommended, invalid identifiers/configuration, an
+/// effort request naming a role the workflow cannot route, or a grant naming
+/// a role it cannot route.
+pub fn resolve_config_with_image(
+    selection: ExecutionSelection,
+    effort: impl Into<EffortRequest>,
+    image: &ImageGenerationPlan,
+    workflow: &WorkflowDefinition,
+    availability: RecommendedAvailability,
+    id: ConfigSnapshotId,
+    created_at: DateTime<Utc>,
+) -> Result<ResolvedConfigSnapshot, RoutingError> {
     let effort = effort.into();
     let roles = routable_roles(workflow);
     let (profile, profile_version, routes) = match selection {
@@ -835,7 +1016,7 @@ pub fn resolve_config(
     // Every role native keeps the exact pre-effort schema-v2 payload; any
     // explicit level persists the whole per-role resource plan under schema
     // v3. Old payloads are never rewritten either way.
-    let (schema_version, resource_plan) = if efforts
+    let (mut schema_version, resource_plan) = if efforts
         .values()
         .all(|setting| *setting == EffortSetting::NativeDefault)
     {
@@ -843,6 +1024,15 @@ pub fn resolve_config(
     } else {
         (3, Some(efforts))
     };
+    // An image grant is the only thing that seals schema v4; without one the
+    // payload stays whatever effort alone would have produced.
+    let image_generation = image.is_enabled().then(|| {
+        schema_version = 4;
+        ImageGenerationDto {
+            roles: image.roles().collect(),
+            max_generations: image.max_generations(),
+        }
+    });
     let payload = RoutingPayloadV2 {
         schema_version,
         profile: profile.to_owned(),
@@ -850,6 +1040,7 @@ pub fn resolve_config(
         routes,
         providers,
         resource_plan,
+        image_generation,
     };
     let snapshot = ResolvedConfigSnapshot::new(
         id,
@@ -860,6 +1051,7 @@ pub fn resolve_config(
     .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
     RoutingPlan::from_snapshot(&snapshot, workflow)?;
     ResourcePlan::from_snapshot(&snapshot, workflow)?;
+    ImageGenerationPlan::from_snapshot(&snapshot, workflow)?;
     Ok(snapshot)
 }
 
@@ -931,6 +1123,7 @@ pub(crate) fn resolve_eval_config(
         routes,
         providers,
         resource_plan,
+        image_generation: None,
     };
     let snapshot = ResolvedConfigSnapshot::new(
         id,
@@ -1101,6 +1294,17 @@ struct RoutingPayloadV2 {
     /// unknown values fail decoding closed instead of degrading silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resource_plan: Option<HashMap<Role, EffortSetting>>,
+    /// Schema v4 only: which roles may call the image tool and the per-run
+    /// bound. Absent on v2/v3 payloads; unknown roles fail decoding closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_generation: Option<ImageGenerationDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageGenerationDto {
+    roles: Vec<Role>,
+    max_generations: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1149,6 +1353,7 @@ fn decode_v2(
         ));
     }
     validate_resource_plan_shape(&payload, workflow)?;
+    validate_image_generation_shape(&payload, workflow)?;
     if !known_profile(&payload.profile, &payload.profile_version) {
         return Err(RoutingError::InvalidProfileMetadata);
     }
@@ -2607,5 +2812,192 @@ mod tests {
         assert_eq!(RECOMMENDED_PROFILE_VERSION_V1, "recommended_v1");
         assert_eq!(RECOMMENDED_PROFILE_VERSION_V2, "recommended_v2");
         assert_eq!(RECOMMENDED_PROFILE_VERSION, "recommended_v3");
+    }
+
+    #[test]
+    fn image_generation_seals_schema_v4_and_disabled_keeps_old_payloads_byte_identical() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let at: DateTime<Utc> = std::time::SystemTime::now().into();
+        let baseline = resolve_config(
+            ExecutionSelection::Uniform(UniformProvider::Claude),
+            EffortSetting::NativeDefault,
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("img-off").unwrap(),
+            at,
+        )
+        .unwrap();
+        let disabled = resolve_config_with_image(
+            ExecutionSelection::Uniform(UniformProvider::Claude),
+            EffortSetting::NativeDefault,
+            &ImageGenerationPlan::disabled(),
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("img-off").unwrap(),
+            at,
+        )
+        .unwrap();
+        assert_eq!(
+            disabled, baseline,
+            "a disabled grant must not touch the payload"
+        );
+        assert_eq!(disabled.schema_version(), 2);
+        assert!(
+            !ImageGenerationPlan::from_snapshot(&disabled, &workflow)
+                .unwrap()
+                .is_enabled()
+        );
+
+        let enabled = resolve_config_with_image(
+            ExecutionSelection::Uniform(UniformProvider::Claude),
+            EffortSetting::NativeDefault,
+            &ImageGenerationPlan::implementer_only(),
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("img-on").unwrap(),
+            at,
+        )
+        .unwrap();
+        assert_eq!(enabled.schema_version(), 4);
+        assert_eq!(
+            enabled.payload()["image_generation"],
+            json!({"roles": ["implementer"], "max_generations": DEFAULT_MAX_IMAGE_GENERATIONS})
+        );
+        assert!(enabled.payload().get("resource_plan").is_none());
+        // The snapshot names no backend and no model: those belong to the backend.
+        assert!(!enabled.payload().to_string().contains("openai"));
+        assert!(!enabled.payload().to_string().contains("gpt-image"));
+        let plan = ImageGenerationPlan::from_snapshot(&enabled, &workflow).unwrap();
+        assert!(plan.allows(Role::Implementer));
+        assert!(!plan.allows(Role::CodeQualityReviewer));
+        assert!(!plan.allows(Role::SpecReviewer));
+        assert_eq!(plan.max_generations(), DEFAULT_MAX_IMAGE_GENERATIONS);
+        // Routing and effort read v4 exactly as they read v2.
+        let routing = RoutingPlan::from_snapshot(&enabled, &workflow).unwrap();
+        assert_eq!(routing.profile(), "uniform");
+        let efforts = ResourcePlan::from_snapshot(&enabled, &workflow).unwrap();
+        for (_, effort) in efforts.efforts() {
+            assert_eq!(effort, EffortSetting::NativeDefault);
+        }
+
+        let both = resolve_config_with_image(
+            ExecutionSelection::Uniform(UniformProvider::Codex),
+            EffortSetting::HIGH,
+            &ImageGenerationPlan::implementer_only(),
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("img-effort").unwrap(),
+            at,
+        )
+        .unwrap();
+        assert_eq!(both.schema_version(), 4);
+        assert!(both.payload().get("resource_plan").is_some());
+        let efforts = ResourcePlan::from_snapshot(&both, &workflow).unwrap();
+        assert_eq!(efforts.effort(Role::Implementer), Some(EffortSetting::HIGH));
+        assert!(
+            ImageGenerationPlan::from_snapshot(&both, &workflow)
+                .unwrap()
+                .is_enabled()
+        );
+    }
+
+    #[test]
+    fn old_snapshots_decode_image_generation_disabled_and_malformed_fails_closed() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Standard);
+        let at: DateTime<Utc> = std::time::SystemTime::now().into();
+        for effort in [EffortSetting::NativeDefault, EffortSetting::LOW] {
+            let old = resolve_config(
+                ExecutionSelection::Uniform(UniformProvider::Fake),
+                effort,
+                &workflow,
+                RecommendedAvailability::default(),
+                ConfigSnapshotId::new("old").unwrap(),
+                at,
+            )
+            .unwrap();
+            assert!(
+                !ImageGenerationPlan::from_snapshot(&old, &workflow)
+                    .unwrap()
+                    .is_enabled(),
+                "schema {} must decode disabled",
+                old.schema_version()
+            );
+        }
+        let legacy = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("legacy").unwrap(),
+            1,
+            json!({"schema_version":1,"profile":"native_codex","provider":"codex","provider_options":{}}),
+            at,
+        )
+        .unwrap();
+        assert_eq!(
+            ImageGenerationPlan::from_snapshot(&legacy, &workflow).unwrap(),
+            ImageGenerationPlan::disabled()
+        );
+
+        let sealed = resolve_config_with_image(
+            ExecutionSelection::Uniform(UniformProvider::Fake),
+            EffortSetting::NativeDefault,
+            &ImageGenerationPlan::implementer_only(),
+            &workflow,
+            RecommendedAvailability::default(),
+            ConfigSnapshotId::new("valid").unwrap(),
+            at,
+        )
+        .unwrap();
+        let corruptions: [CorruptConfig; 7] = [
+            ("unknown role", |payload| {
+                payload["image_generation"]["roles"] = json!(["designer"]);
+            }),
+            ("empty roles", |payload| {
+                payload["image_generation"]["roles"] = json!([]);
+            }),
+            ("duplicate roles", |payload| {
+                payload["image_generation"]["roles"] = json!(["implementer", "implementer"]);
+            }),
+            ("zero bound", |payload| {
+                payload["image_generation"]["max_generations"] = json!(0);
+            }),
+            ("absurd bound", |payload| {
+                payload["image_generation"]["max_generations"] = json!(1_000_000);
+            }),
+            ("unknown field", |payload| {
+                payload["image_generation"]["backend"] = json!("openai");
+            }),
+            ("block smuggled under v2", |payload| {
+                payload["schema_version"] = json!(2);
+            }),
+        ];
+        for (name, corrupt) in corruptions {
+            let mut payload = sealed.payload().clone();
+            corrupt(&mut payload);
+            let version = payload["schema_version"].as_u64().unwrap();
+            let snapshot = ResolvedConfigSnapshot::new(
+                ConfigSnapshotId::new("corrupt").unwrap(),
+                u32::try_from(version).unwrap(),
+                payload,
+                at,
+            )
+            .unwrap();
+            assert!(
+                ImageGenerationPlan::from_snapshot(&snapshot, &workflow).is_err(),
+                "{name} must fail closed"
+            );
+            assert!(
+                RoutingPlan::from_snapshot(&snapshot, &workflow).is_err(),
+                "{name} must also refuse to route"
+            );
+        }
+        // A v4 payload without the block is not "disabled", it is malformed.
+        let mut payload = sealed.payload().clone();
+        payload.as_object_mut().unwrap().remove("image_generation");
+        let snapshot = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new("v4-missing").unwrap(),
+            4,
+            payload,
+            at,
+        )
+        .unwrap();
+        assert!(ImageGenerationPlan::from_snapshot(&snapshot, &workflow).is_err());
     }
 }

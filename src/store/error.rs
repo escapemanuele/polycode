@@ -116,6 +116,8 @@ pub enum StoreError {
     NonUtf8WorkspacePath(PathBuf),
     #[error("stored provider session is invalid: {0}")]
     InvalidProviderSession(String),
+    #[error("stored image generation is invalid: {0}")]
+    InvalidImageGeneration(String),
     #[error("provider session {0} does not exist")]
     ProviderSessionNotFound(ProviderSessionRecordId),
     #[error("provider session for run {run_id} stage {stage_id} attempt {attempt} already exists")]

@@ -180,6 +180,7 @@ mod tests {
             None,
             None,
             crate::domain::EffortSetting::NativeDefault,
+            None,
         )
         .unwrap();
         let stdin = String::from_utf8(command.stdin).unwrap();

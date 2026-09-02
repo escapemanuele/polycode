@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 6;
+pub const DATABASE_SCHEMA_VERSION: u32 = 7;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -15,31 +15,40 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
-            migrate_v6(connection)
+            migrate_v6(connection)?;
+            migrate_v7(connection)
         }
         1 => {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
-            migrate_v6(connection)
+            migrate_v6(connection)?;
+            migrate_v7(connection)
         }
         2 => {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
-            migrate_v6(connection)
+            migrate_v6(connection)?;
+            migrate_v7(connection)
         }
         3 => {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
-            migrate_v6(connection)
+            migrate_v6(connection)?;
+            migrate_v7(connection)
         }
         4 => {
             migrate_v5(connection)?;
-            migrate_v6(connection)
+            migrate_v6(connection)?;
+            migrate_v7(connection)
         }
-        5 => migrate_v6(connection),
+        5 => {
+            migrate_v6(connection)?;
+            migrate_v7(connection)
+        }
+        6 => migrate_v7(connection),
         unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
     }
 }
@@ -430,6 +439,48 @@ fn migrate_v6(connection: &Connection) -> Result<(), StoreError> {
         "BEGIN IMMEDIATE;
          ALTER TABLE runs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1));
          PRAGMA user_version = 6;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// One row per image the image-generation tool produced for a run: the
+/// per-run bound is counted from these rows, and they are the local answer
+/// to who asked for which bytes, when, from which backend. Insert-only like
+/// artifacts; the PNG itself is an ordinary worktree file.
+fn migrate_v7(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE image_generations (
+             id TEXT PRIMARY KEY NOT NULL,
+             run_id TEXT NOT NULL,
+             stage_id TEXT NOT NULL,
+             attempt INTEGER NOT NULL CHECK (attempt > 0),
+             ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+             backend TEXT NOT NULL,
+             model TEXT NOT NULL,
+             output_path TEXT NOT NULL,
+             output_sha256 TEXT NOT NULL CHECK (length(output_sha256) = 64),
+             output_size INTEGER NOT NULL CHECK (output_size > 0),
+             prompt_sha256 TEXT NOT NULL CHECK (length(prompt_sha256) = 64),
+             response_id TEXT,
+             requested_at TEXT NOT NULL,
+             completed_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             UNIQUE (run_id, ordinal)
+         );
+         CREATE INDEX image_generations_run_idx ON image_generations(run_id, ordinal);
+         CREATE TRIGGER image_generations_no_update
+         BEFORE UPDATE ON image_generations
+         BEGIN
+             SELECT RAISE(ABORT, 'image generations are immutable');
+         END;
+         CREATE TRIGGER image_generations_no_delete
+         BEFORE DELETE ON image_generations
+         BEGIN
+             SELECT RAISE(ABORT, 'image generations are immutable');
+         END;
+         PRAGMA user_version = 7;
          COMMIT;",
     )?;
     Ok(())

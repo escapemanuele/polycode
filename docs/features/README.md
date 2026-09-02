@@ -17,6 +17,7 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 | Native providers | Claude Code and Codex adapters, permissions, sandboxes, attention | [providers.md](providers.md) |
 | Evaluations | `eval list/run/report`, suites under `evals/`, evidence layout | [evaluations.md](evaluations.md) |
 | Observability and effort | Usage/latency/prompt-bytes telemetry and `--effort` | [observability-and-effort.md](observability-and-effort.md) |
+| Image generation | `--allow-image-generation`: the Implementer generates PNGs into the worktree through a Polycode-owned OpenAI-backed tool | [image-generation.md](image-generation.md) |
 | Configuration and appearance | Data/config paths and the environment variables the TUI reads | [configuration.md](configuration.md) |
 | Install, update, doctor | Bootstrap installer, self-update, environment check | [install-update-doctor.md](install-update-doctor.md) |
 | Process supervision | tmux-backed managed processes, `__run-process`, `__exec-process` | [process-supervision.md](process-supervision.md) |

@@ -22,6 +22,13 @@ pub enum Command {
     /// Internal signal-normalizing exec bridge.
     #[command(name = "__exec-process", hide = true)]
     ExecProcess { manifest: PathBuf },
+    /// Internal run-scoped MCP server for the image-generation tool.
+    #[command(name = "__image-tool", hide = true)]
+    ImageTool {
+        /// Unix socket of the Polycode process hosting the tool.
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Internal release-pipeline gate: canonical tag matching this build.
     #[command(name = "__verify-release-tag", hide = true)]
     VerifyReleaseTag { tag: String },
@@ -166,6 +173,11 @@ pub struct RunArgs {
     /// under `--provider`; `native` opts every role out.
     #[arg(long)]
     pub effort: Option<String>,
+    /// Let the Implementer generate PNG images into the worktree through the
+    /// local Codex CLI's built-in image tool (needs an authenticated `codex`;
+    /// at most four generations per run). Off by default.
+    #[arg(long)]
+    pub allow_image_generation: bool,
 }
 
 #[cfg(test)]

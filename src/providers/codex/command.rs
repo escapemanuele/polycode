@@ -2,6 +2,45 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{EffortLevel, EffortSetting, ModelId, ProviderSessionId, StageKind};
+use crate::image::{ImageToolServerCommand, MCP_SERVER_NAME, TOOL_NAME};
+
+/// Codex tool timeout for the image server. Generation can take minutes;
+/// the native default of 60 seconds would fail a healthy call.
+const IMAGE_TOOL_TIMEOUT_SEC: u32 = 300;
+
+/// Root-level `-c` overrides that register the run-scoped MCP server for
+/// this invocation only: nothing is written to `~/.codex/config.toml`, and
+/// the user's own servers stay configured. Values are TOML basic strings and
+/// arrays, encoded through JSON string escaping, which TOML accepts.
+pub(crate) fn mcp_overrides(image: &ImageToolServerCommand) -> Vec<OsString> {
+    let command =
+        serde_json::to_string(&image.executable.to_string_lossy()).expect("string encodes");
+    let args = serde_json::to_string(
+        &image
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+    )
+    .expect("string list encodes");
+    vec![
+        OsString::from("-c"),
+        OsString::from(format!("mcp_servers.{MCP_SERVER_NAME}.command={command}")),
+        OsString::from("-c"),
+        OsString::from(format!("mcp_servers.{MCP_SERVER_NAME}.args={args}")),
+        OsString::from("-c"),
+        OsString::from(format!(
+            "mcp_servers.{MCP_SERVER_NAME}.tool_timeout_sec={IMAGE_TOOL_TIMEOUT_SEC}"
+        )),
+        // Under `--ask-for-approval never` an MCP tool call is refused unless
+        // the tool is pre-approved; this is the exact-tool equivalent of the
+        // Claude `--allowedTools` rule, scoped to this one tool.
+        OsString::from("-c"),
+        OsString::from(format!(
+            "mcp_servers.{MCP_SERVER_NAME}.tools.{TOOL_NAME}.approval_mode=\"approve\""
+        )),
+    ]
+}
 
 pub(crate) struct CodexCommand {
     pub argv: Vec<OsString>,
@@ -49,8 +88,9 @@ pub(crate) fn initial(
     model: Option<&ModelId>,
     effort: EffortSetting,
     final_message_path: &Path,
+    image: Option<&ImageToolServerCommand>,
 ) -> CodexCommand {
-    let mut argv = base(stage_kind, model, effort, final_message_path);
+    let mut argv = base(stage_kind, model, effort, final_message_path, image);
     argv.push(OsString::from("-"));
     CodexCommand {
         argv,
@@ -66,8 +106,9 @@ pub(crate) fn resume(
     model: Option<&ModelId>,
     effort: EffortSetting,
     final_message_path: &Path,
+    image: Option<&ImageToolServerCommand>,
 ) -> CodexCommand {
-    let mut argv = base(stage_kind, model, effort, final_message_path);
+    let mut argv = base(stage_kind, model, effort, final_message_path, image);
     argv.push(OsString::from("resume"));
     argv.push(OsString::from(session_id.as_str()));
     argv.push(OsString::from("-"));
@@ -83,8 +124,12 @@ fn base(
     model: Option<&ModelId>,
     effort: EffortSetting,
     final_message_path: &Path,
+    image: Option<&ImageToolServerCommand>,
 ) -> Vec<OsString> {
     let mut argv = Vec::new();
+    if let Some(image) = image {
+        argv.extend(mcp_overrides(image));
+    }
     if let Some(model) = model {
         argv.push(OsString::from("--model"));
         argv.push(OsString::from(model.as_str()));
@@ -136,6 +181,7 @@ mod tests {
             None,
             EffortSetting::NativeDefault,
             Path::new("/private/final.md"),
+            None,
         );
         assert!(
             !command
@@ -161,6 +207,7 @@ mod tests {
                     None,
                     setting,
                     Path::new("/private/final.md"),
+                    None,
                 ),
                 resume(
                     &ProviderSessionId::new("thread-1").unwrap(),
@@ -169,6 +216,7 @@ mod tests {
                     None,
                     setting,
                     Path::new("/private/final.md"),
+                    None,
                 ),
             ] {
                 let args = strings(&command.argv);
@@ -194,6 +242,7 @@ mod tests {
             None,
             EffortSetting::NativeDefault,
             Path::new("/private/final.md"),
+            None,
         );
         let args = strings(&command.argv);
         assert_eq!(args.last().map(String::as_str), Some("-"));
@@ -219,6 +268,7 @@ mod tests {
             Some(&ModelId::new("configured-model").unwrap()),
             EffortSetting::NativeDefault,
             Path::new("/private/final.md"),
+            None,
         );
         let args = strings(&command.argv);
         assert!(
@@ -241,6 +291,7 @@ mod tests {
                 None,
                 EffortSetting::NativeDefault,
                 Path::new("/private/final.md"),
+                None,
             );
             let args = strings(&command.argv);
             assert!(
@@ -260,6 +311,7 @@ mod tests {
             None,
             EffortSetting::NativeDefault,
             Path::new("/private/final.md"),
+            None,
         );
         let args = strings(&command.argv);
         assert!(
@@ -290,5 +342,96 @@ mod tests {
         ] {
             assert!(!args.iter().any(|arg| arg == forbidden));
         }
+    }
+
+    fn image_command() -> ImageToolServerCommand {
+        ImageToolServerCommand {
+            executable: PathBuf::from("/opt/polycode/bin/polycode"),
+            args: vec![
+                OsString::from("__image-tool"),
+                OsString::from("--socket"),
+                OsString::from("/tmp/pcimg-run.sock"),
+            ],
+        }
+    }
+
+    #[test]
+    fn image_grant_registers_the_server_through_root_overrides_only() {
+        let baseline = initial(
+            "prompt",
+            StageKind::Implementation,
+            None,
+            EffortSetting::NativeDefault,
+            Path::new("/private/final.md"),
+            None,
+        );
+        let granted = initial(
+            "prompt",
+            StageKind::Implementation,
+            None,
+            EffortSetting::NativeDefault,
+            Path::new("/private/final.md"),
+            Some(&image_command()),
+        );
+        assert_eq!(granted.stdin, baseline.stdin);
+        let args = strings(&granted.argv);
+        let overrides = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-c")
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            overrides,
+            vec![
+                "mcp_servers.polycode_image.command=\"/opt/polycode/bin/polycode\"",
+                "mcp_servers.polycode_image.args=[\"__image-tool\",\"--socket\",\"/tmp/pcimg-run.sock\"]",
+                "mcp_servers.polycode_image.tool_timeout_sec=300",
+                "mcp_servers.polycode_image.tools.image_generate.approval_mode=\"approve\"",
+            ]
+        );
+        assert!(
+            !overrides.iter().any(|value| value.contains(".env")),
+            "no environment is handed to the server"
+        );
+        // Root-level overrides precede the exec subcommand, like effort does.
+        let last_c = args.iter().rposition(|arg| arg == "-c").unwrap();
+        let exec_index = args.iter().position(|arg| arg == "exec").unwrap();
+        assert!(last_c < exec_index);
+        // Sandbox and approval policy are untouched by the grant.
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--ask-for-approval", "never"])
+        );
+        assert_safe(&args);
+        // Without a grant the argv is byte-identical to before the tool existed.
+        assert!(
+            !strings(&baseline.argv)
+                .iter()
+                .any(|arg| arg.contains("mcp_servers"))
+        );
+    }
+
+    #[test]
+    fn image_grant_carries_no_credential_anywhere_in_the_invocation() {
+        // Same reasoning as the Claude builder: no credential enters this
+        // function, so none can come out of it.
+        let command = resume(
+            &ProviderSessionId::new("thread-1").unwrap(),
+            "continue",
+            StageKind::Implementation,
+            None,
+            EffortSetting::HIGH,
+            Path::new("/private/final.md"),
+            Some(&image_command()),
+        );
+        let joined = strings(&command.argv).join("\n");
+        assert!(!joined.contains("OPENAI"), "{joined}");
+        assert!(!joined.contains(".env"), "{joined}");
+        assert!(!joined.contains("sk-proj"), "{joined}");
+        assert_eq!(command.stdin, b"continue");
     }
 }

@@ -6,7 +6,7 @@ mod detection;
 mod error;
 mod prompt;
 mod protocol;
-mod session_meta;
+pub(crate) mod session_meta;
 
 use session_meta::ObservedRuntime;
 
@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -21,10 +22,12 @@ use crate::domain::{
     EffortSetting, ModelId, ProviderId, ProviderSessionId, Role, StageKind, StageStatus,
 };
 use crate::engine::{Provider, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal};
+use crate::image::{ImageToolHost, ImageToolScope, ImageToolServerCommand, TOOL_NAME};
 use crate::process::{
     ExitResult, ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend,
     ProcessManager, TmuxBackend,
 };
+use crate::providers::stage_prompt;
 use crate::providers::{
     ProviderCommit, ProviderSessionMutation, ProviderSessionRecord, ProviderSessionRecordId,
     ProviderSessionStatus, change_handoff,
@@ -57,6 +60,8 @@ pub struct CodexProvider<B = TmuxBackend> {
     /// construction. `None` disables the lookup entirely, which leaves the
     /// runtime unobserved rather than guessed.
     codex_home: Option<PathBuf>,
+    /// Present only for a role the run's image-generation grant names.
+    image_tool: Option<Arc<ImageToolHost>>,
 }
 
 impl CodexProvider<TmuxBackend> {
@@ -77,6 +82,7 @@ impl CodexProvider<TmuxBackend> {
             manager: ProcessManager::from_environment()?,
             artifact_root: root,
             codex_home: session_meta::home_from_environment(),
+            image_tool: None,
         })
     }
 
@@ -96,6 +102,7 @@ impl CodexProvider<TmuxBackend> {
             manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
             artifact_root: root,
             codex_home: session_meta::home_from_environment(),
+            image_tool: None,
         })
     }
 }
@@ -108,6 +115,54 @@ impl<B> CodexProvider<B> {
     pub fn with_effort(mut self, effort: EffortSetting) -> Self {
         self.effort = effort;
         self
+    }
+
+    /// The image tool this adapter carries, if its role holds the grant.
+    /// `None` keeps every invocation byte-identical to before the tool
+    /// existed.
+    #[must_use]
+    pub fn with_image_tool(mut self, host: Option<Arc<ImageToolHost>>) -> Self {
+        self.image_tool = host;
+        self
+    }
+
+    /// Arms the tool host for this stage on every poll of a granted stage.
+    /// Idempotent, so a Polycode process that restarted and re-attached to a
+    /// running agent re-authorizes the same stage without a new invocation.
+    fn arm_image_tool(&self, store: &SqliteStore, request: &ProviderRequest) {
+        if let Some(host) = &self.image_tool {
+            if let Some(database) = store.database_path() {
+                host.activate(ImageToolScope {
+                    run_id: request.run_id(),
+                    stage_id: request.stage_id().clone(),
+                    attempt: request.attempt(),
+                    role: request.role(),
+                    worktree: request.workspace_path().to_path_buf(),
+                    database,
+                });
+            }
+        }
+    }
+
+    /// What the native CLI must launch to reach the tool, when granted.
+    fn image_server_command(&self) -> Result<Option<ImageToolServerCommand>, std::io::Error> {
+        self.image_tool
+            .as_ref()
+            .map(|host| host.server_command())
+            .transpose()
+    }
+
+    /// Prompt addendum for a granted stage: the bound and what remains, read
+    /// from the store so a resumed process states the truth.
+    fn image_prompt_section(&self, store: &SqliteStore, request: &ProviderRequest) -> String {
+        let Some(host) = &self.image_tool else {
+            return String::new();
+        };
+        let max = host.service().max_generations();
+        let used = store
+            .count_image_generations(request.run_id())
+            .unwrap_or(max);
+        stage_prompt::image_tool_section(TOOL_NAME, max, max.saturating_sub(used))
     }
 }
 
@@ -202,6 +257,7 @@ impl<B: ProcessBackend> CodexProvider<B> {
 
         let final_message_path = self.final_message_path(request, &session, invocation);
         create_private_parent(&final_message_path)?;
+        let image = self.image_server_command()?;
         let command = if let Some(native) = session.native_session_id() {
             command::resume(
                 native,
@@ -210,22 +266,26 @@ impl<B: ProcessBackend> CodexProvider<B> {
                 self.model.as_ref(),
                 self.effort,
                 &final_message_path,
+                image.as_ref(),
             )
         } else {
             let artifacts = store.list_artifacts(request.run_id())?;
             let handoff = change_handoff::for_request(store, request)?;
             let continue_instruction = self.continue_instruction(request)?;
+            let mut prompt = prompt::compose(
+                request,
+                &artifacts,
+                handoff.as_ref(),
+                continue_instruction.as_deref(),
+            )?;
+            prompt.push_str(&self.image_prompt_section(store, request));
             command::initial(
-                &prompt::compose(
-                    request,
-                    &artifacts,
-                    handoff.as_ref(),
-                    continue_instruction.as_deref(),
-                )?,
+                &prompt,
                 request.stage_kind(),
                 self.model.as_ref(),
                 self.effort,
                 &final_message_path,
+                image.as_ref(),
             )
         };
         debug_assert_eq!(command.final_message_path, final_message_path);
@@ -653,6 +713,7 @@ impl<B: ProcessBackend> Provider for CodexProvider<B> {
         store: &mut SqliteStore,
         request: &ProviderRequest,
     ) -> Result<ProviderPoll, ProviderError> {
+        self.arm_image_tool(store, request);
         let result = (|| -> Result<ProviderPoll, CodexProviderError> {
             match store.load_provider_session_for_attempt(
                 request.run_id(),
@@ -1163,6 +1224,98 @@ mod tests {
         fn cleanup(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
             Ok(())
         }
+    }
+
+    /// The credential boundary at the Codex adapter: a granted stage launches
+    /// with the run-scoped server registered through root overrides, the
+    /// exact tool pre-approved, and an empty environment override, so nothing
+    /// the adapter does can put `OPENAI_API_KEY` in front of the native CLI.
+    #[test]
+    fn a_granted_stage_launches_with_the_tool_and_an_empty_environment_override() {
+        use crate::image::{ImageToolHost, ImageToolService};
+
+        let (temp, _database, run_id, mut store, provider) = fixture(SUCCESS_OUTPUT);
+        let host = ImageToolHost::start(
+            ImageToolService::new(temp.path().join("runs"), None, vec![Role::Implementer], 4),
+            run_id,
+        )
+        .unwrap();
+        let socket = host.socket_path().to_string_lossy().into_owned();
+        let provider = provider.with_image_tool(Some(host));
+        let mut engine = WorkflowEngine::new(provider, "landing page with a hero image");
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+        let processes = store.list_managed_processes(run_id).unwrap();
+        assert_eq!(processes.len(), 1);
+        let spec = processes[0].spec();
+        assert!(
+            spec.environment().is_empty(),
+            "the adapter must not add any environment entry: {:?}",
+            spec.environment().keys().collect::<Vec<_>>()
+        );
+        let argv = spec
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let overrides = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "-c")
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>();
+        assert!(
+            overrides.iter().any(|value| value
+                == &format!(
+                    "mcp_servers.polycode_image.args=[\"__image-tool\",\"--socket\",\"{socket}\"]"
+                )),
+            "{overrides:?}"
+        );
+        assert!(overrides.iter().any(|value| {
+            value == "mcp_servers.polycode_image.tools.image_generate.approval_mode=\"approve\""
+        }));
+        assert!(!overrides.iter().any(|value| value.contains(".env")));
+        let joined = argv.join("\n");
+        assert!(!joined.contains("OPENAI"), "{joined}");
+        let stdin = std::fs::read_to_string(spec.stdin_path().unwrap()).unwrap();
+        assert!(stdin.contains("# Image generation"));
+        assert!(!stdin.contains("OPENAI"));
+        assert!(!stdin.contains("sk-"));
+    }
+
+    /// Without a grant the launch is byte-identical to before the tool
+    /// existed: no server override and no prompt note.
+    #[test]
+    fn an_ungranted_stage_launches_exactly_as_before() {
+        let (_temp, _database, run_id, mut store, provider) = fixture(SUCCESS_OUTPUT);
+        let mut engine = WorkflowEngine::new(provider, "landing page with a hero image");
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+        let processes = store.list_managed_processes(run_id).unwrap();
+        let spec = processes[0].spec();
+        let joined = spec
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("mcp_servers"), "{joined}");
+        assert!(spec.environment().is_empty());
+        let stdin = std::fs::read_to_string(spec.stdin_path().unwrap()).unwrap();
+        assert!(!stdin.contains("Image generation"));
     }
 
     #[test]
@@ -1859,6 +2012,7 @@ mod tests {
             // Inside the test's own temp directory: the lookup runs for real
             // and finds nothing, and no test can reach a real Codex home.
             codex_home: Some(temp.path().join("codex-home")),
+            image_tool: None,
         };
         let mut engine = WorkflowEngine::new(provider, "recover task");
         loop {
@@ -1958,6 +2112,7 @@ mod tests {
             // and finds nothing unless the test writes a rollout there, and
             // no test can reach a real Codex home.
             codex_home: Some(temp.path().join("codex-home")),
+            image_tool: None,
         };
         (temp, database, run_id, store, provider)
     }

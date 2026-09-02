@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -22,10 +23,12 @@ use crate::engine::{
     Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest,
     ProviderSignal,
 };
+use crate::image::{ImageToolHost, ImageToolScope, ImageToolServerCommand, TOOL_NAME};
 use crate::process::{
     ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend,
     ProcessManager, TmuxBackend,
 };
+use crate::providers::stage_prompt;
 use crate::providers::{
     PendingProviderAttention, ProviderCommit, ProviderSessionMutation, ProviderSessionRecord,
     ProviderSessionRecordId, ProviderSessionStatus, change_handoff,
@@ -52,6 +55,8 @@ pub struct ClaudeProvider<B = TmuxBackend> {
     manager: ProcessManager<B>,
     artifact_root: PathBuf,
     eval_auto_approve: bool,
+    /// Present only for a role the run's image-generation grant names.
+    image_tool: Option<Arc<ImageToolHost>>,
 }
 
 impl ClaudeProvider<TmuxBackend> {
@@ -72,6 +77,7 @@ impl ClaudeProvider<TmuxBackend> {
             manager: ProcessManager::from_environment()?,
             artifact_root: root,
             eval_auto_approve: false,
+            image_tool: None,
         })
     }
 
@@ -100,6 +106,7 @@ impl ClaudeProvider<TmuxBackend> {
             manager: ProcessManager::new(&root, TmuxBackend::new(runner_executable)),
             artifact_root: root,
             eval_auto_approve,
+            image_tool: None,
         })
     }
 }
@@ -116,6 +123,54 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
     pub fn with_effort(mut self, effort: EffortSetting) -> Self {
         self.effort = effort;
         self
+    }
+
+    /// The image tool this adapter carries, if its role holds the grant.
+    /// `None` keeps every invocation byte-identical to before the tool
+    /// existed.
+    #[must_use]
+    pub fn with_image_tool(mut self, host: Option<Arc<ImageToolHost>>) -> Self {
+        self.image_tool = host;
+        self
+    }
+
+    /// Arms the tool host for this stage on every poll of a granted stage.
+    /// Idempotent, so a Polycode process that restarted and re-attached to a
+    /// running agent re-authorizes the same stage without a new invocation.
+    fn arm_image_tool(&self, store: &SqliteStore, request: &ProviderRequest) {
+        if let Some(host) = &self.image_tool {
+            if let Some(database) = store.database_path() {
+                host.activate(ImageToolScope {
+                    run_id: request.run_id(),
+                    stage_id: request.stage_id().clone(),
+                    attempt: request.attempt(),
+                    role: request.role(),
+                    worktree: request.workspace_path().to_path_buf(),
+                    database,
+                });
+            }
+        }
+    }
+
+    /// What the native CLI must launch to reach the tool, when granted.
+    fn image_server_command(&self) -> Result<Option<ImageToolServerCommand>, std::io::Error> {
+        self.image_tool
+            .as_ref()
+            .map(|host| host.server_command())
+            .transpose()
+    }
+
+    /// Prompt addendum for a granted stage: the bound and what remains, read
+    /// from the store so a resumed process states the truth.
+    fn image_prompt_section(&self, store: &SqliteStore, request: &ProviderRequest) -> String {
+        let Some(host) = &self.image_tool else {
+            return String::new();
+        };
+        let max = host.service().max_generations();
+        let used = store
+            .count_image_generations(request.run_id())
+            .unwrap_or(max);
+        stage_prompt::image_tool_section(TOOL_NAME, max, max.saturating_sub(used))
     }
 
     fn now() -> DateTime<Utc> {
@@ -162,6 +217,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         // without one, and starting over is the only thing left to do — keying
         // on the invocation number would strand that stage on a resume it can
         // never issue. Codex already selects this way.
+        let image = self.image_server_command()?;
         let command = if let Some(native) = session.native_session_id() {
             let denials = session
                 .pending_attention()
@@ -200,21 +256,20 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 response.as_deref(),
                 self.model.as_ref(),
                 self.effort,
+                image.as_ref(),
             )?
         } else {
             let artifacts = store.list_artifacts(request.run_id())?;
             let handoff = change_handoff::for_request(store, request)?;
             let continue_instruction = self.continue_instruction(request)?;
-            command::initial(
-                &prompt::compose(
-                    request,
-                    &artifacts,
-                    handoff.as_ref(),
-                    continue_instruction.as_deref(),
-                )?,
-                self.model.as_ref(),
-                self.effort,
-            )
+            let mut prompt = prompt::compose(
+                request,
+                &artifacts,
+                handoff.as_ref(),
+                continue_instruction.as_deref(),
+            )?;
+            prompt.push_str(&self.image_prompt_section(store, request));
+            command::initial(&prompt, self.model.as_ref(), self.effort, image.as_ref())
         };
         let process = self.manager.prepare_with_input(
             store,
@@ -915,6 +970,7 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
         store: &mut SqliteStore,
         request: &ProviderRequest,
     ) -> Result<ProviderPoll, ProviderError> {
+        self.arm_image_tool(store, request);
         let result = (|| -> Result<ProviderPoll, ClaudeProviderError> {
             match store.load_provider_session_for_attempt(
                 request.run_id(),
@@ -2970,6 +3026,7 @@ mod tests {
             manager: ProcessManager::new(process_root, backend),
             artifact_root: process_root.to_path_buf(),
             eval_auto_approve,
+            image_tool: None,
         }
     }
 
@@ -2978,6 +3035,83 @@ mod tests {
         let (_temp, _database, _run_id, _store, provider) = fixture();
         assert!(provider.supports_role(Role::CodeQualityReviewer));
         assert!(provider.supports_role(Role::SpecReviewer));
+    }
+
+    /// The credential boundary at the adapter: a granted stage launches with
+    /// the run-scoped MCP server and the exact allow rule, and with an
+    /// *empty* environment override, so nothing the adapter does can put
+    /// `OPENAI_API_KEY` in front of the native CLI. The prompt carries the
+    /// tool note and no secret either.
+    #[test]
+    fn a_granted_stage_launches_with_the_tool_and_an_empty_environment_override() {
+        use crate::image::{ImageToolHost, ImageToolService};
+
+        let backend = FixtureBackend::default();
+        backend.set_first_result(success_result("# Done\n", &serde_json::json!([])));
+        let (temp, _database, run_id, mut store, provider) = fixture_with_backend(backend, false);
+        let host = ImageToolHost::start(
+            ImageToolService::new(temp.path().join("runs"), None, vec![Role::Implementer], 4),
+            run_id,
+        )
+        .unwrap();
+        let socket = host.socket_path().to_string_lossy().into_owned();
+        let provider = provider.with_image_tool(Some(host));
+        let mut engine = WorkflowEngine::new(provider, "landing page with a hero image");
+        drive_to_completion(&mut engine, &mut store, run_id);
+
+        let processes = store.list_managed_processes(run_id).unwrap();
+        assert_eq!(processes.len(), 1);
+        let spec = processes[0].spec();
+        assert!(
+            spec.environment().is_empty(),
+            "the adapter must not add any environment entry: {:?}",
+            spec.environment().keys().collect::<Vec<_>>()
+        );
+        let argv = spec
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let config_index = argv.iter().position(|arg| arg == "--mcp-config").unwrap();
+        let config: serde_json::Value = serde_json::from_str(&argv[config_index + 1]).unwrap();
+        let server = &config["mcpServers"]["polycode_image"];
+        assert_eq!(server["args"][2], socket);
+        assert!(server.get("env").is_none());
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--allowedTools", "mcp__polycode_image__image_generate"])
+        );
+        let joined = argv.join("\n");
+        assert!(!joined.contains("OPENAI"), "{joined}");
+        let stdin = std::fs::read_to_string(spec.stdin_path().unwrap()).unwrap();
+        assert!(stdin.contains("# Image generation"));
+        assert!(stdin.contains("4 generations are allowed in this run and 4 remain"));
+        assert!(!stdin.contains("OPENAI"));
+        assert!(!stdin.contains("sk-"));
+    }
+
+    /// Without a grant the launch is byte-identical to before the tool
+    /// existed: no MCP flag, no allow rule, no prompt note.
+    #[test]
+    fn an_ungranted_stage_launches_exactly_as_before() {
+        let backend = FixtureBackend::default();
+        backend.set_first_result(success_result("# Done\n", &serde_json::json!([])));
+        let (_temp, _database, run_id, mut store, provider) = fixture_with_backend(backend, false);
+        let mut engine = WorkflowEngine::new(provider, "landing page with a hero image");
+        drive_to_completion(&mut engine, &mut store, run_id);
+        let processes = store.list_managed_processes(run_id).unwrap();
+        let spec = processes[0].spec();
+        let joined = spec
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("mcp"), "{joined}");
+        assert!(!joined.contains("allowedTools"), "{joined}");
+        assert!(spec.environment().is_empty());
+        let stdin = std::fs::read_to_string(spec.stdin_path().unwrap()).unwrap();
+        assert!(!stdin.contains("Image generation"));
     }
 
     fn init_repository(path: &Path) {

@@ -76,7 +76,7 @@ pub(crate) fn home_from_environment() -> Option<PathBuf> {
 /// The ID arrives from another program's stdout. Restricting it to the shape
 /// Codex actually emits keeps it from reaching the filesystem as anything but
 /// a leaf name component.
-fn is_plausible_thread_id(thread_id: &str) -> bool {
+pub(crate) fn is_plausible_thread_id(thread_id: &str) -> bool {
     !thread_id.is_empty()
         && thread_id.len() <= 64
         && thread_id != "."

@@ -25,6 +25,10 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             crate::process::exec_managed_process(manifest)?;
             Ok(())
         }
+        Some(Command::ImageTool { socket }) => {
+            crate::image::run_stdio_server(socket)?;
+            Ok(())
+        }
         Some(Command::VerifyReleaseTag { tag }) => verify_release_tag(tag),
         Some(Command::RegisterOfficialInstall { executable, asset }) => {
             register_official_install(executable, asset.as_deref())
@@ -141,12 +145,18 @@ fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
         (Some(_), Some(_)) => unreachable!("clap rejects conflicting selection flags"),
     };
     let effort = parse_effort(args.effort.as_deref())?;
+    let image = if args.allow_image_generation {
+        crate::app::ImageGenerationPlan::implementer_only()
+    } else {
+        crate::app::ImageGenerationPlan::disabled()
+    };
     let report = service()?.start_run(
         workflow,
         args.task.clone(),
         &args.repo,
         Some(selection),
         effort,
+        &image,
     )?;
     print_report(&report);
     Ok(())
@@ -467,6 +477,20 @@ fn doctor() -> Result<()> {
         );
     }
     println!("  fake provider: available (deterministic development/testing)");
+    // Image generation is opt-in per run; without the flag nothing here is
+    // needed, so an unavailable backend is information, not a warning.
+    match crate::image::backend_available() {
+        Ok(installation) => println!(
+            "  image generation: available (backend Codex CLI {} built-in image_gen, native auth{}; opt in per run with --allow-image-generation)",
+            installation.version(),
+            installation
+                .auth_method()
+                .map_or(String::new(), |method| format!(" via {method}"))
+        ),
+        Err(error) => println!(
+            "  image generation: unavailable ({error}; only needed with --allow-image-generation)"
+        ),
+    }
     // Git is as fundamental as tmux here: every run needs a repository and a
     // managed worktree.
     if let Some(version) = crate::git::git_version(&crate::git::Git::default()) {
@@ -745,6 +769,24 @@ fn print_details(details: &RunDetails) {
                 request.stage_id,
                 enum_text(request.kind),
                 request.summary
+            );
+        }
+    }
+    if !details.image_generations.is_empty() {
+        println!();
+        println!("Image generations (worktree files; not visually reviewed)");
+        for image in &details.image_generations {
+            println!(
+                "{} · {} (attempt {}) · {}/{} · {} · {} bytes · sha256 {} · {}",
+                image.ordinal,
+                image.stage_id,
+                image.attempt,
+                image.backend,
+                image.model,
+                image.output_path,
+                image.output_size,
+                image.output_sha256,
+                image.completed_at.to_rfc3339()
             );
         }
     }

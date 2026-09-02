@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Engineering responsibility assigned to a stage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     Researcher,

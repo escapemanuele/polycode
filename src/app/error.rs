@@ -44,6 +44,12 @@ pub enum AppError {
     #[error("unsupported provider {0:?}; supported providers: claude, codex, fake")]
     UnsupportedProvider(String),
     #[error(
+        "image generation cannot be enabled: {0}. Install and authenticate the Codex CLI (`codex login`) and retry, or start without --allow-image-generation."
+    )]
+    ImageGenerationUnavailable(String),
+    #[error("image generation is not supported by this provider factory: {0}")]
+    ImageGenerationUnsupported(String),
+    #[error(
         "Repository has uncommitted changes.\n  Commit or stash them before starting a Polycode run."
     )]
     DirtySourceRepository,
