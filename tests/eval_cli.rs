@@ -82,6 +82,41 @@ fn fake_repetitions_write_synthetic_results_without_polluting_normal_runs() {
     assert_eq!(String::from_utf8(listed.stdout).unwrap().trim(), "No runs.");
 }
 
+/// Evidence at one effort level must never be mistaken for evidence at
+/// another: the requested level is on every result, and the default is the
+/// runtime's own, exactly as before the flag existed.
+#[test]
+fn eval_records_the_requested_effort_on_every_result() {
+    let fixture = Fixture::new();
+    let output = fixture.root().join("effort-results");
+    let run = fixture.polycode(&[
+        "eval",
+        "run",
+        "--provider",
+        "fake",
+        "--effort",
+        "xhigh",
+        "--out",
+        output.to_str().unwrap(),
+    ]);
+    assert_success(&run);
+    let results = load_results(&[output]).unwrap();
+    assert!(!results.is_empty());
+    assert!(
+        results
+            .iter()
+            .all(|result| result.requested_effort == Some(polycode::domain::EffortSetting::XHIGH))
+    );
+
+    let refused = fixture.polycode(&["eval", "run", "--provider", "fake", "--effort", "max"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unsupported effort"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
 #[test]
 fn fake_codex_v2_smoke_scores_calibrated_reviewers_without_native_usage() {
     let fixture = Fixture::new();

@@ -278,7 +278,7 @@ fn every_key_in_the_control_room_map_is_bound() {
 #[test]
 fn feature_map_parser_reads_the_documented_shapes() {
     let inv = parse_invocation(
-        r#"polycode fast "<task>" [--repo <path>] [--provider claude|codex|fake | --profile recommended] [--effort native|low|medium|high]"#,
+        r#"polycode fast "<task>" [--repo <path>] [--provider claude|codex|fake | --profile recommended] [--effort native|low|medium|high|xhigh]"#,
     )
     .unwrap();
     assert_eq!(inv.subcommands, ["fast"]);

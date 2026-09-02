@@ -24,7 +24,7 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     assert_success(&started);
     let stdout = String::from_utf8(started.stdout).unwrap();
     assert!(stdout.contains("Status     completed"));
-    assert!(stdout.contains("Profile    recommended (recommended_v2)"));
+    assert!(stdout.contains("Profile    recommended (recommended_v3)"));
     assert!(stdout.contains("architect  claude"));
     assert!(stdout.contains("implementer  codex"));
     let run_id: RunId = stdout
@@ -37,7 +37,9 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     let mut store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
     let loaded = store.load_run(run_id).unwrap();
     assert_eq!(loaded.run.status(), RunStatus::Completed);
-    assert_eq!(loaded.config_snapshot.schema_version(), 2);
+    // Recommended states effort per role, so the snapshot carries a resource
+    // plan under schema v3; the column itself has its own test below.
+    assert_eq!(loaded.config_snapshot.schema_version(), 3);
     let sessions = store.list_provider_sessions(run_id).unwrap();
     assert_eq!(sessions.len(), 6);
     let by_stage = sessions
@@ -103,6 +105,70 @@ fn recommended_standard_routes_native_fixtures_per_role_and_preserves_artifact_b
     );
 }
 
+/// The Recommended profile states a requested effort per role — reasoning
+/// roles high, the implementer medium, the simplifier low — and a default run
+/// seals exactly that column, reports it in the Routing table, and hands each
+/// native runtime its level.
+#[test]
+fn recommended_seals_the_profiles_effort_per_role_and_reports_it() {
+    let fixture = Fixture::new();
+    let started = fixture.polycode_write(&[
+        "standard",
+        "Build effort column fixture",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+    ]);
+    assert_success(&started);
+    let stdout = String::from_utf8(started.stdout).unwrap();
+    for line in [
+        "architect  claude  native default  route_inherited_from_recommended_v2  effort=high",
+        "implementer  codex  native default  route_inherited_from_recommended_v2_measured_at_native_default_effort  effort=medium",
+        "simplifier  claude  native default  route_inherited_from_recommended_v2  effort=low",
+        "code_quality_reviewer  claude  native default  route_inherited_from_recommended_v2_measured_at_native_default_effort  effort=high",
+        "engineering_lead  claude  native default  route_inherited_from_recommended_v2  effort=high",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in:\n{stdout}");
+    }
+    assert!(stdout.contains("· effort=medium requested"), "{stdout}");
+    assert!(stdout.contains("· effort=low requested"), "{stdout}");
+
+    let run_id: RunId = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Run        "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut store = SqliteStore::open(fixture.data.join("polycode.db")).unwrap();
+    let loaded = store.load_run(run_id).unwrap();
+    assert_eq!(loaded.config_snapshot.schema_version(), 3);
+    let plan = &loaded.config_snapshot.payload()["resource_plan"];
+    assert_eq!(plan["architect"], serde_json::json!("high"));
+    assert_eq!(plan["implementer"], serde_json::json!("medium"));
+    assert_eq!(plan["simplifier"], serde_json::json!("low"));
+    assert_eq!(plan["spec_reviewer"], serde_json::json!("high"));
+
+    // `--effort native` is the opt-out: every role native, schema v2, and
+    // the profile unchanged. A fresh fixture, because the fake native agents
+    // issue one fixed session identity per provider.
+    let fixture = Fixture::new();
+    let native = fixture.polycode_write(&[
+        "standard",
+        "Build native effort fixture",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--effort",
+        "native",
+    ]);
+    assert_success(&native);
+    let stdout = String::from_utf8(native.stdout).unwrap();
+    assert!(
+        stdout.contains("Profile    recommended (recommended_v3)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("effort=native default"), "{stdout}");
+    assert!(!stdout.contains("effort=medium"), "{stdout}");
+}
+
 /// Omitting both selection flags is the same request as `--profile
 /// recommended`, and says so in the report rather than routing silently.
 #[test]
@@ -118,7 +184,7 @@ fn omitting_the_selection_flags_starts_the_recommended_profile() {
     let stdout = String::from_utf8(started.stdout).unwrap();
     assert!(stdout.contains("Status     completed"), "{stdout}");
     assert!(
-        stdout.contains("Profile    recommended (recommended_v2)"),
+        stdout.contains("Profile    recommended (recommended_v3)"),
         "the resolved profile is named, not assumed: {stdout}"
     );
 

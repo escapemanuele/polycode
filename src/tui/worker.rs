@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::{
-    ApplyOutcome, ExecutionReport, ExecutionSelection, ProviderFactory, RetryRoute, RunService,
+    ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, ProviderFactory, RetryRoute,
+    RunService,
 };
-use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
+use crate::domain::{AttentionRequestId, RunId, StageId, WorkflowKind};
 use crate::workspace::PublishReceipt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +65,7 @@ pub(crate) enum WorkerCommand {
         task: String,
         repository: PathBuf,
         selection: ExecutionSelection,
-        effort: EffortSetting,
+        effort: EffortRequest,
     },
     ResumeRun {
         run_id: RunId,
@@ -352,7 +353,7 @@ mod tests {
             task: "worker integration".to_owned(),
             repository: repo,
             selection: ExecutionSelection::Uniform(UniformProvider::Fake),
-            effort: EffortSetting::NativeDefault,
+            effort: EffortRequest::ProfileDefault,
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -381,7 +382,7 @@ mod tests {
             task: "invalid repository".to_owned(),
             repository: fixture.path().join("missing"),
             selection: ExecutionSelection::Uniform(UniformProvider::Fake),
-            effort: EffortSetting::NativeDefault,
+            effort: EffortRequest::ProfileDefault,
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -430,7 +431,7 @@ mod tests {
                 task: task.to_owned(),
                 repository: fixture.path().join("missing"),
                 selection: ExecutionSelection::Uniform(UniformProvider::Fake),
-                effort: EffortSetting::NativeDefault,
+                effort: EffortRequest::ProfileDefault,
             });
         }
 

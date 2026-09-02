@@ -120,6 +120,7 @@ pub(crate) const fn native_effort_value(level: EffortLevel) -> &'static str {
         EffortLevel::Low => "low",
         EffortLevel::Medium => "medium",
         EffortLevel::High => "high",
+        EffortLevel::XHigh => "xhigh",
     }
 }
 
@@ -151,6 +152,7 @@ mod tests {
             (EffortSetting::LOW, "model_reasoning_effort=\"low\""),
             (EffortSetting::MEDIUM, "model_reasoning_effort=\"medium\""),
             (EffortSetting::HIGH, "model_reasoning_effort=\"high\""),
+            (EffortSetting::XHIGH, "model_reasoning_effort=\"xhigh\""),
         ] {
             for command in [
                 initial(

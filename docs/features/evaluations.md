@@ -19,10 +19,11 @@ polycode eval run --provider fake                                   # suite defa
 polycode eval run --suite role_core_v3 --provider fake
 polycode eval run --suite role_core_v3 --provider codex --repeat 3 --allow-native-usage
 polycode eval run --suite role_core_v3 --provider claude --model <model> --allow-native-usage --out <dir>
+polycode eval run --suite role_core_v3 --provider codex --effort medium --repeat 3 --allow-native-usage
 polycode eval report ~/.polycode/evals/<evaluation-id>
 polycode eval report <codex-results> <claude-results>
 ```
-Flags on `eval run`: `--suite <version>` (default `role_core_v1`), `--provider claude|codex|fake` (required), `--model <id>`, `--repeat <n>` (default 1), `--allow-native-usage`, `--out <path>`.
+Flags on `eval run`: `--suite <version>` (default `role_core_v1`), `--provider claude|codex|fake` (required), `--model <id>`, `--effort native|low|medium|high|xhigh` (default native; recorded as `requested_effort` on every result), `--repeat <n>` (default 1), `--allow-native-usage`, `--out <path>`.
 
 ## Where it lives
 - `src/cli/mod.rs` — `EvalCommand`, `EvalRunArgs`.
