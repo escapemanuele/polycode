@@ -72,12 +72,19 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             run_id,
             attention_id,
             response,
+            skip,
         }) => {
-            print_report(&service()?.resolve_attention_with_response(
-                *run_id,
-                *attention_id,
-                response.as_deref(),
-            )?);
+            let service = service()?;
+            let report = if *skip {
+                service.skip_attention(*run_id, *attention_id)?
+            } else {
+                service.resolve_attention_with_response(
+                    *run_id,
+                    *attention_id,
+                    response.as_deref(),
+                )?
+            };
+            print_report(&report);
             Ok(())
         }
         Some(Command::Apply { run_id }) => {
