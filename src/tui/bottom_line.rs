@@ -133,8 +133,8 @@ fn strip_marker(trimmed: &str) -> &str {
             .or_else(|| rest.strip_prefix("+ "))
             .or_else(|| numbered_marker(rest))
             .or_else(|| rest.strip_prefix("[ ] "))
-            .or_else(|| rest.strip_prefix("[x] "))
-            .or_else(|| rest.strip_prefix("[X] "));
+            .or_else(|| rest.strip_prefix(" x  "))
+            .or_else(|| rest.strip_prefix(" X  "));
         match stripped {
             Some(next) => rest = next.trim_start(),
             None => return rest,
