@@ -287,6 +287,13 @@ fn render_run_overview(
     for stage in &details.stages {
         lines.push(pipeline_line(stage, false, width, now));
     }
+    // A failed run says why here, before the user has to open it: the
+    // blocking stage's reason is the one fact that decides what to do next.
+    if details.status == RunStatus::Failed
+        && let Some(reason) = details.failure_reason.as_deref()
+    {
+        lines.extend(failure_reason_lines(reason));
+    }
     if details.status == RunStatus::Completed
         && details.workflow != crate::domain::WorkflowKind::Review
     {
@@ -676,7 +683,9 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         theme::muted(),
     )));
     if details.attention.is_empty() && !applyable {
-        if let Some(activity) = hero_activity_text(selected, width) {
+        if let Some(reason) = failed_stage_reason(selected) {
+            lines.extend(failure_reason_lines(reason));
+        } else if let Some(activity) = activity_message(selected) {
             lines.push(Line::from(Span::styled(activity, theme::text())));
         }
     }
@@ -906,24 +915,31 @@ const fn outcome_phrase(outcome: DependencyOutcome) -> &'static str {
     }
 }
 
-/// The hero's one-line "what's happening" text. A failed stage's own reason
-/// outranks the generic [`activity_message`] — it is the one place the hero
-/// says *why*, not just *that* — truncated to fit `width` so the hero stays
-/// a hero, not a log viewer: an untruncated line would wrap in Ratatui and
-/// push whatever follows it down a row. Every other status, Pending/Ready
+/// A failed stage's own reason, when it has one. The reason outranks the
+/// generic [`activity_message`] wherever it is shown: it is the one thing
+/// that says *why*, not just *that*. Every other status, Pending/Ready
 /// included, falls through to `activity_message`, which derives its own
 /// waiting/blocked-on text from `stage.waiting`.
-fn hero_activity_text(stage: &StageSummary, width: u16) -> Option<String> {
-    if stage.status == StageStatus::Failed
-        && let Some(reason) = stage.failure_reason.as_deref()
-    {
-        Some(format::truncate_title(
-            reason,
-            ellipsis_budget(width as usize),
-        ))
-    } else {
-        activity_message(stage)
-    }
+fn failed_stage_reason(stage: &StageSummary) -> Option<&str> {
+    (stage.status == StageStatus::Failed)
+        .then_some(stage.failure_reason.as_deref())
+        .flatten()
+}
+
+/// The failure block shared by the hero and the Runs-screen overview: a
+/// section header, then the whole reason. Deliberately *not* cut to one
+/// line the way the status strip cuts it — both panels are wrapped
+/// paragraphs with room to spare, and the reason was already capped at
+/// [`crate::app::query`]'s 200-character limit and collapsed to one line
+/// of sanitized text, so at worst it spends two or three rows. Reading
+/// the message is the whole point of looking at a failed run; sending the
+/// user to the raw logs for it was the complaint this fixes.
+fn failure_reason_lines(reason: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(""),
+        theme::section("WHY IT FAILED"),
+        Line::from(Span::styled(reason.to_owned(), theme::text())),
+    ]
 }
 
 /// Operational runtime line: which agent is doing the work, at what effort.
@@ -3200,63 +3216,47 @@ mod tests {
         );
     }
 
-    /// `format::truncate_title` appends its ellipsis on top of the budget it
-    /// is handed, so passing the panel's full width straight through used to
-    /// yield one character past it — Ratatui would then wrap that line and
-    /// shift the result section down a row. The rendered activity line must
-    /// never exceed the panel width it was truncated to.
+    /// The hero shows the whole reason, not a one-line cut of it: reading
+    /// the message is why anyone looks at a failed stage. A reason at the
+    /// 200-character cap is longer than the panel, so it must wrap onto
+    /// further rows and still be fully present in the rendered text.
     #[test]
-    fn hero_activity_text_never_exceeds_the_panel_width_it_was_truncated_to() {
-        let mut failing = stage(
-            "implementation",
-            StageKind::Implementation,
-            Role::Implementer,
-            StageStatus::Failed,
+    fn hero_shows_the_whole_failure_reason_wrapped_under_its_own_heading() {
+        let mut state = running_state();
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::Failed;
+        let reason = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:05 PM.";
+        details.stages[1].status = StageStatus::Failed;
+        details.stages[1].failure_reason = Some(reason.to_owned());
+        details.stages[1].blocking = true;
+        state.selected_stage_index = 1;
+        let text = render_text(&state, 120, 40);
+        assert!(text.contains("WHY IT FAILED"), "{text}");
+        let joined: String = text
+            .lines()
+            .map(|line| line.trim_start_matches(['│', ' ']).trim_end())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("try again at 4:05 PM."),
+            "the tail of the reason survives instead of an ellipsis:\n{text}"
         );
-        failing.failure_reason = Some("x".repeat(200));
-        for width in [10u16, 30, 50, 80] {
-            let text = hero_activity_text(&failing, width).unwrap();
-            assert!(
-                text.chars().count() <= width as usize,
-                "width {width}: {text:?} is {} chars",
-                text.chars().count()
-            );
-            assert!(
-                text.ends_with('…'),
-                "width {width}: the cut must be visible"
-            );
-        }
+        assert!(!text.contains("usage limit…"), "no one-line cut:\n{text}");
     }
 
-    /// A short reason that already fits is never truncated or given a false
-    /// ellipsis just because the budget reservation exists.
+    /// A failed stage with no reason, or any non-failed status, falls back
+    /// to the generic typed activity text rather than an empty heading.
     #[test]
-    fn hero_activity_text_leaves_a_short_reason_untouched() {
-        let mut failing = stage(
-            "implementation",
-            StageKind::Implementation,
-            Role::Implementer,
-            StageStatus::Failed,
-        );
-        failing.failure_reason = Some("compile failed".to_owned());
-        assert_eq!(
-            hero_activity_text(&failing, 80),
-            Some("compile failed".to_owned())
-        );
-    }
-
-    /// A non-failed status, or a failed one with no reason, falls back to
-    /// the generic typed activity text regardless of width.
-    #[test]
-    fn hero_activity_text_falls_back_to_the_generic_message_without_a_reason() {
+    fn hero_falls_back_to_the_generic_message_without_a_reason() {
         let failing = stage(
             "implementation",
             StageKind::Implementation,
             Role::Implementer,
             StageStatus::Failed,
         );
+        assert_eq!(failed_stage_reason(&failing), None);
         assert_eq!(
-            hero_activity_text(&failing, 80),
+            activity_message(&failing),
             Some("The provider ended this stage before it completed".to_owned())
         );
         let running = stage(
@@ -3265,18 +3265,17 @@ mod tests {
             Role::Implementer,
             StageStatus::Running,
         );
+        assert_eq!(failed_stage_reason(&running), None);
         assert_eq!(
-            hero_activity_text(&running, 80),
+            activity_message(&running),
             Some("Agent is working…".to_owned())
         );
     }
 
-    /// The composed priority order end to end: a failed stage with a reason
-    /// shows the reason; a Pending/Ready stage falls through to the waiting
-    /// text `activity_message` derives from `stage.waiting`; neither
-    /// feature regresses the other now that both live on `StageSummary`.
+    /// A failed stage's reason outranks stale waiting info on the same
+    /// stage; a Pending stage with no failure keeps its waiting text.
     #[test]
-    fn hero_activity_text_prefers_the_failure_reason_over_waiting_info_by_status() {
+    fn failure_reason_outranks_waiting_info_by_status() {
         let mut failing = stage(
             "implementation",
             StageKind::Implementation,
@@ -3292,11 +3291,7 @@ mod tests {
             blocked_by: Vec::new(),
             degraded: Vec::new(),
         });
-        assert_eq!(
-            hero_activity_text(&failing, 80),
-            Some("compile failed".to_owned()),
-            "a failure reason outranks stale waiting info on the same stage"
-        );
+        assert_eq!(failed_stage_reason(&failing), Some("compile failed"));
 
         let mut pending = stage(
             "implementation",
@@ -3304,6 +3299,7 @@ mod tests {
             Role::Implementer,
             StageStatus::Pending,
         );
+        pending.failure_reason = Some("stale".to_owned());
         pending.waiting = Some(StageWaitingSummary {
             waiting_on: vec![StageDependencyRef {
                 id: StageId::new("architecture").unwrap(),
@@ -3312,10 +3308,72 @@ mod tests {
             blocked_by: Vec::new(),
             degraded: Vec::new(),
         });
+        assert_eq!(failed_stage_reason(&pending), None);
         assert_eq!(
-            hero_activity_text(&pending, 80),
-            Some("Waiting on: Architecture".to_owned()),
-            "a Pending stage with no failure falls through to its waiting info"
+            activity_message(&pending),
+            Some("Waiting on: Architecture".to_owned())
+        );
+    }
+
+    /// The Runs screen's overview names the reason before the run is even
+    /// opened, and only for a failed run with a blocking reason.
+    #[test]
+    fn runs_overview_shows_the_blocking_failure_reason() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.replace_runs(vec![RunListItem {
+            id: RunId::from_u128(1),
+            workflow: WorkflowKind::Standard,
+            status: RunStatus::Failed,
+            task_summary: "OAuth provider".to_owned(),
+            repository: Some(std::path::PathBuf::from("/repo")),
+            updated_at: at(12, 0, 0),
+            hidden: false,
+        }]);
+        let mut failed = details(RunStatus::Failed, Vec::new());
+        failed.failure_reason = Some("You've hit your usage limit.".to_owned());
+        state.details = Some(failed);
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("WHY IT FAILED"), "{text}");
+        assert!(text.contains("You've hit your usage limit."), "{text}");
+
+        state.details = Some(details(RunStatus::Failed, Vec::new()));
+        let text = render_text(&state, 160, 40);
+        assert!(
+            !text.contains("WHY IT FAILED"),
+            "no heading without a reason:\n{text}"
+        );
+    }
+
+    /// Opening a failed run lands on the stage that failed it, so the hero
+    /// opens on the reason; a run that is not failed keeps its selection,
+    /// and a failed stage that did not block the run is not chosen.
+    #[test]
+    fn focus_blocking_failure_selects_the_blocking_failed_stage_only() {
+        let mut state = running_state();
+        state.selected_stage_index = 0;
+        state.selected_stage = state
+            .details
+            .as_ref()
+            .map(|details| details.stages[0].id.clone());
+        state.focus_blocking_failure();
+        assert_eq!(state.selected_stage_index, 0, "a running run is untouched");
+
+        let details = state.details.as_mut().unwrap();
+        details.status = RunStatus::Failed;
+        details.stages[1].status = StageStatus::Failed;
+        details.stages[1].blocking = false;
+        state.focus_blocking_failure();
+        assert_eq!(
+            state.selected_stage_index, 0,
+            "a non-blocking failure is not the reason the run failed"
+        );
+
+        state.details.as_mut().unwrap().stages[1].blocking = true;
+        state.focus_blocking_failure();
+        assert_eq!(state.selected_stage_index, 1);
+        assert_eq!(
+            state.selected_stage.as_ref().map(ToString::to_string),
+            Some(state.details.as_ref().unwrap().stages[1].id.to_string())
         );
     }
 

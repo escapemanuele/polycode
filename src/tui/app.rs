@@ -153,6 +153,7 @@ impl TuiApp {
                 if self.state.selected_run.is_some() {
                     self.state.screen = Screen::RunDetail;
                     self.refresh_selected();
+                    self.state.focus_blocking_failure();
                 }
             }
             // Enter on a stage opens its primary result; open_artifact keeps
