@@ -4,10 +4,11 @@ mod artifact;
 mod command;
 mod detection;
 mod error;
+mod permissions;
 mod prompt;
 mod protocol;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -177,6 +178,99 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         std::time::SystemTime::now().into()
     }
 
+    /// The repository's standing allowlist, read from the run's own worktree.
+    ///
+    /// A workspace that is not ready yet grants nothing rather than failing:
+    /// `prepare_with_input` is the check that a stage cannot run without a
+    /// worktree, and it runs a few lines later with a better error than this
+    /// one would give.
+    fn allow_rules(
+        store: &SqliteStore,
+        run_id: crate::domain::RunId,
+    ) -> Result<BTreeSet<String>, ClaudeProviderError> {
+        let Some(workspace) = store.load_workspace(run_id)? else {
+            return Ok(BTreeSet::new());
+        };
+        permissions::allow_rules(workspace.worktree_path())
+            .map_err(|error| ClaudeProviderError::PermissionsConfig(error.to_string()))
+    }
+
+    /// The command that continues or starts one invocation of a stage.
+    fn invocation_command(
+        &self,
+        store: &mut SqliteStore,
+        request: &ProviderRequest,
+        session: &ProviderSessionRecord,
+    ) -> Result<command::ClaudeCommand, ClaudeProviderError> {
+        // What decides between a fresh command and a resume is whether there is
+        // a native session to resume, not which invocation this is. An
+        // invocation that died before Claude emitted init leaves the session
+        // without one, and starting over is the only thing left to do — keying
+        // on the invocation number would strand that stage on a resume it can
+        // never issue. Codex already selects this way.
+        let image = self.image_server_command()?;
+        if let Some(native) = session.native_session_id() {
+            let denials = session
+                .pending_attention()
+                .map(|pending| Self::pending_new_denials(store, session, pending))
+                .transpose()?
+                .unwrap_or_default();
+            let denials = if self.eval_auto_approve {
+                // Disposable eval never grants anything except the exact safe
+                // Edit/Write subset. Historical/denied Bash stays denied.
+                let context = ProviderAttentionContext::new(
+                    request.run_id(),
+                    request.stage_id().clone(),
+                    request.stage_kind(),
+                    request.role(),
+                    session
+                        .pending_attention()
+                        .map(PendingProviderAttention::attention_id)
+                        .unwrap_or_default(),
+                );
+                Self::safe_eval_grants(store, &context, &denials)?.ok_or_else(|| {
+                    ClaudeProviderError::UnsafePermission(
+                        "eval permission is not an exact in-worktree Edit/Write".to_owned(),
+                    )
+                })?
+            } else {
+                denials
+            };
+            let response = session
+                .pending_attention()
+                .map(|pending| self.read_response(session.id(), pending.attention_id()))
+                .transpose()?
+                .flatten();
+            return command::resume(
+                native,
+                &denials,
+                response.as_deref(),
+                &Self::allow_rules(store, request.run_id())?,
+                self.model.as_ref(),
+                self.effort,
+                image.as_ref(),
+            );
+        }
+
+        let artifacts = store.list_artifacts(request.run_id())?;
+        let handoff = change_handoff::for_request(store, request)?;
+        let continue_instruction = self.continue_instruction(request)?;
+        let mut prompt = prompt::compose(
+            request,
+            &artifacts,
+            handoff.as_ref(),
+            continue_instruction.as_deref(),
+        )?;
+        prompt.push_str(&self.image_prompt_section(store, request));
+        Ok(command::initial(
+            &prompt,
+            &Self::allow_rules(store, request.run_id())?,
+            self.model.as_ref(),
+            self.effort,
+            image.as_ref(),
+        ))
+    }
+
     fn start_invocation(
         &mut self,
         store: &mut SqliteStore,
@@ -211,66 +305,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             self.manager.start(store, orphan.id())?;
             return Ok(ProviderPoll::Pending);
         }
-        // What decides between a fresh command and a resume is whether there is
-        // a native session to resume, not which invocation this is. An
-        // invocation that died before Claude emitted init leaves the session
-        // without one, and starting over is the only thing left to do — keying
-        // on the invocation number would strand that stage on a resume it can
-        // never issue. Codex already selects this way.
-        let image = self.image_server_command()?;
-        let command = if let Some(native) = session.native_session_id() {
-            let denials = session
-                .pending_attention()
-                .map(|pending| Self::pending_new_denials(store, &session, pending))
-                .transpose()?
-                .unwrap_or_default();
-            let denials = if self.eval_auto_approve {
-                // Disposable eval never grants anything except the exact safe
-                // Edit/Write subset. Historical/denied Bash stays denied.
-                let context = ProviderAttentionContext::new(
-                    request.run_id(),
-                    request.stage_id().clone(),
-                    request.stage_kind(),
-                    request.role(),
-                    session
-                        .pending_attention()
-                        .map(PendingProviderAttention::attention_id)
-                        .unwrap_or_default(),
-                );
-                Self::safe_eval_grants(store, &context, &denials)?.ok_or_else(|| {
-                    ClaudeProviderError::UnsafePermission(
-                        "eval permission is not an exact in-worktree Edit/Write".to_owned(),
-                    )
-                })?
-            } else {
-                denials
-            };
-            let response = session
-                .pending_attention()
-                .map(|pending| self.read_response(session.id(), pending.attention_id()))
-                .transpose()?
-                .flatten();
-            command::resume(
-                native,
-                &denials,
-                response.as_deref(),
-                self.model.as_ref(),
-                self.effort,
-                image.as_ref(),
-            )?
-        } else {
-            let artifacts = store.list_artifacts(request.run_id())?;
-            let handoff = change_handoff::for_request(store, request)?;
-            let continue_instruction = self.continue_instruction(request)?;
-            let mut prompt = prompt::compose(
-                request,
-                &artifacts,
-                handoff.as_ref(),
-                continue_instruction.as_deref(),
-            )?;
-            prompt.push_str(&self.image_prompt_section(store, request));
-            command::initial(&prompt, self.model.as_ref(), self.effort, image.as_ref())
-        };
+        let command = self.invocation_command(store, request, &session)?;
         let process = self.manager.prepare_with_input(
             store,
             request.run_id(),
@@ -3028,6 +3063,67 @@ mod tests {
             eval_auto_approve,
             image_tool: None,
         }
+    }
+
+    #[test]
+    fn repository_allowlist_is_granted_from_the_first_invocation() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), false);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        std::fs::write(
+            worktree.join(permissions::CONFIG_FILE),
+            "[permissions]\nallow = [\"Bash(yarn jest:*)\", \"mcp__linear-server\"]\n",
+        )
+        .unwrap();
+        backend.set_first_result(success_result("# Completed\nDone.\n", &json!([])));
+
+        let mut engine = WorkflowEngine::new(provider, "make fixture change");
+        drive_to_completion(&mut engine, &mut store, run_id);
+
+        let argv = all_argv(&store, run_id);
+        let rules = argv
+            .iter()
+            .skip_while(|arg| *arg != "--allowedTools")
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rules,
+            vec![
+                "Bash(yarn jest:*)".to_owned(),
+                "mcp__linear-server".to_owned()
+            ],
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn broken_repository_allowlist_fails_the_poll_instead_of_granting_nothing() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), false);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        std::fs::write(
+            worktree.join(permissions::CONFIG_FILE),
+            "[permissions]\nallow = [\"*\"]\n",
+        )
+        .unwrap();
+        let mut engine = WorkflowEngine::new(provider, "make fixture change");
+        let error = engine
+            .drive(&mut store, run_id)
+            .expect_err("a blanket allowlist must not launch a run");
+        assert!(error.to_string().contains("grants every tool"), "{error}");
     }
 
     #[test]

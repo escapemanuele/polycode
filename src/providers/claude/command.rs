@@ -35,30 +35,70 @@ pub(crate) struct ClaudeCommand {
 
 pub(crate) fn initial(
     prompt: &str,
+    allow: &BTreeSet<String>,
     model: Option<&ModelId>,
     effort: EffortSetting,
     image: Option<&ImageToolServerCommand>,
 ) -> ClaudeCommand {
     let mut argv = base(model, effort, image);
+    let mut rules = allow.clone();
     if image.is_some() {
-        argv.push(OsString::from("--allowedTools"));
-        argv.push(OsString::from(image_tool_rule()));
+        rules.insert(image_tool_rule());
     }
+    push_allowed_tools(&mut argv, rules);
     ClaudeCommand {
         argv,
         stdin: prompt.as_bytes().to_vec(),
     }
 }
 
+/// Builds the command that continues an existing native session.
+///
+/// Never refuses except on an unanswered question. Whatever *can* be granted
+/// as an exact rule is granted; whatever cannot is simply not granted, and the
+/// session is told so in the prompt. [`grant_rules`] is the gate that decides
+/// whether an approval is worth committing, and it runs at resolution time,
+/// before anything is persisted. Refusing here as well would mean a session
+/// already committed to an unreplayable approval — or an interrupted session
+/// carrying no denials at all — can never build a resume command: every later
+/// drive fails on it, and the stage sits `running` for good with no process
+/// behind it, reachable only by a retry that throws the work away.
+///
+/// # Errors
+/// `QuestionResponseRequired` when a pending question has no response: a
+/// question resumed without its answer is the one continuation that cannot
+/// mean anything.
 pub(crate) fn resume(
     session_id: &ProviderSessionId,
     denials: &[PermissionDenial],
     response: Option<&str>,
+    allow: &BTreeSet<String>,
     model: Option<&ModelId>,
     effort: EffortSetting,
     image: Option<&ImageToolServerCommand>,
 ) -> Result<ClaudeCommand, ClaudeProviderError> {
-    let mut rules = grant_rules(denials, response)?;
+    let response = response.filter(|response| !response.trim().is_empty());
+    if response.is_none()
+        && denials
+            .iter()
+            .any(|denial| denial.tool_name == "AskUserQuestion")
+    {
+        return Err(ClaudeProviderError::QuestionResponseRequired);
+    }
+    let mut rules = BTreeSet::new();
+    let mut ungranted = false;
+    for denial in denials
+        .iter()
+        .filter(|denial| denial.tool_name != "AskUserQuestion")
+    {
+        match denial.exact_rule() {
+            Ok(rule) => {
+                rules.insert(rule);
+            }
+            Err(_) => ungranted = true,
+        }
+    }
+    rules.extend(allow.iter().cloned());
     // The image grant rides the same flag as approved denials: still one
     // exact rule, still only when the stage holds the grant.
     if image.is_some() {
@@ -67,17 +107,44 @@ pub(crate) fn resume(
     let mut argv = base(model, effort, image);
     argv.push(OsString::from("--resume"));
     argv.push(OsString::from(session_id.as_str()));
-    if !rules.is_empty() {
-        argv.push(OsString::from("--allowedTools"));
-        argv.extend(rules.into_iter().map(OsString::from));
-    }
-    let stdin = response.unwrap_or(
-        "User approved the exact pending permission request. Continue the same task and session.",
-    );
+    push_allowed_tools(&mut argv, rules);
+    let stdin = match response {
+        Some(response) => response,
+        None if ungranted => UNGRANTED_RESUME_PROMPT,
+        None if denials.is_empty() => CONTINUE_RESUME_PROMPT,
+        None => APPROVED_RESUME_PROMPT,
+    };
     Ok(ClaudeCommand {
         argv,
         stdin: stdin.as_bytes().to_vec(),
     })
+}
+
+/// The text a resumed session is continued on when nothing was pending: a
+/// stopped or interrupted stage picking up where it left off.
+pub(crate) const CONTINUE_RESUME_PROMPT: &str =
+    "Continue the same task and session where it stopped.";
+
+/// The text a resumed session is continued on when the pending request was
+/// granted exactly.
+pub(crate) const APPROVED_RESUME_PROMPT: &str =
+    "User approved the exact pending permission request. Continue the same task and session.";
+
+/// The text a resumed session is continued on when a pending request was
+/// closed but cannot be replayed as any exact rule, so nothing was granted.
+pub(crate) const UNGRANTED_RESUME_PROMPT: &str = concat!(
+    "A pending permission request was closed without granting anything, and it will not be ",
+    "granted: the tool call cannot be expressed as an exact permission rule. Do not retry that ",
+    "call. Continue the same task and session with the tools you already have, or stop and ",
+    "report what you could not do.",
+);
+
+fn push_allowed_tools(argv: &mut Vec<OsString>, rules: BTreeSet<String>) {
+    if rules.is_empty() {
+        return;
+    }
+    argv.push(OsString::from("--allowedTools"));
+    argv.extend(rules.into_iter().map(OsString::from));
 }
 
 /// Exact `--allowedTools` rules that replay one approved attention, or the
@@ -183,7 +250,13 @@ mod tests {
 
     #[test]
     fn native_default_argv_is_byte_identical_to_pre_effort_invocation() {
-        let command = initial("prompt", None, EffortSetting::NativeDefault, None);
+        let command = initial(
+            "prompt",
+            &BTreeSet::new(),
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        );
         let args = command
             .argv
             .iter()
@@ -205,14 +278,20 @@ mod tests {
     #[test]
     fn effort_changes_only_argv_never_the_injected_prompt() {
         let prompt = "identical stage prompt with change map";
-        let baseline = initial(prompt, None, EffortSetting::NativeDefault, None);
+        let baseline = initial(
+            prompt,
+            &BTreeSet::new(),
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        );
         for setting in [
             EffortSetting::LOW,
             EffortSetting::MEDIUM,
             EffortSetting::HIGH,
             EffortSetting::XHIGH,
         ] {
-            let command = initial(prompt, None, setting, None);
+            let command = initial(prompt, &BTreeSet::new(), None, setting, None);
             assert_eq!(command.stdin, baseline.stdin);
             assert_ne!(command.argv, baseline.argv);
         }
@@ -226,7 +305,7 @@ mod tests {
             (EffortSetting::HIGH, "high"),
             (EffortSetting::XHIGH, "xhigh"),
         ] {
-            let command = initial("prompt", None, setting, None);
+            let command = initial("prompt", &BTreeSet::new(), None, setting, None);
             let args = command
                 .argv
                 .iter()
@@ -245,6 +324,7 @@ mod tests {
                 tool_input: json!({"file_path":"/tmp/result.txt"}),
             }],
             None,
+            &BTreeSet::new(),
             None,
             EffortSetting::HIGH,
             None,
@@ -268,6 +348,7 @@ mod tests {
                 tool_input: json!({"file_path":"/tmp/result.txt"}),
             }],
             None,
+            &BTreeSet::new(),
             None,
             EffortSetting::NativeDefault,
             None,
@@ -302,21 +383,13 @@ mod tests {
             tool_use_id: None,
         }];
         let session = ProviderSessionId::new("s").unwrap();
-        let refused = resume(
-            &session,
-            &denials,
-            None,
-            None,
-            EffortSetting::NativeDefault,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+        let refused = grant_rules(&denials, None).unwrap_err().to_string();
         assert!(refused.contains("yarn install"), "{refused}");
         let command = resume(
             &session,
             &denials,
             Some("Skip the install; the tests will run in CI."),
+            &BTreeSet::new(),
             None,
             EffortSetting::NativeDefault,
             None,
@@ -332,16 +405,134 @@ mod tests {
             b"Skip the install; the tests will run in CI."
         );
         assert!(
-            resume(
-                &session,
-                &denials,
-                Some("  "),
-                None,
-                EffortSetting::NativeDefault,
-                None
-            )
-            .is_err(),
+            grant_rules(&denials, Some("  ")).is_err(),
             "blank response is not an answer"
+        );
+    }
+
+    #[test]
+    fn interrupted_session_without_denials_still_builds_a_resume() {
+        let command = resume(
+            &ProviderSessionId::new("session-2").unwrap(),
+            &[],
+            None,
+            &BTreeSet::new(),
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        )
+        .expect("a stopped session carries no denials and must still resume");
+        assert_eq!(command.stdin, CONTINUE_RESUME_PROMPT.as_bytes());
+        assert!(!command.argv.iter().any(|arg| arg == "--allowedTools"));
+    }
+
+    #[test]
+    fn ungrantable_denial_resumes_granting_nothing_instead_of_stranding_the_stage() {
+        let denials = vec![
+            PermissionDenial {
+                tool_name: "Bash".to_owned(),
+                tool_use_id: None,
+                tool_input: json!({"command": "yarn typecheck 2>&1 | tail -15"}),
+            },
+            PermissionDenial {
+                tool_name: "Write".to_owned(),
+                tool_use_id: None,
+                tool_input: json!({"file_path": "/tmp/result.txt"}),
+            },
+        ];
+        // The resolution gate still refuses an unreplayable set, so nothing new
+        // arrives here without an answer; a resolution committed before that
+        // gate existed did, and it has to be able to move again.
+        let command = resume(
+            &ProviderSessionId::new("session-3").unwrap(),
+            &denials,
+            None,
+            &BTreeSet::new(),
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        )
+        .unwrap();
+        let args = command
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "Edit(//tmp/result.txt)"));
+        assert!(
+            !args.iter().any(|arg| arg.contains("yarn typecheck")),
+            "a compound Bash command is never granted: {args:?}"
+        );
+        assert_eq!(command.stdin, UNGRANTED_RESUME_PROMPT.as_bytes());
+
+        assert!(
+            grant_rules(&denials[..1], None).is_err(),
+            "the resolution gate still refuses what cannot be replayed"
+        );
+        let nothing_grantable = resume(
+            &ProviderSessionId::new("session-4").unwrap(),
+            &denials[..1],
+            None,
+            &BTreeSet::new(),
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        )
+        .expect("a session committed to an unreplayable approval must still resume");
+        assert!(
+            !nothing_grantable
+                .argv
+                .iter()
+                .any(|arg| arg == "--allowedTools")
+        );
+        assert_eq!(nothing_grantable.stdin, UNGRANTED_RESUME_PROMPT.as_bytes());
+    }
+
+    #[test]
+    fn repository_allowlist_reaches_both_commands_beside_derived_grants() {
+        let allow = BTreeSet::from(["Bash(yarn jest:*)".to_owned()]);
+        let initial_args = initial("prompt", &allow, None, EffortSetting::NativeDefault, None)
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            initial_args
+                .windows(2)
+                .any(|pair| pair == ["--allowedTools", "Bash(yarn jest:*)"]),
+            "{initial_args:?}"
+        );
+
+        let resume_args = resume(
+            &ProviderSessionId::new("session-5").unwrap(),
+            &[PermissionDenial {
+                tool_name: "Write".to_owned(),
+                tool_use_id: None,
+                tool_input: json!({"file_path": "/tmp/result.txt"}),
+            }],
+            None,
+            &allow,
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        )
+        .unwrap()
+        .argv
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert!(resume_args.iter().any(|arg| arg == "Bash(yarn jest:*)"));
+        assert!(
+            resume_args
+                .iter()
+                .any(|arg| arg == "Edit(//tmp/result.txt)")
+        );
+        assert_eq!(
+            resume_args
+                .iter()
+                .filter(|arg| *arg == "--allowedTools")
+                .count(),
+            1
         );
     }
 
@@ -357,6 +548,7 @@ mod tests {
                 &ProviderSessionId::new("session-1").unwrap(),
                 std::slice::from_ref(&denial),
                 None,
+                &BTreeSet::new(),
                 None,
                 EffortSetting::NativeDefault,
                 None,
@@ -368,6 +560,7 @@ mod tests {
                 &ProviderSessionId::new("session-1").unwrap(),
                 &[denial],
                 Some("Option A"),
+                &BTreeSet::new(),
                 None,
                 EffortSetting::NativeDefault,
                 None,
@@ -389,9 +582,16 @@ mod tests {
 
     #[test]
     fn image_grant_adds_run_scoped_mcp_server_and_exact_allow_rule_only() {
-        let baseline = initial("prompt", None, EffortSetting::NativeDefault, None);
+        let baseline = initial(
+            "prompt",
+            &BTreeSet::new(),
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        );
         let granted = initial(
             "prompt",
+            &BTreeSet::new(),
             None,
             EffortSetting::NativeDefault,
             Some(&image_command()),
@@ -439,6 +639,7 @@ mod tests {
                 tool_input: json!({"file_path":"/tmp/result.txt"}),
             }],
             None,
+            &BTreeSet::new(),
             None,
             EffortSetting::NativeDefault,
             Some(&image_command()),
@@ -468,7 +669,13 @@ mod tests {
         // appear is through the grant, which carries an executable path and
         // a socket path and nothing else. `env` keys and `OPENAI` anywhere
         // in argv are the two shapes a leak would take.
-        let command = initial("prompt", None, EffortSetting::HIGH, Some(&image_command()));
+        let command = initial(
+            "prompt",
+            &BTreeSet::new(),
+            None,
+            EffortSetting::HIGH,
+            Some(&image_command()),
+        );
         let joined = command
             .argv
             .iter()

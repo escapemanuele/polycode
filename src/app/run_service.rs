@@ -216,6 +216,17 @@ where
     /// # Errors
     /// Returns legacy-input/config, reconciliation, guard, or execution errors.
     pub fn resume_run(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
+        // Resuming a run that something else is already driving is the common
+        // case, not an exceptional one: the driver commits on every provider
+        // signal it observes, so a resume issued while output is arriving loses
+        // a revision race on rows the driver touched first. Every step here is
+        // idempotent, so the answer is to redo the attempt against newer rows —
+        // never to tell the user their run could not be resumed because of a
+        // revision number.
+        retry_concurrent(|| self.resume_run_once(run_id), std::thread::sleep)
+    }
+
+    fn resume_run_once(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
         self.reconcile(&mut store, run_id)?;
@@ -914,6 +925,30 @@ fn resume_suspended_stages<P: crate::engine::Provider>(
 /// `sleep` is injected so the policy can be exercised without wall-clock time.
 /// Exhausting either budget returns an error: a stop that gives up says so, and
 /// never reports success over a process that is still running.
+/// Repeats one idempotent attempt while it loses an optimistic-concurrency
+/// race, on the same bound and backoff a stop uses.
+///
+/// `sleep` is injected so the policy can be exercised without wall-clock time.
+fn retry_concurrent<T, F, S>(mut attempt: F, mut sleep: S) -> Result<T, AppError>
+where
+    F: FnMut() -> Result<T, AppError>,
+    S: FnMut(std::time::Duration),
+{
+    let mut attempts = 0;
+    loop {
+        match attempt() {
+            Err(error) if error.is_concurrent_modification() => {
+                attempts += 1;
+                if attempts >= STOP_CONCURRENCY_ATTEMPTS {
+                    return Err(error);
+                }
+                sleep(STOP_CONCURRENCY_BACKOFF);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 fn retry_stop<T, F, S>(run_id: RunId, mut attempt: F, mut sleep: S) -> Result<T, AppError>
 where
     F: FnMut() -> Result<T, AppError>,
@@ -1016,6 +1051,47 @@ mod tests {
 
     fn missing_evidence(process_id: ManagedProcessId) -> AppError {
         AppError::Process(ProcessError::MissingRuntimeEvidence(process_id))
+    }
+
+    // A resume issued while the run is still being driven loses a revision
+    // race on rows the driver touched first. That is contention, not failure:
+    // resuming is idempotent, so it is redone against newer rows instead of
+    // reported to the user as a revision number.
+    #[test]
+    fn resume_redoes_the_attempt_after_losing_a_revision_race() {
+        let cursor_race = || {
+            AppError::Process(ProcessError::CursorConcurrentModification {
+                process_id: ManagedProcessId::new(),
+                stream: OutputStream::Stdout,
+                expected: 33,
+            })
+        };
+        let mut remaining = STOP_CONCURRENCY_ATTEMPTS - 1;
+        let mut slept = 0_u32;
+        let outcome = retry_concurrent(
+            || {
+                if remaining > 0 {
+                    remaining -= 1;
+                    Err(cursor_race())
+                } else {
+                    Ok(7_u32)
+                }
+            },
+            |_| slept += 1,
+        );
+        assert_eq!(outcome.unwrap(), 7);
+        assert_eq!(slept, STOP_CONCURRENCY_ATTEMPTS - 1);
+
+        let exhausted = retry_concurrent::<u32, _, _>(|| Err(cursor_race()), |_| {});
+        assert!(
+            exhausted
+                .expect_err("unbounded contention still has to surface")
+                .is_concurrent_modification()
+        );
+
+        let real_failure =
+            retry_concurrent::<u32, _, _>(|| Err(AppError::DirtySourceRepository), |_| {});
+        assert!(matches!(real_failure, Err(AppError::DirtySourceRepository)));
     }
 
     // The window this covers: the runner spawns its child before writing
