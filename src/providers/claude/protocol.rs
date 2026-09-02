@@ -167,7 +167,7 @@ impl PermissionDenial {
                         .and_then(Value::as_str)
                         .unwrap_or("<missing command>");
                     unsafe_bash = Some(format!(
-                        "Bash command cannot be granted as an exact rule (compound or unsafe shell); stop the run or answer without approving it: {command}"
+                        "Bash command cannot be granted as an exact rule (compound or unsafe shell); type a response to continue without granting it, or stop the run: {command}"
                     ));
                     None
                 }),

@@ -861,15 +861,18 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
             // drive fails building the resume command — the stage sits
             // `running` forever with no process behind it.
             command::grant_rules(&denials, response)?;
-            if denials
+            let has_question = denials
                 .iter()
-                .any(|denial| denial.tool_name == "AskUserQuestion")
-            {
-                self.write_response_once(
-                    session.id(),
-                    context.request_id(),
-                    response.ok_or(ClaudeProviderError::QuestionResponseRequired)?,
-                )?;
+                .any(|denial| denial.tool_name == "AskUserQuestion");
+            // A question needs the answer; a permission request may carry
+            // one too ("continue without it"). Either way the resume
+            // command reads it back from disk, so persist it here.
+            match response {
+                Some(response) if !response.trim().is_empty() => {
+                    self.write_response_once(session.id(), context.request_id(), response)?;
+                }
+                _ if has_question => return Err(ClaudeProviderError::QuestionResponseRequired),
+                _ => {}
             }
             Ok(())
         })();
@@ -1551,6 +1554,59 @@ mod tests {
             store.list_managed_processes(run_id).unwrap().len(),
             processes_before
         );
+    }
+
+    /// The operator's way out of an unreplayable permission: type an answer.
+    /// The session resumes on that text with nothing granted and finishes.
+    #[test]
+    fn operator_response_continues_past_compound_bash_without_granting() {
+        let backend = FixtureBackend::with_first_result(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "Blocked on permission.",
+                "session_id": "native-session-1",
+                "permission_denials": [
+                    {"tool_name":"Bash","tool_input":{"command":"yarn install 2>&1 | tail -20"}}
+                ]
+            })
+            .to_string(),
+        );
+        let (_temp, _database, run_id, mut store, provider) = fixture_with_backend(backend, false);
+        let mut engine = WorkflowEngine::new(provider, "answer instead of grant");
+        let request = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        engine
+            .resolve_attention_with_response(
+                &mut store,
+                run_id,
+                request,
+                Some("Skip the install; CI runs the tests."),
+            )
+            .unwrap();
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+        let argv = all_argv(&store, run_id);
+        assert!(argv.iter().any(|arg| arg == "--resume"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|arg| arg == "--allowedTools"),
+            "nothing granted: {argv:?}"
+        );
+        assert_no_bash_or_broad_grants(&argv);
+        assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 2);
     }
 
     #[test]
