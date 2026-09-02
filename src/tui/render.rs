@@ -300,10 +300,11 @@ fn render_run_overview(
         lines.push(Line::from(""));
         lines.push(Line::from(theme::chip("READY TO REVIEW", theme::success())));
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("[Enter]", Style::default().fg(theme::accent())),
-            Span::styled(" Open the mission deck to review", theme::text()),
-        ]));
+        lines.push(Line::from(theme::action(
+            "Enter",
+            "Open the mission deck to review",
+            theme::accent(),
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -2851,20 +2852,20 @@ mod tests {
         }]);
         state.details = Some(details(RunStatus::Completed, Vec::new()));
         let text = render_text(&state, 120, 30);
-        assert!(text.contains("[h] Hide"), "footer offers hiding");
+        assert!(text.contains(" h  Hide"), "footer offers hiding");
         assert!(!text.contains("Show hidden"), "nothing is hidden yet");
 
         // Something hidden exists: the footer says how to see it.
         state.hidden_count = 1;
-        assert!(render_text(&state, 120, 30).contains("[H] Show hidden"));
+        assert!(render_text(&state, 120, 30).contains(" H  Show hidden"));
 
         // The all-runs view marks the hidden run and offers to re-hide.
         state.show_hidden = true;
         state.runs[0].hidden = true;
         let showing = render_text(&state, 120, 30);
         assert!(showing.contains("hidden  "), "hidden run carries its mark");
-        assert!(showing.contains("[h] Unhide"));
-        assert!(showing.contains("[H] Hide hidden"));
+        assert!(showing.contains(" h  Unhide"));
+        assert!(showing.contains(" H  Hide hidden"));
 
         // Everything hidden: the empty state tells the truth.
         state.show_hidden = false;
@@ -2943,7 +2944,7 @@ mod tests {
             !operational.contains("/Users/e/Code/wp-calypso-2"),
             "operational view keeps the full path out"
         );
-        assert!(operational.contains("[i] Details"));
+        assert!(operational.contains(" i  Details"));
 
         state.technical = true;
         let technical = render_text(&state, 160, 40);
@@ -2962,7 +2963,7 @@ mod tests {
         assert!(technical.contains("recommended_v2"));
         assert!(technical.contains("recommended_role_assignment"));
         assert!(technical.contains("abc1234"), "base commit stays available");
-        assert!(technical.contains("[i] operational view"));
+        assert!(technical.contains(" i  operational view"));
         assert!(
             !technical.contains(POD_SHELL),
             "technical mode spends POD's rows on diagnostics"
@@ -3093,7 +3094,7 @@ mod tests {
         let text = render_text(&state, 160, 40);
         assert!(text.contains("ACTION REQUIRED"));
         assert!(text.contains("Claude requests permission to use Bash"));
-        assert!(text.contains("[u] Review and resolve"));
+        assert!(text.contains(" u  Review and resolve"));
         let action = text.find("ACTION REQUIRED").unwrap();
         for secondary in ["RESOURCES", "RESULT", "codex · native default"] {
             assert!(
@@ -3102,7 +3103,7 @@ mod tests {
             );
         }
         assert!(
-            actions_text(&state).starts_with("[u] Resolve attention"),
+            actions_text(&state).starts_with(" u  Resolve attention"),
             "the footer leads with the attention shortcut"
         );
     }
@@ -3113,8 +3114,8 @@ mod tests {
         assert!(text.contains("RUN COMPLETE"));
         assert!(text.contains("12:48"), "run elapsed is prominent");
         assert!(text.contains("READY TO REVIEW"));
-        assert!(text.contains("[a] Apply changes"));
-        assert!(text.contains("[X] Discard"));
+        assert!(text.contains(" a  Apply changes"));
+        assert!(text.contains(" X  Discard"));
         assert!(
             !text.contains("Agent is working"),
             "monitoring language is gone after completion"
@@ -3135,10 +3136,10 @@ mod tests {
         let text = render_text(&state, 160, 40);
         assert!(text.contains("✗ FAILED"));
         assert!(text.contains("No completed result"));
-        assert!(text.contains("[t] Retry"));
-        assert!(text.contains("[l] Logs"));
+        assert!(text.contains(" t  Retry"));
+        assert!(text.contains(" l  Logs"));
         assert_eq!(
-            text.matches("[t] Retry").count(),
+            text.matches(" t  Retry").count(),
             2,
             "hero and footer each offer retry exactly once"
         );
@@ -3453,13 +3454,13 @@ mod tests {
     fn footer_advertises_apply_only_when_the_run_is_applyable() {
         let running = running_state();
         let actions = actions_text(&running);
-        assert!(!actions.contains("[a] Apply"), "no apply while running");
-        assert!(actions.contains("[o] Result"));
+        assert!(!actions.contains(" a  Apply"), "no apply while running");
+        assert!(actions.contains(" o  Result"));
 
         let completed = completed_state();
         let actions = actions_text(&completed);
-        assert!(actions.contains("[a] Apply"));
-        assert!(actions.contains("[X] Discard"));
+        assert!(actions.contains(" a  Apply"));
+        assert!(actions.contains(" X  Discard"));
 
         // Narrow terminals drop navigation, never the contextual actions.
         let wide: String = footer_line(Screen::RunDetail, &running, 200)
@@ -3473,7 +3474,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert!(narrow.contains("[o] Result"), "actions survive");
+        assert!(narrow.contains(" o  Result"), "actions survive");
         assert!(!narrow.contains("? help"), "navigation yields first");
     }
 
@@ -3496,11 +3497,11 @@ mod tests {
         state.replace_details(continuable);
 
         let actions = actions_text(&state);
-        assert!(actions.contains("[c] Continue"));
-        assert!(actions.contains("[w] Follow-ups"));
+        assert!(actions.contains(" c  Continue"));
+        assert!(actions.contains(" w  Follow-ups"));
         let text = render_text(&state, 160, 40);
-        assert!(text.contains("[c] Continue"));
-        assert!(text.contains("[w] Follow-ups"));
+        assert!(text.contains(" c  Continue"));
+        assert!(text.contains(" w  Follow-ups"));
 
         // Without the EngineeringLead route, neither cycle can be offered.
         let unroutable = actions_text(&completed_with_failure_state());
@@ -3512,16 +3513,16 @@ mod tests {
     fn footer_offers_resume_for_suspended_and_orphaned_runs() {
         // Running with nobody driving it: left behind by a dead instance.
         let orphaned = running_state();
-        assert!(actions_text(&orphaned).contains("[r] Resume"));
+        assert!(actions_text(&orphaned).contains(" r  Resume"));
 
         // Running with its driver in flight needs no second one.
         let mut driven = running_state();
         driven.begin_action(crate::tui::worker::ActionKind::Resume, driven.selected_run);
-        assert!(!actions_text(&driven).contains("[r] Resume"));
+        assert!(!actions_text(&driven).contains(" r  Resume"));
 
         let mut paused = running_state();
         paused.details.as_mut().unwrap().status = RunStatus::Paused;
-        assert!(actions_text(&paused).contains("[r] Resume"));
+        assert!(actions_text(&paused).contains(" r  Resume"));
     }
 
     #[test]
@@ -3540,7 +3541,7 @@ mod tests {
             .insert(StageId::new("implementation").unwrap());
         let text = render_text(&completed, 160, 40);
         assert!(text.contains("✓ Implementation ready"));
-        assert!(text.contains("[Enter/o] Open result"));
+        assert!(text.contains(" Enter/o  Open result"));
     }
 
     /// The panel quotes the artifact of the stage the operator is looking at,
@@ -3562,7 +3563,7 @@ mod tests {
         let text = render_text(&state, 160, 40);
         assert!(text.contains("It does what the task asked, but the retry path is untested."));
         assert!(
-            text.contains("[Enter/o] Open result"),
+            text.contains(" Enter/o  Open result"),
             "the quote is a lead-in, not a replacement"
         );
 
@@ -3789,7 +3790,7 @@ mod tests {
         for label in ["TASK", "WORKFLOW", "REPOSITORY", "EXECUTION", "EFFORT"] {
             assert!(text.contains(label), "{label} field is labelled");
         }
-        assert!(text.contains("[Enter] Start run"));
+        assert!(text.contains(" Enter  Start run"));
         assert!(text.contains("▸ "), "the focused field carries a cursor");
     }
 
@@ -4149,17 +4150,17 @@ mod tests {
     #[test]
     fn footer_shapes_follow_canonical_state() {
         let running = actions_text(&running_state());
-        assert!(running.starts_with("[o] Result"));
+        assert!(running.starts_with(" o  Result"));
         assert!(!running.contains("Apply") && !running.contains("Resolve"));
 
         let completed = actions_text(&completed_state());
-        assert!(completed.starts_with("[d] Review diff"));
-        assert!(!completed.contains("[o] Result"), "review, not monitoring");
+        assert!(completed.starts_with(" d  Review diff"));
+        assert!(!completed.contains(" o  Result"), "review, not monitoring");
 
         let mut technical = running_state();
         technical.technical = true;
         assert!(
-            actions_text(&technical).contains("[i] Operational"),
+            actions_text(&technical).contains(" i  Operational"),
             "the toggle names the mode it leads to"
         );
     }
@@ -4177,7 +4178,7 @@ mod tests {
                 "current stage survives at {width}x{height}"
             );
             assert!(
-                text.contains("[o] Result"),
+                text.contains(" o  Result"),
                 "the primary action survives at {width}x{height}"
             );
             assert!(
@@ -4207,7 +4208,7 @@ mod tests {
             text.contains("ACTION REQUIRED"),
             "attention cannot be missed"
         );
-        assert!(text.contains("[u] Resolve attention"));
+        assert!(text.contains(" u  Resolve attention"));
     }
 
     #[test]

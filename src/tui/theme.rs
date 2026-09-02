@@ -315,11 +315,17 @@ pub(crate) fn chip(label: &str, color: Color) -> Span<'static> {
     )
 }
 
-/// Keyboard affordance: the key reads as the interactive part, the verb as
-/// plain content.
+/// Keyboard affordance drawn as a button: the key is a reversed keycap in
+/// the action's colour, the verb sits beside it as plain content.
 pub(crate) fn action(key: &str, label: &str, color: Color) -> Vec<Span<'static>> {
     vec![
-        Span::styled(format!("[{key}]"), Style::default().fg(color)),
+        Span::styled(
+            format!(" {key} "),
+            Style::default()
+                .bg(color)
+                .fg(chip_fg())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!(" {label}"), text()),
     ]
 }
@@ -652,7 +658,7 @@ mod tests {
         );
         let spans = action("a", "Apply changes", success());
         let rendered: String = spans.iter().map(|span| span.content.as_ref()).collect();
-        assert_eq!(rendered, "[a] Apply changes");
+        assert_eq!(rendered, " a  Apply changes");
     }
 
     #[test]
