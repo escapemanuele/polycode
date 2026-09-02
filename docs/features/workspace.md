@@ -4,7 +4,7 @@ Every run works in its own Git worktree; the source checkout changes only when y
 
 ## Sub-features
 - worktree: `~/.polycode/worktrees/<sanitized-repo>-<common-dir-hash>/<run-id>` from the committed `HEAD` at creation (the base commit).
-- modes: implementation workflows own a `polycode/run-<run-id>` branch; review workflows use a detached worktree.
+- modes: implementation workflows own a `polycode/<slug>-<id-tail>` branch — `<slug>` is the issue key from a Linear or GitHub URL or bare `KEY-123` in the task (`dotcom-17972`), else the task's first words; `<id-tail>` is the last 6 characters of the run id, and a run without input falls back to `polycode/run-<run-id>`; review workflows use a detached worktree.
 - apply: patch transfer from base commit to a clean source checkout; no staging, no commit.
 - verification-gate: `apply` and `pr` refuse unless the run's latest Verify stage — the last one in the graph, since every fix or continue cycle appends its own — is `Completed` (`verification did not pass: stage verify is failed`). Older verify stages do not count: a failed `verify` answered by a passed `verify_1` no longer blocks. Checked before the run-status check.
 - pr: commit the delta on the run's branch, push to `origin`, open a PR through `gh`; source checkout untouched.

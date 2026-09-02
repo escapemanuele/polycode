@@ -12,8 +12,9 @@ use crate::git::{
     generate_patch, generate_patch_preview, inspect_worktree, push_branch, remote_url,
     remove_worktree, source_is_clean, tree_is_clean,
 };
-use crate::store::{RunRevision, SqliteStore, worktree_root};
+use crate::store::{RunInput, RunRevision, SqliteStore, worktree_root};
 
+use super::branch_name;
 use super::github::GhClient;
 use super::pull_request::PullRequestDraft;
 use super::{
@@ -106,7 +107,9 @@ impl WorkspaceManager {
         } else {
             WorkspaceMode::Detached
         };
-        let branch = (mode == WorkspaceMode::Branch).then(|| format!("polycode/run-{run_id}"));
+        let input = store.load_run_input(run_id)?;
+        let branch = (mode == WorkspaceMode::Branch)
+            .then(|| branch_name::branch_name(run_id, input.as_ref().map(RunInput::task)));
         if let Some(branch) = branch.as_deref() {
             if branch_exists(&self.git, &repository, branch)? {
                 return Err(WorkspaceError::BranchConflict(branch.to_owned()));
@@ -287,7 +290,8 @@ impl WorkspaceManager {
         }
         let repository = self.validate_source(&workspace)?;
         self.validate_workspace(&workspace, false)?;
-        let branch = format!("polycode/run-{run_id}");
+        let input = store.load_run_input(run_id)?;
+        let branch = branch_name::branch_name(run_id, input.as_ref().map(RunInput::task));
         if branch_exists(&self.git, &repository, &branch)? {
             return Err(WorkspaceError::BranchConflict(branch));
         }
@@ -1320,6 +1324,25 @@ mod tests {
     }
 
     #[test]
+    fn a_run_with_a_task_owns_a_branch_named_after_its_issue() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        create_run_with_task(
+            &mut fixture.store,
+            WorkflowKind::Standard,
+            2,
+            "Fix https://linear.app/a8c/issue/DOTCOM-17972/stepper-transfer-waits",
+        );
+        fixture.run_id = RunId::from_u128(2);
+
+        let workspace = fixture.prepare();
+        let id = fixture.run_id.to_string().to_ascii_lowercase();
+        let expected = format!("polycode/dotcom-17972-{}", &id[id.len() - 6..]);
+        assert_eq!(workspace.branch_name(), Some(expected.as_str()));
+        let repository = GitRepository::discover(&fixture.source).unwrap();
+        assert!(branch_exists(&fixture.manager().git, &repository, &expected).unwrap());
+    }
+
+    #[test]
     fn branch_workspace_is_isolated_and_source_may_be_dirty_at_creation() {
         let mut fixture = Fixture::new(WorkflowKind::Standard);
         fs::write(fixture.source.join("local-only.txt"), "dirty source\n").unwrap();
@@ -2341,6 +2364,24 @@ mod tests {
     }
 
     fn create_run(store: &mut SqliteStore, kind: WorkflowKind, id: u128) -> RunId {
+        create_run_with_task_option(store, kind, id, None)
+    }
+
+    fn create_run_with_task(
+        store: &mut SqliteStore,
+        kind: WorkflowKind,
+        id: u128,
+        task: &str,
+    ) -> RunId {
+        create_run_with_task_option(store, kind, id, Some(task))
+    }
+
+    fn create_run_with_task_option(
+        store: &mut SqliteStore,
+        kind: WorkflowKind,
+        id: u128,
+        task: Option<&str>,
+    ) -> RunId {
         let run_id = RunId::from_u128(id);
         let (stage_id, stage_kind, role) = if kind == WorkflowKind::Review {
             (
@@ -2365,7 +2406,17 @@ mod tests {
         let run = Run::new(run_id, workflow, config_id.clone(), created_at);
         let config = ResolvedConfigSnapshot::new(config_id, 1, json!({}), created_at).unwrap();
         let event = run.created_event(metadata(created_at));
-        store.create_run(&run, &config, &[event]).unwrap();
+        match task {
+            Some(task) => {
+                let input = RunInput::new(run_id, task, created_at).unwrap();
+                store
+                    .create_run_with_input(&run, &input, &config, &[event])
+                    .unwrap();
+            }
+            None => {
+                store.create_run(&run, &config, &[event]).unwrap();
+            }
+        }
         run_id
     }
 
