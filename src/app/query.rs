@@ -881,10 +881,13 @@ pub(crate) fn read_artifact(
     })
 }
 
-/// The pull request the latest editing stage wrote for the run's change, if
-/// it wrote one. Fix and follow-up stages restate it, so the most recent
-/// editing artifact — by creation time, then attempt — is the one that
-/// describes what the branch carries now. Read through the same
+/// The pull request the newest editing stage that wrote one drafted for the
+/// run's change. Fix and follow-up stages restate it, so the most recent
+/// editing artifact — by creation time, then attempt — describes what the
+/// branch carries now; when that one ignored the contract, an older editing
+/// artifact that honored it still describes the change far better than the
+/// task text does, so the search walks back rather than giving up on the
+/// first artifact without a section. Read through the same
 /// integrity-verified path as opening the artifact.
 ///
 /// # Errors
@@ -895,18 +898,21 @@ pub(crate) fn pull_request_draft(
     run_id: RunId,
 ) -> Result<Option<crate::workspace::PullRequestDraft>, AppError> {
     let artifacts = store.list_artifacts(run_id)?;
-    let Some(latest) = latest_editing_artifact(&artifacts) else {
-        return Ok(None);
-    };
-    let view = read_artifact(store, run_id, latest.metadata().stage_id())?;
-    Ok(crate::workspace::extract_pull_request_draft(&view.text))
+    for artifact in editing_artifacts_newest_first(&artifacts) {
+        let view = read_artifact(store, run_id, artifact.metadata().stage_id())?;
+        if let Some(draft) = crate::workspace::extract_pull_request_draft(&view.text) {
+            return Ok(Some(draft));
+        }
+    }
+    Ok(None)
 }
 
-/// The most recent complete artifact of a stage that edits the workspace.
-fn latest_editing_artifact(
+/// The complete artifacts of stages that edit the workspace, newest first by
+/// creation time, then attempt.
+fn editing_artifacts_newest_first(
     artifacts: &[crate::providers::ArtifactRecord],
-) -> Option<&crate::providers::ArtifactRecord> {
-    artifacts
+) -> Vec<&crate::providers::ArtifactRecord> {
+    let mut editing: Vec<_> = artifacts
         .iter()
         .filter(|artifact| {
             artifact.metadata().status() == ArtifactStatus::Complete
@@ -918,7 +924,11 @@ fn latest_editing_artifact(
                         | ArtifactKind::FollowUp
                 )
         })
-        .max_by_key(|artifact| (*artifact.metadata().created_at(), artifact.attempt()))
+        .collect();
+    editing.sort_by_key(|artifact| {
+        std::cmp::Reverse((*artifact.metadata().created_at(), artifact.attempt()))
+    });
+    editing
 }
 
 pub(crate) fn process_log_tail(
@@ -1373,7 +1383,7 @@ mod tests {
     /// editing artifact wins; reviews and decisions never describe a change
     /// they did not make, and a failed attempt never speaks for the branch.
     #[test]
-    fn the_newest_complete_editing_artifact_drafts_the_pull_request() {
+    fn editing_artifacts_are_walked_back_newest_first_for_the_pull_request() {
         let artifacts = vec![
             artifact(
                 "implementation",
@@ -1419,12 +1429,29 @@ mod tests {
             ),
         ];
 
-        let latest = latest_editing_artifact(&artifacts).unwrap();
+        let ordered = editing_artifacts_newest_first(&artifacts);
 
-        assert_eq!(latest.metadata().stage_id().to_string(), "fix-1");
-        assert_eq!(latest.attempt(), 2);
-        assert!(latest_editing_artifact(&artifacts[1..2]).is_none());
-        assert!(latest_editing_artifact(&[]).is_none());
+        let first = ordered.first().unwrap();
+        assert_eq!(first.metadata().stage_id().to_string(), "fix-1");
+        assert_eq!(first.attempt(), 2);
+        // The walk-back order: the newest fix's earlier attempt, then the
+        // implementation. A decision, a review, and a failed fix are not
+        // editing artifacts and never enter it.
+        let rest: Vec<_> = ordered[1..]
+            .iter()
+            .map(|artifact| {
+                (
+                    artifact.metadata().stage_id().to_string(),
+                    artifact.attempt(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rest,
+            vec![("fix-1".to_owned(), 1), ("implementation".to_owned(), 1)]
+        );
+        assert!(editing_artifacts_newest_first(&artifacts[1..2]).is_empty());
+        assert!(editing_artifacts_newest_first(&[]).is_empty());
     }
 
     fn event(
