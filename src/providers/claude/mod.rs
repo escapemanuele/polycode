@@ -504,6 +504,15 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                 // Disposable eval never grants Bash; a denied call never ran, so
                 // only mutation/question/unknown requests block a successful
                 // eval terminal. Production keeps stage-kind conservative rules.
+                // A refused call the agent then worked around is spent
+                // history: it never ran, and the invocation's own log shows
+                // the agent was not left blocked. Only refusals with no such
+                // evidence still reach the operator.
+                let superseded = if success && !self.eval_auto_approve {
+                    Self::superseded_requests(store, &session)?
+                } else {
+                    BTreeSet::new()
+                };
                 let needs_user = !unresolved.is_empty()
                     && (!success
                         || unresolved.iter().any(|denial| {
@@ -511,6 +520,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
                                 denial.requires_eval_terminal_attention()
                             } else {
                                 denial.requires_terminal_attention(request.stage_kind())
+                                    && !denial.was_superseded(&superseded)
                             }
                         }));
                 if needs_user {
@@ -614,6 +624,32 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
             commit: ProviderCommit::new(chunk, end)
                 .with_session(ProviderSessionMutation::new(session, expected)),
         })
+    }
+
+    /// Identifiers this invocation's own log shows the agent worked around.
+    ///
+    /// Read-only: the log is scanned from the start of the current process's
+    /// stdout, no cursor moves, and an oversized or unreadable log yields an
+    /// empty set, which asks the operator rather than assuming recovery.
+    fn superseded_requests(
+        store: &SqliteStore,
+        session: &ProviderSessionRecord,
+    ) -> Result<BTreeSet<String>, ClaudeProviderError> {
+        let Some(process_id) = session.current_process_id() else {
+            return Ok(BTreeSet::new());
+        };
+        let process = store.load_managed_process(process_id)?;
+        let path = process.spec().stdout_path();
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return Ok(BTreeSet::new());
+        };
+        if metadata.len() > protocol::MAX_SUPERSESSION_SCAN_BYTES as u64 {
+            return Ok(BTreeSet::new());
+        }
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Ok(BTreeSet::new());
+        };
+        Ok(protocol::superseded_requests(&raw))
     }
 
     fn read_pending_denials(
@@ -3208,6 +3244,108 @@ mod tests {
         assert!(spec.environment().is_empty());
         let stdin = std::fs::read_to_string(spec.stdin_path().unwrap()).unwrap();
         assert!(!stdin.contains("Image generation"));
+    }
+
+    /// One invocation's stdout: the tool calls the agent made, then its
+    /// terminal result listing what was refused.
+    fn invocation_stream(calls: &[(&str, &str, bool)], denials: &serde_json::Value) -> String {
+        let mut lines = Vec::new();
+        for (id, command, ok) in calls {
+            lines.push(
+                json!({
+                    "type": "assistant",
+                    "message": {"content": [
+                        {"type": "tool_use", "id": id, "name": "Bash",
+                         "input": {"command": command}}
+                    ]}
+                })
+                .to_string(),
+            );
+            let mut result = json!({
+                "type": "tool_result", "tool_use_id": id, "content": "output"
+            });
+            if !ok {
+                result["is_error"] = json!(true);
+                result["content"] = json!(
+                    "Permission to use Bash has been denied because Claude Code is running in don't ask mode."
+                );
+            }
+            lines.push(json!({"type": "user", "message": {"content": [result]}}).to_string());
+        }
+        lines.push(success_result("# Done\nPage written.\n", denials));
+        lines.join("\n")
+    }
+
+    /// The reported case, end to end. An editing stage asks for a pipeline
+    /// ending in an interpreter — a command no exact permission rule can ever
+    /// describe — is refused, runs a plain diagnostic instead, and finishes.
+    /// The refusal is spent history, so the run completes on its own.
+    #[test]
+    fn a_shell_refusal_the_agent_worked_around_no_longer_stops_a_finished_run() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), false);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        backend.set_first_result(invocation_stream(
+            &[
+                (
+                    "call_1",
+                    "ls -la . assets && git status --short && python3 - <<'PY'",
+                    false,
+                ),
+                ("call_2", "ls -la assets", true),
+            ],
+            &json!([bash_denial(
+                "call_1",
+                "ls -la . assets && git status --short && python3 - <<'PY'",
+                &worktree
+            )]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "landing page");
+        drive_to_completion(&mut engine, &mut store, run_id);
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::Completed
+        );
+        assert!(
+            !store.list_artifacts(run_id).unwrap().is_empty(),
+            "the stage's report is kept, exactly as an unrefused run keeps it"
+        );
+    }
+
+    /// The other half of the same rule. Identical refusal, but the agent
+    /// never got a shell command through, so nobody knows whether it was
+    /// blocked from something it needed. That still reaches the operator.
+    #[test]
+    fn a_shell_refusal_with_no_recovery_still_asks_the_operator() {
+        let backend = FixtureBackend::default();
+        let (_temp, _database, run_id, mut store, provider) =
+            fixture_with_backend(backend.clone(), false);
+        let worktree = store
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        backend.set_first_result(invocation_stream(
+            &[("call_1", "cd /tmp && rm -rf build && make install", false)],
+            &json!([bash_denial(
+                "call_1",
+                "cd /tmp && rm -rf build && make install",
+                &worktree
+            )]),
+        ));
+        let mut engine = WorkflowEngine::new(provider, "landing page");
+        drive_to_attention(&mut engine, &mut store, run_id);
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::NeedsUser
+        );
     }
 
     fn init_repository(path: &Path) {
