@@ -438,6 +438,16 @@ mod tests {
         assert_eq!(reviewer["result"]["isError"], true);
         assert!(!worktree.join("assets/other.png").exists());
         drop(host);
+        // Releasing the last handle a *test* holds is not necessarily the last
+        // handle: the acceptor thread upgrades its weak reference for as long
+        // as it is serving a call, and the request just above is one. So `Drop`
+        // — and the removal it does — can land after this line rather than
+        // during it. Waiting for the socket to go is the contract; waiting no
+        // time at all was a race the test lost under CI load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(!socket.exists(), "dropping the host removes its socket");
     }
 }

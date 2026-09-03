@@ -36,6 +36,26 @@ fn main() -> std::io::Result<()> {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
+        // A child that catches every signal it is allowed to catch and keeps
+        // going, which is how a test-runner worker pool behaves when a stop
+        // asks it politely. Only SIGKILL ends this, so a stop that gives up
+        // before the last rung of its ladder leaves it running.
+        "ignore-signals" => {
+            let caught = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            for signal in [
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+                signal_hook::consts::SIGHUP,
+            ] {
+                signal_hook::flag::register(signal, std::sync::Arc::clone(&caught))?;
+            }
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(b"ignoring-signals\n")?;
+            stdout.flush()?;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
         "large" => {
             let length = parse_u64(arguments.next())?;
             let mut remaining = length;
