@@ -19,7 +19,7 @@ use super::environment::{HANDOFF_SOCKET_ENV, encode_forwarded_environment, safe_
 use super::model::RuntimeEvidence;
 use super::{
     BackendAvailability, BackendSessionId, BackendSessionState, ExitEvidence, ManagedProcess,
-    ManagedProcessId, OutputChunk, OutputStream, ProcessBackend, ProcessError,
+    ManagedProcessId, OutputChunk, OutputStream, ProcessBackend, ProcessError, TerminationSignal,
 };
 
 pub(crate) const OWNER_PROCESS_ENV: &str = "POLYCODE_MANAGED_PROCESS_ID";
@@ -379,22 +379,32 @@ impl ProcessBackend for TmuxBackend {
         Ok(Some(evidence))
     }
 
-    fn interrupt(&self, process: &ManagedProcess) -> Result<(), ProcessError> {
+    fn signal(
+        &self,
+        process: &ManagedProcess,
+        signal: TerminationSignal,
+    ) -> Result<(), ProcessError> {
         if self.inspect_session(process)? == BackendSessionState::Absent {
             return Ok(());
         }
         let runtime = self.runtime_evidence(process)?;
+        // The negative PID addresses the whole group. The agent is only ever
+        // the root of a tree — its own children are what actually hold the
+        // machine — so signalling the leader alone would leave the expensive
+        // half running.
         let process_group = format!("-{}", runtime.process_group_id());
         let output = Command::new("/bin/kill")
-            .arg("-INT")
+            .arg(signal.flag())
             .arg("--")
             .arg(process_group)
             .output()
             .map_err(|error| ProcessError::SignalCommand(error.kind().to_string()))?;
         if !output.status.success() {
-            return Err(ProcessError::SignalCommand(sanitized_stderr(
-                &output.stderr,
-            )));
+            let message = sanitized_stderr(&output.stderr);
+            if group_already_gone(&message) {
+                return Ok(());
+            }
+            return Err(ProcessError::SignalCommand(message));
         }
         Ok(())
     }
@@ -489,6 +499,16 @@ impl EnvironmentHandoff {
     fn deliver(self) -> Result<(), ProcessError> {
         Err(ProcessError::UnsupportedPlatform)
     }
+}
+
+/// Whether a failed signal only means the group finished first.
+///
+/// Escalation makes this the common case rather than an edge one: the rung
+/// below usually worked, and the next rung is sent to a group that has already
+/// gone. Both BSD and GNU `kill` say so in the same words, and neither offers
+/// a distinguishable exit status, so the message is what there is to read.
+fn group_already_gone(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("no such process")
 }
 
 fn sanitized_stderr(stderr: &[u8]) -> String {

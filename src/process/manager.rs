@@ -14,15 +14,28 @@ use crate::store::{SqliteStore, process_root};
 use super::{
     BackendSessionState, ExitResult, ManagedProcess, ManagedProcessId, ManagedProcessStatus,
     OutputChunk, OutputCursor, OutputStream, ProcessBackend, ProcessError, ProcessInspection,
-    ProcessSpec, TmuxBackend,
+    ProcessSpec, TerminationSignal, TmuxBackend,
 };
 
-const INTERRUPT_POLLS: usize = 100;
 const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Five seconds for Ctrl-C: long enough for an agent to finish the turn it is
+/// writing and record its own exit, which is the outcome worth waiting for.
+const INTERRUPT_POLLS: usize = 100;
+/// Three seconds for SIGTERM. Whatever is still alive here already ignored
+/// Ctrl-C, so this is a courtesy to children that handle only the conventional
+/// signal, not a second full wait.
+const TERMINATE_POLLS: usize = 60;
+/// One second after SIGKILL, which the kernel does not negotiate. The wait is
+/// for the reaping to land in the store, not for the process to decide.
+const KILL_POLLS: usize = 20;
 
 pub struct ProcessManager<B> {
     root: PathBuf,
     backend: B,
+    /// How long one poll of the termination ladder waits. Only the pace is
+    /// adjustable, never how many rungs there are: a test that skipped a rung
+    /// would stop proving the ladder is climbed in full.
+    poll_interval: Duration,
 }
 
 impl<B: ProcessBackend> ProcessManager<B> {
@@ -31,7 +44,16 @@ impl<B: ProcessBackend> ProcessManager<B> {
         Self {
             root: root.into(),
             backend,
+            poll_interval: INTERRUPT_POLL_INTERVAL,
         }
+    }
+
+    /// Runs the termination ladder at a different pace, for tests that must
+    /// climb all of it without waiting out the real grace periods.
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
     }
 
     #[must_use]
@@ -382,10 +404,19 @@ impl<B: ProcessBackend> ProcessManager<B> {
         store.acknowledge_process_output(chunk, acknowledged_end)
     }
 
-    /// Persists interrupt intent, sends Ctrl-C, and waits bounded time for evidence.
+    /// Persists interrupt intent, then climbs the termination ladder until the
+    /// process group is gone or the ladder runs out.
+    ///
+    /// Each rung is sent to the group and given its own bounded grace period.
+    /// Ctrl-C comes first and is given the longest wait, because it is the only
+    /// rung an agent can shut itself down cleanly under; the rungs below it
+    /// exist for what the agent leaves behind. A stop that gave up after Ctrl-C
+    /// left worker pools running for days, so giving up now means the kernel
+    /// itself refused, not that a child declined to listen.
     ///
     /// # Errors
-    /// Rejects invalid status, foreign ownership, persistence failures, or timeout.
+    /// Rejects invalid status, foreign ownership, persistence failures, or a
+    /// process that survived every rung.
     pub fn interrupt(
         &self,
         store: &mut SqliteStore,
@@ -428,27 +459,30 @@ impl<B: ProcessBackend> ProcessManager<B> {
                 });
             }
         };
-        self.backend.interrupt(&process)?;
-
-        for _ in 0..INTERRUPT_POLLS {
+        for signal in TerminationSignal::LADDER {
+            self.backend.signal(&process, signal)?;
+            for _ in 0..Self::grace_polls(signal) {
+                inspection = self.reconcile(store, process_id)?;
+                if settled(&inspection) {
+                    return Ok(inspection);
+                }
+                std::thread::sleep(self.poll_interval);
+            }
             inspection = self.reconcile(store, process_id)?;
-            if matches!(
-                inspection.process.status(),
-                ManagedProcessStatus::Interrupted
-                    | ManagedProcessStatus::Exited
-                    | ManagedProcessStatus::Broken
-            ) && !(inspection.process.status() == ManagedProcessStatus::Interrupted
-                && inspection.backend_session == BackendSessionState::Owned)
-            {
+            if settled(&inspection) || inspection.process.status() == ManagedProcessStatus::Missing {
                 return Ok(inspection);
             }
-            std::thread::sleep(INTERRUPT_POLL_INTERVAL);
-        }
-        inspection = self.reconcile(store, process_id)?;
-        if inspection.process.status() == ManagedProcessStatus::Missing {
-            return Ok(inspection);
         }
         Err(ProcessError::InterruptTimeout(process_id))
+    }
+
+    /// How long one rung of the ladder is given before the next one is sent.
+    const fn grace_polls(signal: TerminationSignal) -> usize {
+        match signal {
+            TerminationSignal::Interrupt => INTERRUPT_POLLS,
+            TerminationSignal::Terminate => TERMINATE_POLLS,
+            TerminationSignal::Kill => KILL_POLLS,
+        }
     }
 
     /// Removes owned backend session while preserving manifest and output history.
@@ -619,6 +653,22 @@ fn touch_append_only(path: &Path) -> Result<(), ProcessError> {
     Ok(())
 }
 
+/// Whether a stop has finished: the process is done and its backend session is
+/// no longer holding anything open.
+///
+/// `Interrupted` with an owned session still counts as running, because the
+/// session outliving the signal is what a child that ignored it looks like —
+/// exactly the case the next rung of the ladder exists for.
+fn settled(inspection: &ProcessInspection) -> bool {
+    matches!(
+        inspection.process.status(),
+        ManagedProcessStatus::Interrupted
+            | ManagedProcessStatus::Exited
+            | ManagedProcessStatus::Broken
+    ) && !(inspection.process.status() == ManagedProcessStatus::Interrupted
+        && inspection.backend_session == BackendSessionState::Owned)
+}
+
 fn can_mark_broken(status: ManagedProcessStatus) -> bool {
     matches!(
         status,
@@ -657,6 +707,13 @@ mod tests {
         evidence: Option<ExitResult>,
         complete_on_next_inspection: Option<ExitResult>,
         calls: Vec<&'static str>,
+        /// Every signal the manager sent, in order, so a test can read back
+        /// which rungs of the ladder were actually climbed.
+        signals: Vec<TerminationSignal>,
+        /// The gentlest signal this fixture will die to. `Interrupt` models a
+        /// well-behaved agent; `Kill` models the worker pool that ignores
+        /// everything catchable.
+        dies_to: Option<TerminationSignal>,
     }
 
     #[derive(Clone, Default)]
@@ -687,6 +744,18 @@ mod tests {
 
         fn calls(&self) -> Vec<&'static str> {
             self.state.lock().unwrap().calls.clone()
+        }
+
+        /// Models a child that only dies to `signal` and ignores every gentler
+        /// one, the way a Jest worker pool ignores Ctrl-C.
+        fn survives_until(&self, signal: TerminationSignal) {
+            let mut state = self.state.lock().unwrap();
+            state.dies_to = Some(signal);
+            state.calls.clear();
+        }
+
+        fn signals(&self) -> Vec<TerminationSignal> {
+            self.state.lock().unwrap().signals.clone()
         }
     }
 
@@ -773,8 +842,19 @@ mod tests {
             }))
         }
 
-        fn interrupt(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
-            self.finish(ExitResult::Signal { signal: 2 });
+        fn signal(
+            &self,
+            _process: &ManagedProcess,
+            signal: TerminationSignal,
+        ) -> Result<(), ProcessError> {
+            let dies_to = {
+                let mut state = self.state.lock().unwrap();
+                state.signals.push(signal);
+                state.dies_to.unwrap_or(TerminationSignal::Interrupt)
+            };
+            if signal >= dies_to {
+                self.finish(ExitResult::Signal { signal: 2 });
+            }
             Ok(())
         }
 
@@ -823,7 +903,10 @@ mod tests {
                 .prepare_run_workspace(&mut store, run_id, &source)
                 .unwrap();
             let backend = InterleavingBackend::default();
-            let manager = ProcessManager::new(temp.path().join("runs"), backend.clone());
+            // The ladder's real grace periods are seconds long by design; the
+            // rung count is what these tests are about, not the waiting.
+            let manager = ProcessManager::new(temp.path().join("runs"), backend.clone())
+                .with_poll_interval(Duration::ZERO);
             let process = manager
                 .prepare(
                     &mut store,
@@ -845,6 +928,55 @@ mod tests {
                 process_id: process.id(),
             }
         }
+    }
+
+    /// The property the old stop lacked: a child that ignores Ctrl-C is still
+    /// stopped. Before escalation existed, this run left its process group
+    /// alive and returned `InterruptTimeout`, which is how worker pools
+    /// survived their run by days.
+    #[test]
+    fn a_process_that_ignores_ctrl_c_is_escalated_until_it_dies() {
+        let mut fixture = Fixture::running();
+        fixture.backend.survives_until(TerminationSignal::Kill);
+
+        let inspection = fixture
+            .manager
+            .interrupt(&mut fixture.store, fixture.process_id)
+            .expect("a killed group settles the stop");
+
+        assert!(
+            settled(&inspection),
+            "the process is stopped, not left running"
+        );
+        assert_eq!(
+            fixture.backend.signals(),
+            vec![
+                TerminationSignal::Interrupt,
+                TerminationSignal::Terminate,
+                TerminationSignal::Kill,
+            ],
+            "the ladder is climbed in order, gentlest first"
+        );
+    }
+
+    /// The other half of the same property: escalation is a fallback, not the
+    /// normal path. An agent that honours Ctrl-C is never signalled again, so
+    /// it keeps the chance to write its own exit evidence.
+    #[test]
+    fn a_process_that_honours_ctrl_c_is_never_escalated() {
+        let mut fixture = Fixture::running();
+        fixture.backend.survives_until(TerminationSignal::Interrupt);
+
+        fixture
+            .manager
+            .interrupt(&mut fixture.store, fixture.process_id)
+            .expect("an interrupted process settles the stop");
+
+        assert_eq!(
+            fixture.backend.signals(),
+            vec![TerminationSignal::Interrupt],
+            "nothing harsher than Ctrl-C is sent to a process that stopped"
+        );
     }
 
     #[test]
