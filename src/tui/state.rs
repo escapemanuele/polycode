@@ -481,6 +481,8 @@ pub(crate) struct TuiState {
     pub artifact_raw: bool,
     /// Operational view by default; `i` reveals the diagnostic rows.
     pub technical: bool,
+    /// The rail shows the task's first line only; `e` opens the whole thing.
+    pub task_expanded: bool,
     pub evidence: Option<StageExecutionEvidence>,
     pub stages_with_artifacts: HashSet<StageId>,
     /// What the selected stage's artifact says about itself, in one line.
@@ -563,6 +565,7 @@ impl TuiState {
             artifact: None,
             artifact_raw: false,
             technical: false,
+            task_expanded: false,
             evidence: None,
             stages_with_artifacts: HashSet::new(),
             headline: None,
