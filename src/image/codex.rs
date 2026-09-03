@@ -443,7 +443,10 @@ mod tests {
         // A codex that fails its turn is a typed rejection, not a panic.
         std::fs::write(
             &script,
-            "#!/bin/sh\necho '{\"type\":\"thread.started\",\"thread_id\":\"t-43\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"quota\"}}'\n",
+            // Drains stdin first: the parent writes the prompt, and a script
+            // that exits without reading it kills the pipe under that write —
+            // a Broken pipe the test would report as a Network failure.
+            "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"thread.started\",\"thread_id\":\"t-43\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"quota\"}}'\n",
         )
         .unwrap();
         assert_eq!(

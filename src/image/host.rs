@@ -438,6 +438,13 @@ mod tests {
         assert_eq!(reviewer["result"]["isError"], true);
         assert!(!worktree.join("assets/other.png").exists());
         drop(host);
+        // The acceptor thread upgrades its `Weak` while serving a call, so the
+        // host's `Drop` can land after this line rather than before it. Poll
+        // for the socket to go instead of asserting on one instant.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!socket.exists(), "dropping the host removes its socket");
     }
 }
