@@ -588,6 +588,68 @@ fn sprite_grid(
     grid
 }
 
+/// The plunger at rest, handle up and the charge still quiet.
+const PLUNGER_ARMED: [&str; 9] = [
+    "..BBBBB..",
+    "....B....",
+    "....B....",
+    "....B....",
+    ".DDDDDDD.",
+    ".DDDDDDD.",
+    ".DDDDDDD.",
+    ".........",
+    "....YYYYY",
+];
+
+/// The plunger driven home: the handle is down and the charge has caught.
+const PLUNGER_FIRED: [&str; 9] = [
+    ".........",
+    ".........",
+    "..BBBBB..",
+    "....B....",
+    ".DDDDDDD.",
+    ".DDDDDDD.",
+    ".DDDDDDD.",
+    "......YWY",
+    "....YYYYY",
+];
+
+/// POD at the plunger, for the one action that destroys a run.
+///
+/// The only scene that belongs to no stage: nothing in the pipeline deletes
+/// anything, so this one is asked for by name, by the delete confirmation
+/// alone. POD works the handle whenever the surface allows motion — the
+/// charge is armed, not yet fired, which is exactly the moment the overlay
+/// is asking about.
+pub(crate) fn demolition_lines(motion: MotionFrame) -> Vec<Line<'static>> {
+    let expr = expression(MascotState::Failed, motion.is_blinking(), false);
+    let prop = if motion.prop_frame() == 0 {
+        PLUNGER_ARMED
+    } else {
+        PLUNGER_FIRED
+    };
+    let mut grid: Vec<String> = hat_rows(None)
+        .iter()
+        .map(|row| format!("{row}........."))
+        .collect();
+    for (face_row, prop_row) in face_rows(None, &expr).iter().zip(prop) {
+        grid.push(format!("{face_row}{prop_row}"));
+    }
+    let body = theme::danger();
+    let mut lines: Vec<Line<'static>> = grid
+        .chunks(2)
+        .map(|pair| render_pixel_pair(&pair[0], &pair[1], body))
+        .collect();
+    lines.push(
+        Line::from(Span::styled(
+            "DEMOLITION",
+            Style::new().fg(body).add_modifier(Modifier::BOLD),
+        ))
+        .alignment(ratatui::layout::Alignment::Center),
+    );
+    lines
+}
+
 /// The color a pixel token resolves to; `None` is punched through to the
 /// terminal background ('.' outside the sprite, 'K' for facial features).
 fn pixel_color(token: u8, body: Color) -> Option<Color> {

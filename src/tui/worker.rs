@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::{
-    ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, ProviderFactory, RetryRoute,
-    RunService,
+    ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, ProviderFactory,
+    PurgeReceipt, RetryRoute, RunService,
 };
 use crate::domain::{AttentionRequestId, RunId, StageId, WorkflowKind};
 use crate::workspace::PublishReceipt;
@@ -21,6 +21,7 @@ pub(crate) enum ActionKind {
     Apply,
     Publish,
     Discard,
+    Purge,
 }
 
 impl ActionKind {
@@ -36,6 +37,7 @@ impl ActionKind {
             Self::Apply => "applying changes",
             Self::Publish => "publishing pull request",
             Self::Discard => "discarding run",
+            Self::Purge => "deleting run",
         }
     }
 
@@ -53,7 +55,7 @@ impl ActionKind {
             | Self::Fix
             | Self::Continue
             | Self::ResolveAttention => true,
-            Self::Stop | Self::Apply | Self::Publish | Self::Discard => false,
+            Self::Stop | Self::Apply | Self::Publish | Self::Discard | Self::Purge => false,
         }
     }
 }
@@ -101,6 +103,10 @@ pub(crate) enum WorkerCommand {
     DiscardRun {
         run_id: RunId,
     },
+    /// Deletes an archived run for good — worktree, files, rows.
+    PurgeRun {
+        run_id: RunId,
+    },
 }
 
 impl WorkerCommand {
@@ -116,6 +122,7 @@ impl WorkerCommand {
             Self::ApplyRun { .. } => ActionKind::Apply,
             Self::PublishRun { .. } => ActionKind::Publish,
             Self::DiscardRun { .. } => ActionKind::Discard,
+            Self::PurgeRun { .. } => ActionKind::Purge,
         }
     }
 
@@ -130,7 +137,8 @@ impl WorkerCommand {
             | Self::ResolveAttention { run_id, .. }
             | Self::ApplyRun { run_id }
             | Self::PublishRun { run_id }
-            | Self::DiscardRun { run_id } => Some(*run_id),
+            | Self::DiscardRun { run_id }
+            | Self::PurgeRun { run_id } => Some(*run_id),
         }
     }
 }
@@ -140,14 +148,19 @@ pub(crate) enum WorkerSuccess {
     Execution(ExecutionReport),
     Applied(ApplyOutcome, ExecutionReport),
     Published(PublishReceipt, ExecutionReport),
+    /// A purge leaves no run to report on: the rows it would describe are
+    /// the ones it deleted.
+    Purged(PurgeReceipt),
 }
 
 impl WorkerSuccess {
-    pub(crate) const fn report(&self) -> &ExecutionReport {
+    /// The run this action left behind, when it left one.
+    pub(crate) const fn report(&self) -> Option<&ExecutionReport> {
         match self {
             Self::Execution(report) | Self::Applied(_, report) | Self::Published(_, report) => {
-                report
+                Some(report)
             }
+            Self::Purged(_) => None,
         }
     }
 }
@@ -324,6 +337,7 @@ where
         WorkerCommand::DiscardRun { run_id } => {
             service.discard_run(run_id).map(WorkerSuccess::Execution)
         }
+        WorkerCommand::PurgeRun { run_id } => service.purge_run(run_id).map(WorkerSuccess::Purged),
     }
 }
 
@@ -373,7 +387,10 @@ mod tests {
         };
         let success = result.result.unwrap();
         assert_eq!(result.action, ActionKind::Start);
-        assert_eq!(success.report().details.status, RunStatus::Completed);
+        assert_eq!(
+            success.report().unwrap().details.status,
+            RunStatus::Completed
+        );
     }
 
     #[test]

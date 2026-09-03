@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 7;
+pub const DATABASE_SCHEMA_VERSION: u32 = 8;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -16,7 +16,8 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
-            migrate_v7(connection)
+            migrate_v7(connection)?;
+            migrate_v8(connection)
         }
         1 => {
             migrate_v2(connection)?;
@@ -24,31 +25,40 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
-            migrate_v7(connection)
+            migrate_v7(connection)?;
+            migrate_v8(connection)
         }
         2 => {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
-            migrate_v7(connection)
+            migrate_v7(connection)?;
+            migrate_v8(connection)
         }
         3 => {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
-            migrate_v7(connection)
+            migrate_v7(connection)?;
+            migrate_v8(connection)
         }
         4 => {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
-            migrate_v7(connection)
+            migrate_v7(connection)?;
+            migrate_v8(connection)
         }
         5 => {
             migrate_v6(connection)?;
-            migrate_v7(connection)
+            migrate_v7(connection)?;
+            migrate_v8(connection)
         }
-        6 => migrate_v7(connection),
+        6 => {
+            migrate_v7(connection)?;
+            migrate_v8(connection)
+        }
+        7 => migrate_v8(connection),
         unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
     }
 }
@@ -481,6 +491,33 @@ fn migrate_v7(connection: &Connection) -> Result<(), StoreError> {
              SELECT RAISE(ABORT, 'image generations are immutable');
          END;
          PRAGMA user_version = 7;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Archiving, and the purge it leads to.
+///
+/// `hidden` becomes `archived`: the same list metadata under the name the
+/// operator acts on — a run is archived, and an archived run is the only one
+/// that can be deleted for good.
+///
+/// The delete guards go with it. Artifacts, run inputs, and image generations
+/// are immutable, and they stay immutable: nothing may edit one, and nothing
+/// may delete one on its own. What the guards blocked as a side effect was
+/// deleting a whole run, which is not an edit of the record but the end of
+/// it — so the `no_delete` triggers give way to the update guards alone, and
+/// a purge deletes a run's rows in one transaction or none of them. Losing
+/// the run is the point; losing a single artifact under a live run is still
+/// impossible, because nothing but the purge deletes rows at all.
+fn migrate_v8(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE runs RENAME COLUMN hidden TO archived;
+         DROP TRIGGER artifacts_no_delete;
+         DROP TRIGGER run_inputs_no_delete;
+         DROP TRIGGER image_generations_no_delete;
+         PRAGMA user_version = 8;
          COMMIT;",
     )?;
     Ok(())

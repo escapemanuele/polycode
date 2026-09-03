@@ -9,7 +9,10 @@ use crate::domain::{
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
 use crate::process::{ManagedProcessStatus, ProcessManager};
-use crate::store::{ResolvedConfigSnapshot, RunInput, SqliteStore, database_file, worktree_root};
+use crate::store::{
+    ResolvedConfigSnapshot, RunInput, SqliteStore, StoreError, database_file, process_root,
+    worktree_root,
+};
 use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
 
 use super::provider_factory::{ProviderFactory, ProviderResolver};
@@ -53,6 +56,14 @@ const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 pub enum ApplyOutcome {
     Applied,
     NoChanges,
+}
+
+/// What a purge destroyed. The rows always go; the run's directory of
+/// artifacts and logs may already have been gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PurgeReceipt {
+    pub run_id: RunId,
+    pub files_removed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -580,11 +591,23 @@ where
     pub fn discard_run(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
+        self.release_owned_resources(&mut store, run_id)?;
+        Self::report(&mut store, run_id, before, None)
+    }
+
+    /// Interrupts and cleans up the run's managed processes, then discards
+    /// its workspace: everything the run owns outside its own rows and
+    /// files. Shared by discard and by the purge that follows it.
+    fn release_owned_resources(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<(), AppError> {
         let process_manager = ProcessManager::from_environment()?;
         for process in store.list_managed_processes(run_id)? {
-            let inspection = process_manager.inspect(&mut store, process.id())?;
+            let inspection = process_manager.inspect(store, process.id())?;
             let inspection = if inspection.process.status().is_active() {
-                process_manager.interrupt(&mut store, process.id())?
+                process_manager.interrupt(store, process.id())?
             } else {
                 inspection
             };
@@ -595,23 +618,65 @@ where
                     | ManagedProcessStatus::Missing
                     | ManagedProcessStatus::Broken
             ) {
-                process_manager.cleanup(&mut store, process.id())?;
+                process_manager.cleanup(store, process.id())?;
             }
         }
-        WorkspaceManager::new(&self.worktrees).discard(&mut store, run_id)?;
-        Self::report(&mut store, run_id, before, None)
+        WorkspaceManager::new(&self.worktrees).discard(store, run_id)?;
+        Ok(())
     }
 
-    /// Sets whether a run is hidden from the default Runs list. Pure list
-    /// metadata: no lifecycle transition, no revision bump, no process or
-    /// workspace side effects.
+    /// Sets whether a run is archived out of the default Runs list. Pure
+    /// list metadata: no lifecycle transition, no revision bump, no process
+    /// or workspace side effects.
     ///
     /// # Errors
     /// Returns store or path errors; unknown runs surface as `RunNotFound`.
-    pub fn set_run_hidden(&self, run_id: RunId, hidden: bool) -> Result<(), AppError> {
+    pub fn set_run_archived(&self, run_id: RunId, archived: bool) -> Result<(), AppError> {
         let mut store = SqliteStore::open(&self.database)?;
-        store.set_run_hidden(run_id, hidden)?;
+        store.set_run_archived(run_id, archived)?;
         Ok(())
+    }
+
+    /// Deletes an archived run for good: its worktree, its files, its rows.
+    ///
+    /// The one irreversible operation Polycode offers, so it is deliberately
+    /// hard to reach by accident — only an already archived run qualifies,
+    /// and only one that is no longer running. Everything the run owns goes
+    /// in the order that survives an interruption: processes and worktree
+    /// first (each already idempotent and resumable), then the run's own
+    /// directory of artifacts and process logs, and only then the rows that
+    /// said where all of it lived. A failure part-way leaves a run that is
+    /// still listed and can be deleted again.
+    ///
+    /// # Errors
+    /// Returns [`AppError::RunNotArchived`] for a run not set aside first,
+    /// [`AppError::RunNotDeletable`] while it is still running, and
+    /// workspace, process, filesystem, or store errors.
+    pub fn purge_run(&self, run_id: RunId) -> Result<PurgeReceipt, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let summary = store
+            .list_runs()?
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .ok_or(StoreError::RunNotFound(run_id))?;
+        if !summary.archived {
+            return Err(AppError::RunNotArchived(run_id));
+        }
+        if matches!(summary.status, RunStatus::Running | RunStatus::NeedsUser) {
+            return Err(AppError::RunNotDeletable(run_id, summary.status));
+        }
+        self.release_owned_resources(&mut store, run_id)?;
+        let run_directory = process_root()?.join(run_id.to_string());
+        let files_removed = match std::fs::remove_dir_all(&run_directory) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(AppError::RunFilesNotRemoved(run_directory, error)),
+        };
+        store.purge_run(run_id)?;
+        Ok(PurgeReceipt {
+            run_id,
+            files_removed,
+        })
     }
 
     /// Returns indexed summaries without creating a missing database.
@@ -3213,6 +3278,45 @@ mod tests {
             discarded.details.workspace_status,
             Some(crate::workspace::WorkspaceStatus::Removed)
         );
+    }
+
+    /// Deleting a run for good is gated twice — the run must be archived,
+    /// and it must not still be running — and once it goes through, nothing
+    /// of the run is left to list, load, or delete again.
+    #[test]
+    fn only_an_archived_finished_run_can_be_deleted_and_then_nothing_remains() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let started = service
+            .start_run(
+                WorkflowKind::Fast,
+                "delete me for good",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+        let run_id = started.details.id;
+
+        // Not archived: refused by name, and the run is untouched.
+        assert!(matches!(
+            service.purge_run(run_id),
+            Err(AppError::RunNotArchived(refused)) if refused == run_id
+        ));
+        assert!(service.inspect_run(run_id).is_ok());
+
+        service.set_run_archived(run_id, true).unwrap();
+        let receipt = service.purge_run(run_id).unwrap();
+
+        assert_eq!(receipt.run_id, run_id);
+        assert!(service.list_runs().unwrap().is_empty());
+        assert!(matches!(
+            service.inspect_run(run_id),
+            Err(AppError::Store(StoreError::RunNotFound(_)))
+        ));
+        // Nothing left to delete twice.
+        assert!(service.purge_run(run_id).is_err());
     }
 
     #[test]

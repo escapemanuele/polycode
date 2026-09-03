@@ -62,9 +62,9 @@ pub struct RunSummary {
     pub repository_path: Option<String>,
     pub revision: RunRevision,
     pub updated_at: DateTime<Utc>,
-    /// Operator-facing visibility; a hidden run is left out of the default
-    /// Runs list but stays fully intact.
-    pub hidden: bool,
+    /// Operator-facing visibility; an archived run is left out of the
+    /// default Runs list but stays fully intact until it is purged.
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,7 +322,7 @@ impl SqliteStore {
         let mut statement = self.connection.prepare(
             "SELECT runs.id, runs.status, runs.workflow, run_inputs.task,
                     run_workspaces.source_repo_path, runs.revision, runs.updated_at,
-                    runs.hidden
+                    runs.archived
              FROM runs
              LEFT JOIN run_inputs ON run_inputs.run_id = runs.id
              LEFT JOIN run_workspaces ON run_workspaces.run_id = runs.id
@@ -342,7 +342,8 @@ impl SqliteStore {
         })?;
         let mut summaries = Vec::new();
         for row in rows {
-            let (id, status, workflow, task, repository_path, revision, updated_at, hidden) = row?;
+            let (id, status, workflow, task, repository_path, revision, updated_at, archived) =
+                row?;
             summaries.push(RunSummary {
                 id: id
                     .parse()
@@ -353,27 +354,77 @@ impl SqliteStore {
                 repository_path,
                 revision: RunRevision(i64_to_u64(revision, "run revision")?),
                 updated_at: parse_timestamp(&updated_at)?,
-                hidden,
+                archived,
             });
         }
         Ok(summaries)
     }
 
     /// Sets the operator-facing visibility flag. Deliberately outside the
-    /// CAS revision protocol: hiding is list metadata, not a run mutation,
-    /// so it must neither bump the revision nor touch `updated_at`.
+    /// CAS revision protocol: archiving is list metadata, not a run
+    /// mutation, so it must neither bump the revision nor touch
+    /// `updated_at`.
     ///
     /// # Errors
     /// Returns [`StoreError::RunNotFound`] for an unknown run, or `SQLite`
     /// errors.
-    pub fn set_run_hidden(&mut self, run_id: RunId, hidden: bool) -> Result<(), StoreError> {
+    pub fn set_run_archived(&mut self, run_id: RunId, archived: bool) -> Result<(), StoreError> {
         let changed = self.connection.execute(
-            "UPDATE runs SET hidden = ?1 WHERE id = ?2",
-            rusqlite::params![hidden, run_id.to_string()],
+            "UPDATE runs SET archived = ?1 WHERE id = ?2",
+            rusqlite::params![archived, run_id.to_string()],
         )?;
         if changed == 0 {
             return Err(StoreError::RunNotFound(run_id));
         }
+        Ok(())
+    }
+
+    /// Deletes every row the run owns, in one transaction.
+    ///
+    /// The only path in Polycode that removes persisted history, and the
+    /// end of the record rather than an edit of it: the tables it clears are
+    /// insert-only precisely so that no smaller deletion exists. Child rows
+    /// go before the run so the `ON DELETE RESTRICT` foreign keys stay
+    /// satisfied at every step, and the whole thing is one transaction, so a
+    /// failure part-way leaves the run exactly as it was. The run's config
+    /// snapshot is shared with other runs and is never touched.
+    ///
+    /// Caller's duty, not this one's: the run must already be finished, its
+    /// processes cleaned up, its workspace removed, and its files deleted —
+    /// once the rows are gone, nothing remembers where those lived.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::RunNotFound`] for an unknown run, or `SQLite`
+    /// errors.
+    pub fn purge_run(&mut self, run_id: RunId) -> Result<(), StoreError> {
+        let id = run_id.to_string();
+        let transaction = self.connection.transaction()?;
+        // Deepest dependents first: provider sessions point at managed
+        // processes, apply operations point at workspaces, and everything
+        // points at the run.
+        for table in [
+            "provider_sessions",
+            "managed_processes",
+            "run_apply_operations",
+            "image_generations",
+            "artifacts",
+            "events",
+            "run_inputs",
+            "run_workspaces",
+        ] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                rusqlite::params![id],
+            )?;
+        }
+        let changed = transaction.execute(
+            "DELETE FROM runs WHERE id = ?1",
+            rusqlite::params![id.clone()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::RunNotFound(run_id));
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1461,26 +1512,26 @@ mod tests {
             .into_iter()
             .find(|summary| summary.id == run.id())
             .unwrap();
-        assert!(!before.hidden);
+        assert!(!before.archived);
 
-        store.set_run_hidden(run.id(), true).unwrap();
+        store.set_run_archived(run.id(), true).unwrap();
         let after = store
             .list_runs()
             .unwrap()
             .into_iter()
             .find(|summary| summary.id == run.id())
             .unwrap();
-        assert!(after.hidden);
+        assert!(after.archived);
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.updated_at, before.updated_at);
         assert_eq!(store.load_run(run.id()).unwrap().run, run);
 
-        store.set_run_hidden(run.id(), false).unwrap();
-        assert!(!store.list_runs().unwrap()[0].hidden);
+        store.set_run_archived(run.id(), false).unwrap();
+        assert!(!store.list_runs().unwrap()[0].archived);
 
         let missing = crate::domain::RunId::from_u128(999_999);
         assert!(matches!(
-            store.set_run_hidden(missing, false),
+            store.set_run_archived(missing, false),
             Err(StoreError::RunNotFound(id)) if id == missing
         ));
     }
@@ -1506,14 +1557,50 @@ mod tests {
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == ErrorCode::ConstraintViolation
         ));
-        let delete = store.connection.execute(
-            "DELETE FROM run_inputs WHERE run_id = ?1",
-            [run.id().to_string()],
-        );
+    }
+
+    /// A purge is the one deletion the store performs, and it performs it
+    /// whole: every table the run owns is emptied of it, the shared config
+    /// snapshot other runs still point at is not, and a second purge of the
+    /// same run finds nothing left to delete.
+    #[test]
+    fn purging_a_run_removes_every_row_it_owns_and_nothing_shared() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, events) = complex_run(206, "purge-config", 3_700);
+        let config = config("purge-config");
+        let input = RunInput::new(run.id(), "delete me", at(0)).unwrap();
+        store
+            .create_run_with_input(&run, &input, &config, &events)
+            .unwrap();
+        let (survivor, survivor_events) = complex_run(207, "purge-config", 3_800);
+        let survivor_input = RunInput::new(survivor.id(), "keep me", at(0)).unwrap();
+        store
+            .create_run_with_input(&survivor, &survivor_input, &config, &survivor_events)
+            .unwrap();
+
+        store.purge_run(run.id()).unwrap();
+
         assert!(matches!(
-            delete,
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == ErrorCode::ConstraintViolation
+            store.load_run(run.id()),
+            Err(StoreError::RunNotFound(_))
+        ));
+        assert_eq!(store.load_run_input(run.id()).unwrap(), None);
+        assert!(matches!(
+            store.load_events(run.id()),
+            Err(StoreError::RunNotFound(_))
+        ));
+        let listed: Vec<_> = store
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect();
+        assert_eq!(listed, vec![survivor.id()]);
+        // The other run still loads, so its shared config snapshot survived.
+        assert!(store.load_run(survivor.id()).is_ok());
+        assert!(matches!(
+            store.purge_run(run.id()),
+            Err(StoreError::RunNotFound(_))
         ));
     }
 

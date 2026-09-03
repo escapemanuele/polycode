@@ -29,5 +29,6 @@ pub use routing::{
     resolve_config_with_image, unroutable_fix_role,
 };
 pub use run_service::{
-    ApplyOutcome, ExecutionReport, QuiescentState, RunService, SKIP_ATTENTION_RESPONSE,
+    ApplyOutcome, ExecutionReport, PurgeReceipt, QuiescentState, RunService,
+    SKIP_ATTENTION_RESPONSE,
 };
