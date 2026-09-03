@@ -27,9 +27,13 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
-/// The per-repository configuration file, shared with `[verify]` and read from
-/// the run's worktree so a change the run itself makes is what takes effect.
-pub(crate) const CONFIG_FILE: &str = ".polycode.toml";
+use crate::providers::repo_config;
+
+/// The per-repository configuration file, shared with `[verify]`. Read from
+/// the run's worktree so a change the run itself makes is what takes effect,
+/// falling back to the repository the worktree was cut from; `repo_config`
+/// owns that order and the reason for it.
+pub(crate) use repo_config::CONFIG_FILE;
 
 /// Rules that would grant every tool, refused however they are spelled.
 const BLANKET_RULES: [&str; 2] = ["*", "Bash(*)"];
@@ -61,7 +65,7 @@ struct PermissionsTable {
     allow: Vec<String>,
 }
 
-/// Reads the standing allowlist for one worktree.
+/// Reads the standing allowlist for one run.
 ///
 /// A missing file, or a file without a `[permissions]` table, is an empty
 /// allowlist rather than an error — most repositories have neither.
@@ -69,12 +73,14 @@ struct PermissionsTable {
 /// # Errors
 /// A `.polycode.toml` that exists but cannot be read or parsed, an empty rule,
 /// or a rule that grants every tool.
-pub(crate) fn allow_rules(worktree: &Path) -> Result<BTreeSet<String>, PermissionsConfigError> {
-    let path = worktree.join(CONFIG_FILE);
-    if !path.is_file() {
+pub(crate) fn allow_rules(
+    worktree: &Path,
+    source_repo: Option<&Path>,
+) -> Result<BTreeSet<String>, PermissionsConfigError> {
+    let Some(found) = repo_config::locate(worktree, source_repo) else {
         return Ok(BTreeSet::new());
-    }
-    let text = std::fs::read_to_string(&path)
+    };
+    let text = std::fs::read_to_string(&found.path)
         .map_err(|error| PermissionsConfigError::Unreadable(error.to_string()))?;
     let file: ConfigFile = toml::from_str(&text)
         .map_err(|error| PermissionsConfigError::Unreadable(error.message().to_owned()))?;
@@ -111,13 +117,39 @@ mod tests {
     #[test]
     fn missing_file_and_missing_table_both_grant_nothing() {
         let empty = tempfile::tempdir().expect("temp worktree");
-        assert!(allow_rules(empty.path()).expect("no file").is_empty());
+        assert!(allow_rules(empty.path(), None).expect("no file").is_empty());
 
         let other_table = worktree_with("[verify]\ncommands = [\"cargo test\"]\n");
         assert!(
-            allow_rules(other_table.path())
+            allow_rules(other_table.path(), None)
                 .expect("verify-only config")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_source_repository_grants_for_a_repository_polycode_cannot_commit_to() {
+        let worktree = tempfile::tempdir().expect("temp worktree");
+        let source = worktree_with("[permissions]\nallow = [\"Bash(yarn jest:*)\"]\n");
+
+        let rules = allow_rules(worktree.path(), Some(source.path())).expect("source-repo grants");
+
+        assert_eq!(
+            rules.into_iter().collect::<Vec<_>>(),
+            vec!["Bash(yarn jest:*)".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_worktree_file_still_wins_over_the_source_repository() {
+        let worktree = worktree_with("[permissions]\nallow = [\"Bash(cargo test:*)\"]\n");
+        let source = worktree_with("[permissions]\nallow = [\"Bash(yarn jest:*)\"]\n");
+
+        let rules = allow_rules(worktree.path(), Some(source.path())).expect("worktree grants");
+
+        assert_eq!(
+            rules.into_iter().collect::<Vec<_>>(),
+            vec!["Bash(cargo test:*)".to_owned()]
         );
     }
 
@@ -126,7 +158,7 @@ mod tests {
         let directory = worktree_with(
             "[permissions]\nallow = [\"Bash(yarn jest:*)\", \" mcp__linear-server \", \"Bash(yarn jest:*)\"]\n",
         );
-        let rules = allow_rules(directory.path()).expect("valid allowlist");
+        let rules = allow_rules(directory.path(), None).expect("valid allowlist");
         assert_eq!(
             rules.into_iter().collect::<Vec<_>>(),
             vec![
@@ -139,11 +171,11 @@ mod tests {
     #[test]
     fn blanket_and_empty_rules_are_refused_by_position() {
         let blanket = worktree_with("[permissions]\nallow = [\"Bash(yarn jest:*)\", \"*\"]\n");
-        let error = allow_rules(blanket.path()).expect_err("blanket rule");
+        let error = allow_rules(blanket.path(), None).expect_err("blanket rule");
         assert!(error.to_string().contains("rule 2"), "{error}");
 
         let empty = worktree_with("[permissions]\nallow = [\"  \"]\n");
-        let error = allow_rules(empty.path()).expect_err("empty rule");
+        let error = allow_rules(empty.path(), None).expect_err("empty rule");
         assert!(error.to_string().contains("rule 1"), "{error}");
     }
 
@@ -151,7 +183,7 @@ mod tests {
     fn misspelt_key_fails_instead_of_granting_nothing() {
         let directory = worktree_with("[permissions]\nallowed = [\"Bash(yarn jest:*)\"]\n");
         assert!(matches!(
-            allow_rules(directory.path()),
+            allow_rules(directory.path(), None),
             Err(PermissionsConfigError::Unreadable(_))
         ));
     }

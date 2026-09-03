@@ -75,22 +75,29 @@ impl VerifyProvider {
         store: &mut SqliteStore,
         request: &ProviderRequest,
     ) -> Result<Verdict, VerifyError> {
-        let (plan, reports, verdict) = match config::plan_for(request.workspace_path()) {
-            Ok(plan) => {
-                let reports = run_until_first_failure(&plan, request.workspace_path())?;
-                let verdict = artifact::verdict(&plan, &reports);
-                (Some(plan), reports, verdict)
-            }
-            // A configuration the stage cannot read is a finding about the
-            // repository, so it is reported the way a failing command is:
-            // in the artifact and as the stage's failure reason.
-            Err(VerifyError::Config(message)) => (None, Vec::new(), Verdict::Failed(message)),
-            Err(error) => return Err(error),
-        };
+        // Loaded once, before the commands run: the row carries both the
+        // repository the worktree was cut from, which can hold the
+        // configuration the worktree does not, and the base commit the
+        // artifact is stamped with.
+        let workspace = store.load_workspace(request.run_id())?;
+        let source_repo = workspace
+            .as_ref()
+            .map(|workspace| workspace.source_repo_path().to_owned());
+        let (plan, reports, verdict) =
+            match config::plan_for(request.workspace_path(), source_repo.as_deref()) {
+                Ok(plan) => {
+                    let reports = run_until_first_failure(&plan, request.workspace_path())?;
+                    let verdict = artifact::verdict(&plan, &reports);
+                    (Some(plan), reports, verdict)
+                }
+                // A configuration the stage cannot read is a finding about the
+                // repository, so it is reported the way a failing command is:
+                // in the artifact and as the stage's failure reason.
+                Err(VerifyError::Config(message)) => (None, Vec::new(), Verdict::Failed(message)),
+                Err(error) => return Err(error),
+            };
         let content = artifact::render(plan.as_ref(), &reports, &verdict);
-        let base_commit = store
-            .load_workspace(request.run_id())?
-            .map(|workspace| workspace.base_commit().to_owned());
+        let base_commit = workspace.map(|workspace| workspace.base_commit().to_owned());
         let record = artifact::persist(
             &self.artifact_root,
             request,
@@ -266,17 +273,18 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        ConfigSnapshotId, EventId, EventMetadata, Run, RunId, StageId, StageKind,
+        ConfigSnapshotId, EventId, EventMetadata, Run, RunId, RunTransition, StageId, StageKind,
         WorkflowDefinition, WorkflowKind,
     };
     use crate::store::ResolvedConfigSnapshot;
+    use crate::workspace::{RunWorkspace, WorkspaceMode};
 
     fn run_id() -> RunId {
         RunId::from_u128(7)
     }
 
     struct Harness {
-        _temp: tempfile::TempDir,
+        temp: tempfile::TempDir,
         worktree: PathBuf,
         provider: VerifyProvider,
         store: SqliteStore,
@@ -312,12 +320,44 @@ mod tests {
                 provider: VerifyProvider::new(temp.path().join("runs")),
                 worktree,
                 store,
-                _temp: temp,
+                temp,
             }
         }
 
         fn config(&self, text: &str) {
             std::fs::write(self.worktree.join(CONFIG_FILE), text).unwrap();
+        }
+
+        /// Registers a workspace row whose source repository holds `text`,
+        /// so what the test exercises is the provider's own lookup — the
+        /// stored row reaching the config reader — and not just the reader.
+        fn source_repo_config(&mut self, text: &str) {
+            let source = self.temp.path().join("source-repo");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join(CONFIG_FILE), text).unwrap();
+            let now: DateTime<Utc> = std::time::SystemTime::now().into();
+            let workspace = RunWorkspace::preparing(
+                run_id(),
+                source.clone(),
+                source.join(".git"),
+                "0".repeat(40),
+                self.worktree.clone(),
+                None,
+                WorkspaceMode::Detached,
+                now,
+            )
+            .unwrap();
+            let loaded = self.store.load_run(run_id()).unwrap();
+            let mut run = loaded.run;
+            let event = run
+                .transition(
+                    RunTransition::BeginPreparation,
+                    EventMetadata::new(EventId::new(), now),
+                )
+                .unwrap();
+            self.store
+                .begin_workspace_preparation(&workspace, &run, loaded.revision, &event)
+                .unwrap();
         }
 
         fn request(&self, signal_index: usize, status: StageStatus) -> ProviderRequest {
@@ -425,11 +465,45 @@ mod tests {
     }
 
     #[test]
+    fn a_source_repository_config_verifies_a_worktree_that_carries_none() {
+        let mut harness = Harness::new();
+        // Detection would answer `npm test` here, which for a monorepo is
+        // the wrong suite and can be red for reasons no change caused.
+        std::fs::write(harness.worktree.join("package.json"), "{}\n").unwrap();
+        harness.source_repo_config("[verify]\ncommands = [\"echo scoped\"]\n");
+
+        assert_eq!(harness.run(), ProviderSignal::Completed);
+
+        let artifact = harness.artifact();
+        assert!(artifact.contains("## Bottom line\npassed — 1 command\n"));
+        assert!(artifact.contains("### $ echo scoped\nexit: 0\n"));
+        // The artifact names the checkout, so a green stage stays readable
+        // back to the file that configured it.
+        assert!(
+            artifact.contains("## Source\n`.polycode.toml` `[verify]` table (source repository)\n")
+        );
+    }
+
+    #[test]
+    fn the_worktrees_own_config_still_wins_over_the_source_repository() {
+        let mut harness = Harness::new();
+        harness.source_repo_config("[verify]\ncommands = [\"echo from the source repo\"]\n");
+        harness.config("[verify]\ncommands = [\"echo from the worktree\"]\n");
+
+        assert_eq!(harness.run(), ProviderSignal::Completed);
+
+        let artifact = harness.artifact();
+        assert!(artifact.contains("### $ echo from the worktree\n"));
+        assert!(!artifact.contains("from the source repo"));
+        assert!(artifact.contains("## Source\n`.polycode.toml` `[verify]` table (worktree)\n"));
+    }
+
+    #[test]
     fn a_cargo_project_without_configuration_verifies_with_cargo_test() {
         let harness = Harness::new();
         std::fs::write(harness.worktree.join("Cargo.toml"), "[package]\n").unwrap();
 
-        let plan = config::plan_for(&harness.worktree).unwrap();
+        let plan = config::plan_for(&harness.worktree, None).unwrap();
 
         assert_eq!(plan.commands, ["cargo test"]);
         assert_eq!(plan.source, config::CommandSource::Detected("Cargo.toml"));

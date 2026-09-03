@@ -6,6 +6,7 @@ mod checkpoint;
 pub mod claude;
 pub mod codex;
 pub(crate) mod continue_instruction;
+pub(crate) mod repo_config;
 pub(crate) mod section;
 mod session;
 mod stage_prompt;

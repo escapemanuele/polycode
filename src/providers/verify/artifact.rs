@@ -123,7 +123,9 @@ pub(crate) fn render(
 fn source_line(plan: Option<&VerifyPlan>) -> String {
     match plan.map(|plan| &plan.source) {
         None => format!("`{CONFIG_FILE}` (could not be read)"),
-        Some(CommandSource::ConfigFile) => format!("`{CONFIG_FILE}` `[verify]` table"),
+        Some(CommandSource::ConfigFile(origin)) => {
+            format!("`{CONFIG_FILE}` `[verify]` table ({})", origin.as_str())
+        }
         Some(CommandSource::Detected(marker)) => format!("auto-detected from `{marker}`"),
         Some(CommandSource::Nothing) => {
             format!("nothing: no `[verify]` table in `{CONFIG_FILE}` and no recognised build file")
@@ -350,6 +352,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::providers::repo_config::ConfigOrigin;
     use crate::providers::verify::runner::Captured;
 
     fn plan(commands: &[&str], source: CommandSource) -> VerifyPlan {
@@ -377,7 +380,7 @@ mod tests {
     fn a_passing_pass_renders_one_section_per_command_with_its_exit_code() {
         let plan = plan(
             &["cargo fmt --check", "cargo test"],
-            CommandSource::ConfigFile,
+            CommandSource::ConfigFile(ConfigOrigin::Worktree),
         );
         let reports = [
             report("cargo fmt --check", CommandExit::Code(0), "", ""),
@@ -389,7 +392,7 @@ mod tests {
         let text = render(Some(&plan), &reports, &verdict);
 
         assert!(text.starts_with("# Verification\n\n## Bottom line\npassed — 2 commands\n"));
-        assert!(text.contains("## Source\n`.polycode.toml` `[verify]` table\n"));
+        assert!(text.contains("## Source\n`.polycode.toml` `[verify]` table (worktree)\n"));
         assert!(
             text.contains("### $ cargo fmt --check\nexit: 0\nstdout: (empty)\nstderr: (empty)\n")
         );
@@ -400,7 +403,10 @@ mod tests {
 
     #[test]
     fn the_first_failure_is_the_bottom_line_and_later_commands_are_marked_skipped() {
-        let plan = plan(&["cargo test", "cargo clippy"], CommandSource::ConfigFile);
+        let plan = plan(
+            &["cargo test", "cargo clippy"],
+            CommandSource::ConfigFile(ConfigOrigin::Worktree),
+        );
         let reports = [report("cargo test", CommandExit::Code(101), "", "boom\n")];
         let verdict = verdict(&plan, &reports);
         assert_eq!(verdict.bottom_line(), "failed — cargo test exited 101");
@@ -488,7 +494,7 @@ mod tests {
 
     #[test]
     fn the_bottom_line_reads_back_from_a_rendered_artifact() {
-        let plan = plan(&["true"], CommandSource::ConfigFile);
+        let plan = plan(&["true"], CommandSource::ConfigFile(ConfigOrigin::Worktree));
         let reports = [report("true", CommandExit::Code(0), "", "")];
         let text = render(Some(&plan), &reports, &verdict(&plan, &reports));
 
