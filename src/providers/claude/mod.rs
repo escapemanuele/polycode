@@ -178,7 +178,8 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         std::time::SystemTime::now().into()
     }
 
-    /// The repository's standing allowlist, read from the run's own worktree.
+    /// The repository's standing allowlist, read from the run's own worktree
+    /// and then from the repository that worktree was cut from.
     ///
     /// A workspace that is not ready yet grants nothing rather than failing:
     /// `prepare_with_input` is the check that a stage cannot run without a
@@ -191,8 +192,11 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         let Some(workspace) = store.load_workspace(run_id)? else {
             return Ok(BTreeSet::new());
         };
-        permissions::allow_rules(workspace.worktree_path())
-            .map_err(|error| ClaudeProviderError::PermissionsConfig(error.to_string()))
+        permissions::allow_rules(
+            workspace.worktree_path(),
+            Some(workspace.source_repo_path()),
+        )
+        .map_err(|error| ClaudeProviderError::PermissionsConfig(error.to_string()))
     }
 
     /// The command that continues or starts one invocation of a stage.

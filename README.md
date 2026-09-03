@@ -119,6 +119,8 @@ commands = ["cargo fmt --check", "cargo clippy --all-targets", "cargo test"]
 timeout_seconds = 1800
 ```
 
+The file is read from the run's worktree first, so a change the run itself makes to it is what gets verified, and from the source repository the worktree was cut from second. That second place is how you configure a repository you cannot commit to: an untracked `.polycode.toml` beside your own checkout applies to every run of it without touching a tracked file. The artifact names which of the two answered.
+
 Without that table Polycode runs the one command the build file implies (`Cargo.toml` → `cargo test`, `package.json` → `npm test`, `pyproject.toml`/`pytest.ini` → `pytest`, `go.mod` → `go test ./...`), and with no recognised build file it completes having checked nothing and says so. Commands are argv, not shell — no pipes or `&&` — and the sequence stops at the first failure.
 
 ## Local control room
@@ -372,7 +374,7 @@ Repository settings live at `<repo>/.polycode.toml`: its `[verify]` table (see V
 allow = ["Bash(yarn jest:*)", "Bash(yarn lint:css:*)", "mcp__linear-server"]
 ```
 
-A rule that would grant every tool is refused. The user configuration file is resolved but never read or created, so the update opt-out below is an environment variable rather than a configuration key.
+A rule that would grant every tool is refused. Both tables are read from the same file and follow the same order — the run's worktree, then the source repository it was cut from — so an untracked `.polycode.toml` in your own checkout configures a repository you have no commit rights on. The user configuration file is resolved but never read or created, so the update opt-out below is an environment variable rather than a configuration key.
 
 ### Appearance
 

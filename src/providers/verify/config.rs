@@ -1,10 +1,13 @@
 //! Where a workspace's verification commands come from.
 //!
 //! The repository owns its own definition of "verified": a `[verify]` table
-//! in `<worktree>/.polycode.toml` when it has one, otherwise a guess from the
-//! build files present. Polycode never invents commands beyond that guess,
-//! and it says which of the three it used in the artifact, so a green stage
-//! can always be read back to what was actually checked.
+//! in its `.polycode.toml` when it has one, otherwise a guess from the build
+//! files present. Polycode never invents commands beyond that guess, and it
+//! says which of the three it used in the artifact — naming the checkout the
+//! file came from — so a green stage can always be read back to what was
+//! actually checked.
+//!
+//! Which checkout answers is `repo_config`'s question, not this module's.
 
 use std::path::Path;
 use std::time::Duration;
@@ -12,10 +15,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::VerifyError;
+use crate::providers::repo_config::{self, ConfigOrigin};
 
-/// The per-repository configuration file, read from the run's worktree so a
-/// change to it made by the run itself is what gets verified.
-pub const CONFIG_FILE: &str = ".polycode.toml";
+pub use repo_config::CONFIG_FILE;
 
 /// How long one command may run before it is killed and counted as failed.
 /// Generous because a full test suite is the common case; the artifact
@@ -36,8 +38,10 @@ const DETECTION_RULES: [(&str, &str); 5] = [
 /// Which of the three sources answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommandSource {
-    /// The `[verify]` table of `.polycode.toml`.
-    ConfigFile,
+    /// The `[verify]` table of `.polycode.toml`; carries the checkout the
+    /// file was read from, because the two are configured differently and a
+    /// reader chasing a command needs to know which file to open.
+    ConfigFile(ConfigOrigin),
     /// A build file Polycode recognises; carries the file that matched.
     Detected(&'static str),
     /// Neither a table nor a recognised build file.
@@ -77,15 +81,17 @@ struct VerifyTable {
 /// `[verify]` table with an empty command or a zero timeout. The stage
 /// fails on these rather than falling back to detection: a broken
 /// configuration is a finding, not an absence.
-pub(crate) fn plan_for(worktree: &Path) -> Result<VerifyPlan, VerifyError> {
-    let config_path = worktree.join(CONFIG_FILE);
-    if config_path.is_file() {
-        let text = std::fs::read_to_string(&config_path)
+pub(crate) fn plan_for(
+    worktree: &Path,
+    source_repo: Option<&Path>,
+) -> Result<VerifyPlan, VerifyError> {
+    if let Some(found) = repo_config::locate(worktree, source_repo) {
+        let text = std::fs::read_to_string(&found.path)
             .map_err(|error| VerifyError::Config(format!("{CONFIG_FILE}: {error}")))?;
         let file: ConfigFile = toml::from_str(&text)
             .map_err(|error| VerifyError::Config(format!("{CONFIG_FILE}: {}", error.message())))?;
         if let Some(table) = file.verify {
-            return plan_from_table(table);
+            return plan_from_table(table, found.origin);
         }
     }
     Ok(DETECTION_RULES
@@ -105,7 +111,7 @@ pub(crate) fn plan_for(worktree: &Path) -> Result<VerifyPlan, VerifyError> {
         ))
 }
 
-fn plan_from_table(table: VerifyTable) -> Result<VerifyPlan, VerifyError> {
+fn plan_from_table(table: VerifyTable, origin: ConfigOrigin) -> Result<VerifyPlan, VerifyError> {
     for (index, command) in table.commands.iter().enumerate() {
         if command.split_whitespace().next().is_none() {
             return Err(VerifyError::Config(format!(
@@ -126,7 +132,7 @@ fn plan_from_table(table: VerifyTable) -> Result<VerifyPlan, VerifyError> {
     Ok(VerifyPlan {
         commands: table.commands,
         timeout,
-        source: CommandSource::ConfigFile,
+        source: CommandSource::ConfigFile(origin),
     })
 }
 
@@ -148,11 +154,82 @@ mod tests {
         )
         .unwrap();
 
-        let plan = plan_for(dir.path()).unwrap();
+        let plan = plan_for(dir.path(), None).unwrap();
 
         assert_eq!(plan.commands, ["cargo fmt --check", "cargo test"]);
         assert_eq!(plan.timeout, Duration::from_secs(60));
-        assert_eq!(plan.source, CommandSource::ConfigFile);
+        assert_eq!(
+            plan.source,
+            CommandSource::ConfigFile(ConfigOrigin::Worktree)
+        );
+    }
+
+    #[test]
+    fn the_source_repository_configures_a_repository_polycode_cannot_commit_to() {
+        let dir = worktree();
+        let source = worktree();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(source.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            source.path().join(CONFIG_FILE),
+            "[verify]\ncommands = [\"yarn test-client client/dashboard\"]\n",
+        )
+        .unwrap();
+
+        let plan = plan_for(dir.path(), Some(source.path())).unwrap();
+
+        // Detection would have said `npm test` here; the source repository's
+        // file is what stops that from being the answer forever.
+        assert_eq!(plan.commands, ["yarn test-client client/dashboard"]);
+        assert_eq!(
+            plan.source,
+            CommandSource::ConfigFile(ConfigOrigin::SourceRepo)
+        );
+    }
+
+    #[test]
+    fn the_worktree_file_still_wins_over_the_source_repository() {
+        let dir = worktree();
+        let source = worktree();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[verify]\ncommands = [\"from the worktree\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join(CONFIG_FILE),
+            "[verify]\ncommands = [\"from the source repo\"]\n",
+        )
+        .unwrap();
+
+        let plan = plan_for(dir.path(), Some(source.path())).unwrap();
+
+        assert_eq!(plan.commands, ["from the worktree"]);
+        assert_eq!(
+            plan.source,
+            CommandSource::ConfigFile(ConfigOrigin::Worktree)
+        );
+    }
+
+    #[test]
+    fn a_worktree_file_without_a_verify_table_does_not_reach_past_itself() {
+        let dir = worktree();
+        let source = worktree();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), "[permissions]\nallow = []\n").unwrap();
+        std::fs::write(
+            source.path().join(CONFIG_FILE),
+            "[verify]\ncommands = [\"from the source repo\"]\n",
+        )
+        .unwrap();
+
+        let plan = plan_for(dir.path(), Some(source.path())).unwrap();
+
+        // One file answers, not two merged: the worktree's file is the
+        // repository's current word on every table, including the ones it
+        // leaves out.
+        assert_eq!(plan.commands, ["npm test"]);
+        assert_eq!(plan.source, CommandSource::Detected("package.json"));
     }
 
     #[test]
@@ -161,7 +238,7 @@ mod tests {
         std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
         std::fs::write(dir.path().join(CONFIG_FILE), "[other]\nkey = 1\n").unwrap();
 
-        let plan = plan_for(dir.path()).unwrap();
+        let plan = plan_for(dir.path(), None).unwrap();
 
         assert_eq!(plan.commands, ["npm test"]);
         assert_eq!(plan.source, CommandSource::Detected("package.json"));
@@ -174,7 +251,7 @@ mod tests {
         std::fs::write(dir.path().join("go.mod"), "module x\n").unwrap();
         std::fs::write(dir.path().join("pyproject.toml"), "[tool]\n").unwrap();
 
-        let plan = plan_for(dir.path()).unwrap();
+        let plan = plan_for(dir.path(), None).unwrap();
 
         assert_eq!(plan.commands, ["pytest"]);
         assert_eq!(plan.source, CommandSource::Detected("pyproject.toml"));
@@ -184,7 +261,7 @@ mod tests {
     fn nothing_recognised_means_an_empty_plan_not_an_error() {
         let dir = worktree();
 
-        let plan = plan_for(dir.path()).unwrap();
+        let plan = plan_for(dir.path(), None).unwrap();
 
         assert!(plan.commands.is_empty());
         assert_eq!(plan.source, CommandSource::Nothing);
@@ -200,7 +277,7 @@ mod tests {
             "[verify]\ncommand = [\"cargo test\"]\n",
         ] {
             std::fs::write(dir.path().join(CONFIG_FILE), text).unwrap();
-            let error = plan_for(dir.path()).unwrap_err();
+            let error = plan_for(dir.path(), None).unwrap_err();
             assert!(
                 matches!(&error, VerifyError::Config(message) if message.starts_with(CONFIG_FILE)),
                 "{text:?} produced {error:?}"
