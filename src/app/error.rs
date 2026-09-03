@@ -53,6 +53,14 @@ pub enum AppError {
         "Repository has uncommitted changes.\n  Commit or stash them before starting a Polycode run."
     )]
     DirtySourceRepository,
+    #[error(
+        "Pull request {url} cannot be read.\n  {detail}\n  The run would give every stage the same nothing, so it is not started.\n  Fix: restore access to {host} (VPN, then `gh auth login --hostname {host}`) and start the run again, or paste the pull request title, description and diff into the task instead."
+    )]
+    PullRequestUnreachable {
+        url: String,
+        host: String,
+        detail: String,
+    },
     #[error("run {0} cannot be stopped from status {1:?}")]
     RunNotStoppable(RunId, crate::domain::RunStatus),
     #[error("run {0} cannot be resumed because its input predates the executable schema")]

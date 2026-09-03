@@ -67,14 +67,46 @@ impl PermissionDenial {
         }
     }
 
+    /// Whether the denial cost the stage an input it went outside the
+    /// workspace to fetch.
+    ///
+    /// Mutation is not the only unfinished business a denial can leave. A
+    /// denied fetch — an MCP call, a web fetch, `gh`/`curl`, a `git fetch` —
+    /// means the evidence the stage asked for never arrived, and every later
+    /// stage inherits an artifact written without it. That is exactly the
+    /// shape a "successful" result hides, so it is terminal for every stage
+    /// kind, read-only ones included.
+    ///
+    /// Unparseable shell stays non-acquisition: the classifier only reports
+    /// what it can read, and the remaining rules still apply.
+    pub(crate) fn is_denied_acquisition(&self) -> bool {
+        if self.tool_name.starts_with("mcp__") {
+            return true;
+        }
+        match self.tool_name.as_str() {
+            "WebFetch" | "WebSearch" => true,
+            "Bash" => self
+                .tool_input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(fetches_over_network),
+            _ => false,
+        }
+    }
+
     /// Whether a denial left in a *successful* terminal result still needs a human.
     ///
-    /// A denied tool call never executed, so it cannot have mutated anything.
-    /// For read-only stages the only unfinished business is a requested
-    /// mutation or an unanswered question; any denied Bash/read history is
-    /// recovered history regardless of shell syntax. Mutating stages stay
-    /// conservative: only deterministically read-only diagnostics are history.
+    /// A denied tool call never executed, so it cannot have mutated anything —
+    /// but it can still have withheld an input (`is_denied_acquisition`), which
+    /// is terminal everywhere. Beyond that, for read-only stages the only
+    /// unfinished business is a requested mutation or an unanswered question;
+    /// any denied local Bash/read history is recovered history regardless of
+    /// shell syntax. Mutating stages stay conservative: only deterministically
+    /// read-only diagnostics are history.
     pub(crate) fn requires_terminal_attention(&self, stage_kind: StageKind) -> bool {
+        if self.is_denied_acquisition() {
+            return true;
+        }
         if read_only_stage(stage_kind) {
             self.is_mutating_tool() || self.is_question()
         } else {
@@ -415,6 +447,51 @@ fn strip_redirections(segment: &[ShellWord]) -> Option<Vec<&str>> {
         index += 1;
     }
     Some(words)
+}
+
+/// Whether any simple command in the line reaches the network for data.
+///
+/// Deliberately narrow: named fetch tools and the Git subcommands that talk to
+/// a remote. It answers "did this denial cost the stage an input", not "is this
+/// command safe" — `safe_diagnostic_shell` owns that question.
+fn fetches_over_network(command: &str) -> bool {
+    split_simple_commands(command).is_some_and(|segments| {
+        segments.iter().any(|segment| {
+            strip_redirections(segment).is_some_and(|words| {
+                words
+                    .split_first()
+                    .is_some_and(|(executable, arguments)| network_fetch(executable, arguments))
+            })
+        })
+    })
+}
+
+fn network_fetch(executable: &str, arguments: &[&str]) -> bool {
+    let executable = std::path::Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(executable);
+    match executable {
+        "gh" | "glab" | "hub" | "curl" | "wget" | "http" | "https" | "ssh" | "scp" | "sftp"
+        | "rsync" | "aws" | "nc" | "ncat" | "telnet" => true,
+        "git" => {
+            let mut index = 0;
+            while let Some(word) = arguments.get(index) {
+                match *word {
+                    "-C" => index += 2,
+                    "--no-pager" | "-P" => index += 1,
+                    _ => break,
+                }
+            }
+            arguments.get(index).is_some_and(|subcommand| {
+                matches!(
+                    *subcommand,
+                    "fetch" | "clone" | "pull" | "ls-remote" | "remote" | "submodule"
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 fn safe_diagnostic_command(segment: &[ShellWord]) -> bool {
@@ -1211,6 +1288,77 @@ mod tests {
                 !tool("Read", serde_json::json!({"file_path":"/x"}))
                     .requires_terminal_attention(kind)
             );
+        }
+    }
+
+    /// Real denial shapes from run `01M1K8KAJ1HMS47H7WR8YMN2PW`, where every
+    /// stage lost its only route to an internal pull request and each one
+    /// still terminated `"subtype":"success","is_error":false`. Research,
+    /// synthesis, both reviews and the decision then wrote artifacts saying
+    /// they were blocked, and the run rolled on to the end.
+    #[test]
+    fn denied_fetch_is_terminal_for_read_only_stages() {
+        let denials = [
+            bash(
+                "gh api repos/Automattic/missioncontrol/pulls/164318 --hostname github.a8c.com 2>&1 | head -50",
+            ),
+            tool(
+                "mcp__context-a8c__context-a8c-load-provider",
+                serde_json::json!({"provider":"github-a8c"}),
+            ),
+            tool(
+                "WebFetch",
+                serde_json::json!({
+                    "url":"https://github.a8c.com/Automattic/missioncontrol/pull/164318",
+                    "prompt":"What is the PR title, description, and files changed?"
+                }),
+            ),
+        ];
+        for denial in &denials {
+            assert!(denial.is_denied_acquisition(), "{denial:?}");
+            for kind in [
+                StageKind::Research,
+                StageKind::CodeQualityReview,
+                StageKind::SpecReview,
+                StageKind::Implementation,
+            ] {
+                assert!(
+                    denial.requires_terminal_attention(kind),
+                    "{denial:?} left {kind:?} without the evidence it asked for"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_diagnostics_are_not_acquisitions() {
+        for command in [
+            "git status --porcelain",
+            "git -C /ABS/EVAL/WORKTREE --no-pager log --oneline -5",
+            "git diff trunk...HEAD --stat | tail -15",
+            "cargo test",
+            "grep -rn \"gh api\" src",
+            "echo curl",
+        ] {
+            assert!(
+                !bash(command).is_denied_acquisition(),
+                "{command} never leaves the machine"
+            );
+        }
+        for tool_name in ["Read", "Glob", "Grep", "LS", "Edit", "AskUserQuestion"] {
+            assert!(
+                !tool(tool_name, serde_json::json!({})).is_denied_acquisition(),
+                "{tool_name}"
+            );
+        }
+    }
+
+    /// Unclassifiable shell keeps the pre-existing rules; the classifier only
+    /// reports network use it can actually read.
+    #[test]
+    fn unparseable_shell_is_not_reported_as_acquisition() {
+        for command in ["curl $(cat url.txt)", "`gh pr view 1`"] {
+            assert!(!bash(command).is_denied_acquisition(), "{command}");
         }
     }
 

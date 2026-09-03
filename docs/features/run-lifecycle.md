@@ -4,6 +4,7 @@ Start one task as a run, watch it move through its stages, and get it moving aga
 
 ## Sub-features
 - start: `fast`/`standard`/`deep`/`review` create a run, prepare its workspace, and drive it to the first quiescent state.
+- start-preconditions: a dirty source repository is refused; so is a task naming a pull request `gh` cannot read. Both run before anything durable exists.
 - statuses: Created -> Preparing -> Ready -> Running -> {NeedsUser, Paused, Interrupted, Completed, Failed} -> {Applied, Discarded}. In Standard/Deep a failed verify stage still yields `Completed` (its edge into the decision is optional) and apply is gated separately; in Fast it is a leaf and the run is `Failed`. See verification.md.
 - ready-boundary: `Ready` is a persisted atomic boundary; configuration and workspace succeeded but nothing executed yet.
 - resume-vs-recover: `Paused` (user asked) takes Resume; `Interrupted` (process or runtime lost) takes Recover. One command, `resume`, does both.
@@ -39,6 +40,7 @@ A run you are done with is archived (`h` in the Runs list, `polycode archive <ru
 ## Where it lives
 - `src/cli/mod.rs` — clap definitions (`RunArgs`, `Command::{Runs,Status,Resume,Stop,Retry,Resolve}`).
 - `src/cli/commands.rs` — `start`, `parse_effort`, `print_report`, `print_details`; `QuiescentState` hints printed after each report.
+- `src/workspace/github.rs` — `PullRequestRef::parse`, `GhClient::pull_request_reach`, `PullRequestReach`: the start precondition's probe.
 - `src/app/run_service.rs` — `start_run`, `resume_run`, `stop_run`, `retry_stage`, `resolve_attention_with_response`, `inspect_run`, `list_runs`; `ABANDONED_AFTER` 30 s observe pass.
 - `src/domain/run.rs` — `Run` aggregate, `RunTransition`, `ensure_retry_safe` (`RetryWouldInvalidate`), `skipped_descendants`.
 - `src/engine/scheduler.rs` — `retry_stage` returns the skipped descendants to `Pending` in the same commit, and commits the route override (when given) in that commit too.
@@ -52,6 +54,9 @@ A run you are done with is archived (`h` in the Runs list, `polycode archive <ru
 
 ## Gotchas
 - Blocked quiescent states (`needs_user`, paused, interrupted, failed) exit 0; only operational errors exit 1 and clap errors exit 2. Do not treat exit 0 as "completed".
+- The pull request in a task need not belong to the run's repository — reviewing a remote one is a supported run — so the precondition asks whether it can be *read*, never whether it matches the checkout. A pull request that cannot be read fails the start with `PullRequestUnreachable`; run `01M1K8KAJ1HMS47H7WR8YMN2PW` had no route to `github.a8c.com`, and all five stages wrote "I was blocked" artifacts under `"subtype":"success"`.
+- A missing `gh` never blocks a start. Absence of `gh` is not evidence of absent access: an MCP provider or a pasted diff may still carry the pull request, so the probe reports `Unknown` and the run proceeds.
+- The probe inherits `gh`'s own timeout (~30 s against an unroutable host). That is the cost ceiling of the precondition, paid once instead of by every stage.
 - `resume` never bypasses attention and never retries a failed stage; use `resolve` or `retry` explicitly.
 - Retry is rejected once any downstream stage, direct or transitive, has started or reached an outcome other than `Skipped`; the error is `RetryWouldInvalidate`. Skipped stages return to `Pending` with the retried one, so a Fast implementation whose failure skipped `verify` can still be retried.
 - `stop` is refused unless the run is `Running` or `NeedsUser`; an `Interrupted` run reports its existing state instead of a second interruption.

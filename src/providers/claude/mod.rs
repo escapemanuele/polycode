@@ -1080,7 +1080,13 @@ fn permission_summary(denials: &[PermissionDenial]) -> String {
         .map(|denial| denial.tool_name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    format!("Claude Code requests permission for: {names}")
+    let mut summary = format!("Claude Code requests permission for: {names}");
+    if denials.iter().any(PermissionDenial::is_denied_acquisition) {
+        summary.push_str(
+            " \u{2014} the stage never got evidence it went looking for; approve it, or answer with --response to say what to do instead",
+        );
+    }
+    summary
 }
 
 #[cfg(test)]
