@@ -905,7 +905,7 @@ mod tests {
     use crate::engine::{EngineStatus, WorkflowEngine};
     use crate::process::{
         BackendAvailability, BackendSessionId, BackendSessionState, ExitEvidence, ManagedProcess,
-        ManagedProcessId, ProcessError,
+        ManagedProcessId, ProcessError, TerminationSignal,
     };
     use crate::store::{ResolvedConfigSnapshot, RunInput};
     use crate::workspace::WorkspaceManager;
@@ -1088,7 +1088,11 @@ mod tests {
             )))
         }
 
-        fn interrupt(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
+        fn signal(
+            &self,
+            _process: &ManagedProcess,
+            _signal: TerminationSignal,
+        ) -> Result<(), ProcessError> {
             Ok(())
         }
 
@@ -1217,7 +1221,11 @@ mod tests {
             )))
         }
 
-        fn interrupt(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
+        fn signal(
+            &self,
+            _process: &ManagedProcess,
+            _signal: TerminationSignal,
+        ) -> Result<(), ProcessError> {
             Ok(())
         }
 

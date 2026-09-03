@@ -65,6 +65,7 @@ impl TuiApp {
     }
 
     pub(crate) fn run(mut self, terminal: &mut TerminalSession) -> anyhow::Result<()> {
+        spawn_workspace_reclaim();
         self.refresh();
         while !self.state.quit {
             self.receive_worker_results();
@@ -79,11 +80,77 @@ impl TuiApp {
             terminal
                 .terminal_mut()
                 .draw(|frame| render::render(frame, &self.state))?;
-            if event::poll(EVENT_POLL)? {
+            if event::poll(self.idle_for())? {
                 self.handle_event(event::read()?);
             }
         }
+        self.shut_down(terminal);
         Ok(())
+    }
+
+    /// How long to wait for input before drawing again.
+    ///
+    /// Every redraw used to cost a full frame at ten a second, whether or not
+    /// anything on screen could have changed. Nothing here changes on its own
+    /// except on a schedule this loop owns — the half-second data refresh and,
+    /// while something is animating, the quarter-second animation tick — so the
+    /// wait runs to whichever of those comes first. Input is never delayed by
+    /// it: a keypress ends the wait early.
+    ///
+    /// A still surface therefore idles at the refresh rate rather than at the
+    /// input-poll rate, and an animated one draws exactly the frames the
+    /// animation has.
+    fn idle_for(&self) -> Duration {
+        let until_refresh = REFRESH_INTERVAL.saturating_sub(self.last_refresh.elapsed());
+        let wait = if self.state.motion_frame().is_animating() {
+            until_refresh.min(motion::TICK)
+        } else {
+            until_refresh
+        };
+        // Never busy-spin, and never wait so long that a resize or keypress
+        // feels laggy on a surface with no clock of its own.
+        wait.clamp(EVENT_POLL, REFRESH_INTERVAL)
+    }
+
+    /// Stops what this session started before the session goes away.
+    ///
+    /// Quitting used to leave every running agent behind: the interface closed,
+    /// the run stayed `Running` in the store, and the process group kept the
+    /// machine's memory until someone found it. Nothing else ever came back for
+    /// them, because the next session resumes runs from the store and has no
+    /// way to know the old operating-system processes are still there.
+    ///
+    /// The wait is real — a stop climbs the termination ladder, and several
+    /// runs climb it one after another — so the interface says what it is doing
+    /// rather than appearing to hang. Failures are shown and then dropped:
+    /// quitting must not be the one action a user cannot complete.
+    fn shut_down(&mut self, terminal: &mut TerminalSession) {
+        let running: Vec<RunId> = self
+            .state
+            .runs
+            .iter()
+            .filter(|run| run.status == RunStatus::Running)
+            .map(|run| run.id)
+            .collect();
+        if running.is_empty() {
+            return;
+        }
+        self.state.notify(
+            UiMessageKind::Info,
+            format!(
+                "Stopping {} agent{}…",
+                running.len(),
+                if running.len() == 1 { "" } else { "s" }
+            ),
+        );
+        let _ = terminal
+            .terminal_mut()
+            .draw(|frame| render::render(frame, &self.state));
+        for run_id in running {
+            if let Err(error) = self.reader.stop_run(run_id) {
+                tracing::warn!(%run_id, %error, "could not stop run during shutdown");
+            }
+        }
     }
 
     /// Absorbs the background check without ever blocking, then opens the
@@ -1287,6 +1354,30 @@ fn install_release(info: &UpdateInfo) -> anyhow::Result<String> {
 /// Runs one update check on a detached thread so startup never waits on the
 /// network. Every failure — including an unresolvable data directory — simply
 /// produces no update.
+/// Returns the worktrees of runs that closed before reclamation existed, or
+/// whose reclamation was interrupted part-way.
+///
+/// Off the startup path entirely: the sweep opens Git repositories and removes
+/// directories that can be gigabytes each, and none of that is work the user
+/// asked for or should wait behind. Nothing reports the result, because
+/// nothing about it changes what the user can do — the runs are already closed
+/// and their branches are kept either way. Failures are left for the next
+/// session's sweep.
+fn spawn_workspace_reclaim() {
+    std::thread::spawn(|| {
+        let Ok(service) = RunService::from_environment(RuntimeProviderFactory) else {
+            return;
+        };
+        match service.reclaim_closed_workspaces() {
+            Ok(reclaimed) if !reclaimed.is_empty() => {
+                tracing::info!(count = reclaimed.len(), "reclaimed closed run worktrees");
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "worktree reclaim sweep failed"),
+        }
+    });
+}
+
 fn spawn_update_check() -> Receiver<UpdateOutcome> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {

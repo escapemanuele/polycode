@@ -256,6 +256,17 @@ impl RunWorkspace {
         self.updated_at = now.max(self.updated_at);
     }
 
+    /// Gives up the claim on the branch, so removal takes the worktree and
+    /// leaves the branch standing.
+    ///
+    /// The disposition has to be persisted rather than passed along, because
+    /// removal is resumable: a crash between the intent and the deletion leaves
+    /// only the stored workspace to say what was meant. Ownership is what
+    /// removal reads, so releasing it here is what a later resume obeys.
+    pub(crate) fn release_branch_ownership(&mut self) {
+        self.branch_owned = false;
+    }
+
     pub(crate) fn confirm_branch_ownership(&mut self) {
         if self.mode == WorkspaceMode::Branch {
             self.branch_owned = true;

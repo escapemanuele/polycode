@@ -15,7 +15,7 @@ use crate::store::{
 };
 use crate::workspace::{
     GhClient, PullRequestReach, PullRequestRef, ReconciliationOutcome, WorkspaceError,
-    WorkspaceManager,
+    WorkspaceManager, WorkspaceStatus,
 };
 
 use super::provider_factory::{ProviderFactory, ProviderResolver};
@@ -500,8 +500,61 @@ where
             Err(WorkspaceError::EmptyPatch) => ApplyOutcome::NoChanges,
             Err(error) => return Err(error.into()),
         };
+        // The changes are in the source checkout now, and an applied run can
+        // neither be applied again nor fixed, so its worktree has stopped being
+        // work in progress and become a copy of a repository nobody will open.
+        // For a large checkout that is gigabytes per run, kept forever.
+        self.reclaim_workspace(&mut store, run_id);
         let report = Self::report(&mut store, run_id, before, None)?;
         Ok((outcome, report))
+    }
+
+    /// Returns the worktree of a run that is finished with it, keeping the
+    /// branch so nothing the run produced is lost.
+    ///
+    /// Best effort by construction. Reclaiming disk is never worth failing an
+    /// operation that has already succeeded, so a workspace that refuses to go
+    /// — a dirty tree, a source repository that has moved, a concurrent apply —
+    /// is left exactly as it was for the next sweep to try again.
+    fn reclaim_workspace(&self, store: &mut SqliteStore, run_id: RunId) -> bool {
+        WorkspaceManager::new(&self.worktrees)
+            .release_worktree(store, run_id)
+            .is_ok()
+    }
+
+    /// Returns the worktrees of every run that has closed its lifecycle and
+    /// still holds one, and reports which runs were reclaimed.
+    ///
+    /// Reclaiming at the moment a run closes only helps runs that close from
+    /// now on. This is the sweep for the rest: runs applied or discarded
+    /// before reclamation existed, and runs whose reclamation was interrupted
+    /// part-way. Only `Applied` and `Discarded` qualify — a `Completed` run
+    /// can still be applied, fixed, or continued, and all three read the
+    /// worktree, so its checkout is live data rather than a leak.
+    ///
+    /// # Errors
+    /// Returns store failures. A single workspace that refuses to go is not an
+    /// error: it is skipped and the sweep continues.
+    pub fn reclaim_closed_workspaces(&self) -> Result<Vec<RunId>, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let closed: Vec<RunId> = store
+            .list_runs()?
+            .into_iter()
+            .filter(|run| run.status.is_lifecycle_closed())
+            .map(|run| run.id)
+            .collect();
+        let mut reclaimed = Vec::new();
+        for run_id in closed {
+            let holds_worktree = store
+                .load_workspace(run_id)
+                .ok()
+                .flatten()
+                .is_some_and(|workspace| workspace.status() != WorkspaceStatus::Removed);
+            if holds_worktree && self.reclaim_workspace(&mut store, run_id) {
+                reclaimed.push(run_id);
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// Publishes completed workspace changes as a remote branch and pull
@@ -3467,6 +3520,107 @@ mod tests {
         assert_eq!(
             fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
             "changed by run\n"
+        );
+    }
+
+    /// Applying is the moment a worktree stops being work and starts being a
+    /// duplicate checkout nobody will open. Keeping it was costing gigabytes
+    /// per applied run; the branch is what carries the work forward, and it
+    /// survives.
+    #[test]
+    fn applying_a_run_returns_its_worktree_and_keeps_its_branch() {
+        let fixture = Fixture::new();
+        let complete = fixture
+            .default_service()
+            .start_run(
+                WorkflowKind::Fast,
+                "reclaim after apply",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+        let run_id = complete.details.id;
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        let workspace = store.load_workspace(run_id).unwrap().unwrap();
+        let worktree_path = workspace.worktree_path().to_path_buf();
+        let branch = workspace.branch_name().unwrap().to_owned();
+        fs::write(worktree_path.join("README.md"), "changed by run\n").unwrap();
+        drop(store);
+
+        let (outcome, report) = fixture.default_service().apply_run(run_id).unwrap();
+
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        assert_eq!(report.details.status, RunStatus::Applied);
+        assert!(
+            !worktree_path.exists(),
+            "an applied run's worktree is reclaimed"
+        );
+        assert!(
+            git_output(&fixture.repo, &["branch", "--list", &branch]).contains(&branch),
+            "the branch carrying the work is kept"
+        );
+    }
+
+    /// What the sweep decides, which is the only thing it adds over reclaiming
+    /// at the moment a run closes: which runs are finished with their
+    /// worktrees. A completed run is not one of them — apply, fix, and continue
+    /// all read its worktree, so that checkout is live data rather than a leak.
+    #[test]
+    fn the_sweep_leaves_a_completed_runs_worktree_alone_and_reclaims_nothing_twice() {
+        let fixture = Fixture::new();
+        let service = fixture.default_service();
+        let start = |task: &str| {
+            service
+                .start_run(
+                    WorkflowKind::Fast,
+                    task,
+                    &fixture.repo,
+                    Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                    EffortSetting::NativeDefault,
+                    &ImageGenerationPlan::disabled(),
+                )
+                .unwrap()
+                .details
+                .id
+        };
+        let applied = start("applied run");
+        let completed = start("completed run");
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        let applied_path = store
+            .load_workspace(applied)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        let completed_path = store
+            .load_workspace(completed)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        fs::write(applied_path.join("README.md"), "landed\n").unwrap();
+        drop(store);
+        service.apply_run(applied).unwrap();
+
+        let reclaimed = service.reclaim_closed_workspaces().unwrap();
+
+        assert!(
+            completed_path.exists(),
+            "a completed run can still be applied, fixed, or continued from its worktree"
+        );
+        assert!(
+            !reclaimed.contains(&completed),
+            "the sweep does not touch a run that can still be dispositioned"
+        );
+        assert!(
+            !applied_path.exists(),
+            "no closed run is left holding a worktree once the sweep has run"
+        );
+        assert!(
+            reclaimed.is_empty(),
+            "a worktree already reclaimed at apply time is not reclaimed again: {reclaimed:?}"
         );
     }
 

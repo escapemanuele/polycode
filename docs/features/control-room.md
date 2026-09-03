@@ -13,7 +13,7 @@ Watch and drive every run from one terminal screen without touching the database
 - help: `?` overlay listing every key.
 
 ## How to get to it (user POV)
-Run `polycode` with no arguments in an interactive terminal, or `polycode tui`. Non-interactive stdin/stdout prints CLI help instead. The TUI starts on the Runs screen with the current directory as the composer's repository. Quitting (`q`, Ctrl-C) detaches the frontend only; tmux-owned providers keep running.
+Run `polycode` with no arguments in an interactive terminal, or `polycode tui`. Non-interactive stdin/stdout prints CLI help instead. The TUI starts on the Runs screen with the current directory as the composer's repository. Quitting (`q`, Ctrl-C) stops the runs this session shows as `Running` before it closes, reporting "Stopping N agents…" while it waits.
 
 ## Driving it
 ```bash
@@ -41,7 +41,8 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 
 ## Gotchas
 - Text mode (Task/Repository fields, attention and continue overlays) uses `map_text_key`: letters are input, not commands. `q` does not quit there; Ctrl-C still does.
-- Quit never interrupts, discards or applies anything; reopen and press `r` to reconcile durable state and consume retained output.
+- Quit stops running runs but never discards or applies anything; a stopped run resumes. Quitting with agents at work therefore takes as long as their stops do, one after another. Reopen and press `r` to reconcile durable state and consume retained output.
+- Startup sweeps the worktrees of `Applied` and `Discarded` runs on a background thread; nothing reports it, and a `Completed` run's worktree is never touched.
 - Read paths are side-effect free except the 30 s abandoned-run observe pass; they never acknowledge provider output or create apply intent.
 - The TUI caps concurrently working agents at 4 (`CONCURRENT_AGENTS`); a booked fix that cannot start yet stays booked silently. The CLI has no such cap.
 - Attention overlays outrank the update overlay; the update prompt is shown at most once per process.
