@@ -138,8 +138,115 @@ pub(crate) fn viewer_line(line: &str) -> String {
     safe
 }
 
+/// Whether `truncate_title` had to drop anything: a task longer than the
+/// rail, or one carrying more lines than the single one the rail shows.
+#[must_use]
+pub(crate) fn title_overflows(task: &str, limit: usize) -> bool {
+    let mut prose = task.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = prose.next() else {
+        return false;
+    };
+    first.trim().chars().count() > limit || prose.next().is_some()
+}
+
+/// The whole task, wrapped to `width`, for the expanded rail.
+///
+/// Wraps on whitespace and keeps the author's own line breaks, so a task
+/// pasted as a list still reads as one. A word longer than the rail (a URL,
+/// the usual case) is broken rather than allowed to overflow it.
+#[must_use]
+pub(crate) fn wrap_title(task: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut wrapped: Vec<String> = Vec::new();
+    for line in task.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            // Collapse the author's blank runs to one separating row.
+            if wrapped.last().is_some_and(|blank| !blank.is_empty()) {
+                wrapped.push(String::new());
+            }
+            continue;
+        }
+        let mut current = String::new();
+        for word in line.split_whitespace() {
+            let mut word = word;
+            while word.chars().count() > width {
+                if !current.is_empty() {
+                    wrapped.push(std::mem::take(&mut current));
+                }
+                let head: String = word.chars().take(width).collect();
+                let taken = head.len();
+                wrapped.push(head);
+                word = &word[taken..];
+            }
+            let extra = usize::from(!current.is_empty());
+            if current.chars().count() + extra + word.chars().count() > width {
+                wrapped.push(std::mem::take(&mut current));
+            } else if extra == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        if !current.is_empty() {
+            wrapped.push(current);
+        }
+    }
+    while wrapped.last().is_some_and(String::is_empty) {
+        wrapped.pop();
+    }
+    wrapped
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wrapping_keeps_every_word_and_never_exceeds_the_rail() {
+        let task =
+            "Build a static landing page (index.html + styles.css) for a hiking-trail company";
+        let wrapped = wrap_title(task, 30);
+        assert!(wrapped.iter().all(|line| line.chars().count() <= 30));
+        assert_eq!(wrapped.join(" "), task, "no word is lost or duplicated");
+    }
+
+    /// The author's own line breaks are structure, not accidents: a task
+    /// pasted as a list stays a list.
+    #[test]
+    fn wrapping_keeps_the_authors_line_breaks_and_collapses_blank_runs() {
+        let wrapped = wrap_title("Do the thing\n\n\n- first\n- second\n", 40);
+        assert_eq!(wrapped, vec!["Do the thing", "", "- first", "- second"]);
+    }
+
+    /// A URL is the usual word longer than the rail; breaking it is ugly but
+    /// it is the only option that keeps the rail's width honest.
+    #[test]
+    fn a_word_longer_than_the_rail_is_broken_rather_than_overflowing_it() {
+        let wrapped = wrap_title(
+            "see https://github.com/Automattic/wp-calypso/pull/12345",
+            20,
+        );
+        assert!(wrapped.iter().all(|line| line.chars().count() <= 20));
+        assert_eq!(
+            wrapped.concat().replace("see", ""),
+            "https://github.com/Automattic/wp-calypso/pull/12345"
+        );
+    }
+
+    #[test]
+    fn overflow_is_reported_for_a_long_line_or_a_second_one_only() {
+        assert!(!title_overflows("short", 20));
+        assert!(title_overflows(
+            "a task far longer than the rail is wide",
+            20
+        ));
+        // truncate_title shows the first line only, so a second one is lost
+        // even when the first fits.
+        assert!(title_overflows("short\nbut there is more", 20));
+        assert!(!title_overflows("short\n\n   ", 20));
+        assert!(!title_overflows("", 20));
+    }
+
     use chrono::TimeZone as _;
 
     use super::*;

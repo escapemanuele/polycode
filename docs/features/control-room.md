@@ -4,7 +4,7 @@ Watch and drive every run from one terminal screen without touching the database
 
 ## Sub-features
 - runs-screen: list of runs; archive/unarchive runs; delete an archived run for good; Enter opens detail.
-- run-detail: stage timeline, routes, attention, usage; `i` toggles the technical (evidence) view. Opening a failed run lands the selection on the blocking failed stage, whose hero carries a `WHY IT FAILED` section with the whole (sanitized, 200-char capped) provider reason; the Runs-screen overview shows the same section for a failed run before it is opened.
+- run-detail: stage timeline, routes, attention, usage; `i` toggles the technical (evidence) view; `e` expands the rail's one-line task to the whole thing, offered only when that line dropped something. Opening a failed run lands the selection on the blocking failed stage, whose hero carries a `WHY IT FAILED` section with the whole (sanitized, 200-char capped) provider reason; the Runs-screen overview shows the same section for a failed run before it is opened.
 - activity-strip: one prose sentence for what is happening now — a failed stage's own reason ("Implementation failed: compile failed"), or why a stage has not started ("Waiting on: Architecture", "Blocked: Quality review failed, Spec review was skipped", "Waiting on you", "Stage suspended", "Stage skipped by the workflow").
 - viewers: artifact (`o`/Enter, `m` raw/rendered), raw process logs (`l`), workspace diff (`d`).
 - composer: `n` opens the new-run form (Task, Workflow, Repository, Execution, Effort).
@@ -21,7 +21,7 @@ polycode
 polycode tui
 ```
 Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home`/`End` top/bottom in viewers, `Enter` open/confirm, `Esc` back/close, `n` new run, `R` runs screen, `x` dismiss notification, `?` help, `q` or `Ctrl-C` quit/detach.
-Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage (chooser: Configured provider / Claude / Codex, Enter retries), `u` attention overlay, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `P` pull request (Enter confirms), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `i` technical details.
+Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage (chooser: Configured provider / Claude / Codex, Enter retries), `u` attention overlay, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `P` pull request (Enter confirms), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `e` expand the task in the rail, `i` technical details.
 Runs list: `h` archive/unarchive selected run, `H` show/hide archived runs, `D` delete an archived run for good (POD stands at the plunger; a second `D` goes through, Esc cancels). Only an archived run offers `D`.
 Artifact viewer: `m` toggle raw/rendered Markdown.
 Composer: `Tab`/`Shift-Tab` move fields, `←`/`→` cycle Workflow, Execution and Effort, typing/paste edits Task and Repository, `Enter` submits, `Esc` back.

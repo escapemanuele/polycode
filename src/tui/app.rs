@@ -264,6 +264,9 @@ impl TuiApp {
             Intent::ToggleRaw if self.state.screen == Screen::Artifact => {
                 self.state.artifact_raw = !self.state.artifact_raw;
             }
+            Intent::ExpandTask if self.state.screen == Screen::RunDetail => {
+                self.state.task_expanded = !self.state.task_expanded;
+            }
             Intent::TechnicalDetails if self.state.screen == Screen::RunDetail => {
                 self.state.technical = !self.state.technical;
                 self.refresh_evidence();

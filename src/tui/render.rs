@@ -533,17 +533,37 @@ fn completed_sentence(details: &RunDetails) -> String {
 fn render_pipeline(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &RunDetails) {
     let now: DateTime<Utc> = std::time::SystemTime::now().into();
     let width = area.width.saturating_sub(3);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format::truncate_title(
-                details.task.as_deref().unwrap_or("<legacy input>"),
-                width.saturating_sub(1) as usize,
-            ),
+    let task = details.task.as_deref().unwrap_or("<legacy input>");
+    let title_width = width.saturating_sub(1) as usize;
+    // The rail shows one line of the task so the pipeline stays visible; the
+    // whole thing is one key away whenever that line dropped something.
+    let overflows = format::title_overflows(task, title_width);
+    let mut lines: Vec<Line<'static>> = if state.task_expanded && overflows {
+        format::wrap_title(task, title_width)
+            .into_iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+            })
+            .collect()
+    } else {
+        vec![Line::from(Span::styled(
+            format::truncate_title(task, title_width),
             Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        theme::section("PIPELINE"),
-    ];
+        ))]
+    };
+    if overflows {
+        let label = if state.task_expanded {
+            "Collapse task"
+        } else {
+            "Full task"
+        };
+        lines.push(Line::from(theme::action("e", label, theme::muted_color())));
+    }
+    lines.push(Line::from(""));
+    lines.push(theme::section("PIPELINE"));
     // Connector segments cost one row per gap; they are the first thing to
     // go when the rail is short.
     let stage_rows = details.stages.len() * 2 - details.stages.len().min(1);
@@ -1874,7 +1894,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -2863,6 +2883,58 @@ mod tests {
         let state = TuiState::new(std::path::Path::new("/repo"));
         assert!(render_text(&state, 90, 24).contains("No runs yet"));
         assert!(render_text(&state, 49, 9).contains("Terminal too small"));
+    }
+
+    /// The rail's one task line is what the operator reads to know which run
+    /// they are looking at; a long task lost everything past the first ~40
+    /// characters with no way to see the rest.
+    #[test]
+    fn a_long_task_can_be_opened_in_the_rail_and_closed_again() {
+        let task = "Build a static landing page (index.html + styles.css) for a \
+                    hiking-trail company, with a hero, three trail cards and a \
+                    contact form";
+        let mut state = running_state();
+        if let Some(details) = state.details.as_mut() {
+            details.task = Some(task.to_owned());
+        }
+
+        let collapsed = render_text(&state, 160, 40);
+        assert!(collapsed.contains('…'), "the rail line is still truncated");
+        assert!(
+            !collapsed.contains("contact form"),
+            "the tail is not shown until it is asked for"
+        );
+        assert!(collapsed.contains("Full task"), "the key is offered");
+
+        state.task_expanded = true;
+        let expanded = render_text(&state, 160, 40);
+        assert!(
+            expanded.contains("contact form"),
+            "expanding shows the whole task"
+        );
+        assert!(
+            expanded.contains("Collapse task"),
+            "the same key closes it again"
+        );
+        // The pipeline is what the rail exists for; opening the task never
+        // costs it.
+        assert!(expanded.contains("PIPELINE"));
+        assert!(expanded.contains("Implementation"));
+    }
+
+    /// A task that already fits is not something to expand, so the key is not
+    /// advertised and pressing it changes nothing.
+    #[test]
+    fn a_task_that_fits_is_never_offered_an_expansion() {
+        let mut state = running_state();
+        let collapsed = render_text(&state, 160, 40);
+        assert!(!collapsed.contains("Full task"));
+        state.task_expanded = true;
+        assert_eq!(
+            render_text(&state, 160, 40),
+            collapsed,
+            "the toggle is inert for a task the rail already shows whole"
+        );
     }
 
     #[test]
