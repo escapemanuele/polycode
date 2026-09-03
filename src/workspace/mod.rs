@@ -8,6 +8,7 @@ mod model;
 mod pull_request;
 
 pub use error::WorkspaceError;
+pub use github::{GhClient, PullRequestReach, PullRequestRef};
 pub use manager::{PublishReceipt, PullRequestStatus, ReconciliationOutcome, WorkspaceManager};
 pub use model::{
     ApplyStatus, RunApplyOperation, RunWorkspace, WorkspaceMode, WorkspaceRevision, WorkspaceStatus,

@@ -13,7 +13,10 @@ use crate::store::{
     ResolvedConfigSnapshot, RunInput, SqliteStore, StoreError, database_file, process_root,
     worktree_root,
 };
-use crate::workspace::{ReconciliationOutcome, WorkspaceError, WorkspaceManager};
+use crate::workspace::{
+    GhClient, PullRequestReach, PullRequestRef, ReconciliationOutcome, WorkspaceError,
+    WorkspaceManager,
+};
 
 use super::provider_factory::{ProviderFactory, ProviderResolver};
 use super::{
@@ -95,6 +98,7 @@ pub struct RunService<F> {
     worktrees: PathBuf,
     provider_factory: F,
     abandoned_after: std::time::Duration,
+    gh: GhClient,
 }
 
 impl<F> RunService<F>
@@ -102,13 +106,24 @@ where
     F: ProviderResolver,
 {
     #[must_use]
-    pub const fn new(database: PathBuf, worktrees: PathBuf, provider_factory: F) -> Self {
+    pub fn new(database: PathBuf, worktrees: PathBuf, provider_factory: F) -> Self {
         Self {
             database,
             worktrees,
             provider_factory,
             abandoned_after: ABANDONED_AFTER,
+            gh: GhClient::default(),
         }
+    }
+
+    /// Replaces the `gh` client used by the pull-request start precondition.
+    ///
+    /// The default reads `gh` from `PATH`. Only a caller that knows which
+    /// executable should answer that probe has any business replacing it.
+    #[must_use]
+    pub fn probing_pull_requests_with(mut self, gh: GhClient) -> Self {
+        self.gh = gh;
+        self
     }
 
     /// Overrides how long a run must sit untouched before a read settles it.
@@ -208,6 +223,22 @@ where
         // persisted, so a rejected start leaves nothing behind.
         if !crate::git::source_is_clean(&crate::git::Git::default(), &repository)? {
             return Err(AppError::DirtySourceRepository);
+        }
+        // A task naming a pull request is a task whose evidence lives outside
+        // the workspace. The pull request need not belong to this repository —
+        // reviewing a remote one is a legitimate run — but if nothing can read
+        // it, every stage produces the same "I was blocked" artifact and the
+        // run reaches its end looking successful. Refuse here, in the same
+        // window as the dirty-source check, so nothing is persisted.
+        if let Some(pull_request) = PullRequestRef::parse(&task) {
+            if let PullRequestReach::Unreachable(detail) = self.gh.pull_request_reach(&pull_request)
+            {
+                return Err(AppError::PullRequestUnreachable {
+                    url: pull_request.url(),
+                    host: pull_request.host,
+                    detail,
+                });
+            }
         }
         let input = RunInput::new(run_id, task, created_at)?;
         let config_id = config.id().clone();
@@ -2081,6 +2112,89 @@ mod tests {
                 "{label}: a refused start left a run behind"
             );
         }
+    }
+
+    /// A `gh` stand-in that answers every probe with `body`. No test reaches a
+    /// network.
+    fn stub_gh(directory: &std::path::Path, body: &str) -> GhClient {
+        use std::os::unix::fs::PermissionsExt;
+        let script = directory.join("gh");
+        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        GhClient::with_executable(script)
+    }
+
+    /// Run `01M1K8KAJ1HMS47H7WR8YMN2PW` was started on an enterprise pull
+    /// request URL while its host was reachable only over VPN. Every stage
+    /// then wrote an artifact saying it was blocked, and the run finished
+    /// looking successful. The pull request need not live in this repository —
+    /// reviewing a remote one is allowed — but an unreadable one is refused
+    /// before anything durable exists.
+    #[test]
+    fn an_unreadable_pull_request_is_refused_before_any_run_is_persisted() {
+        let fixture = Fixture::new();
+        let service = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(
+                fixture.temp.path(),
+                "echo 'dial tcp 192.0.80.209:443: i/o timeout' >&2\nexit 1",
+            ));
+        let error = service
+            .start_run(
+                WorkflowKind::Review,
+                "https://github.a8c.com/Automattic/missioncontrol/pull/164318",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap_err();
+        let AppError::PullRequestUnreachable {
+            ref url,
+            ref host,
+            ref detail,
+        } = error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(
+            url,
+            "https://github.a8c.com/Automattic/missioncontrol/pull/164318"
+        );
+        assert_eq!(host, "github.a8c.com");
+        assert!(detail.contains("i/o timeout"), "{detail}");
+        let message = error.to_string();
+        assert!(message.contains("not started"), "{message}");
+        assert!(message.contains("gh auth login"), "{message}");
+
+        assert!(
+            !fixture.database.exists(),
+            "a refused start created a database"
+        );
+        assert!(
+            !fixture.worktrees.exists(),
+            "a refused start created workspace resources"
+        );
+    }
+
+    /// A pull request in another repository is a legitimate run: the run is
+    /// refused for unreadability alone, never for belonging elsewhere.
+    #[test]
+    fn a_readable_pull_request_from_another_repository_still_starts() {
+        let fixture = Fixture::new();
+        let started = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"))
+            .start_run(
+                WorkflowKind::Review,
+                "https://github.a8c.com/Automattic/missioncontrol/pull/164318",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+        assert_ne!(started.details.status, RunStatus::Failed);
     }
 
     /// Review workflows read the source too, so they take the same preflight.
