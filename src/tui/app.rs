@@ -183,10 +183,15 @@ impl TuiApp {
             Intent::Continue => self.open_continue(),
             Intent::FollowUps => self.open_follow_ups(),
             Intent::Discard => self.state.overlay = Some(Overlay::DiscardConfirm),
-            Intent::Hide if self.state.screen == Screen::Runs => self.toggle_selected_hidden(),
-            Intent::ShowHidden if self.state.screen == Screen::Runs => {
-                self.state.show_hidden = !self.state.show_hidden;
+            Intent::Archive if self.state.screen == Screen::Runs => {
+                self.toggle_selected_archived();
+            }
+            Intent::ShowArchived if self.state.screen == Screen::Runs => {
+                self.state.show_archived = !self.state.show_archived;
                 self.refresh();
+            }
+            Intent::DeleteForever if self.state.screen == Screen::Runs => {
+                self.open_delete_confirmation();
             }
             Intent::DismissMessage => self.state.dismiss_message(),
             Intent::ToggleRaw if self.state.screen == Screen::Artifact => {
@@ -233,10 +238,17 @@ impl TuiApp {
                     self.state.overlay = None;
                 }
             }
+            Overlay::DeleteConfirm if intent == Intent::DeleteForever => {
+                if let Some(run_id) = self.state.selected_run {
+                    self.dispatch(WorkerCommand::PurgeRun { run_id });
+                    self.state.overlay = None;
+                }
+            }
             Overlay::Help
             | Overlay::ApplyConfirm
             | Overlay::PublishConfirm
             | Overlay::DiscardConfirm
+            | Overlay::DeleteConfirm
             | Overlay::Update => {}
         }
     }
@@ -913,7 +925,23 @@ impl TuiApp {
         self.state.settle_action(result.action, result.run_id);
         match result.result {
             Ok(success) => {
-                let run_id = success.report().details.id;
+                if let WorkerSuccess::Purged(receipt) = success {
+                    // The run this was looking at no longer exists; the list
+                    // it came from is where the operator belongs.
+                    if self.state.selected_run == Some(receipt.run_id) {
+                        self.state.selected_run = None;
+                        self.state.details = None;
+                        self.state.screen = Screen::Runs;
+                    }
+                    self.state
+                        .set_message(format!("Run {} deleted for good.", receipt.run_id));
+                    self.refresh();
+                    return;
+                }
+                let Some(report) = success.report() else {
+                    return;
+                };
+                let run_id = report.details.id;
                 // An action finishing is not a reason to move the user. Only
                 // the run they are already looking at — or the first run this
                 // session has, when they are looking at nothing — opens on its
@@ -926,8 +954,8 @@ impl TuiApp {
                     .is_none_or(|selected| selected == run_id)
                 {
                     self.state.selected_run = Some(run_id);
-                    self.state.replace_details(success.report().details.clone());
-                    self.state.quiescent = Some(success.report().outcome.clone());
+                    self.state.replace_details(report.details.clone());
+                    self.state.quiescent = Some(report.outcome.clone());
                     self.state.screen = Screen::RunDetail;
                 }
                 let message = match success {
@@ -943,7 +971,7 @@ impl TuiApp {
                             format!("Branch {} pushed. {reason}", receipt.branch)
                         }
                     },
-                    WorkerSuccess::Execution(_) => {
+                    WorkerSuccess::Execution(_) | WorkerSuccess::Purged(_) => {
                         format!("{} finished for {run_id}", result.action.label())
                     }
                 };
@@ -960,33 +988,54 @@ impl TuiApp {
         self.refresh();
     }
 
-    /// Hides the selected run from the default list, or unhides it when the
-    /// list is showing hidden runs. Synchronous on purpose: it is a single
-    /// metadata update with no processes or workspaces involved, exactly like
-    /// the settling writes `list_runs` already performs on this thread.
-    fn toggle_selected_hidden(&mut self) {
+    /// Archives the selected run out of the default list, or brings it back
+    /// when the list is showing archived runs. Synchronous on purpose: it is
+    /// a single metadata update with no processes or workspaces involved,
+    /// exactly like the settling writes `list_runs` already performs on this
+    /// thread.
+    fn toggle_selected_archived(&mut self) {
         let Some(run) = self.state.runs.get(self.state.selected_run_index) else {
             return;
         };
-        let (run_id, hidden) = (run.id, run.hidden);
-        if let Err(error) = self.reader.set_run_hidden(run_id, !hidden) {
+        let (run_id, archived) = (run.id, run.archived);
+        if let Err(error) = self.reader.set_run_archived(run_id, !archived) {
             self.state.set_error(error.to_string());
             return;
         }
         self.refresh();
     }
 
+    /// Offers to delete the selected run for good. Only an archived run is
+    /// offered: setting a run aside is the step that makes deleting it
+    /// deliberate, and the refusal says so rather than doing nothing.
+    fn open_delete_confirmation(&mut self) {
+        let Some(run) = self.state.runs.get(self.state.selected_run_index) else {
+            return;
+        };
+        if !run.archived {
+            self.state.set_error(
+                "Archive this run first — only an archived run can be deleted.".to_owned(),
+            );
+            return;
+        }
+        self.state.selected_run = Some(run.id);
+        self.state.overlay = Some(Overlay::DeleteConfirm);
+    }
+
     fn refresh(&mut self) {
         match self.reader.list_runs() {
             Ok(runs) => {
                 self.recover_orphaned_runs(&runs);
-                let (visible, hidden_count) = if self.state.show_hidden {
+                let (visible, archived_count) = if self.state.show_archived {
                     (runs, 0)
                 } else {
-                    let hidden = runs.iter().filter(|run| run.hidden).count();
-                    (runs.into_iter().filter(|run| !run.hidden).collect(), hidden)
+                    let archived = runs.iter().filter(|run| run.archived).count();
+                    (
+                        runs.into_iter().filter(|run| !run.archived).collect(),
+                        archived,
+                    )
                 };
-                self.state.hidden_count = hidden_count;
+                self.state.archived_count = archived_count;
                 self.state.replace_runs(visible);
                 self.start_booked_fixes();
                 self.refresh_selected();
@@ -1508,7 +1557,7 @@ mod tests {
             task_summary: "Add OAuth provider support".to_owned(),
             repository: Some(std::path::PathBuf::from("/repo")),
             updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
-            hidden: false,
+            archived: false,
         }];
         app.start_booked_fixes();
 
@@ -2478,7 +2527,7 @@ mod tests {
             task_summary: "task".to_owned(),
             repository: None,
             updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
-            hidden: false,
+            archived: false,
         }
     }
 

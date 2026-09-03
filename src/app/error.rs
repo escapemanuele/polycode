@@ -88,6 +88,15 @@ continue-cycle routing existed and has no route for {role:?}. Start a new run in
     #[error("run {run_id} has no stage {stage_id}")]
     StageNotFound { run_id: RunId, stage_id: StageId },
     #[error(
+        "run {0} is not archived. Deleting a run for good is only offered for a run already \
+set aside, so archive it first."
+    )]
+    RunNotArchived(RunId),
+    #[error("run {0} is still {1:?} and cannot be deleted. Stop it first.")]
+    RunNotDeletable(RunId, crate::domain::RunStatus),
+    #[error("run files at {0} could not be removed: {1}. The run is still listed; try again.")]
+    RunFilesNotRemoved(std::path::PathBuf, #[source] std::io::Error),
+    #[error(
         "run {run_id} was NOT stopped: managed process {process_id} never recorded the runtime \
 evidence a signal needs within {waited_ms}ms. The process may still be running; try stopping again."
     )]

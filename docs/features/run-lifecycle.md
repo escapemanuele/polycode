@@ -33,6 +33,9 @@ polycode resolve <run-id> <attention-id> --response "<answer>"   # answer a ques
 ```
 TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage (↑/↓ pick Configured provider / Claude / Codex, Enter retries), `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves).
 
+## Archiving and deleting
+A run you are done with is archived (`h` in the Runs list, `polycode archive <run-id>`): it leaves the default list and stays otherwise untouched, and `--undo` brings it back. An archived run — and only an archived one — can then be deleted for good (`D` in the Runs list, `polycode delete <run-id> --yes`): its worktree and branch, its artifacts and logs under `~/.polycode/runs/<run-id>`, and every row Polycode keeps about it. Nothing it already applied or published is touched. There is no undo, and a run still running cannot be deleted.
+
 ## Where it lives
 - `src/cli/mod.rs` — clap definitions (`RunArgs`, `Command::{Runs,Status,Resume,Stop,Retry,Resolve}`).
 - `src/cli/commands.rs` — `start`, `parse_effort`, `print_report`, `print_details`; `QuiescentState` hints printed after each report.

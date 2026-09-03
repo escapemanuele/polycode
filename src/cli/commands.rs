@@ -124,6 +124,38 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             print_report(&service()?.discard_run(*run_id)?);
             Ok(())
         }
+        Some(Command::Archive { run_id, undo }) => {
+            service()?.set_run_archived(*run_id, !*undo)?;
+            println!(
+                "Run {run_id} {}.",
+                if *undo {
+                    "returned to the list"
+                } else {
+                    "archived"
+                }
+            );
+            Ok(())
+        }
+        Some(Command::Delete { run_id, yes }) => {
+            if !*yes {
+                println!(
+                    "Run {run_id} was NOT deleted. Deleting a run destroys its worktree, its \
+files, and its history, and cannot be undone. Pass --yes to go through with it."
+                );
+                return Ok(());
+            }
+            let receipt = service()?.purge_run(*run_id)?;
+            println!(
+                "Run {} deleted for good{}.",
+                receipt.run_id,
+                if receipt.files_removed {
+                    ""
+                } else {
+                    " (its files were already gone)"
+                }
+            );
+            Ok(())
+        }
         None => {
             Cli::command().print_help()?;
             println!();

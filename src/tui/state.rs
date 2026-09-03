@@ -33,6 +33,8 @@ pub(crate) enum Overlay {
     ApplyConfirm,
     PublishConfirm,
     DiscardConfirm,
+    /// The last stop before a run is deleted for good.
+    DeleteConfirm,
     /// Application-level software update. Deliberately the lowest-priority
     /// overlay: run attention always outranks it.
     Update,
@@ -464,12 +466,12 @@ pub(crate) struct TuiState {
     pub screen: Screen,
     pub overlay: Option<Overlay>,
     pub runs: Vec<RunListItem>,
-    /// Whether hidden runs are shown in the Runs list. Off by default;
+    /// Whether archived runs are shown in the Runs list. Off by default;
     /// toggled by the operator, never persisted.
-    pub show_hidden: bool,
+    pub show_archived: bool,
     /// How many runs the current list is leaving out because they are
-    /// hidden. Lets the empty state and the footer say so.
-    pub hidden_count: usize,
+    /// archived. Lets the empty state and the footer say so.
+    pub archived_count: usize,
     pub selected_run: Option<RunId>,
     pub selected_run_index: usize,
     pub details: Option<RunDetails>,
@@ -551,8 +553,8 @@ impl TuiState {
             screen: Screen::Runs,
             overlay: None,
             runs: Vec::new(),
-            show_hidden: false,
-            hidden_count: 0,
+            show_archived: false,
+            archived_count: 0,
             selected_run: None,
             selected_run_index: 0,
             details: None,
@@ -976,7 +978,7 @@ mod tests {
                 .with_ymd_and_hms(2026, 8, 17, 12, 0, 0)
                 .single()
                 .unwrap(),
-            hidden: false,
+            archived: false,
         }
     }
 

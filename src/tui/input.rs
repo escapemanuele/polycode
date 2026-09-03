@@ -32,8 +32,10 @@ pub(crate) enum Intent {
     Continue,
     FollowUps,
     Discard,
-    Hide,
-    ShowHidden,
+    Archive,
+    ShowArchived,
+    /// Delete the selected archived run for good.
+    DeleteForever,
     DismissMessage,
     ToggleRaw,
     TechnicalDetails,
@@ -78,8 +80,9 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('c') => Intent::Continue,
         KeyCode::Char('w') => Intent::FollowUps,
         KeyCode::Char('X') => Intent::Discard,
-        KeyCode::Char('h') => Intent::Hide,
-        KeyCode::Char('H') => Intent::ShowHidden,
+        KeyCode::Char('h') => Intent::Archive,
+        KeyCode::Char('H') => Intent::ShowArchived,
+        KeyCode::Char('D') => Intent::DeleteForever,
         KeyCode::Char('x') => Intent::DismissMessage,
         KeyCode::Char('m') => Intent::ToggleRaw,
         KeyCode::Char('i') => Intent::TechnicalDetails,
@@ -177,14 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_h_hides_and_stays_distinct_from_uppercase_show_hidden() {
+    fn lowercase_h_archives_and_stays_distinct_from_uppercase_show_archived() {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
-            Intent::Hide
+            Intent::Archive
         );
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT)),
-            Intent::ShowHidden
+            Intent::ShowArchived
         );
     }
 }

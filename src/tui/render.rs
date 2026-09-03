@@ -139,22 +139,22 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ));
             lines.push(Line::from(""));
         }
-        if state.hidden_count > 0 {
-            // Not actually empty — everything is hidden; say so instead of
+        if state.archived_count > 0 {
+            // Not actually empty — everything is archived; say so instead of
             // pretending the operator never ran anything.
-            let plural = if state.hidden_count == 1 {
+            let plural = if state.archived_count == 1 {
                 "run"
             } else {
                 "runs"
             };
             lines.push(Line::from(Span::styled(
-                format!("{} hidden {plural}.", state.hidden_count),
+                format!("{} archived {plural}.", state.archived_count),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(theme::action(
                 "H",
-                "Show hidden runs",
+                "Show archived runs",
                 theme::accent(),
             )));
         } else {
@@ -223,9 +223,9 @@ fn run_row(
     let age = format::elapsed(Some(run.updated_at), None, now)
         .map(|span| format!("{} ago", format::format_duration(span)))
         .unwrap_or_default();
-    // Only ever visible while the list is showing hidden runs.
-    let hidden_mark = if run.hidden { "hidden  " } else { "" };
-    let meta = format!("{hidden_mark}{}  {age}", enum_text(run.workflow));
+    // Only ever visible while the list is showing archived runs.
+    let archived_mark = if run.archived { "archived  " } else { "" };
+    let meta = format!("{archived_mark}{}  {age}", enum_text(run.workflow));
     // Budget: cursor, glyph, the meta column, and a gap wide enough that the
     // ellipsis can never push the row past the rail.
     let task_width = (width as usize).saturating_sub(meta.chars().count() + 7);
@@ -1674,6 +1674,29 @@ fn render_new_run(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 /// The screen's contextual actions, gated on canonical state so the footer
 /// never advertises something the domain would refuse. Apply and discard
 /// appear only for an applyable run.
+/// The Runs list's own keys. Archiving is always on offer; deleting is
+/// offered only where it is allowed, so the footer never advertises a key
+/// that answers with a refusal.
+fn runs_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)) {
+    push("Enter", "Open", theme::accent());
+    push("n", "New run", theme::accent());
+    if let Some(run) = state.runs.get(state.selected_run_index) {
+        push(
+            "h",
+            if run.archived { "Unarchive" } else { "Archive" },
+            theme::muted_color(),
+        );
+        if run.archived {
+            push("D", "Delete forever", theme::danger());
+        }
+    }
+    if state.show_archived {
+        push("H", "Hide archived", theme::muted_color());
+    } else if state.archived_count > 0 {
+        push("H", "Show archived", theme::muted_color());
+    }
+}
+
 fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut push = |key: &str, label: &str, color: Color| {
@@ -1683,22 +1706,7 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
         spans.extend(theme::action(key, label, color));
     };
     match screen {
-        Screen::Runs => {
-            push("Enter", "Open", theme::accent());
-            push("n", "New run", theme::accent());
-            if let Some(run) = state.runs.get(state.selected_run_index) {
-                push(
-                    "h",
-                    if run.hidden { "Unhide" } else { "Hide" },
-                    theme::muted_color(),
-                );
-            }
-            if state.show_hidden {
-                push("H", "Hide hidden", theme::muted_color());
-            } else if state.hidden_count > 0 {
-                push("H", "Show hidden", theme::muted_color());
-            }
-        }
+        Screen::Runs => runs_actions(state, &mut push),
         Screen::RunDetail => {
             let needs_user = state
                 .details
@@ -1866,7 +1874,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h hide/unhide selected run\n  H show/hide hidden runs\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  l raw logs (read-only)\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -1876,6 +1884,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::ApplyConfirm => render_confirmation(frame, popup, state, Confirmation::Apply),
         Overlay::PublishConfirm => render_confirmation(frame, popup, state, Confirmation::Publish),
         Overlay::DiscardConfirm => render_confirmation(frame, popup, state, Confirmation::Discard),
+        Overlay::DeleteConfirm => render_delete_confirmation(frame, popup, state),
         Overlay::Continue => render_continue(frame, popup, state),
         Overlay::FollowUps => render_follow_ups(frame, popup, state),
         Overlay::RetryRoute => render_retry_route(frame, popup, state),
@@ -2271,6 +2280,66 @@ fn render_confirmation(
                 },
                 color,
             )),
+        area,
+    );
+}
+
+/// The last stop before a run is gone.
+///
+/// Every other confirmation takes Enter, the key a hand rests on. This one
+/// takes `D` again — the same key that opened it — so no reflex carries a
+/// run past the point of return. POD stands at the plunger while the
+/// overlay lists, in plain words, each thing that is about to stop existing.
+fn render_delete_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let selected = state.runs.get(state.selected_run_index);
+    let task = selected.map_or_else(
+        || {
+            state
+                .details
+                .as_ref()
+                .and_then(|details| details.task.clone())
+                .unwrap_or_else(|| "this run".to_owned())
+        },
+        |run| run.task_summary.clone(),
+    );
+    let run_id = selected.map(|run| run.id).or(state.selected_run);
+    let mut lines = vec![Line::from(theme::chip("DELETE FOREVER", theme::danger()))];
+    if area.height >= mascot::MASCOT_HEIGHT + 12 {
+        lines.push(Line::from(""));
+        lines.extend(mascot::demolition_lines(state.motion_frame()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        task,
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    if let Some(run_id) = run_id {
+        lines.push(Line::from(Span::styled(
+            format!("run {run_id}"),
+            theme::muted(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "This run stops existing: its worktree and branch, its artifacts and \
+         logs on disk, and every row Polycode keeps about it.",
+    ));
+    lines.push(Line::from(
+        "Nothing it already applied or pushed is touched — your repository and \
+         any pull request stay exactly as they are.",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "There is no undo. D deletes.",
+        Style::default()
+            .fg(theme::danger())
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled("Esc cancels", theme::muted())));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" DELETE FOREVER ", theme::danger())),
         area,
     );
 }
@@ -2829,7 +2898,7 @@ mod tests {
             task_summary: "OAuth provider".to_owned(),
             repository: Some(std::path::PathBuf::from("/repo")),
             updated_at: at(12, 0, 0),
-            hidden: false,
+            archived: false,
         }]);
         state.details = Some(details(RunStatus::NeedsUser, Vec::new()));
         let text = render_text(&state, 120, 30);
@@ -2840,11 +2909,12 @@ mod tests {
         assert!(render_text(&state, 120, 30).contains("Help · Esc closes"));
     }
 
-    /// Hiding has three visible surfaces: the footer offers the keys, a run
-    /// shown by the all-runs view carries a "hidden" mark, and a list where
-    /// everything is hidden says so instead of claiming there are no runs.
+    /// Archiving has four visible surfaces: the footer offers the keys, a run
+    /// shown by the all-runs view carries an "archived" mark, a list where
+    /// everything is archived says so instead of claiming there are no runs,
+    /// and delete is offered on an archived run alone.
     #[test]
-    fn hidden_runs_are_advertised_marked_and_counted() {
+    fn archived_runs_are_advertised_marked_counted_and_deletable() {
         let mut state = TuiState::new(std::path::Path::new("/repo"));
         state.replace_runs(vec![RunListItem {
             id: RunId::from_u128(7),
@@ -2853,33 +2923,71 @@ mod tests {
             task_summary: "Ship the widget".to_owned(),
             repository: None,
             updated_at: at(12, 0, 0),
-            hidden: false,
+            archived: false,
         }]);
         state.details = Some(details(RunStatus::Completed, Vec::new()));
         let text = render_text(&state, 120, 30);
-        assert!(text.contains(" h  Hide"), "footer offers hiding");
-        assert!(!text.contains("Show hidden"), "nothing is hidden yet");
+        assert!(text.contains(" h  Archive"), "footer offers archiving");
+        assert!(!text.contains("Show archived"), "nothing is archived yet");
+        assert!(
+            !text.contains("Delete forever"),
+            "delete belongs to archived runs alone"
+        );
 
-        // Something hidden exists: the footer says how to see it.
-        state.hidden_count = 1;
-        assert!(render_text(&state, 120, 30).contains(" H  Show hidden"));
+        // Something archived exists: the footer says how to see it.
+        state.archived_count = 1;
+        assert!(render_text(&state, 120, 30).contains(" H  Show archived"));
 
-        // The all-runs view marks the hidden run and offers to re-hide.
-        state.show_hidden = true;
-        state.runs[0].hidden = true;
+        // The all-runs view marks the archived run, offers to bring it back,
+        // and only now offers to delete it.
+        state.show_archived = true;
+        state.runs[0].archived = true;
         let showing = render_text(&state, 120, 30);
-        assert!(showing.contains("hidden  "), "hidden run carries its mark");
-        assert!(showing.contains(" h  Unhide"));
-        assert!(showing.contains(" H  Hide hidden"));
+        assert!(
+            showing.contains("archived  "),
+            "archived run carries its mark"
+        );
+        assert!(showing.contains(" h  Unarchive"));
+        assert!(showing.contains(" H  Hide archived"));
+        assert!(showing.contains(" D  Delete forever"));
 
-        // Everything hidden: the empty state tells the truth.
-        state.show_hidden = false;
+        // Everything archived: the empty state tells the truth.
+        state.show_archived = false;
         state.replace_runs(Vec::new());
-        state.hidden_count = 2;
+        state.archived_count = 2;
         let empty = render_text(&state, 120, 30);
-        assert!(empty.contains("2 hidden runs."), "{empty}");
-        assert!(empty.contains("Show hidden runs"));
+        assert!(empty.contains("2 archived runs."), "{empty}");
+        assert!(empty.contains("Show archived runs"));
         assert!(!empty.contains("No runs yet"));
+    }
+
+    /// The last stop before a run is gone: POD stands over the plunger, the
+    /// overlay names what is about to be destroyed, and the key that goes
+    /// through is the same `D` that opened it — never Enter, which every
+    /// other confirmation takes.
+    #[test]
+    fn the_delete_overlay_names_the_damage_and_asks_for_its_own_key() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.replace_runs(vec![RunListItem {
+            id: RunId::from_u128(7),
+            workflow: WorkflowKind::Standard,
+            status: RunStatus::Completed,
+            task_summary: "Ship the widget".to_owned(),
+            repository: None,
+            updated_at: at(12, 0, 0),
+            archived: true,
+        }]);
+        state.details = Some(details(RunStatus::Completed, Vec::new()));
+        state.overlay = Some(Overlay::DeleteConfirm);
+        let text = render_text(&state, 120, 34);
+        assert!(text.contains("DELETE FOREVER"));
+        assert!(text.contains("Ship the widget"), "names the run");
+        assert!(
+            text.contains("worktree") && text.contains("artifacts"),
+            "says what is destroyed: {text}"
+        );
+        assert!(text.contains("D deletes"), "asks for its own key: {text}");
+        assert!(text.contains(POD_SHELL), "POD works the plunger");
     }
 
     #[test]
@@ -3405,7 +3513,7 @@ mod tests {
             task_summary: "OAuth provider".to_owned(),
             repository: Some(std::path::PathBuf::from("/repo")),
             updated_at: at(12, 0, 0),
-            hidden: false,
+            archived: false,
         }]);
         let mut failed = details(RunStatus::Failed, Vec::new());
         failed.failure_reason = Some("You've hit your usage limit.".to_owned());
@@ -4335,7 +4443,7 @@ mod tests {
             task_summary: "OAuth".to_owned(),
             repository: None,
             updated_at: at(12, 0, 0),
-            hidden: false,
+            archived: false,
         }]);
         assert!(
             !state.update_prompt_is_due(),

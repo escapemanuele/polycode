@@ -99,6 +99,20 @@ pub enum Command {
     Pr { run_id: RunId },
     /// Discard run and remove owned workspace resources.
     Discard { run_id: RunId },
+    /// Archive a run out of the default list, or bring it back with --undo.
+    Archive {
+        run_id: RunId,
+        /// Return the run to the default list instead of archiving it.
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Delete an archived run for good: worktree, files, and rows. No undo.
+    Delete {
+        run_id: RunId,
+        /// Required: deleting a run is irreversible, so it is never implied.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Check for a newer official Polycode release.
     Update(UpdateArgs),
     /// Check Polycode's local environment.
