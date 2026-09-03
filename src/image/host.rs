@@ -246,7 +246,20 @@ impl Drop for ImageToolHost {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.acceptor.lock().ok().and_then(|mut slot| slot.take()) {
-            let _ = handle.join();
+            // Whose thread this runs on is not a given. The acceptor holds a
+            // strong handle for as long as it is serving a call, so if the
+            // owner lets go first, the acceptor's own drop is the last one and
+            // this runs on the acceptor thread. Joining there is a thread
+            // joining itself: `EDEADLK`, a panic inside a `Drop`, and — because
+            // the panic happens before the line below — a socket file left in
+            // the temp directory for every run that ended that way.
+            //
+            // The join is only ever a courtesy. The loop stops on its own once
+            // the weak handle stops upgrading, which the drop finishing is
+            // exactly what causes.
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
         }
         let _ = std::fs::remove_file(&self.socket_path);
     }
