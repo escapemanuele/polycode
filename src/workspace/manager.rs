@@ -40,6 +40,22 @@ pub enum PullRequestStatus {
     Unavailable(String),
 }
 
+/// What a removal does with the branch the worktree was checked out on.
+///
+/// The two callers want opposite things. Discarding a run throws the work away,
+/// so the branch goes with it. Reclaiming the worktree of a run that has
+/// already landed keeps the work and wants only the disk back — and after an
+/// apply the branch holds the only commits of that work, because apply leaves
+/// the change unstaged in the source checkout. Deleting it there would turn
+/// "give me the space back" into data loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchDisposition {
+    /// Delete the branch along with the worktree.
+    Delete,
+    /// Leave the branch standing; take only the worktree.
+    Keep,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReconciliationOutcome {
     Ready(RunWorkspace),
@@ -554,6 +570,29 @@ impl WorkspaceManager {
     /// Only completed/applied/discarded runs are eligible. Ownership mismatches
     /// become a persisted broken workspace instead of deleting foreign data.
     pub fn cleanup(&self, store: &mut SqliteStore, run_id: RunId) -> Result<(), WorkspaceError> {
+        self.remove_workspace(store, run_id, BranchDisposition::Delete)
+    }
+
+    /// Takes back the worktree of a run that no longer needs one, leaving the
+    /// branch that carries its work.
+    ///
+    /// # Errors
+    /// The same as [`Self::cleanup`]: ineligible run status, an apply under
+    /// way, or an ownership mismatch that becomes a persisted broken workspace.
+    pub fn release_worktree(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<(), WorkspaceError> {
+        self.remove_workspace(store, run_id, BranchDisposition::Keep)
+    }
+
+    fn remove_workspace(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        branch: BranchDisposition,
+    ) -> Result<(), WorkspaceError> {
         let loaded = store.load_run(run_id)?;
         if !matches!(
             loaded.run.status(),
@@ -630,6 +669,13 @@ impl WorkspaceManager {
         };
         let prior_revision = workspace.revision();
         workspace.mark_removing(removal_head, now());
+        // Recorded as part of the removal intent rather than carried in the
+        // call, because removal resumes from the store: a crash between here
+        // and the deletion leaves the workspace row as the only thing that
+        // still knows the branch was meant to survive.
+        if branch == BranchDisposition::Keep {
+            workspace.release_branch_ownership();
+        }
         store.update_workspace(&workspace, prior_revision)?;
         self.fault(FaultPoint::RemovalIntent)?;
         let workspace = store
