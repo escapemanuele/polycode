@@ -245,10 +245,23 @@ impl ImageToolHost {
 impl Drop for ImageToolHost {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.acceptor.lock().ok().and_then(|mut slot| slot.take()) {
-            let _ = handle.join();
-        }
+        // The socket goes first. Everything below can be skipped or can fail,
+        // and a host that has dropped must never leave a path other processes
+        // will still connect to.
         let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(handle) = self.acceptor.lock().ok().and_then(|mut slot| slot.take()) {
+            // The acceptor upgrades its `Weak` for as long as it serves a
+            // call, so it can be holding the last strong handle when that call
+            // ends — and this `Drop` then runs on the acceptor thread itself.
+            // Joining yourself is `EDEADLK`, which `JoinHandle::join` reports
+            // by panicking rather than by returning an error, so `let _ =`
+            // never caught it: the thread died and the socket stayed behind.
+            // The thread is already returning on its own here; there is
+            // nothing to wait for.
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
