@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use crate::domain::{NativeModelUsage, StageKind};
@@ -78,6 +80,21 @@ impl PermissionDenial {
         } else {
             !self.is_recovered_diagnostic()
         }
+    }
+
+    /// Whether this refusal is answered by the agent's own later success.
+    ///
+    /// Restricted to requests that could not themselves have changed
+    /// anything. A refused *mutation* is never excused this way: the operator
+    /// still needs to know the agent was blocked from editing, even if it
+    /// managed to write something else afterwards.
+    pub(crate) fn was_superseded(&self, superseded: &BTreeSet<String>) -> bool {
+        !self.is_mutating_tool()
+            && !self.is_question()
+            && self
+                .tool_use_id
+                .as_ref()
+                .is_some_and(|id| superseded.contains(id))
     }
 
     /// Terminal attention rule for explicit disposable native eval execution.
@@ -492,6 +509,75 @@ fn safe_cargo(arguments: &[&str]) -> bool {
         "fmt" => rest.contains(&"--check"),
         _ => false,
     }
+}
+
+/// Largest invocation log scanned for supersession evidence. Past it the
+/// scan gives up and reports nothing superseded, so an unreadably large
+/// stream asks the operator instead of guessing.
+pub(crate) const MAX_SUPERSESSION_SCAN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Native `tool_use` identifiers whose refusal the agent later worked around.
+///
+/// A refused call never ran, so the only question it leaves is whether the
+/// agent stayed blocked. This answers that from the invocation's own record:
+/// an identifier is superseded when a *later* call of the same tool, in the
+/// same invocation, returned a result that was not an error. The agent asked,
+/// was told no, tried again another way, and got through.
+///
+/// Only the tool matters, not the arguments. Recovery is precisely the case
+/// where the agent does something different — a shorter command, a different
+/// file — so demanding the same target would never match anything. What the
+/// evidence supports is narrow and stated plainly: the capability was not
+/// denied to the agent overall.
+///
+/// Callers decide what supersession excuses. It is evidence, not a policy.
+pub(crate) fn superseded_requests(raw: &str) -> BTreeSet<String> {
+    let mut calls: Vec<(String, String)> = Vec::new();
+    let mut succeeded: BTreeSet<String> = BTreeSet::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(content) = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for block in content {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if let (Some(id), Some(name)) = (
+                        block.get("id").and_then(Value::as_str),
+                        block.get("name").and_then(Value::as_str),
+                    ) {
+                        calls.push((id.to_owned(), name.to_owned()));
+                    }
+                }
+                Some("tool_result") => {
+                    let failed = block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !failed && let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                        succeeded.insert(id.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut superseded = BTreeSet::new();
+    for (index, (id, name)) in calls.iter().enumerate() {
+        if calls[index + 1..]
+            .iter()
+            .any(|(later_id, later_name)| later_name == name && succeeded.contains(later_id))
+        {
+            superseded.insert(id.clone());
+        }
+    }
+    superseded
 }
 
 fn safe_rule_value(value: &str) -> bool {
@@ -986,6 +1072,100 @@ mod tests {
                 .is_recovered_diagnostic()
         );
         assert!(bash("grep -rn \"a > b\" src").is_recovered_diagnostic());
+    }
+
+    /// The exact shape a real invocation has: an assistant message issues a
+    /// `tool_use`, a user message answers with a `tool_result`, and a refusal
+    /// is that result carrying `is_error`.
+    fn stream(events: &[(&str, &str, bool)]) -> String {
+        let mut lines = Vec::new();
+        for (id, name, ok) in events {
+            lines.push(
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "id": id, "name": name,
+                                             "input": {"command": "irrelevant"}}]}
+                })
+                .to_string(),
+            );
+            let mut result = serde_json::json!({
+                "type": "tool_result", "tool_use_id": id, "content": "output"
+            });
+            if !ok {
+                result["is_error"] = serde_json::json!(true);
+            }
+            lines.push(
+                serde_json::json!({"type": "user", "message": {"content": [result]}}).to_string(),
+            );
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn a_refusal_is_superseded_only_by_a_later_success_of_the_same_tool() {
+        // Refused, then the agent got through with a different command.
+        let recovered = superseded_requests(&stream(&[
+            ("call_1", "Bash", false),
+            ("call_2", "Bash", true),
+        ]));
+        assert!(recovered.contains("call_1"));
+        assert!(
+            !recovered.contains("call_2"),
+            "the success itself is not superseded"
+        );
+
+        // Refused and never got through: the operator still decides.
+        assert!(superseded_requests(&stream(&[("call_1", "Bash", false)])).is_empty());
+        assert!(
+            superseded_requests(&stream(&[
+                ("call_1", "Bash", false),
+                ("call_2", "Bash", false),
+            ]))
+            .is_empty(),
+            "a second refusal is not recovery"
+        );
+
+        // Order matters: an earlier success says nothing about a later refusal.
+        let backwards = superseded_requests(&stream(&[
+            ("call_1", "Bash", true),
+            ("call_2", "Bash", false),
+        ]));
+        assert!(backwards.is_empty());
+
+        // A different tool succeeding is not evidence about this one.
+        assert!(
+            superseded_requests(&stream(&[
+                ("call_1", "Bash", false),
+                ("call_2", "Read", true),
+            ]))
+            .is_empty()
+        );
+
+        // Nothing to read is not evidence of anything.
+        assert!(superseded_requests("").is_empty());
+        assert!(superseded_requests("not json\n{}\n").is_empty());
+    }
+
+    #[test]
+    fn supersession_never_excuses_a_refused_mutation_or_question() {
+        let recovered = BTreeSet::from(["call_1".to_owned()]);
+        let mut write = tool("Write", serde_json::json!({"file_path": "/x"}));
+        write.tool_use_id = Some("call_1".to_owned());
+        assert!(
+            !write.was_superseded(&recovered),
+            "a blocked edit still asks"
+        );
+
+        let mut question = tool("AskUserQuestion", serde_json::json!({}));
+        question.tool_use_id = Some("call_1".to_owned());
+        assert!(!question.was_superseded(&recovered));
+
+        let mut shell = bash("ls && python3 - <<'PY'");
+        shell.tool_use_id = Some("call_1".to_owned());
+        assert!(shell.was_superseded(&recovered));
+        // Without an identifier there is no evidence to match against.
+        shell.tool_use_id = None;
+        assert!(!shell.was_superseded(&recovered));
     }
 
     #[test]
