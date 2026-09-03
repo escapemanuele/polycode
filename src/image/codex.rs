@@ -441,9 +441,15 @@ mod tests {
         assert!(instruction.contains("size: 1024x1024"));
 
         // A codex that fails its turn is a typed rejection, not a panic.
+        //
+        // The script drains stdin before saying anything. A real codex reads
+        // its instruction; a fake one that exits without reading closes the
+        // pipe under the write still in progress, and the rejection under test
+        // arrives as `Network("codex stdin: Broken pipe")` instead. That is a
+        // race with the machine, not a behaviour — it lost only under CI load.
         std::fs::write(
             &script,
-            "#!/bin/sh\necho '{\"type\":\"thread.started\",\"thread_id\":\"t-43\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"quota\"}}'\n",
+            "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"thread.started\",\"thread_id\":\"t-43\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"quota\"}}'\n",
         )
         .unwrap();
         assert_eq!(

@@ -517,6 +517,45 @@ fn interrupt_records_evidence_leaves_no_session_and_cleanup_is_idempotent() {
     assert!(process.spec().stderr_path().exists());
 }
 
+/// The end-to-end version of the escalation the unit tests cover with a
+/// fixture: a real process, in a real tmux session, that catches every signal
+/// it is allowed to catch.
+///
+/// This is the shape that leaked. An agent forwards Ctrl-C to the test runner
+/// it launched, the runner's worker pool ignores it, and the old stop reported
+/// `InterruptTimeout` and walked away — leaving the pool holding memory for as
+/// long as the machine stayed up. Exit signal 9 is the proof that the ladder
+/// was climbed to the end rather than abandoned at the first rung.
+///
+/// Slow by nature: the real grace periods are what make the result meaningful,
+/// so this waits out SIGINT and SIGTERM before SIGKILL lands.
+#[test]
+fn a_process_that_catches_every_catchable_signal_is_still_stopped() {
+    let fixture = Fixture::new();
+    let process = fixture.prepare(&["ignore-signals"]);
+    let manager = fixture.manager();
+    let mut store = fixture.store();
+    manager.start(&mut store, process.id()).unwrap();
+    wait_for_output(&manager, &store, process.id(), OutputStream::Stdout);
+    wait_for_runtime_evidence(&process);
+
+    let stopped = manager.interrupt(&mut store, process.id()).unwrap();
+
+    assert_eq!(
+        stopped.backend_session,
+        polycode::process::BackendSessionState::Absent,
+        "the session is gone, so nothing of the process group is left"
+    );
+    assert!(
+        matches!(
+            stopped.process.exit_result(),
+            Some(ExitResult::Signal { signal: 9 })
+        ),
+        "only SIGKILL can end this child, so that is what must have ended it: {:?}",
+        stopped.process.exit_result()
+    );
+}
+
 /// Reproduces the startup window deterministically instead of racing it.
 ///
 /// The runner spawns its child before writing `runtime.json`, so between those
