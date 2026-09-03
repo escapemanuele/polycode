@@ -469,7 +469,8 @@ impl<B: ProcessBackend> ProcessManager<B> {
                 std::thread::sleep(self.poll_interval);
             }
             inspection = self.reconcile(store, process_id)?;
-            if settled(&inspection) || inspection.process.status() == ManagedProcessStatus::Missing {
+            if settled(&inspection) || inspection.process.status() == ManagedProcessStatus::Missing
+            {
                 return Ok(inspection);
             }
         }

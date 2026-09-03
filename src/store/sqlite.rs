@@ -104,9 +104,14 @@ impl SqliteStore {
     /// Returns typed filesystem, `SQLite`, or migration errors.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+        // Reads open the store afresh every time — the interface does so
+        // several times a second — and only the very first of those can find
+        // the directory missing. Creating it is a filesystem round trip, so it
+        // is asked for only when the database is not already sitting there.
+        if !path.exists()
+            && let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
         {
             std::fs::create_dir_all(parent)?;
         }
@@ -125,8 +130,19 @@ impl SqliteStore {
     fn initialize(connection: Connection) -> Result<Self, StoreError> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        // Journal mode is a property of the database file, not of this
+        // connection, and setting it takes a lock on a file other connections
+        // may be writing to. Every open after the first would be paying for a
+        // change that has already happened, so ask before telling.
+        if !journal_mode_is_wal(&connection)? {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         connection.pragma_update(None, "synchronous", "NORMAL")?;
+        // Left to itself the write-ahead log only truncates at a thousand
+        // pages, so it sat at roughly the size of the database it fronts.
+        // Checkpointing sooner keeps it to about a megabyte, which for a store
+        // this small is the whole of it.
+        connection.pragma_update(None, "wal_autocheckpoint", 256)?;
         migrations::migrate(&connection)?;
         Ok(Self { connection })
     }
@@ -487,24 +503,45 @@ impl SqliteStore {
     /// # Errors
     /// Returns corrupt JSON, non-contiguous sequence, projection, or `SQLite` errors.
     pub fn load_events(&self, run_id: RunId) -> Result<Vec<SequencedEvent>, StoreError> {
+        self.load_events_after(run_id, 0)
+    }
+
+    /// Loads the run's events after one already-seen sequence number.
+    ///
+    /// The log only ever grows, so a reader that already holds a prefix of it
+    /// can ask for the rest instead of re-reading and re-parsing the whole
+    /// history. The contiguity check continues from `after` rather than
+    /// restarting, so a gap is still a gap.
+    ///
+    /// # Errors
+    /// Returns corrupt JSON, non-contiguous sequence, projection, or `SQLite` errors.
+    pub fn load_events_after(
+        &self,
+        run_id: RunId,
+        after: u64,
+    ) -> Result<Vec<SequencedEvent>, StoreError> {
         if !run_exists(&self.connection, run_id)? {
             return Err(StoreError::RunNotFound(run_id));
         }
         let mut statement = self.connection.prepare(
             "SELECT sequence, event_id, event_type, payload_json, occurred_at
-             FROM events WHERE run_id = ?1 ORDER BY sequence",
+             FROM events WHERE run_id = ?1 AND sequence > ?2 ORDER BY sequence",
         )?;
-        let rows = statement.query_map([run_id.to_string()], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
+        let after_bound = u64_to_i64(after, "event sequence")?;
+        let rows =
+            statement.query_map(rusqlite::params![run_id.to_string(), after_bound], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
         let mut events = Vec::new();
-        let mut expected = 1_u64;
+        let mut expected = after
+            .checked_add(1)
+            .ok_or(StoreError::IntegerRange("event sequence"))?;
         for row in rows {
             let (sequence, event_id, event_type, payload_json, occurred_at) = row?;
             let sequence = i64_to_u64(sequence, "event sequence")?;
@@ -987,6 +1024,16 @@ pub(crate) fn format_timestamp(timestamp: &DateTime<Utc>) -> String {
 
 pub(crate) fn parse_timestamp(timestamp: &str) -> Result<DateTime<Utc>, StoreError> {
     Ok(DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc))
+}
+
+/// Whether the database already keeps a write-ahead log.
+///
+/// An in-memory database cannot, and says so by reporting "memory"; that is not
+/// a failure, just a database this does not apply to.
+fn journal_mode_is_wal(connection: &Connection) -> Result<bool, StoreError> {
+    let mode: String =
+        connection.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+    Ok(mode.eq_ignore_ascii_case("wal"))
 }
 
 pub(crate) fn i64_to_u64(value: i64, field: &'static str) -> Result<u64, StoreError> {
@@ -1480,6 +1527,59 @@ mod tests {
             original_events
         );
         assert_eq!(stored_events.last().unwrap().sequence, 18);
+    }
+
+    /// Reading the log in pieces has to give exactly what reading it whole
+    /// gives, because that equivalence is the only thing that makes it safe for
+    /// the drive loop to keep a prefix and fetch the rest.
+    #[test]
+    fn reading_the_event_log_in_pieces_matches_reading_it_whole() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 300, "config-tail", 4_000);
+        let whole = store.load_events(run.id()).unwrap();
+        assert!(whole.len() > 2, "the fixture needs a log worth splitting");
+
+        let split_at = whole.len() / 2;
+        let mut pieced = store.load_events_after(run.id(), 0).unwrap();
+        pieced.truncate(split_at);
+        let resumed_from = pieced.last().unwrap().sequence;
+        pieced.extend(store.load_events_after(run.id(), resumed_from).unwrap());
+
+        assert_eq!(pieced, whole);
+        assert!(
+            store
+                .load_events_after(run.id(), whole.last().unwrap().sequence)
+                .unwrap()
+                .is_empty(),
+            "a reader already at the end of the log is told there is nothing new"
+        );
+    }
+
+    /// A gap is still a gap when the read starts part-way: the contiguity check
+    /// continues from where the reader was, rather than restarting at one and
+    /// accepting whatever it finds.
+    #[test]
+    fn a_gap_after_the_resume_point_is_still_refused() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (run, _, _) = create_complex(&mut store, 301, "config-gap", 5_000);
+        let whole = store.load_events(run.id()).unwrap();
+        let removed = whole[whole.len() / 2].sequence;
+        store
+            .connection
+            .execute(
+                "DELETE FROM events WHERE run_id = ?1 AND sequence = ?2",
+                rusqlite::params![run.id().to_string(), u64_to_i64(removed, "seq").unwrap()],
+            )
+            .unwrap();
+
+        let error = store
+            .load_events_after(run.id(), removed - 1)
+            .expect_err("a hole in the log is not a shorter log");
+
+        assert!(
+            matches!(error, StoreError::EventSequenceGap { expected, .. } if expected == removed),
+            "{error:?}"
+        );
     }
 
     #[test]

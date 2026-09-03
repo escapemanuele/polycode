@@ -80,12 +80,36 @@ impl TuiApp {
             terminal
                 .terminal_mut()
                 .draw(|frame| render::render(frame, &self.state))?;
-            if event::poll(EVENT_POLL)? {
+            if event::poll(self.idle_for())? {
                 self.handle_event(event::read()?);
             }
         }
         self.shut_down(terminal);
         Ok(())
+    }
+
+    /// How long to wait for input before drawing again.
+    ///
+    /// Every redraw used to cost a full frame at ten a second, whether or not
+    /// anything on screen could have changed. Nothing here changes on its own
+    /// except on a schedule this loop owns — the half-second data refresh and,
+    /// while something is animating, the quarter-second animation tick — so the
+    /// wait runs to whichever of those comes first. Input is never delayed by
+    /// it: a keypress ends the wait early.
+    ///
+    /// A still surface therefore idles at the refresh rate rather than at the
+    /// input-poll rate, and an animated one draws exactly the frames the
+    /// animation has.
+    fn idle_for(&self) -> Duration {
+        let until_refresh = REFRESH_INTERVAL.saturating_sub(self.last_refresh.elapsed());
+        let wait = if self.state.motion_frame().is_animating() {
+            until_refresh.min(motion::TICK)
+        } else {
+            until_refresh
+        };
+        // Never busy-spin, and never wait so long that a resize or keypress
+        // feels laggy on a surface with no clock of its own.
+        wait.clamp(EVENT_POLL, REFRESH_INTERVAL)
     }
 
     /// Stops what this session started before the session goes away.

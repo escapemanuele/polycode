@@ -47,7 +47,7 @@ use super::state::{Overlay, Screen};
 /// prop-resting tick, so a blink changes POD's eyes and nothing else. Tick 0
 /// is the resting art: a surface that never asks the clock and a surface at
 /// the top of the loop draw exactly the same thing.
-const TICK: Duration = Duration::from_millis(250);
+pub(crate) const TICK: Duration = Duration::from_millis(250);
 const CYCLE_TICKS: u128 = 8;
 const BLINK_TICK: u8 = 5;
 
@@ -243,6 +243,15 @@ impl MotionFrame {
     /// says something happened rather than repeating itself forever.
     pub(crate) fn is_reacting(self) -> bool {
         self.reacting && self.allowance.allows_transitions()
+    }
+
+    /// Whether this frame has a clock of its own, and so whether the loop
+    /// drawing it has any reason to come back before its next data refresh.
+    ///
+    /// A surface that may not move looks the same on every tick, so redrawing
+    /// it at the animation rate spends a frame to produce an identical one.
+    pub(crate) fn is_animating(self) -> bool {
+        self.allowance.allows_active_state() || self.is_reacting()
     }
 }
 

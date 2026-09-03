@@ -9,9 +9,7 @@ mod model;
 mod runner;
 mod tmux;
 
-pub use backend::{
-    BackendAvailability, BackendSessionState, ProcessBackend, TerminationSignal,
-};
+pub use backend::{BackendAvailability, BackendSessionState, ProcessBackend, TerminationSignal};
 pub use error::ProcessError;
 pub use ids::{BackendSessionId, ManagedProcessId};
 pub use manager::ProcessManager;

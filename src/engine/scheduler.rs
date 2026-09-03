@@ -58,6 +58,25 @@ pub enum EngineStatus {
     },
 }
 
+/// The run's event log as this engine has read it so far.
+///
+/// One drive is a loop of ticks, and every tick that polls a stage needs the
+/// log to rebuild that stage's provider checkpoint. Re-reading and re-parsing
+/// the whole history each time made a drive quadratic in the events it was
+/// itself appending. The log is append-only and, for the length of one drive,
+/// this engine is the only thing writing to it, so the prefix already read
+/// stays true and only the tail has to be fetched.
+struct EventLog {
+    run_id: RunId,
+    events: Vec<SequencedEvent>,
+}
+
+impl EventLog {
+    fn last_sequence(&self) -> u64 {
+        self.events.last().map_or(0, |event| event.sequence)
+    }
+}
+
 /// Deterministic synchronous DAG scheduler for one resolved provider.
 pub struct WorkflowEngine<P, C = SystemExecutionContext> {
     provider: P,
@@ -65,6 +84,7 @@ pub struct WorkflowEngine<P, C = SystemExecutionContext> {
     context: C,
     drive_limit: usize,
     observe_only: bool,
+    events: Option<EventLog>,
 }
 
 impl<P> WorkflowEngine<P, SystemExecutionContext>
@@ -90,7 +110,29 @@ where
             context,
             drive_limit: DEFAULT_DRIVE_LIMIT,
             observe_only: false,
+            events: None,
         }
+    }
+
+    /// The run's events, reading only what this engine has not already seen.
+    fn events(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<&[SequencedEvent], EngineError> {
+        let log = match self.events.take() {
+            Some(log) if log.run_id == run_id => log,
+            // A different run means a different log, and no prefix worth
+            // keeping.
+            _ => EventLog {
+                run_id,
+                events: Vec::new(),
+            },
+        };
+        let mut log = log;
+        let tail = store.load_events_after(run_id, log.last_sequence())?;
+        log.events.extend(tail);
+        Ok(&self.events.insert(log).events)
     }
 
     /// Drives without ever starting or resuming provider work.
@@ -587,8 +629,7 @@ where
         workspace: &RunWorkspace,
         stage_id: &StageId,
     ) -> Result<EngineStatus, EngineError> {
-        let events = store.load_events(loaded.run.id())?;
-        let checkpoint = reduce_checkpoint(&events, stage_id)?;
+        let checkpoint = reduce_checkpoint(self.events(store, loaded.run.id())?, stage_id)?;
         let stage = loaded
             .run
             .stage(stage_id)
