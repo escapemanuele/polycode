@@ -9,7 +9,7 @@ Keep every native provider invocation alive and observable even when the Polycod
 - exec-bridge: `__exec-process` resets tmux's ignored SIGINT to default and then `exec`s the provider, so Ctrl-C works on macOS and Linux.
 - cursors: SQLite owns acknowledged byte offsets per stream; reads never advance them.
 - reconciliation: process status derived from owned session, runtime and exit evidence (`Running`, `Exited`, `Interrupted`, `Missing`, `Broken`, `Cleaned`).
-- interrupt: `stop` validates ownership, pane PID, fingerprint and process group, then sends SIGINT.
+- interrupt: `stop` validates ownership, pane PID, fingerprint and process group, then climbs a termination ladder over the group — SIGINT for 5s, SIGTERM for 3s, SIGKILL for 1s — stopping at the first rung that settles the process.
 
 ## How to get to it (user POV)
 You do not call this directly. Every native stage goes through it. What you see: `process=` in `polycode status`, raw log tails in the TUI (`l`), and the fact that quitting the TUI leaves the provider running. `polycode doctor` reports whether tmux is available.
@@ -44,5 +44,6 @@ TUI: `l` on run detail opens the bounded raw log tail (read-only, no cursor ackn
 - Foreign tmux sessions with colliding names are neither reused nor killed; ownership needs both env markers to match persisted identity.
 - Corrupt pre-existing exit evidence blocks launch and marks the process `Broken`.
 - Cleanup retains all process files; `stop` interrupts only and never cleans, because recovery needs the records.
+- Ctrl-C alone is not a stop. Agent CLIs forward it, but worker pools they spawn (Jest, Vitest) ignore it or outlast any usable wait, so a stop that ended at SIGINT left the pool holding the machine. `InterruptTimeout` now means the whole ladder including SIGKILL was climbed, not that a child declined to listen.
 - Secrets never enter argv, tmux environment, manifest, SQLite or durable files; if a provider needs a credential variable that is not on the allowlist, it still arrives via the socket, once.
 - Everything here is unix-only (`ProcessError::UnsupportedPlatform` elsewhere).

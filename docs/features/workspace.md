@@ -10,6 +10,7 @@ Every run works in its own Git worktree; the source checkout changes only when y
 - pr: commit the delta on the run's branch, push to `origin`, open a PR through `gh`; source checkout untouched.
 - pr-draft: the PR title and description are quoted from the `## Pull request` section of the latest editing stage's artifact (Implementation, Simplification, Fix, FollowUp); the task's first line and text stand in when no stage wrote one.
 - discard: record `Discarded`, then remove owned worktree and branch.
+- reclaim: applying removes the worktree and keeps the branch, because an applied run can be neither applied again nor fixed. A sweep at TUI startup does the same for `Applied` and `Discarded` runs that still hold one. `Completed` runs are never swept — apply, fix and continue all read their worktree.
 - diff-preview: the same delta apply would move, read-only (`d` in the TUI).
 - reconciliation: persisted workspace intent is validated against Git evidence before any lifecycle command.
 
@@ -46,5 +47,6 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, 
 - After `pr` the run stays `Completed`, so apply, fix and discard remain available; publishing again after a fix updates the same branch and PR. The PR body is only written on creation: a fix's fresh draft changes the commit subject but not an already-open PR's text.
 - The drafted title is cut at 72 characters; a corrupt latest editing artifact fails the publish (artifact integrity fails closed) rather than silently publishing from the task.
 - Discard commits the logical disposition before cleanup; cleanup is idempotent and retains process files. Branch deletion needs persisted ownership and an unchanged tip, otherwise the workspace turns `Broken` and the branch is kept.
+- Reclaiming after apply keeps the branch because apply leaves its change unstaged in the source checkout — the branch holds the only commits of that work. The disposition is persisted with the removal intent (ownership is released before `Removing`), so a crash mid-removal still resumes without deleting the branch.
 - `Broken` workspace status (moved repo, foreign path, branch collision) blocks execution; Polycode never guesses or deletes foreign data.
 - Ordinary run commits and cleanup are rejected while an apply intent is `Prepared` or `AppliedToSource`.
