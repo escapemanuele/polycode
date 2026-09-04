@@ -141,6 +141,50 @@ pub(crate) fn plan_for(
         ))
 }
 
+/// The one thing a configured command may ask Polycode to fill in.
+///
+/// Commands are argv, not shell, so there is no `$VAR` to expand and no way
+/// for a repository to name the commit its worktree was cut from — which is
+/// exactly what a test runner needs to check the change rather than the whole
+/// tree (`yarn test-client --changedSince={base_commit}`, `cargo test
+/// --since {base_commit}`). One substitution keeps that reachable without
+/// reintroducing a shell.
+pub(crate) const BASE_COMMIT_PLACEHOLDER: &str = "{base_commit}";
+
+/// Fills [`BASE_COMMIT_PLACEHOLDER`] in with the run's base commit.
+///
+/// Substituting before the runner splits on whitespace is safe: a commit ID
+/// is hexadecimal, so it can never introduce a word boundary and turn one
+/// argument into two.
+///
+/// # Errors
+/// A command asks for the base commit on a run that has none recorded.
+/// Running it with the placeholder left in would send the literal text
+/// `{base_commit}` to the test runner, which either errors confusingly or —
+/// worse — is read as a revision name and silently checks the wrong thing.
+pub(crate) fn resolve_placeholders(
+    commands: &[String],
+    base_commit: Option<&str>,
+) -> Result<Vec<String>, VerifyError> {
+    commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            if !command.contains(BASE_COMMIT_PLACEHOLDER) {
+                return Ok(command.clone());
+            }
+            let base_commit = base_commit.ok_or_else(|| {
+                VerifyError::Config(format!(
+                    "{CONFIG_FILE}: [verify] command {} uses {BASE_COMMIT_PLACEHOLDER}, \
+                     but this run has no recorded base commit",
+                    index + 1
+                ))
+            })?;
+            Ok(command.replace(BASE_COMMIT_PLACEHOLDER, base_commit))
+        })
+        .collect()
+}
+
 /// Whether the command a matched build file implies is worth running.
 ///
 /// Only `package.json` is inspected. The other markers imply a command that
@@ -329,6 +373,50 @@ mod tests {
         assert_eq!(plan.commands, ["npm test"]);
         assert_eq!(plan.source, CommandSource::Detected("package.json"));
         assert_eq!(plan.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn the_base_commit_placeholder_is_filled_in_before_the_command_runs() {
+        let commands = vec![
+            "yarn test-client --changedSince={base_commit}".to_owned(),
+            "cargo test".to_owned(),
+        ];
+
+        let resolved = resolve_placeholders(&commands, Some("0".repeat(40).as_str())).unwrap();
+
+        assert_eq!(
+            resolved,
+            [
+                format!("yarn test-client --changedSince={}", "0".repeat(40)),
+                "cargo test".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_placeholder_with_no_base_commit_is_a_configuration_error() {
+        // Left in, the literal `{base_commit}` reaches the test runner, which
+        // either errors confusingly or reads it as a revision and checks the
+        // wrong thing. Neither is something to discover from a green stage.
+        let commands = vec!["yarn test-client --changedSince={base_commit}".to_owned()];
+
+        let error = resolve_placeholders(&commands, None).unwrap_err();
+
+        assert!(
+            matches!(&error, VerifyError::Config(message)
+                if message.contains("command 1") && message.contains(BASE_COMMIT_PLACEHOLDER)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn commands_without_the_placeholder_never_need_a_base_commit() {
+        let commands = vec!["cargo test".to_owned()];
+
+        assert_eq!(
+            resolve_placeholders(&commands, None).unwrap(),
+            ["cargo test"]
+        );
     }
 
     #[test]

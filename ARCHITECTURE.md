@@ -579,6 +579,7 @@ src/
 │   ├── manager.rs    intent/effect/finalize orchestration
 │   ├── model.rs      workspace and apply-operation records
 │   ├── github.rs     minimal GitHub CLI (`gh`) boundary for opening pull requests
+│   ├── setup.rs      `[setup]` commands run in a new worktree before it is ready
 │   └── error.rs      typed lifecycle/reconciliation failures
 ├── update/
 │   ├── mod.rs        update discovery for official releases

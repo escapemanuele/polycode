@@ -6,6 +6,7 @@ mod github;
 mod manager;
 mod model;
 mod pull_request;
+mod setup;
 
 pub use error::WorkspaceError;
 pub use github::{GhClient, PullRequestReach, PullRequestRef};
