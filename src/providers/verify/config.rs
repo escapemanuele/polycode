@@ -44,8 +44,31 @@ pub(crate) enum CommandSource {
     ConfigFile(ConfigOrigin),
     /// A build file Polycode recognises; carries the file that matched.
     Detected(&'static str),
+    /// A build file matched, but the command it implies was refused because
+    /// it would not have said anything about the change; carries the file
+    /// and why, so the artifact can tell the reader what to configure.
+    Declined {
+        marker: &'static str,
+        reason: DeclineReason,
+    },
     /// Neither a table nor a recognised build file.
     Nothing,
+}
+
+/// Why a build file's implied command was not worth running.
+///
+/// Both cases are the same judgement: a guess that cannot come back green on
+/// an unchanged tree is worse than checking nothing, because the stage then
+/// reports a failure no change caused and a fix cycle gets spent on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclineReason {
+    /// A workspaces root. `npm test` there runs the whole monorepo — every
+    /// package, for any change — which is slow and, in a repository of any
+    /// size, usually already failing for reasons of its own.
+    Workspaces,
+    /// No `test` script, so `npm test` would exit non-zero on the missing
+    /// script alone and fail the stage without running anything.
+    NoTestScript,
 }
 
 /// The commands one verification pass will run, in order, and its limits.
@@ -103,12 +126,59 @@ pub(crate) fn plan_for(
                 timeout: DEFAULT_TIMEOUT,
                 source: CommandSource::Nothing,
             },
-            |(marker, command)| VerifyPlan {
-                commands: vec![(*command).to_owned()],
-                timeout: DEFAULT_TIMEOUT,
-                source: CommandSource::Detected(marker),
+            |(marker, command)| match decline_reason(worktree, marker) {
+                Some(reason) => VerifyPlan {
+                    commands: Vec::new(),
+                    timeout: DEFAULT_TIMEOUT,
+                    source: CommandSource::Declined { marker, reason },
+                },
+                None => VerifyPlan {
+                    commands: vec![(*command).to_owned()],
+                    timeout: DEFAULT_TIMEOUT,
+                    source: CommandSource::Detected(marker),
+                },
             },
         ))
+}
+
+/// Whether the command a matched build file implies is worth running.
+///
+/// Only `package.json` is inspected. The other markers imply a command that
+/// is right for a workspace root as well as a single crate or module —
+/// `cargo test` and `go test ./...` mean "this workspace" and are meant to be
+/// run there — whereas `npm test` means "whatever the root `test` script
+/// says", which in a monorepo is every package at once and in many
+/// repositories is nothing at all.
+///
+/// A `package.json` that cannot be read or parsed falls through to the guess.
+/// It is someone else's file, not Polycode's configuration, so a surprise in
+/// it must not decide the stage; `.polycode.toml` is the file whose being
+/// broken is a finding.
+fn decline_reason(worktree: &Path, marker: &str) -> Option<DeclineReason> {
+    if marker != "package.json" {
+        return None;
+    }
+    let text = std::fs::read_to_string(worktree.join(marker)).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // Both array form (`["packages/*"]`) and the object form npm and Bun
+    // accept (`{ "packages": [...] }`) mark a workspaces root.
+    let workspaces = match manifest.get("workspaces") {
+        Some(serde_json::Value::Array(globs)) => !globs.is_empty(),
+        Some(serde_json::Value::Object(table)) => table
+            .get("packages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|globs| !globs.is_empty()),
+        _ => false,
+    };
+    if workspaces {
+        return Some(DeclineReason::Workspaces);
+    }
+    let has_test_script = manifest
+        .get("scripts")
+        .and_then(|scripts| scripts.get("test"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|script| !script.trim().is_empty());
+    (!has_test_script).then_some(DeclineReason::NoTestScript)
 }
 
 fn plan_from_table(table: VerifyTable, origin: ConfigOrigin) -> Result<VerifyPlan, VerifyError> {
@@ -168,8 +238,16 @@ mod tests {
     fn the_source_repository_configures_a_repository_polycode_cannot_commit_to() {
         let dir = worktree();
         let source = worktree();
-        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
-        std::fs::write(source.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"scripts\":{\"test\":\"jest\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join("package.json"),
+            "{\"scripts\":{\"test\":\"jest\"}}\n",
+        )
+        .unwrap();
         std::fs::write(
             source.path().join(CONFIG_FILE),
             "[verify]\ncommands = [\"yarn test-client client/dashboard\"]\n",
@@ -215,7 +293,11 @@ mod tests {
     fn a_worktree_file_without_a_verify_table_does_not_reach_past_itself() {
         let dir = worktree();
         let source = worktree();
-        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"scripts\":{\"test\":\"jest\"}}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join(CONFIG_FILE), "[permissions]\nallow = []\n").unwrap();
         std::fs::write(
             source.path().join(CONFIG_FILE),
@@ -235,7 +317,11 @@ mod tests {
     #[test]
     fn a_config_file_without_a_verify_table_falls_back_to_detection() {
         let dir = worktree();
-        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"scripts\":{\"test\":\"jest\"}}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join(CONFIG_FILE), "[other]\nkey = 1\n").unwrap();
 
         let plan = plan_for(dir.path(), None).unwrap();
@@ -243,6 +329,122 @@ mod tests {
         assert_eq!(plan.commands, ["npm test"]);
         assert_eq!(plan.source, CommandSource::Detected("package.json"));
         assert_eq!(plan.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn a_workspaces_root_is_not_guessed_at() {
+        for manifest in [
+            r#"{"workspaces":["packages/*"]}"#,
+            r#"{"workspaces":{"packages":["packages/*"]}}"#,
+            // A test script does not rescue it: the root script is what runs
+            // the whole monorepo in the first place.
+            r#"{"workspaces":["packages/*"],"scripts":{"test":"jest"}}"#,
+        ] {
+            let dir = worktree();
+            std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+
+            let plan = plan_for(dir.path(), None).unwrap();
+
+            assert!(plan.commands.is_empty(), "{manifest}");
+            assert_eq!(
+                plan.source,
+                CommandSource::Declined {
+                    marker: "package.json",
+                    reason: DeclineReason::Workspaces,
+                },
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_without_a_test_script_is_not_guessed_at() {
+        for manifest in [
+            r#"{"name":"x"}"#,
+            r#"{"scripts":{"build":"tsc"}}"#,
+            r#"{"scripts":{"test":"   "}}"#,
+        ] {
+            let dir = worktree();
+            std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+
+            let plan = plan_for(dir.path(), None).unwrap();
+
+            assert!(plan.commands.is_empty(), "{manifest}");
+            assert_eq!(
+                plan.source,
+                CommandSource::Declined {
+                    marker: "package.json",
+                    reason: DeclineReason::NoTestScript,
+                },
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_package_with_a_test_script_still_runs_npm_test() {
+        let dir = worktree();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"jest"}}"#,
+        )
+        .unwrap();
+
+        let plan = plan_for(dir.path(), None).unwrap();
+
+        assert_eq!(plan.commands, ["npm test"]);
+        assert_eq!(plan.source, CommandSource::Detected("package.json"));
+    }
+
+    #[test]
+    fn an_unreadable_package_json_falls_through_to_the_guess() {
+        // Someone else's manifest is not Polycode's configuration: a surprise
+        // in it must not decide the stage the way a broken `.polycode.toml`
+        // does.
+        let dir = worktree();
+        std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
+
+        let plan = plan_for(dir.path(), None).unwrap();
+
+        assert_eq!(plan.commands, ["npm test"]);
+        assert_eq!(plan.source, CommandSource::Detected("package.json"));
+    }
+
+    #[test]
+    fn a_verify_table_still_wins_over_a_declined_build_file() {
+        let dir = worktree();
+        std::fs::write(dir.path().join("package.json"), r#"{"workspaces":["p/*"]}"#).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "[verify]\ncommands = [\"yarn build-packages\"]\n",
+        )
+        .unwrap();
+
+        let plan = plan_for(dir.path(), None).unwrap();
+
+        assert_eq!(plan.commands, ["yarn build-packages"]);
+        assert_eq!(
+            plan.source,
+            CommandSource::ConfigFile(ConfigOrigin::Worktree)
+        );
+    }
+
+    #[test]
+    fn only_package_json_is_second_guessed() {
+        // `cargo test` and `go test ./...` mean "this workspace" and are the
+        // right command at a workspace root, so a Cargo workspace keeps its
+        // guess.
+        let dir = worktree();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\"]\n",
+        )
+        .unwrap();
+
+        let plan = plan_for(dir.path(), None).unwrap();
+
+        assert_eq!(plan.commands, ["cargo test"]);
+        assert_eq!(plan.source, CommandSource::Detected("Cargo.toml"));
     }
 
     #[test]

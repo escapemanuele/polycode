@@ -16,7 +16,7 @@ use crate::engine::ProviderRequest;
 use crate::providers::ArtifactRecord;
 
 use super::VerifyError;
-use super::config::{CONFIG_FILE, CommandSource, VerifyPlan};
+use super::config::{CONFIG_FILE, CommandSource, DeclineReason, VerifyPlan};
 use super::runner::{CommandExit, CommandReport};
 
 /// Lines kept from the end of each stream. A failing test suite says what
@@ -127,8 +127,29 @@ fn source_line(plan: Option<&VerifyPlan>) -> String {
             format!("`{CONFIG_FILE}` `[verify]` table ({})", origin.as_str())
         }
         Some(CommandSource::Detected(marker)) => format!("auto-detected from `{marker}`"),
+        Some(CommandSource::Declined { marker, reason }) => format!(
+            "nothing: `{marker}` was found but the command it implies was not run — {}. \
+             Add a `[verify]` table to `{CONFIG_FILE}` naming the commands this repository \
+             should be checked with.",
+            decline_sentence(*reason)
+        ),
         Some(CommandSource::Nothing) => {
             format!("nothing: no `[verify]` table in `{CONFIG_FILE}` and no recognised build file")
+        }
+    }
+}
+
+/// The half-sentence naming why a detected command was refused, written so
+/// the `## Source` line reads as one sentence a reader can act on.
+fn decline_sentence(reason: DeclineReason) -> &'static str {
+    match reason {
+        DeclineReason::Workspaces => {
+            "this is a workspaces root, so `npm test` runs every package in the monorepo \
+             rather than anything about this change"
+        }
+        DeclineReason::NoTestScript => {
+            "it declares no `test` script, so `npm test` would fail on the missing script \
+             without running a check"
         }
     }
 }

@@ -121,7 +121,9 @@ timeout_seconds = 1800
 
 The file is read from the run's worktree first, so a change the run itself makes to it is what gets verified, and from the source repository the worktree was cut from second. That second place is how you configure a repository you cannot commit to: an untracked `.polycode.toml` beside your own checkout applies to every run of it without touching a tracked file. The artifact names which of the two answered.
 
-Without that table Polycode runs the one command the build file implies (`Cargo.toml` → `cargo test`, `package.json` → `npm test`, `pyproject.toml`/`pytest.ini` → `pytest`, `go.mod` → `go test ./...`), and with no recognised build file it completes having checked nothing and says so. Commands are argv, not shell — no pipes or `&&` — and the sequence stops at the first failure.
+Without that table Polycode runs the one command the build file implies (`Cargo.toml` → `cargo test`, `package.json` → `npm test`, `pyproject.toml`/`pytest.ini` → `pytest`, `go.mod` → `go test ./...`), and with no recognised build file it completes having checked nothing and says so.
+
+Two `package.json` shapes get no guess at all: a workspaces root, where `npm test` runs every package in the monorepo rather than anything about the change, and a manifest with no `test` script, where `npm test` fails on the missing script alone. Both complete having checked nothing, and the artifact names the file and says to add a `[verify]` table — a fifteen-minute red that no change caused is worse than an honest nothing. Commands are argv, not shell — no pipes or `&&` — and the sequence stops at the first failure.
 
 ## Local control room
 

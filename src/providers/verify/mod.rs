@@ -511,6 +511,35 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfigured_monorepo_completes_the_stage_instead_of_running_the_whole_suite() {
+        let mut harness = Harness::new();
+        std::fs::write(
+            harness.worktree.join("package.json"),
+            r#"{"workspaces":["packages/*"],"scripts":{"test":"run-s test-client test-server"}}"#,
+        )
+        .unwrap();
+
+        // Completed, not Failed: an unconfigured repository must not be left
+        // unable to apply. The artifact is where the reader learns why.
+        assert_eq!(harness.run(), ProviderSignal::Completed);
+
+        let artifact = harness.artifact();
+        assert!(
+            artifact
+                .contains("## Bottom line\nnothing checked — no commands configured or detected\n")
+        );
+        assert!(artifact.contains("workspaces root"), "{artifact}");
+        assert!(artifact.contains("Add a `[verify]` table"), "{artifact}");
+        assert!(!artifact.contains("### $ npm test"), "{artifact}");
+        assert_eq!(
+            harness.store.list_artifacts(run_id()).unwrap()[0]
+                .metadata()
+                .status(),
+            crate::domain::ArtifactStatus::Complete
+        );
+    }
+
+    #[test]
     fn malformed_configuration_fails_the_stage_with_the_parse_error() {
         let mut harness = Harness::new();
         harness.config("[verify]\ncommands = \"not a list\"\n");
