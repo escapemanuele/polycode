@@ -4,7 +4,7 @@ Know where Polycode keeps its state and which environment variables change its p
 
 ## Sub-features
 - config-path: `$POLYCODE_CONFIG_DIR/config.toml`, else `$XDG_CONFIG_HOME/polycode/config.toml`, else `$HOME/.config/polycode/config.toml`; resolved, printed by `doctor`, but never read or created.
-- repo-config: `<repo>/.polycode.toml`, read from the run's worktree, else from the source repository the worktree was cut from; its `[verify]` table (`commands`, `timeout_seconds`) by the Verify stage (see verification.md) and its `[permissions]` table (`allow`) by the Claude adapter (see providers.md).
+- repo-config: `<repo>/.polycode.toml`, read from the run's worktree, else from the source repository the worktree was cut from; its `[verify]` table (`commands`, `timeout_seconds`) by the Verify stage (see verification.md), its `[setup]` table (`commands`, `timeout_seconds`) by workspace preparation (see workspace.md), and its `[permissions]` table (`allow`) by the Claude adapter (see providers.md).
 - data-dir: `POLYCODE_DATA_DIR` relocates the SQLite database (`polycode.db`), managed worktrees (`worktrees/`), process data (`runs/<run-id>/processes/`), artifacts, `update.json` and `install.json`. Default `~/.polycode`.
 - appearance: `NO_COLOR`, `POLYCODE_THEME` (`vivid` or default `native`), `POLYCODE_MOTION` (`off`, `reduced`, default), `COLORTERM` (read only to decide whether `vivid` can render).
 - update-kill-switch: `POLYCODE_DISABLE_UPDATE_CHECK=1` stops every network check, typed or automatic.
@@ -25,6 +25,10 @@ RUST_LOG=polycode=debug cargo run -- doctor
 ```
 `<repo>/.polycode.toml`:
 ```toml
+[setup]
+commands = ["yarn build-packages"]
+timeout_seconds = 3600
+
 [verify]
 commands = ["cargo fmt --check", "cargo clippy --all-targets", "cargo test"]
 timeout_seconds = 1800
@@ -48,7 +52,7 @@ allow = ["Bash(yarn jest:*)", "Bash(yarn lint:css:*)", "mcp__linear-server"]
 
 ## Gotchas
 - Path resolution is side-effect free; opening the store creates the directory and database and applies migrations. `runs` and `doctor` never create a missing database.
-- `<repo>/.polycode.toml` has two readers and they are independent: the Verify stage reads `[verify]`, the Claude adapter reads `[permissions]`. Each tolerates the other's table and rejects unknown keys inside its own, so a misspelt key fails rather than silently doing nothing. The user config file is still never read.
+- `<repo>/.polycode.toml` has three readers and they are independent: the Verify stage reads `[verify]`, workspace preparation reads `[setup]`, the Claude adapter reads `[permissions]`. Each tolerates the others' tables and rejects unknown keys inside its own, so a misspelt key fails rather than silently doing nothing. The user config file is still never read.
 - Both readers resolve to one file, never a merge of two: the worktree's `.polycode.toml` if it exists, otherwise the source repository's. A worktree file carrying only one of the tables therefore hides the source repository's other table as well — keep both tables in whichever file answers.
 - An empty `NO_COLOR` is not a request for mono; only present-and-non-empty counts. `TERM=dumb` behaves like `NO_COLOR`.
 - `vivid` on a terminal without truecolor falls back to the named ANSI palette; `NO_COLOR` outranks it.

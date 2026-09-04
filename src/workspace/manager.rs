@@ -17,6 +17,7 @@ use crate::store::{RunInput, RunRevision, SqliteStore, worktree_root};
 use super::branch_name;
 use super::github::GhClient;
 use super::pull_request::PullRequestDraft;
+use super::setup;
 use super::{
     ApplyStatus, RunApplyOperation, RunWorkspace, WorkspaceError, WorkspaceMode, WorkspaceStatus,
 };
@@ -156,6 +157,12 @@ impl WorkspaceManager {
         self.create_intended_worktree(&repository, &workspace)?;
         self.fault(FaultPoint::WorktreeCreated)?;
         self.validate_workspace(&workspace, true)?;
+        // Before the workspace is ready, so no stage ever sees a tree the
+        // repository considers half-built. Synchronous like verification and
+        // for the same reason: a cold build interrupted halfway would need
+        // its own supervision, and this one has to finish before anything
+        // downstream is worth starting.
+        setup::run_for(workspace.worktree_path(), workspace.source_repo_path())?;
 
         let ready_time = next_time(&run);
         workspace.mark_ready(ready_time);
@@ -1331,6 +1338,14 @@ mod tests {
         fn complete(&mut self) {
             complete_run(&mut self.store, self.run_id);
         }
+
+        /// Attempts preparation and hands back the error, for the cases
+        /// where refusing to prepare is the behaviour under test.
+        fn prepare_err(&mut self) -> WorkspaceError {
+            self.manager()
+                .prepare_run_workspace(&mut self.store, self.run_id, &self.source)
+                .expect_err("preparation should have failed")
+        }
     }
 
     /// Everything the operator can see of their own checkout: every file in
@@ -1371,6 +1386,55 @@ mod tests {
     /// hazard is a long-running run beside someone editing the same
     /// checkout — the operator is left mid-edit here on purpose, with both
     /// an untracked file and a modified tracked one.
+    #[test]
+    fn setup_commands_run_before_the_workspace_is_handed_over() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        // Untracked in the source checkout, so it cannot reach the worktree
+        // through git — which is the point: the build output a worktree
+        // lacks is configured from the checkout the user owns.
+        fs::write(
+            fixture.source.join(".polycode.toml"),
+            "[setup]\ncommands = [\"touch built-artifact\"]\n",
+        )
+        .unwrap();
+
+        let workspace = fixture.prepare();
+
+        assert!(
+            workspace.worktree_path().join("built-artifact").is_file(),
+            "setup must have run in the worktree before it was ready"
+        );
+        assert_eq!(workspace.status(), WorkspaceStatus::Ready);
+    }
+
+    #[test]
+    fn a_failing_setup_command_refuses_the_workspace_instead_of_handing_over_a_half_built_tree() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        fs::write(
+            fixture.source.join(".polycode.toml"),
+            "[setup]\ncommands = [\"ls /no-such-polycode-setup-path\"]\n",
+        )
+        .unwrap();
+
+        let error = fixture.prepare_err();
+
+        assert!(
+            matches!(&error, WorkspaceError::SetupFailed { command, .. }
+                if command == "ls /no-such-polycode-setup-path"),
+            "{error}"
+        );
+        // The run never reaches Ready, so no stage is dispatched into a tree
+        // the repository itself says is not usable.
+        assert_ne!(
+            fixture
+                .store
+                .load_workspace(fixture.run_id)
+                .unwrap()
+                .map(|workspace| workspace.status()),
+            Some(WorkspaceStatus::Ready)
+        );
+    }
+
     #[test]
     fn a_run_leaves_the_operators_checkout_exactly_as_it_found_it() {
         let mut fixture = Fixture::new(WorkflowKind::Standard);

@@ -5,6 +5,7 @@ Every run works in its own Git worktree; the source checkout changes only when y
 ## Sub-features
 - worktree: `~/.polycode/worktrees/<sanitized-repo>-<common-dir-hash>/<run-id>` from the committed `HEAD` at creation (the base commit).
 - modes: implementation workflows own a `polycode/<slug>-<id-tail>` branch — `<slug>` is the issue key from a Linear or GitHub URL or bare `KEY-123` in the task (`dotcom-17972`), else the task's first words; `<id-tail>` is the last 6 characters of the run id, and a run without input falls back to `polycode/run-<run-id>`; review workflows use a detached worktree.
+- setup: the `[setup]` table of `.polycode.toml` (`commands`, `timeout_seconds`, default 3600 s), found worktree-then-source-repository like every other table, runs in the new worktree after validation and before the workspace is marked `Ready` — so no stage ever sees a tree whose gitignored build output is missing. Argv, no shell, stops at the first failure. A failing command raises `SetupFailed` carrying the command, why it failed, and the last 20 lines of each stream; a table that cannot be read raises `SetupConfig`. Preparation fails in both cases and the workspace never reaches `Ready`. Repositories with no `[setup]` table are unaffected.
 - apply: patch transfer from base commit to a clean source checkout; no staging, no commit.
 - verification-gate: `apply` and `pr` refuse unless the run's latest Verify stage — the last one in the graph, since every fix or continue cycle appends its own — is `Completed` (`verification did not pass: stage verify is failed`). Older verify stages do not count: a failed `verify` answered by a passed `verify_1` no longer blocks. Checked before the run-status check.
 - pr: commit the delta on the run's branch, push to `origin`, open a PR through `gh`; source checkout untouched.
@@ -28,7 +29,8 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, 
 
 ## Where it lives
 - `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`, `ensure_verification_passed`.
-- `src/workspace/error.rs` — `WorkspaceError`, incl. `VerificationNotPassed`.
+- `src/workspace/error.rs` — `WorkspaceError`, incl. `VerificationNotPassed`, `SetupConfig`, `SetupFailed`.
+- `src/workspace/setup.rs` — the `[setup]` table reader and its runner, called from `prepare_run_workspace` before the workspace is marked ready.
 - `src/workspace/model.rs` — `RunWorkspace`, `WorkspaceStatus`, apply operation records.
 - `src/workspace/github.rs` — `gh pr list --head` / `gh pr create` boundary.
 - `src/workspace/pull_request.rs` — `PullRequestDraft`, `extract` of the artifact's `## Pull request` section; `src/app/query.rs` `pull_request_draft` walks the editing artifacts newest first and takes the first that wrote the section. When none did, `publish_title`/`publish_body` in `manager.rs` name the run from the task with its links dropped, falling back to the linked issue.

@@ -107,6 +107,18 @@ Simplification edits the implementation change in place before anyone judges it:
 
 Code Quality Review inspects actual repository state and judges how implementation is engineered. Specification Review independently compares delivered behavior with immutable task intent and available design evidence, classifying gaps as Missing, Wrong, or Unrequested. Both are read-only and create separate stage-ID-based Markdown artifacts. Existing persisted runs retain their original stored graph, including legacy generic review stages.
 
+### Setup
+
+A worktree is a fresh checkout of tracked files, so anything gitignored — `packages/*/dist`, `target/`, `vendor/` — starts empty. For repositories where that is not a working tree, `[setup]` runs once after the worktree is created and before the first agent sees it:
+
+```toml
+[setup]
+commands = ["yarn build-packages"]
+timeout_seconds = 3600
+```
+
+A failing setup command refuses the workspace rather than handing over a half-built tree, and says which command failed and what it printed. Repositories without the table are unaffected.
+
 ### Verification
 
 After the last stage that edits the worktree, Polycode runs the repository's own verification commands there — no agent involved — and records every command and exit code in a Markdown artifact whose bottom line the control room quotes. The stage completes only when every command exits zero. In Standard and Deep a failed check does not fail the run: the decision still runs with the failure in front of it and the run completes, so `fix` can answer it in place — each fix cycle re-verifies — while `apply` and `pr` refuse by name until the run's latest verification passes. In Fast there is no decision, so a failed check fails the run and `retry <run-id> verify` re-runs it. The reviews run beside verification and the decision waits for it.
@@ -122,6 +134,8 @@ timeout_seconds = 1800
 The file is read from the run's worktree first, so a change the run itself makes to it is what gets verified, and from the source repository the worktree was cut from second. That second place is how you configure a repository you cannot commit to: an untracked `.polycode.toml` beside your own checkout applies to every run of it without touching a tracked file. The artifact names which of the two answered.
 
 Without that table Polycode runs the one command the build file implies (`Cargo.toml` → `cargo test`, `package.json` → `npm test`, `pyproject.toml`/`pytest.ini` → `pytest`, `go.mod` → `go test ./...`), and with no recognised build file it completes having checked nothing and says so.
+
+A command may carry `{base_commit}`, which Polycode replaces with the commit the worktree was cut from — `commands = ["yarn test-client --changedSince={base_commit}"]` — so a repository can check the change rather than the whole tree without needing a shell.
 
 Two `package.json` shapes get no guess at all: a workspaces root, where `npm test` runs every package in the monorepo rather than anything about the change, and a manifest with no `test` script, where `npm test` fails on the missing script alone. Both complete having checked nothing, and the artifact names the file and says to add a `[verify]` table — a fifteen-minute red that no change caused is worse than an honest nothing. Commands are argv, not shell — no pipes or `&&` — and the sequence stops at the first failure.
 

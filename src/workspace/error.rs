@@ -44,6 +44,20 @@ pub enum WorkspaceError {
     WorkspaceBroken { run_id: RunId, reason: String },
     #[error("source checkout contains local changes: {0}")]
     SourceCheckoutDirty(PathBuf),
+    /// The repository's `[setup]` table could not be read. Preparation fails
+    /// on it for the reason `[verify]` does: a configuration Polycode cannot
+    /// understand is a finding, not an absence.
+    #[error("{0}")]
+    SetupConfig(String),
+    /// A `[setup]` command did not exit zero, so the worktree is not the
+    /// working tree the repository says it needs. There is no artifact at
+    /// preparation time, so the output travels in the error.
+    #[error("workspace setup command `{command}` {reason}\n{output}")]
+    SetupFailed {
+        command: String,
+        reason: String,
+        output: String,
+    },
     #[error("review/detached workspace cannot be applied")]
     ReviewWorkspaceNotApplicable,
     /// The run's latest verify stage did not pass. A failed verification

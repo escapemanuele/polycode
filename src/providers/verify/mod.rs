@@ -16,7 +16,7 @@
 
 mod artifact;
 mod config;
-mod runner;
+pub(crate) mod runner;
 
 use std::path::{Path, PathBuf};
 
@@ -83,8 +83,11 @@ impl VerifyProvider {
         let source_repo = workspace
             .as_ref()
             .map(|workspace| workspace.source_repo_path().to_owned());
+        let base_commit = workspace
+            .as_ref()
+            .map(|workspace| workspace.base_commit().to_owned());
         let (plan, reports, verdict) =
-            match config::plan_for(request.workspace_path(), source_repo.as_deref()) {
+            match resolved_plan(request, source_repo.as_deref(), base_commit.as_deref()) {
                 Ok(plan) => {
                     let reports = run_until_first_failure(&plan, request.workspace_path())?;
                     let verdict = artifact::verdict(&plan, &reports);
@@ -96,8 +99,9 @@ impl VerifyProvider {
                 Err(VerifyError::Config(message)) => (None, Vec::new(), Verdict::Failed(message)),
                 Err(error) => return Err(error),
             };
-        let content = artifact::render(plan.as_ref(), &reports, &verdict);
-        let base_commit = workspace.map(|workspace| workspace.base_commit().to_owned());
+        let repeated =
+            Self::earlier_identical_failure(store, request, base_commit.as_deref(), &verdict)?;
+        let content = artifact::render(plan.as_ref(), &reports, &verdict, repeated.as_deref());
         let record = artifact::persist(
             &self.artifact_root,
             request,
@@ -109,6 +113,48 @@ impl VerifyProvider {
         )?;
         store.insert_artifact(&record)?;
         Ok(verdict)
+    }
+
+    /// An earlier verification of this run that failed the same way at the
+    /// same base commit, if there is one.
+    ///
+    /// The question a failed verification cannot answer on its own is the
+    /// only one that matters to the lead: *did this change break it?* A fix
+    /// cycle re-verifies, so when `verify` and `verify_1` end on the same
+    /// sentence at the same base commit, two different trees produced one
+    /// failure — which is far more often the repository's state than
+    /// anything either attempt did. Saying so costs a read of artifacts
+    /// already on disk; proving it would cost running the suite again on an
+    /// untouched checkout.
+    ///
+    /// This is a hint, and the artifact words it as one. Two attempts can
+    /// genuinely fail the same way for the same reason the change caused.
+    fn earlier_identical_failure(
+        store: &mut SqliteStore,
+        request: &ProviderRequest,
+        base_commit: Option<&str>,
+        verdict: &Verdict,
+    ) -> Result<Option<String>, VerifyError> {
+        let Verdict::Failed(_) = verdict else {
+            return Ok(None);
+        };
+        let bottom_line = verdict.bottom_line();
+        for existing in store.list_artifacts(request.run_id())? {
+            let metadata = existing.metadata();
+            if metadata.kind() != crate::domain::ArtifactKind::Verify
+                || metadata.stage_id() == request.stage_id()
+                || metadata.base_commit() != base_commit
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(existing.path()) else {
+                continue;
+            };
+            if artifact::bottom_line_of(&content).is_some_and(|earlier| earlier == bottom_line) {
+                return Ok(Some(metadata.stage_id().as_str().to_owned()));
+            }
+        }
+        Ok(None)
     }
 
     /// The verdict already recorded for this exact attempt, if a previous
@@ -163,6 +209,22 @@ impl VerifyProvider {
         store.insert_artifact(&record)?;
         Ok(Some(bottom_line))
     }
+}
+
+/// The plan as it will actually run: read from the repository, then with the
+/// base commit filled into any command that asked for it.
+///
+/// Resolution happens here rather than in the reader so the artifact records
+/// the command that ran, with a real commit ID a reader can paste into their
+/// own shell, rather than the template it came from.
+fn resolved_plan(
+    request: &ProviderRequest,
+    source_repo: Option<&Path>,
+    base_commit: Option<&str>,
+) -> Result<config::VerifyPlan, VerifyError> {
+    let mut plan = config::plan_for(request.workspace_path(), source_repo)?;
+    plan.commands = config::resolve_placeholders(&plan.commands, base_commit)?;
+    Ok(plan)
 }
 
 /// Runs the plan's commands in order and stops at the first that does not
@@ -361,9 +423,18 @@ mod tests {
         }
 
         fn request(&self, signal_index: usize, status: StageStatus) -> ProviderRequest {
+            self.request_for("verify", signal_index, status)
+        }
+
+        fn request_for(
+            &self,
+            stage_id: &str,
+            signal_index: usize,
+            status: StageStatus,
+        ) -> ProviderRequest {
             ProviderRequest::new(
                 run_id(),
-                StageId::new("verify").unwrap(),
+                StageId::new(stage_id).unwrap(),
                 StageKind::Verify,
                 status,
                 Role::Verifier,
@@ -378,7 +449,13 @@ mod tests {
 
         /// Drives both polls and returns the terminal signal.
         fn run(&mut self) -> ProviderSignal {
-            let request = self.request(0, StageStatus::Ready);
+            self.run_stage("verify")
+        }
+
+        /// The same, under a named stage, so one harness can hold the
+        /// `verify` / `verify_1` pair a fix cycle produces.
+        fn run_stage(&mut self, stage_id: &str) -> ProviderSignal {
+            let request = self.request_for(stage_id, 0, StageStatus::Ready);
             let started = self.provider.poll(&mut self.store, &request).unwrap();
             assert!(matches!(
                 started,
@@ -387,7 +464,7 @@ mod tests {
                     session_id: None
                 })
             ));
-            let request = self.request(1, StageStatus::Running);
+            let request = self.request_for(stage_id, 1, StageStatus::Running);
             match self.provider.poll(&mut self.store, &request).unwrap() {
                 ProviderPoll::Signal(signal) => signal,
                 other => panic!("expected a terminal signal, got {other:?}"),
@@ -508,6 +585,123 @@ mod tests {
         assert_eq!(plan.commands, ["cargo test"]);
         assert_eq!(plan.source, config::CommandSource::Detected("Cargo.toml"));
         assert_eq!(plan.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn a_command_can_ask_for_the_base_commit_the_worktree_was_cut_from() {
+        let mut harness = Harness::new();
+        // `echo` is the only argv-only way to prove what the command received.
+        harness.source_repo_config("[verify]\ncommands = [\"echo {base_commit}\"]\n");
+
+        assert_eq!(harness.run(), ProviderSignal::Completed);
+
+        let artifact = harness.artifact();
+        let base_commit = "0".repeat(40);
+        // Both the heading and the output carry the real commit, so the
+        // reader can paste the line into their own shell.
+        assert!(
+            artifact.contains(&format!("### $ echo {base_commit}\n")),
+            "{artifact}"
+        );
+        assert!(
+            artifact.contains(&format!("```text\n{base_commit}\n```")),
+            "{artifact}"
+        );
+        assert!(!artifact.contains("{base_commit}"), "{artifact}");
+    }
+
+    #[test]
+    fn a_second_failure_identical_to_the_first_is_flagged_as_not_new() {
+        let mut harness = Harness::new();
+        harness.source_repo_config("[verify]\ncommands = [\"false\"]\n");
+
+        assert_eq!(
+            harness.run_stage("verify"),
+            ProviderSignal::Failed("failed — false exited 1".to_owned())
+        );
+        assert_eq!(
+            harness.run_stage("verify_1"),
+            ProviderSignal::Failed("failed — false exited 1".to_owned())
+        );
+
+        let artifacts = harness.store.list_artifacts(run_id()).unwrap();
+        let mut by_stage = artifacts.iter().map(|artifact| {
+            (
+                artifact.metadata().stage_id().as_str().to_owned(),
+                std::fs::read_to_string(artifact.path()).unwrap(),
+            )
+        });
+        let first = by_stage
+            .clone()
+            .find(|(stage, _)| stage == "verify")
+            .expect("first verification")
+            .1;
+        let second = by_stage
+            .find(|(stage, _)| stage == "verify_1")
+            .expect("second verification")
+            .1;
+
+        // The first failure has nothing to compare against; the second says
+        // the fix cycle did not introduce it.
+        assert!(!first.contains("## Not the first time"), "{first}");
+        assert!(second.contains("## Not the first time"), "{second}");
+        assert!(
+            second.contains("Stage `verify` ended on this same line"),
+            "{second}"
+        );
+    }
+
+    #[test]
+    fn a_failure_unlike_the_earlier_one_is_left_to_speak_for_itself() {
+        let mut harness = Harness::new();
+        harness.source_repo_config("[verify]\ncommands = [\"false\"]\n");
+        assert!(matches!(
+            harness.run_stage("verify"),
+            ProviderSignal::Failed(_)
+        ));
+
+        // A different command, so a different bottom line: nothing says this
+        // one is old news, because it is not.
+        harness.config("[verify]\ncommands = [\"ls /no-such-polycode-path\"]\n");
+        assert!(matches!(
+            harness.run_stage("verify_1"),
+            ProviderSignal::Failed(_)
+        ));
+
+        let second = harness
+            .store
+            .list_artifacts(run_id())
+            .unwrap()
+            .into_iter()
+            .find(|artifact| artifact.metadata().stage_id().as_str() == "verify_1")
+            .map(|artifact| std::fs::read_to_string(artifact.path()).unwrap())
+            .expect("second verification");
+
+        assert!(!second.contains("## Not the first time"), "{second}");
+    }
+
+    #[test]
+    fn a_passing_stage_is_never_told_it_failed_before() {
+        let mut harness = Harness::new();
+        harness.source_repo_config("[verify]\ncommands = [\"false\"]\n");
+        assert!(matches!(
+            harness.run_stage("verify"),
+            ProviderSignal::Failed(_)
+        ));
+
+        harness.config("[verify]\ncommands = [\"true\"]\n");
+        assert_eq!(harness.run_stage("verify_1"), ProviderSignal::Completed);
+
+        let second = harness
+            .store
+            .list_artifacts(run_id())
+            .unwrap()
+            .into_iter()
+            .find(|artifact| artifact.metadata().stage_id().as_str() == "verify_1")
+            .map(|artifact| std::fs::read_to_string(artifact.path()).unwrap())
+            .expect("second verification");
+
+        assert!(!second.contains("## Not the first time"), "{second}");
     }
 
     #[test]

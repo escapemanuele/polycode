@@ -101,12 +101,25 @@ pub(crate) fn render(
     plan: Option<&VerifyPlan>,
     reports: &[CommandReport],
     verdict: &Verdict,
+    repeated_from: Option<&str>,
 ) -> String {
     let mut text = String::from("# Verification\n\n## Bottom line\n");
     text.push_str(&verdict.bottom_line());
     text.push_str("\n\n## Source\n");
     text.push_str(&source_line(plan));
     text.push('\n');
+    // Directly under the verdict, because it changes how the verdict should
+    // be read and the lead may not get further down the page.
+    if let Some(stage_id) = repeated_from {
+        let _ = write!(
+            text,
+            "\n## Not the first time\n\
+             Stage `{stage_id}` ended on this same line, at this same base commit, \
+             earlier in this run. Two different trees failing identically points at \
+             the repository's state rather than at either change — check whether this \
+             also fails on an untouched checkout before treating it as a regression.\n"
+        );
+    }
     let Some(plan) = plan else {
         return text;
     };
@@ -410,7 +423,7 @@ mod tests {
         let verdict = verdict(&plan, &reports);
         assert_eq!(verdict, Verdict::Passed { commands: 2 });
 
-        let text = render(Some(&plan), &reports, &verdict);
+        let text = render(Some(&plan), &reports, &verdict, None);
 
         assert!(text.starts_with("# Verification\n\n## Bottom line\npassed — 2 commands\n"));
         assert!(text.contains("## Source\n`.polycode.toml` `[verify]` table (worktree)\n"));
@@ -433,7 +446,7 @@ mod tests {
         assert_eq!(verdict.bottom_line(), "failed — cargo test exited 101");
         assert_eq!(verdict.artifact_status(), ArtifactStatus::Failed);
 
-        let text = render(Some(&plan), &reports, &verdict);
+        let text = render(Some(&plan), &reports, &verdict, None);
 
         assert!(text.contains("### $ cargo test\nexit: 101\n"));
         assert!(text.contains("### $ cargo clippy\nskipped: not run after the first failure\n"));
@@ -485,7 +498,7 @@ mod tests {
         assert_eq!(verdict, Verdict::NothingChecked);
         assert_eq!(verdict.artifact_status(), ArtifactStatus::Complete);
 
-        let text = render(Some(&plan), &[], &verdict);
+        let text = render(Some(&plan), &[], &verdict, None);
 
         assert!(text.contains("nothing checked — no commands configured or detected"));
         assert!(text.contains("## Source\nnothing:"));
@@ -517,7 +530,7 @@ mod tests {
     fn the_bottom_line_reads_back_from_a_rendered_artifact() {
         let plan = plan(&["true"], CommandSource::ConfigFile(ConfigOrigin::Worktree));
         let reports = [report("true", CommandExit::Code(0), "", "")];
-        let text = render(Some(&plan), &reports, &verdict(&plan, &reports));
+        let text = render(Some(&plan), &reports, &verdict(&plan, &reports), None);
 
         assert_eq!(bottom_line_of(&text).as_deref(), Some("passed — 1 command"));
         assert_eq!(bottom_line_of("# Nothing here\n"), None);
