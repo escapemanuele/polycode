@@ -30,8 +30,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, state: &TuiState) {
         );
         return;
     }
-    // Footer grows one row for a notification; key hints are never replaced.
-    let footer_height = if state.message.is_some() { 3 } else { 2 };
+    // Footer grows for a notification; key hints are never replaced. A long
+    // message — a refused permission naming the command it refused — wraps
+    // over several rows instead of being cut off at the terminal's edge.
+    let footer_height = state.message.as_ref().map_or(2, |message| {
+        2 + u16::try_from(message_rows(&message.text, area.width).len()).unwrap_or(1)
+    });
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1864,18 +1868,67 @@ fn message_presentation(kind: UiMessageKind) -> (&'static str, Style) {
     }
 }
 
+/// The notification split into the rows it needs.
+///
+/// A message the operator has to act on — which command was refused, why an
+/// action failed — is worthless truncated, so it wraps on word boundaries
+/// rather than running off the edge. Capped: the footer is a footer, and a
+/// runaway provider string must never eat the screen.
+fn message_rows(text: &str, width: u16) -> Vec<String> {
+    const MAX_ROWS: usize = 4;
+    // Two columns for the glyph, then room for the dismiss hint on the right.
+    let usable = usize::from(width).saturating_sub(2 + DISMISS_HINT.chars().count() + 2);
+    if usable < 8 {
+        return vec![text.to_owned()];
+    }
+    let mut rows: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match rows.last_mut() {
+            Some(row) if row.chars().count() + 1 + word.chars().count() <= usable => {
+                row.push(' ');
+                row.push_str(word);
+            }
+            _ => rows.push(word.to_owned()),
+        }
+    }
+    if rows.len() > MAX_ROWS {
+        rows.truncate(MAX_ROWS);
+        if let Some(row) = rows.last_mut() {
+            row.push('\u{2026}');
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+const DISMISS_HINT: &str = "x dismiss";
+
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let mut lines = Vec::new();
     if let Some(message) = state.message.as_ref() {
         let (glyph, style) = message_presentation(message.kind);
-        lines.push(theme::spread(
-            vec![
-                Span::styled(format!("{glyph} "), style),
-                Span::styled(message.text.clone(), style),
-            ],
-            vec![Span::styled("x dismiss", theme::muted())],
-            area.width,
-        ));
+        let rows = message_rows(&message.text, area.width);
+        let last = rows.len().saturating_sub(1);
+        for (index, row) in rows.into_iter().enumerate() {
+            let prefix = if index == 0 {
+                format!("{glyph} ")
+            } else {
+                "  ".to_owned()
+            };
+            // The dismiss hint sits once, beside the message's last row.
+            let hint = if index == last {
+                vec![Span::styled(DISMISS_HINT, theme::muted())]
+            } else {
+                Vec::new()
+            };
+            lines.push(theme::spread(
+                vec![Span::styled(prefix, style), Span::styled(row, style)],
+                hint,
+                area.width,
+            ));
+        }
     }
     lines.push(footer_line(state.screen, state, area.width));
     frame.render_widget(
@@ -3803,6 +3856,38 @@ mod tests {
         assert!(text.contains("boom"), "message is visible");
         assert!(text.contains("Esc runs"), "leave-screen hint stays visible");
         assert!(text.contains("x dismiss"), "dismiss affordance advertised");
+    }
+
+    /// A refusal that names the command it refused is longer than one row.
+    /// Clipping it at the terminal edge hides exactly the part the operator
+    /// needs, so the footer grows instead.
+    #[test]
+    fn a_long_notification_wraps_instead_of_being_cut_off() {
+        let mut state = running_state();
+        state.set_error(
+            "resolving attention failed for run-1: Claude Code permission cannot be resumed \
+             safely: Bash command cannot be granted as an exact rule (shell this parser will \
+             not read: command substitution, subshell, or heredoc); type a response to \
+             continue without granting it, or stop the run: yarn install \"$(cat .yarnrc)\"",
+        );
+        let text = render_text(&state, 100, 40);
+        assert!(
+            text.contains("yarn install \"$(cat .yarnrc)\""),
+            "the refused command survives to the screen: {text}"
+        );
+        assert!(text.contains("x dismiss"), "dismiss affordance advertised");
+        assert!(text.contains("Esc runs"), "key hints keep their row");
+    }
+
+    /// The footer is a footer: a runaway provider string may not eat the run.
+    #[test]
+    fn a_runaway_notification_is_capped_and_marked_as_cut() {
+        let rows = message_rows(&"word ".repeat(500), 100);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.last().unwrap().ends_with('\u{2026}'));
+        for row in &rows {
+            assert!(row.chars().count() <= 100, "{row}");
+        }
     }
 
     #[test]

@@ -87,17 +87,25 @@ pub(crate) fn resume(
     }
     let mut rules = BTreeSet::new();
     let mut ungranted = false;
-    for denial in denials
-        .iter()
-        .filter(|denial| denial.tool_name != "AskUserQuestion")
-    {
-        match denial.exact_rule() {
-            Ok(rule) => {
-                rules.insert(rule);
+    // An operator answer is not an approval. Skipping ("do it without that")
+    // and answering ("do X instead") both continue the session and grant
+    // nothing: turning the denials into rules anyway would hand the agent
+    // the exact permission the operator just declined.
+    if response.is_none() {
+        for denial in denials
+            .iter()
+            .filter(|denial| denial.tool_name != "AskUserQuestion")
+        {
+            match denial.exact_rules() {
+                Ok(granted) => rules.extend(granted),
+                Err(_) => ungranted = true,
             }
-            Err(_) => ungranted = true,
         }
     }
+    // What this approval itself granted, before the stage's standing rules
+    // are folded in: the prompt below has to describe *this* request, not the
+    // permissions the stage already held.
+    let granted_now = !rules.is_empty();
     rules.extend(allow.iter().cloned());
     // The image grant rides the same flag as approved denials: still one
     // exact rule, still only when the stage holds the grant.
@@ -110,6 +118,7 @@ pub(crate) fn resume(
     push_allowed_tools(&mut argv, rules);
     let stdin = match response {
         Some(response) => response,
+        None if ungranted && granted_now => PARTIAL_RESUME_PROMPT,
         None if ungranted => UNGRANTED_RESUME_PROMPT,
         None if denials.is_empty() => CONTINUE_RESUME_PROMPT,
         None => APPROVED_RESUME_PROMPT,
@@ -139,6 +148,16 @@ pub(crate) const UNGRANTED_RESUME_PROMPT: &str = concat!(
     "report what you could not do.",
 );
 
+/// The text a resumed session is continued on when the approval covered some
+/// of the pending requests but not all of them: the session must not read a
+/// partial grant as permission to retry the part that was refused.
+pub(crate) const PARTIAL_RESUME_PROMPT: &str = concat!(
+    "User approved the pending permission requests, and the ones that can be expressed as exact ",
+    "permission rules were granted. At least one could not be, and was not granted. Do not retry ",
+    "that call. Continue the same task and session with the tools you now have, and report what ",
+    "you could not do.",
+);
+
 fn push_allowed_tools(argv: &mut Vec<OsString>, rules: BTreeSet<String>) {
     if rules.is_empty() {
         return;
@@ -151,9 +170,9 @@ fn push_allowed_tools(argv: &mut Vec<OsString>, rules: BTreeSet<String>) {
 /// reason it cannot be replayed at all.
 ///
 /// This is the single gate for "can this approval be honoured": resolution
-/// must run it *before* committing, so an unreplayable denial (compound Bash)
-/// is refused to the user instead of committing a resolution every later
-/// drive fails on.
+/// must run it *before* committing, so an unreplayable denial — shell no
+/// parser will read exactly, an unknown tool — is refused to the user instead
+/// of committing a resolution every later drive fails on.
 ///
 /// An operator response is also an answer to a permission request: when no
 /// denial can be granted exactly, a non-empty response still resumes the
@@ -180,10 +199,8 @@ pub(crate) fn grant_rules(
         .iter()
         .filter(|denial| denial.tool_name != "AskUserQuestion")
     {
-        match denial.exact_rule() {
-            Ok(rule) => {
-                rules.insert(rule);
-            }
+        match denial.exact_rules() {
+            Ok(granted) => rules.extend(granted),
             Err(error) => unsafe_permission = Some(error),
         }
     }
@@ -379,7 +396,7 @@ mod tests {
     fn unreplayable_permission_resumes_on_operator_response_without_granting() {
         let denials = vec![PermissionDenial {
             tool_name: "Bash".to_owned(),
-            tool_input: json!({"command": "yarn install 2>&1 | tail -20"}),
+            tool_input: json!({"command": "yarn install \"$(cat .yarnrc)\""}),
             tool_use_id: None,
         }];
         let session = ProviderSessionId::new("s").unwrap();
@@ -432,7 +449,7 @@ mod tests {
             PermissionDenial {
                 tool_name: "Bash".to_owned(),
                 tool_use_id: None,
-                tool_input: json!({"command": "yarn typecheck 2>&1 | tail -15"}),
+                tool_input: json!({"command": "yarn typecheck `date +%s`"}),
             },
             PermissionDenial {
                 tool_name: "Write".to_owned(),
@@ -461,9 +478,11 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "Edit(//tmp/result.txt)"));
         assert!(
             !args.iter().any(|arg| arg.contains("yarn typecheck")),
-            "a compound Bash command is never granted: {args:?}"
+            "shell the parser will not read is never granted: {args:?}"
         );
-        assert_eq!(command.stdin, UNGRANTED_RESUME_PROMPT.as_bytes());
+        // Part of the batch was granted, so the session must not be told that
+        // nothing was — only that the refused call stays refused.
+        assert_eq!(command.stdin, PARTIAL_RESUME_PROMPT.as_bytes());
 
         assert!(
             grant_rules(&denials[..1], None).is_err(),
