@@ -286,6 +286,9 @@ pub struct RunDetails {
     pub updated_at: DateTime<Utc>,
     pub stages: Vec<StageSummary>,
     pub attention: Vec<AttentionSummary>,
+    /// Whether the operator armed this run to approve grantable permission
+    /// requests on its own.
+    pub auto_approve: bool,
     pub usage: RunUsage,
     /// Semantic wall-clock span of the run, folded from committed
     /// `RunStarted` and terminal run events. Resuming does not restart it.
@@ -580,8 +583,10 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
                 .and_then(|stage| stage.failure_reason.clone())
         })
         .flatten();
+    let auto_approve = store.run_auto_approve(run_id)?;
     Ok(RunDetails {
         id: loaded.run.id(),
+        auto_approve,
         task: input.map(|input| input.task().to_owned()),
         workflow: loaded.run.workflow_kind(),
         status: loaded.run.status(),

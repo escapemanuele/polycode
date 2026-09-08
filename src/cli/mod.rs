@@ -106,6 +106,16 @@ pub enum Command {
         #[arg(long)]
         undo: bool,
     },
+    /// Approve this run's permission requests without asking each time.
+    ///
+    /// Questions, and requests that cannot be expressed as an exact
+    /// permission rule, still stop the run and wait for you.
+    AutoApprove {
+        run_id: RunId,
+        /// Go back to being asked about every permission request.
+        #[arg(long)]
+        off: bool,
+    },
     /// Delete an archived run for good: worktree, files, and rows. No undo.
     Delete {
         run_id: RunId,

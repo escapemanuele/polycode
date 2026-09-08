@@ -31,8 +31,15 @@ polycode retry <run-id> <stage-id>
 polycode retry <run-id> <stage-id> --provider claude [--model <id>]   # retry this stage on another provider
 polycode resolve <run-id> <attention-id>                    # approve a permission request
 polycode resolve <run-id> <attention-id> --response "<answer>"   # answer a question
+polycode auto-approve <run-id>            # stop asking about this run's permission requests
+polycode auto-approve <run-id> --off      # go back to being asked
 ```
-TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage (↑/↓ pick Configured provider / Claude / Codex, Enter retries), `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves).
+TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage (↑/↓ pick Configured provider / Claude / Codex, Enter retries), `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves), `A` arm or disarm automatic approval.
+
+## Approving without being asked
+Answering the same permission request all day is a cost, not a safety property, so a run can be armed to approve them itself: `A` on the run detail screen, or `polycode auto-approve <run-id>`. The flag lives on that run — it survives a restart, reaches no other run, and no existing run is armed by upgrading. While it is armed the header carries an `AUTO-APPROVE` chip and the footer offers `A` to withdraw it.
+
+Armed is not unconditional. A question still stops the run, because no approval stands in for an answer, and so does a request that cannot be expressed as an exact permission rule, because approving it would not grant anything. Approval also stops after `MAX_AUTO_APPROVALS` requests in one settling: a stage that keeps asking is one something is wrong with, and the operator gets the run back instead of a loop. Arming a run that is already waiting also resumes it — that is what "stop asking me" means.
 
 ## Archiving and deleting
 A run you are done with is archived (`h` in the Runs list, `polycode archive <run-id>`): it leaves the default list and stays otherwise untouched, and `--undo` brings it back. An archived run — and only an archived one — can then be deleted for good (`D` in the Runs list, `polycode delete <run-id> --yes`): its worktree and branch, its artifacts and logs under `~/.polycode/runs/<run-id>`, and every row Polycode keeps about it. Nothing it already applied or published is touched. There is no undo, and a run still running cannot be deleted.
@@ -41,7 +48,7 @@ A run you are done with is archived (`h` in the Runs list, `polycode archive <ru
 - `src/cli/mod.rs` — clap definitions (`RunArgs`, `Command::{Runs,Status,Resume,Stop,Retry,Resolve}`).
 - `src/cli/commands.rs` — `start`, `parse_effort`, `print_report`, `print_details`; `QuiescentState` hints printed after each report.
 - `src/workspace/github.rs` — `PullRequestRef::parse`, `GhClient::pull_request_reach`, `PullRequestReach`: the start precondition's probe.
-- `src/app/run_service.rs` — `start_run`, `resume_run`, `stop_run`, `retry_stage`, `resolve_attention_with_response`, `inspect_run`, `list_runs`; `ABANDONED_AFTER` 30 s observe pass.
+- `src/app/run_service.rs` — `start_run`, `resume_run`, `stop_run`, `retry_stage`, `resolve_attention_with_response`, `inspect_run`, `list_runs`; `settle` and `MAX_AUTO_APPROVALS` for automatic approval; `ABANDONED_AFTER` 30 s observe pass.
 - `src/domain/run.rs` — `Run` aggregate, `RunTransition`, `ensure_retry_safe` (`RetryWouldInvalidate`), `skipped_descendants`.
 - `src/engine/scheduler.rs` — `retry_stage` returns the skipped descendants to `Pending` in the same commit, and commits the route override (when given) in that commit too.
 - `src/domain/stage.rs` — stage state machine.

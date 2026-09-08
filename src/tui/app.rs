@@ -253,6 +253,9 @@ impl TuiApp {
             Intent::Archive if self.state.screen == Screen::Runs => {
                 self.toggle_selected_archived();
             }
+            Intent::AutoApprove if self.state.screen == Screen::RunDetail => {
+                self.toggle_auto_approve();
+            }
             Intent::ShowArchived if self.state.screen == Screen::Runs => {
                 self.state.show_archived = !self.state.show_archived;
                 self.refresh();
@@ -1086,6 +1089,36 @@ impl TuiApp {
         self.refresh();
     }
 
+    /// Arms or disarms automatic approval for the open run.
+    ///
+    /// Arming is an instruction about what happens next, and a run already
+    /// stopped on a permission request is waiting *now* — so arming one also
+    /// resumes it, which is what the operator meant by "stop asking me".
+    /// Disarming only disarms: a run mid-flight is left alone.
+    fn toggle_auto_approve(&mut self) {
+        let Some(details) = self.state.details.as_ref() else {
+            return;
+        };
+        let (run_id, armed) = (details.id, details.auto_approve);
+        if let Err(error) = self.reader.set_run_auto_approve(run_id, !armed) {
+            self.state.set_error(error.to_string());
+            return;
+        }
+        let waiting = details.status == RunStatus::NeedsUser;
+        self.refresh();
+        if armed {
+            self.state
+                .set_message("Auto-approve off — permission requests wait for you.".to_owned());
+        } else {
+            self.state.set_message(
+                "Auto-approve on — grantable permission requests are approved for this run. Questions still stop it.".to_owned(),
+            );
+            if waiting {
+                self.resume();
+            }
+        }
+    }
+
     /// Offers to delete the selected run for good. Only an archived run is
     /// offered: setting a run aside is the step that makes deleting it
     /// deliberate, and the refusal says so rather than doing nothing.
@@ -1476,6 +1509,7 @@ mod tests {
     fn details(status: RunStatus, workflow: WorkflowKind) -> RunDetails {
         RunDetails {
             id: RunId::from_u128(7),
+            auto_approve: false,
             task: Some("Add OAuth provider support".to_owned()),
             workflow,
             status,

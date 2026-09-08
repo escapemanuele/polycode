@@ -40,6 +40,8 @@ pub(crate) enum Intent {
     Discard,
     Archive,
     ShowArchived,
+    /// Arm or disarm automatic approval for the selected run.
+    AutoApprove,
     /// Delete the selected archived run for good.
     DeleteForever,
     DismissMessage,
@@ -89,6 +91,7 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('X') => Intent::Discard,
         KeyCode::Char('h') => Intent::Archive,
         KeyCode::Char('H') => Intent::ShowArchived,
+        KeyCode::Char('A') => Intent::AutoApprove,
         KeyCode::Char('D') => Intent::DeleteForever,
         KeyCode::Char('x') => Intent::DismissMessage,
         KeyCode::Char('m') => Intent::ToggleRaw,
@@ -228,6 +231,21 @@ mod tests {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
             Intent::ToggleRaw
+        );
+    }
+
+    /// Auto-approve is a standing permission, so it does not share a key
+    /// with apply — the two are one shift apart and mean very different
+    /// things.
+    #[test]
+    fn uppercase_a_arms_auto_approve_and_lowercase_a_still_applies() {
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Intent::AutoApprove
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Intent::Apply
         );
     }
 

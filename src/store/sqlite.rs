@@ -65,6 +65,9 @@ pub struct RunSummary {
     /// Operator-facing visibility; an archived run is left out of the
     /// default Runs list but stays fully intact until it is purged.
     pub archived: bool,
+    /// Whether the operator armed this run to approve grantable permission
+    /// requests without being asked each time.
+    pub auto_approve: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,7 +341,7 @@ impl SqliteStore {
         let mut statement = self.connection.prepare(
             "SELECT runs.id, runs.status, runs.workflow, run_inputs.task,
                     run_workspaces.source_repo_path, runs.revision, runs.updated_at,
-                    runs.archived
+                    runs.archived, runs.auto_approve
              FROM runs
              LEFT JOIN run_inputs ON run_inputs.run_id = runs.id
              LEFT JOIN run_workspaces ON run_workspaces.run_id = runs.id
@@ -354,12 +357,22 @@ impl SqliteStore {
                 row.get::<_, i64>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, bool>(7)?,
+                row.get::<_, bool>(8)?,
             ))
         })?;
         let mut summaries = Vec::new();
         for row in rows {
-            let (id, status, workflow, task, repository_path, revision, updated_at, archived) =
-                row?;
+            let (
+                id,
+                status,
+                workflow,
+                task,
+                repository_path,
+                revision,
+                updated_at,
+                archived,
+                auto_approve,
+            ) = row?;
             summaries.push(RunSummary {
                 id: id
                     .parse()
@@ -371,6 +384,7 @@ impl SqliteStore {
                 revision: RunRevision(i64_to_u64(revision, "run revision")?),
                 updated_at: parse_timestamp(&updated_at)?,
                 archived,
+                auto_approve,
             });
         }
         Ok(summaries)
@@ -393,6 +407,48 @@ impl SqliteStore {
             return Err(StoreError::RunNotFound(run_id));
         }
         Ok(())
+    }
+
+    /// Arms or disarms automatic approval for one run.
+    ///
+    /// Outside the CAS revision protocol for the same reason as archiving:
+    /// it records an operator's standing instruction about a run, not a
+    /// change to what the run has done.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::RunNotFound`] for an unknown run, or `SQLite`
+    /// errors.
+    pub fn set_run_auto_approve(
+        &mut self,
+        run_id: RunId,
+        auto_approve: bool,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE runs SET auto_approve = ?1 WHERE id = ?2",
+            rusqlite::params![auto_approve, run_id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::RunNotFound(run_id));
+        }
+        Ok(())
+    }
+
+    /// Whether this run is armed to approve permission requests by itself.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::RunNotFound`] for an unknown run, or `SQLite`
+    /// errors.
+    pub fn run_auto_approve(&self, run_id: RunId) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT auto_approve FROM runs WHERE id = ?1",
+                rusqlite::params![run_id.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::RunNotFound(run_id),
+                other => other.into(),
+            })
     }
 
     /// Deletes every row the run owns, in one transaction.
@@ -1632,6 +1688,45 @@ mod tests {
         let missing = crate::domain::RunId::from_u128(999_999);
         assert!(matches!(
             store.set_run_archived(missing, false),
+            Err(StoreError::RunNotFound(id)) if id == missing
+        ));
+    }
+
+    /// Standing approval belongs to the run it was given for: it survives
+    /// reopening the database, it never touches what the run has done, and it
+    /// reaches no other run.
+    #[test]
+    fn auto_approve_is_per_run_durable_and_not_a_run_mutation() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (armed, _, _) = create_complex(&mut store, 220, "armed-config", 4_100);
+        let (other, _, _) = create_complex(&mut store, 221, "other-config", 4_200);
+        assert!(!store.run_auto_approve(armed.id()).unwrap());
+
+        let before = store.load_run(armed.id()).unwrap();
+        store.set_run_auto_approve(armed.id(), true).unwrap();
+        let after = store.load_run(armed.id()).unwrap();
+        assert!(store.run_auto_approve(armed.id()).unwrap());
+        assert!(!store.run_auto_approve(other.id()).unwrap());
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.run, before.run);
+        let summary = store
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == armed.id())
+            .unwrap();
+        assert!(summary.auto_approve);
+
+        store.set_run_auto_approve(armed.id(), false).unwrap();
+        assert!(!store.run_auto_approve(armed.id()).unwrap());
+
+        let missing = crate::domain::RunId::from_u128(999_998);
+        assert!(matches!(
+            store.set_run_auto_approve(missing, true),
+            Err(StoreError::RunNotFound(id)) if id == missing
+        ));
+        assert!(matches!(
+            store.run_auto_approve(missing),
             Err(StoreError::RunNotFound(id)) if id == missing
         ));
     }
