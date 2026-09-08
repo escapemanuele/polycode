@@ -25,7 +25,9 @@ polycode pr <run-id>
 polycode discard <run-id>
 polycode status <run-id>      # Workspace and Base lines
 ```
-TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, `X` then Enter discard.
+TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish (publishing card while it runs, then a result card with the PR URL: `o` open, `y` copy), `X` then Enter discard.
+
+CLI `pr` prints its progress line to stderr and the receipt (branch, commit, elapsed, PR URL on its own line) to stdout.
 
 ## Where it lives
 - `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`, `ensure_verification_passed`.
@@ -38,6 +40,7 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish, 
 - `src/store/workspace.rs` — workspace and apply-intent persistence with CAS.
 - `src/store/path.rs` — `worktree_root`, `POLYCODE_DATA_DIR`.
 - `src/app/run_service.rs` — `apply_run`, `publish_run`, `discard_run`, `preview_run_diff`.
+- `src/tui/state.rs` `PublishInFlight`/`PublishOutcome`, `src/tui/render.rs` `render_publishing`/`render_published`, `src/tui/desktop.rs` `open_in_browser`/`copy_to_clipboard` (platform `open`/`xdg-open`, `pbcopy`/`wl-copy`/`xclip`).
 - `tests/codex_cli.rs` — `native_codex_fixture_runs_through_tmux_preserves_source_then_applies`.
 
 ## Gotchas
