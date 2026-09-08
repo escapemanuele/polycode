@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AttentionRequestId, ConfigSnapshotId, EventId, EventMetadata, Run, RunId, RunStatus,
-    RunTransition, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
+    AttentionKind, AttentionRequestId, ConfigSnapshotId, EventId, EventMetadata, Run, RunId,
+    RunStatus, RunTransition, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
 };
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
@@ -92,6 +92,15 @@ pub enum QuiescentState {
 /// What the provider hears when the operator skips a permission request:
 /// the call stays denied and the task continues on what is already allowed.
 pub const SKIP_ATTENTION_RESPONSE: &str = "The operator declined this permission request. Do not retry it or work around it. Continue the task without it, and state plainly in your result what you could not do or verify because of it.";
+
+/// How many permission requests one settling may approve on the operator's
+/// behalf before handing the run back.
+///
+/// Not every approved call is a call the provider will then allow: some are
+/// refused again whatever rule is granted, and the stage asks once more. A
+/// ceiling turns that into a run that stops and shows the operator the
+/// request, instead of a loop approving forever while nothing progresses.
+const MAX_AUTO_APPROVALS: usize = 12;
 
 pub struct RunService<F> {
     database: PathBuf,
@@ -250,7 +259,7 @@ where
         let manager = WorkspaceManager::new(&self.worktrees);
         manager.prepare_run_workspace(&mut store, run_id, repository.source_path())?;
         let status = self.drive(&mut store, run_id, ResumeAction::Continue)?;
-        Self::report(&mut store, run_id, 0, status.as_ref())
+        self.settle(&mut store, run_id, 0, status.as_ref())
     }
 
     /// Continues one persisted run according to safe lifecycle policy.
@@ -273,7 +282,7 @@ where
         let before = last_sequence(&store, run_id)?;
         self.reconcile(&mut store, run_id)?;
         let status = self.drive(&mut store, run_id, ResumeAction::Resume)?;
-        Self::report(&mut store, run_id, before, status.as_ref())
+        self.settle(&mut store, run_id, before, status.as_ref())
     }
 
     /// Resolves one attention request, then executes to quiescence.
@@ -317,7 +326,7 @@ where
         let mut engine = self.engine(&mut store, run_id)?;
         engine.resolve_attention_with_response(&mut store, run_id, request_id, response)?;
         let status = drive_attached(&mut engine, &mut store, run_id)?;
-        Self::report(&mut store, run_id, before, Some(&status))
+        self.settle(&mut store, run_id, before, Some(&status))
     }
 
     /// Resolves attention only when provider policy explicitly proves safe
@@ -373,7 +382,7 @@ where
             route.map(|route| (route.into_override(), OPERATOR_OVERRIDE_REASON)),
         )?;
         let status = drive_attached(&mut engine, &mut store, run_id)?;
-        Self::report(&mut store, run_id, before, Some(&status))
+        self.settle(&mut store, run_id, before, Some(&status))
     }
 
     /// Sends a completed run back for one remediation cycle, then executes to
@@ -424,7 +433,7 @@ where
         WorkspaceManager::new(&self.worktrees).adopt_branch_for_fix(&mut store, run_id)?;
         engine.request_fix(&mut store, run_id)?;
         let status = drive_attached(&mut engine, &mut store, run_id)?;
-        Self::report(&mut store, run_id, before, Some(&status))
+        self.settle(&mut store, run_id, before, Some(&status))
     }
 
     /// Sends a completed run back with the operator's own next instruction,
@@ -484,7 +493,7 @@ where
         WorkspaceManager::new(&self.worktrees).adopt_branch_for_fix(&mut store, run_id)?;
         engine.request_continue(&mut store, run_id, &instruction)?;
         let status = drive_attached(&mut engine, &mut store, run_id)?;
-        Self::report(&mut store, run_id, before, Some(&status))
+        self.settle(&mut store, run_id, before, Some(&status))
     }
 
     /// Applies completed workspace changes to source checkout.
@@ -718,6 +727,21 @@ where
     pub fn set_run_archived(&self, run_id: RunId, archived: bool) -> Result<(), AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         store.set_run_archived(run_id, archived)?;
+        Ok(())
+    }
+
+    /// Arms or disarms automatic approval of this run's permission requests.
+    ///
+    /// Arming records an instruction for the future; it does not reach into a
+    /// request that is already waiting. A run sitting on one keeps sitting on
+    /// it until something drives the run again — resuming it is what makes
+    /// the standing approval apply.
+    ///
+    /// # Errors
+    /// Returns store or path errors; unknown runs surface as `RunNotFound`.
+    pub fn set_run_auto_approve(&self, run_id: RunId, auto_approve: bool) -> Result<(), AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        store.set_run_auto_approve(run_id, auto_approve)?;
         Ok(())
     }
 
@@ -984,6 +1008,58 @@ where
             return Ok(Some(engine.drive_observing(store, run_id)?));
         }
         Ok(Some(drive_attached(&mut engine, store, run_id)?))
+    }
+
+    /// Reports where the run came to rest, approving on the way when the
+    /// operator armed this run for it.
+    ///
+    /// Every driving entry point ends here, so arming is honoured wherever
+    /// the run was driven from — the TUI, the CLI, a resume that happened to
+    /// pass through a permission request — and never has to be remembered at
+    /// each call site.
+    ///
+    /// Only permission requests are approved. A question needs an answer no
+    /// approval can stand in for, and a request that cannot be replayed as an
+    /// exact rule cannot be approved at all: both stop the run and wait for
+    /// the operator, exactly as they would unarmed. An approval that fails
+    /// leaves its request pending and ends the settling rather than
+    /// propagating: the work already reported here really did happen, and the
+    /// operator meets the untouched request on the next screen.
+    fn settle(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        after_sequence: u64,
+        engine_status: Option<&EngineStatus>,
+    ) -> Result<ExecutionReport, AppError> {
+        let mut report = Self::report(store, run_id, after_sequence, engine_status)?;
+        if !store.run_auto_approve(run_id)? {
+            return Ok(report);
+        }
+        for _ in 0..MAX_AUTO_APPROVALS {
+            if report.outcome != QuiescentState::NeedsUser {
+                break;
+            }
+            let Some(request) = report
+                .details
+                .attention
+                .iter()
+                .find(|attention| attention.kind == AttentionKind::Permission)
+                .map(|attention| attention.id)
+            else {
+                break;
+            };
+            let approved = (|| -> Result<EngineStatus, AppError> {
+                let mut engine = self.engine(store, run_id)?;
+                engine.resolve_attention(store, run_id, request)?;
+                drive_attached(&mut engine, store, run_id)
+            })();
+            let Ok(status) = approved else {
+                break;
+            };
+            report = Self::report(store, run_id, after_sequence, Some(&status))?;
+        }
+        Ok(report)
     }
 
     fn report(
@@ -4014,6 +4090,129 @@ mod tests {
             fixture.default_service().resume_run(run_id),
             Err(AppError::LegacyExecutionConfig(id)) if id == run_id
         ));
+    }
+
+    /// Builds a service whose implementation stage stops for `count`
+    /// permission requests before completing.
+    fn service_asking_for_permission(
+        fixture: &Fixture,
+        count: usize,
+        kind: AttentionKind,
+    ) -> RunService<ScriptedFactory> {
+        let mut events = vec![FakeEvent::Started];
+        for index in 0..count {
+            events.push(FakeEvent::needs_user(kind, format!("request {index}")));
+        }
+        events.push(FakeEvent::Completed);
+        let scenario = FakeScenario::new()
+            .stage("implementation")
+            .events(events)
+            .stage("verify")
+            .events([FakeEvent::Started, FakeEvent::Completed]);
+        RunService::new(
+            fixture.database.clone(),
+            fixture.worktrees.clone(),
+            ScriptedFactory {
+                scenario,
+                inner: fixture.fake_factory(),
+            },
+        )
+    }
+
+    fn start_fake_run<F: ProviderFactory>(
+        service: &RunService<F>,
+        fixture: &Fixture,
+    ) -> ExecutionReport {
+        service
+            .start_run(
+                WorkflowKind::Fast,
+                "keep going without asking",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap()
+    }
+
+    /// The point of arming a run: every later permission request is approved
+    /// and driven on, so a run that would have stopped three times finishes
+    /// from a single resume.
+    #[test]
+    fn an_armed_run_approves_its_own_permission_requests() {
+        let fixture = Fixture::new();
+        let service = service_asking_for_permission(&fixture, 3, AttentionKind::Permission);
+        let started = start_fake_run(&service, &fixture);
+        let run_id = started.details.id;
+        assert_eq!(started.details.status, RunStatus::NeedsUser);
+
+        service.set_run_auto_approve(run_id, true).unwrap();
+        let resumed = service.resume_run(run_id).unwrap();
+
+        assert_eq!(resumed.outcome, QuiescentState::Completed);
+        assert!(
+            resumed.details.attention.is_empty(),
+            "nothing left waiting: {:?}",
+            resumed.details.attention
+        );
+        assert!(resumed.details.auto_approve, "the run stays armed");
+    }
+
+    /// Arming is not a licence to answer for the operator. A question has no
+    /// approval that means anything, so an armed run stops on one exactly as
+    /// an unarmed one does.
+    #[test]
+    fn an_armed_run_still_stops_for_a_question() {
+        let fixture = Fixture::new();
+        let service = service_asking_for_permission(&fixture, 1, AttentionKind::Question);
+        let started = start_fake_run(&service, &fixture);
+        let run_id = started.details.id;
+
+        service.set_run_auto_approve(run_id, true).unwrap();
+        let resumed = service.resume_run(run_id).unwrap();
+
+        assert_eq!(resumed.details.status, RunStatus::NeedsUser);
+        assert_eq!(resumed.details.attention.len(), 1);
+        assert_eq!(resumed.details.attention[0].kind, AttentionKind::Question);
+    }
+
+    /// A run that keeps asking is a run something is wrong with. Approval
+    /// stops after the ceiling and gives the operator back a run they can
+    /// see, rather than approving in a loop forever.
+    #[test]
+    fn automatic_approval_stops_at_its_ceiling_instead_of_looping() {
+        let fixture = Fixture::new();
+        let service = service_asking_for_permission(
+            &fixture,
+            MAX_AUTO_APPROVALS + 4,
+            AttentionKind::Permission,
+        );
+        let started = start_fake_run(&service, &fixture);
+        let run_id = started.details.id;
+
+        service.set_run_auto_approve(run_id, true).unwrap();
+        let resumed = service.resume_run(run_id).unwrap();
+
+        assert_eq!(
+            resumed.details.status,
+            RunStatus::NeedsUser,
+            "the operator gets the run back"
+        );
+        assert!(!resumed.details.attention.is_empty());
+    }
+
+    /// An unarmed run is untouched by any of this: it stops on the first
+    /// request and waits, which is still the default for every run.
+    #[test]
+    fn an_unarmed_run_still_waits_on_the_first_request() {
+        let fixture = Fixture::new();
+        let service = service_asking_for_permission(&fixture, 2, AttentionKind::Permission);
+        let started = start_fake_run(&service, &fixture);
+
+        assert_eq!(started.details.status, RunStatus::NeedsUser);
+        assert!(!started.details.auto_approve);
+        let resumed = service.resume_run(started.details.id).unwrap();
+        assert_eq!(resumed.details.status, RunStatus::NeedsUser);
     }
 
     /// The image tool's whole lifecycle claim in one place: a PNG the tool

@@ -87,6 +87,18 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Style::default().fg(theme::accent()),
         ));
     }
+    // A run approving on the operator's behalf says so wherever that run is
+    // open. Standing permission nobody can see is the failure mode worth
+    // spending header space to avoid.
+    if state.screen == Screen::RunDetail
+        && state
+            .details
+            .as_ref()
+            .is_some_and(|details| details.auto_approve)
+    {
+        left.push(Span::raw("  "));
+        left.push(theme::chip("⚡ AUTO-APPROVE", theme::attention()));
+    }
     let right = state
         .details
         .as_ref()
@@ -1721,6 +1733,100 @@ fn runs_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)) {
     }
 }
 
+/// The run screen's contextual actions.
+///
+/// Split out of `primary_actions` so each screen's offer reads on its own.
+fn run_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)) {
+    let needs_user = state
+        .details
+        .as_ref()
+        .is_some_and(|details| !details.attention.is_empty());
+    let stage_status = state
+        .details
+        .as_ref()
+        .and_then(|details| details.stages.get(state.selected_stage_index))
+        .map(|stage| stage.status);
+    let run_status = state.details.as_ref().map(|details| details.status);
+    let armed = state
+        .details
+        .as_ref()
+        .is_some_and(|details| details.auto_approve);
+    if needs_user {
+        push("u", "Resolve attention", theme::attention());
+        push(
+            "A",
+            if armed {
+                "Ask me again"
+            } else {
+                "Auto-approve"
+            },
+            theme::attention(),
+        );
+        push("l", "Logs", theme::accent());
+        push("s", "Stop", theme::attention());
+    } else if state.run_is_applyable() {
+        push("d", "Review diff", theme::accent());
+        push("a", "Apply", theme::success());
+        push("P", "Pull request", theme::success());
+        if let Some(label) = FixOffer::of(state).label() {
+            push("f", label, theme::attention());
+        }
+        if state.run_can_be_continued() {
+            push("c", "Continue", theme::attention());
+            push("w", "Follow-ups", theme::attention());
+        }
+        push("X", "Discard", theme::danger());
+    } else {
+        push("o", "Result", theme::accent());
+        push("l", "Logs", theme::accent());
+        push("d", "Diff", theme::accent());
+        if stage_status == Some(StageStatus::Failed) {
+            push("t", "Retry", theme::attention());
+        }
+        if let Some(label) = FixOffer::of(state).label() {
+            push("f", label, theme::attention());
+        }
+        if state.run_can_be_continued() {
+            push("c", "Continue", theme::attention());
+            push("w", "Follow-ups", theme::attention());
+        }
+        // A running run normally has its driver in this process and
+        // needs no key; one nobody holds was left behind by a dead
+        // instance, and resume is how it gets a driver again.
+        let orphaned = run_status == Some(RunStatus::Running)
+            && state
+                .selected_run
+                .is_some_and(|run_id| !state.run_is_held(run_id));
+        if matches!(
+            run_status,
+            Some(RunStatus::Paused | RunStatus::Interrupted | RunStatus::Ready)
+        ) || orphaned
+        {
+            push("r", "Resume", theme::attention());
+        }
+        if state.run_is_stoppable() {
+            push("s", "Stop", theme::attention());
+        }
+        // Arming is offered on the screen where it is felt — a run stopped
+        // on a request, above. Here only the way back is, and only while it
+        // is armed: a standing permission must never be one nobody can see
+        // how to withdraw, but an unarmed run has nothing to say about it and
+        // the row's space belongs to the keys that act on this run.
+        if armed {
+            push("A", "Ask me again", theme::muted_color());
+        }
+    }
+    push(
+        "i",
+        if state.technical {
+            "Operational"
+        } else {
+            "Details"
+        },
+        theme::muted_color(),
+    );
+}
+
 fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut push = |key: &str, label: &str, color: Color| {
@@ -1731,75 +1837,7 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
     };
     match screen {
         Screen::Runs => runs_actions(state, &mut push),
-        Screen::RunDetail => {
-            let needs_user = state
-                .details
-                .as_ref()
-                .is_some_and(|details| !details.attention.is_empty());
-            let stage_status = state
-                .details
-                .as_ref()
-                .and_then(|details| details.stages.get(state.selected_stage_index))
-                .map(|stage| stage.status);
-            let run_status = state.details.as_ref().map(|details| details.status);
-            if needs_user {
-                push("u", "Resolve attention", theme::attention());
-                push("l", "Logs", theme::accent());
-                push("s", "Stop", theme::attention());
-            } else if state.run_is_applyable() {
-                push("d", "Review diff", theme::accent());
-                push("a", "Apply", theme::success());
-                push("P", "Pull request", theme::success());
-                if let Some(label) = FixOffer::of(state).label() {
-                    push("f", label, theme::attention());
-                }
-                if state.run_can_be_continued() {
-                    push("c", "Continue", theme::attention());
-                    push("w", "Follow-ups", theme::attention());
-                }
-                push("X", "Discard", theme::danger());
-            } else {
-                push("o", "Result", theme::accent());
-                push("l", "Logs", theme::accent());
-                push("d", "Diff", theme::accent());
-                if stage_status == Some(StageStatus::Failed) {
-                    push("t", "Retry", theme::attention());
-                }
-                if let Some(label) = FixOffer::of(state).label() {
-                    push("f", label, theme::attention());
-                }
-                if state.run_can_be_continued() {
-                    push("c", "Continue", theme::attention());
-                    push("w", "Follow-ups", theme::attention());
-                }
-                // A running run normally has its driver in this process and
-                // needs no key; one nobody holds was left behind by a dead
-                // instance, and resume is how it gets a driver again.
-                let orphaned = run_status == Some(RunStatus::Running)
-                    && state
-                        .selected_run
-                        .is_some_and(|run_id| !state.run_is_held(run_id));
-                if matches!(
-                    run_status,
-                    Some(RunStatus::Paused | RunStatus::Interrupted | RunStatus::Ready)
-                ) || orphaned
-                {
-                    push("r", "Resume", theme::attention());
-                }
-                if state.run_is_stoppable() {
-                    push("s", "Stop", theme::attention());
-                }
-            }
-            push(
-                "i",
-                if state.technical {
-                    "Operational"
-                } else {
-                    "Details"
-                },
-                theme::muted_color(),
-            );
-        }
+        Screen::RunDetail => run_detail_actions(state, &mut push),
         Screen::Artifact => push("m", "Raw/rendered", theme::accent()),
         Screen::Logs | Screen::Diff => push("Esc", "Back", theme::accent()),
         Screen::NewRun => {
@@ -1947,7 +1985,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -2776,6 +2814,7 @@ mod tests {
     fn details(status: RunStatus, stages: Vec<StageSummary>) -> RunDetails {
         RunDetails {
             id: RunId::from_u128(3),
+            auto_approve: false,
             task: Some("Add OAuth provider support".to_owned()),
             workflow: WorkflowKind::Standard,
             status,
@@ -3888,6 +3927,38 @@ mod tests {
         for row in &rows {
             assert!(row.chars().count() <= 100, "{row}");
         }
+    }
+
+    /// Standing permission is visible from the run's own screen: the chip
+    /// says the run is armed, and the footer offers the way back.
+    #[test]
+    fn an_armed_run_says_so_in_the_header_and_offers_the_way_back() {
+        let mut state = running_state();
+        let asking = state.details.as_mut().unwrap();
+        asking.auto_approve = true;
+        asking.attention = vec![crate::app::AttentionSummary {
+            id: crate::domain::AttentionRequestId::from_u128(1),
+            stage_id: crate::domain::StageId::new("implementation").unwrap(),
+            kind: AttentionKind::Permission,
+            summary: "Claude Code requests permission for: Bash cargo test".to_owned(),
+        }];
+        let armed = render_text(&state, 160, 40);
+        assert!(
+            armed.contains("AUTO-APPROVE"),
+            "the chip is visible: {armed}"
+        );
+        assert!(
+            armed.contains("Ask me again"),
+            "disarming is offered: {armed}"
+        );
+
+        state.details.as_mut().unwrap().auto_approve = false;
+        let unarmed = render_text(&state, 160, 40);
+        assert!(!unarmed.contains("AUTO-APPROVE"), "{unarmed}");
+        assert!(
+            unarmed.contains("Auto-approve"),
+            "arming is offered: {unarmed}"
+        );
     }
 
     #[test]

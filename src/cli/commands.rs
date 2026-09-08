@@ -136,6 +136,18 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             );
             Ok(())
         }
+        Some(Command::AutoApprove { run_id, off }) => {
+            service()?.set_run_auto_approve(*run_id, !*off)?;
+            if *off {
+                println!("Run {run_id} will wait for you on every permission request.");
+            } else {
+                println!(
+                    "Run {run_id} will approve grantable permission requests by itself. Questions still stop it."
+                );
+                println!("Resume it with `polycode resume {run_id}` if it is waiting on one now.");
+            }
+            Ok(())
+        }
         Some(Command::Delete { run_id, yes }) => {
             if !*yes {
                 println!(

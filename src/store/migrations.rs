@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 8;
+pub const DATABASE_SCHEMA_VERSION: u32 = 9;
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
@@ -17,7 +17,8 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
-            migrate_v8(connection)
+            migrate_v8(connection)?;
+            migrate_v9(connection)
         }
         1 => {
             migrate_v2(connection)?;
@@ -26,7 +27,8 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
-            migrate_v8(connection)
+            migrate_v8(connection)?;
+            migrate_v9(connection)
         }
         2 => {
             migrate_v3(connection)?;
@@ -34,31 +36,40 @@ pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
-            migrate_v8(connection)
+            migrate_v8(connection)?;
+            migrate_v9(connection)
         }
         3 => {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
-            migrate_v8(connection)
+            migrate_v8(connection)?;
+            migrate_v9(connection)
         }
         4 => {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
-            migrate_v8(connection)
+            migrate_v8(connection)?;
+            migrate_v9(connection)
         }
         5 => {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
-            migrate_v8(connection)
+            migrate_v8(connection)?;
+            migrate_v9(connection)
         }
         6 => {
             migrate_v7(connection)?;
-            migrate_v8(connection)
+            migrate_v8(connection)?;
+            migrate_v9(connection)
         }
-        7 => migrate_v8(connection),
+        7 => {
+            migrate_v8(connection)?;
+            migrate_v9(connection)
+        }
+        8 => migrate_v9(connection),
         unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
     }
 }
@@ -523,6 +534,23 @@ fn migrate_v8(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Automatic approval, per run.
+///
+/// Answering the same permission request by hand all day is the cost of a
+/// safe default, not a safety property in itself: the operator who trusts a
+/// run wants it to keep going. `auto_approve` records that trust on the run
+/// it was given for, so it survives a restart and never leaks to the next
+/// run. Existing runs default to off — nobody is opted in by upgrading.
+fn migrate_v9(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE runs ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0;
+         PRAGMA user_version = 9;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
@@ -599,6 +627,50 @@ mod tests {
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
             DATABASE_SCHEMA_VERSION
+        );
+    }
+
+    /// Upgrading is not consent: a database written before automatic
+    /// approval existed comes back with every run still asking.
+    #[test]
+    fn v9_leaves_every_existing_run_asking_for_permission() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        migrate_v1(&connection).unwrap();
+        migrate_v2(&connection).unwrap();
+        migrate_v3(&connection).unwrap();
+        migrate_v4(&connection).unwrap();
+        migrate_v5(&connection).unwrap();
+        migrate_v6(&connection).unwrap();
+        migrate_v7(&connection).unwrap();
+        migrate_v8(&connection).unwrap();
+        let mut store = SqliteStore { connection };
+        let at: DateTime<Utc> = std::time::SystemTime::now().into();
+        let config_id = ConfigSnapshotId::new("v8-config").unwrap();
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Fast,
+            vec![StageDefinition::new(
+                StageId::new("implementation").unwrap(),
+                StageKind::Implementation,
+                Role::Implementer,
+                vec![],
+            )],
+        )
+        .unwrap();
+        let run = Run::new(RunId::from_u128(910), workflow, config_id.clone(), at);
+        let config = ResolvedConfigSnapshot::new(config_id, 1, json!({"v": 8}), at).unwrap();
+        let event = run.created_event(EventMetadata::new(EventId::from_u128(911), at));
+        store.create_run(&run, &config, &[event]).unwrap();
+
+        migrate(&store.connection).unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), DATABASE_SCHEMA_VERSION);
+        assert_eq!(store.load_run(run.id()).unwrap().run, run);
+        assert!(
+            !store.run_auto_approve(run.id()).unwrap(),
+            "no run is opted in by upgrading"
         );
     }
 
