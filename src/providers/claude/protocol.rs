@@ -39,6 +39,30 @@ impl PermissionDenial {
         self.tool_name == "AskUserQuestion"
     }
 
+    /// What the request is *about*: the command, path or URL the operator has
+    /// to judge. A bare tool name is not a permission question anyone can
+    /// answer, so every summary shown to a human carries this.
+    pub(crate) fn subject(&self) -> Option<&str> {
+        let field = match self.tool_name.as_str() {
+            "Bash" => "command",
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "Read" | "NotebookRead" => {
+                "file_path"
+            }
+            "WebFetch" => "url",
+            _ => return None,
+        };
+        self.tool_input
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Whether approving this request as asked can actually be replayed.
+    pub(crate) fn is_grantable(&self) -> bool {
+        self.exact_rules().is_ok()
+    }
+
     /// Whether two denial entries describe the same native permission request.
     ///
     /// Prefers `tool_use_id`; falls back to structural equality only when the
@@ -52,7 +76,7 @@ impl PermissionDenial {
 
     /// Whether denial can be treated as historical after a successful terminal result.
     ///
-    /// This is deliberately stricter than `exact_rule`: an exact Bash rule is
+    /// This is deliberately stricter than `exact_rules`: an exact Bash rule is
     /// still not enough to grant execution authority. Only commands proven to
     /// be read-only diagnostics may be ignored as recovered history.
     pub(crate) fn is_recovered_diagnostic(&self) -> bool {
@@ -186,7 +210,21 @@ impl PermissionDenial {
         canonical.is_some_and(|path| path.starts_with(&root) && path != root)
     }
 
-    pub(crate) fn exact_rule(&self) -> Result<String, ClaudeProviderError> {
+    /// Every exact `--allowedTools` rule that replays this one denied call.
+    ///
+    /// One rule for every tool but Bash. A Bash line that is a single simple
+    /// command is one rule; a compound line is one rule per simple command,
+    /// because that is how Claude Code itself reads it — it splits a compound
+    /// command on its separators and runs it only when *every* part matches a
+    /// rule. Granting the parts therefore replays exactly the denied call and
+    /// nothing wider.
+    ///
+    /// # Errors
+    /// `UnsafePermission` when the request cannot be expressed as exact rules
+    /// at all: an unknown tool, a path or command carrying rule syntax, or
+    /// shell this parser refuses to read (command substitution, backticks,
+    /// subshells, heredocs).
+    pub(crate) fn exact_rules(&self) -> Result<Vec<String>, ClaudeProviderError> {
         let mut unsafe_bash = None;
         let target = match self.tool_name.as_str() {
             "Write" | "Edit" => self
@@ -194,19 +232,18 @@ impl PermissionDenial {
                 .get("file_path")
                 .and_then(Value::as_str)
                 .filter(|path| safe_rule_value(path))
-                .map(|path| format!("Edit({})", path_rule(path))),
+                .map(|path| vec![format!("Edit({})", path_rule(path))]),
             "Read" => self
                 .tool_input
                 .get("file_path")
                 .and_then(Value::as_str)
                 .filter(|path| safe_rule_value(path))
-                .map(|path| format!("Read({})", path_rule(path))),
+                .map(|path| vec![format!("Read({})", path_rule(path))]),
             "Bash" => self
                 .tool_input
                 .get("command")
                 .and_then(Value::as_str)
-                .filter(|command| safe_rule_value(command) && !compound_shell(command))
-                .map(|command| format!("Bash({command})"))
+                .and_then(bash_rules)
                 .or_else(|| {
                     // Surface the command itself: the user sees *which* Bash
                     // call cannot be granted exactly, not a bare tool name.
@@ -216,7 +253,7 @@ impl PermissionDenial {
                         .and_then(Value::as_str)
                         .unwrap_or("<missing command>");
                     unsafe_bash = Some(format!(
-                        "Bash command cannot be granted as an exact rule (compound or unsafe shell); type a response to continue without granting it, or stop the run: {command}"
+                        "Bash command cannot be granted as an exact rule (shell this parser will not read: command substitution, subshell, or heredoc); type a response to continue without granting it, or stop the run: {command}"
                     ));
                     None
                 }),
@@ -225,15 +262,50 @@ impl PermissionDenial {
                 .get("url")
                 .and_then(Value::as_str)
                 .and_then(|url| url.split('/').nth(2))
-                .map(|domain| format!("WebFetch(domain:{domain})")),
+                .map(|domain| vec![format!("WebFetch(domain:{domain})")]),
             _ => None,
         };
-        target.ok_or_else(|| {
+        target.filter(|rules| !rules.is_empty()).ok_or_else(|| {
             ClaudeProviderError::UnsafePermission(
                 unsafe_bash.unwrap_or_else(|| self.tool_name.clone()),
             )
         })
     }
+}
+
+/// The exact rules that grant one denied Bash command, or `None` when the
+/// line cannot be expressed as rules.
+///
+/// A compound line becomes one rule per simple command, built from the
+/// *original* source text of each part — quote removal is lossy, and a rule
+/// has to match the command Claude Code will re-read character for
+/// character. A part that is only a redirection, or that carries rule
+/// syntax, makes the whole line ungrantable rather than partly granted.
+fn bash_rules(command: &str) -> Option<Vec<String>> {
+    if command.trim().is_empty() {
+        return None;
+    }
+    // Every line goes through the parser, single command included: a rule may
+    // only name shell that was read and understood, never text waved through
+    // because it happened to hold no separator.
+    let segments = split_simple_commands(command)?;
+    if segments.is_empty() {
+        return None;
+    }
+    segments
+        .iter()
+        .map(|segment| {
+            if segment.words.iter().all(|word| word.redirect) {
+                return None;
+            }
+            let text = command.get(segment.source.clone())?.trim();
+            // Re-read the slice rather than scanning it for separator
+            // characters: `2>&1` is an `&` that separates nothing, and a rule
+            // holding a real separator would grant more than one command.
+            let single = split_simple_commands(text).is_some_and(|parts| parts.len() == 1);
+            (single && safe_rule_value(text)).then(|| format!("Bash({text})"))
+        })
+        .collect()
 }
 
 fn path_rule(path: &str) -> String {
@@ -244,14 +316,6 @@ fn path_rule(path: &str) -> String {
     }
 }
 
-fn compound_shell(command: &str) -> bool {
-    command.contains("&&")
-        || command.contains("||")
-        || command
-            .chars()
-            .any(|character| matches!(character, ';' | '|' | '&' | '\n' | '\r'))
-}
-
 /// One shell word after quote removal.
 #[derive(Debug, Default)]
 struct ShellWord {
@@ -260,71 +324,90 @@ struct ShellWord {
     redirect: bool,
 }
 
+/// One simple command inside a shell line.
+#[derive(Debug)]
+struct SimpleCommand {
+    words: Vec<ShellWord>,
+    /// Byte range this command occupies in the original line, separators
+    /// excluded. Quote removal makes `words` unusable for anything that has
+    /// to be handed back to a shell — or to Claude Code as a permission
+    /// rule — so the untouched source text travels alongside it.
+    source: std::ops::Range<usize>,
+}
+
 /// Splits one Bash command line into simple commands (segments of words).
 ///
 /// Understands single/double quotes, backslash escapes, and the separators
 /// `;`, `|`, `||`, `&`, `&&`, newlines. Returns `None` for anything that is
 /// not a flat sequence of simple commands: subshells, grouping, command
 /// substitution, backticks, heredocs, or process substitution.
-fn split_simple_commands(command: &str) -> Option<Vec<Vec<ShellWord>>> {
-    if command.contains("$(") || command.contains('`') {
+fn split_simple_commands(command: &str) -> Option<Vec<SimpleCommand>> {
+    // Heredocs and here-strings turn the following lines into data, so the
+    // line-by-line reading below would take a document body for commands.
+    if command.contains("$(") || command.contains('`') || command.contains("<<") {
         return None;
     }
-    let mut segments = Vec::new();
-    let mut segment: Vec<ShellWord> = Vec::new();
+    let mut segments: Vec<SimpleCommand> = Vec::new();
+    let mut words: Vec<ShellWord> = Vec::new();
     let mut word = ShellWord::default();
     let mut in_word = false;
-    let mut chars = command.chars().peekable();
-    let flush_word = |segment: &mut Vec<ShellWord>, word: &mut ShellWord, in_word: &mut bool| {
-        if *in_word {
-            segment.push(std::mem::take(word));
-            *in_word = false;
-        }
-    };
-    while let Some(character) = chars.next() {
+    // Byte span of the segment being read: `start` opens on its first word
+    // character, `end` follows the last one, so separators and the spaces
+    // around them stay outside the recorded source.
+    let mut start: Option<usize> = None;
+    let mut end = 0;
+    let mut chars = command.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
         match character {
             '\'' => {
                 in_word = true;
-                read_single_quoted(&mut chars, &mut word.text)?;
+                start = start.or(Some(index));
+                end = read_single_quoted(&mut chars, &mut word.text)?;
             }
             '"' => {
                 in_word = true;
-                read_double_quoted(&mut chars, &mut word.text)?;
+                start = start.or(Some(index));
+                end = read_double_quoted(&mut chars, &mut word.text)?;
             }
             '\\' => match chars.next() {
-                Some('\n') => flush_word(&mut segment, &mut word, &mut in_word),
-                Some(escaped) => {
+                Some((_, '\n')) => flush_word(&mut words, &mut word, &mut in_word),
+                Some((escaped_index, escaped)) => {
                     in_word = true;
+                    start = start.or(Some(index));
+                    end = escaped_index + escaped.len_utf8();
                     word.text.push(escaped);
                 }
                 None => return None,
             },
-            ' ' | '\t' => flush_word(&mut segment, &mut word, &mut in_word),
+            ' ' | '\t' => flush_word(&mut words, &mut word, &mut in_word),
             '\n' | '\r' | ';' => {
-                flush_word(&mut segment, &mut word, &mut in_word);
-                segments.push(std::mem::take(&mut segment));
+                flush_word(&mut words, &mut word, &mut in_word);
+                flush_segment(&mut words, &mut start, end, &mut segments);
             }
             '|' => {
-                flush_word(&mut segment, &mut word, &mut in_word);
-                if chars.peek() == Some(&'|') {
+                flush_word(&mut words, &mut word, &mut in_word);
+                if chars.peek().is_some_and(|(_, next)| *next == '|') {
                     chars.next();
                 }
-                segments.push(std::mem::take(&mut segment));
+                flush_segment(&mut words, &mut start, end, &mut segments);
             }
             '&' => {
-                if chars.peek() == Some(&'>') {
+                if chars.peek().is_some_and(|(_, next)| *next == '>') {
                     // `&>target` redirection prefix.
                     in_word = true;
+                    start = start.or(Some(index));
+                    end = index + 1;
                     word.text.push('&');
                 } else if in_word && word.redirect && word.text.ends_with('>') {
                     // `2>&1` style descriptor duplication.
+                    end = index + 1;
                     word.text.push('&');
                 } else {
-                    flush_word(&mut segment, &mut word, &mut in_word);
-                    if chars.peek() == Some(&'&') {
+                    flush_word(&mut words, &mut word, &mut in_word);
+                    if chars.peek().is_some_and(|(_, next)| *next == '&') {
                         chars.next();
                     }
-                    segments.push(std::mem::take(&mut segment));
+                    flush_segment(&mut words, &mut start, end, &mut segments);
                 }
             }
             '<' | '>' => {
@@ -335,58 +418,85 @@ fn split_simple_commands(command: &str) -> Option<Vec<Vec<ShellWord>>> {
                         || word.text == "&"
                         || word.text == ">");
                 if !glued {
-                    flush_word(&mut segment, &mut word, &mut in_word);
+                    flush_word(&mut words, &mut word, &mut in_word);
                 }
                 in_word = true;
+                start = start.or(Some(index));
+                end = index + 1;
                 word.redirect = true;
                 word.text.push(character);
             }
             '(' | ')' => return None,
             other => {
                 in_word = true;
+                start = start.or(Some(index));
+                end = index + other.len_utf8();
                 word.text.push(other);
             }
         }
     }
-    flush_word(&mut segment, &mut word, &mut in_word);
-    segments.push(segment);
-    Some(
-        segments
-            .into_iter()
-            .filter(|segment| !segment.is_empty())
-            .collect(),
-    )
+    flush_word(&mut words, &mut word, &mut in_word);
+    flush_segment(&mut words, &mut start, end, &mut segments);
+    Some(segments)
 }
 
+/// Closes the word being read, if one is open.
+fn flush_word(words: &mut Vec<ShellWord>, word: &mut ShellWord, in_word: &mut bool) {
+    if *in_word {
+        words.push(std::mem::take(word));
+        *in_word = false;
+    }
+}
+
+/// Closes the simple command being read, if it collected any word.
+fn flush_segment(
+    words: &mut Vec<ShellWord>,
+    start: &mut Option<usize>,
+    end: usize,
+    segments: &mut Vec<SimpleCommand>,
+) {
+    if let (false, Some(open)) = (words.is_empty(), start.take()) {
+        segments.push(SimpleCommand {
+            words: std::mem::take(words),
+            source: open..end,
+        });
+    } else {
+        words.clear();
+        *start = None;
+    }
+}
+
+/// Reads to the closing quote and returns the byte index just past it.
 fn read_single_quoted(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     text: &mut String,
-) -> Option<()> {
+) -> Option<usize> {
     loop {
         match chars.next() {
-            Some('\'') => return Some(()),
-            Some(inner) => text.push(inner),
+            Some((index, '\'')) => return Some(index + 1),
+            Some((_, inner)) => text.push(inner),
             None => return None,
         }
     }
 }
 
+/// Reads to the closing quote and returns the byte index just past it.
 fn read_double_quoted(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     text: &mut String,
-) -> Option<()> {
+) -> Option<usize> {
     loop {
         match chars.next() {
-            Some('"') => return Some(()),
-            Some('\\') => match chars.next() {
-                Some(escaped @ ('"' | '\\' | '$' | '`')) => text.push(escaped),
-                Some(other) => {
+            Some((index, '"')) => return Some(index + 1),
+            Some((_, '\\')) => match chars.next() {
+                Some((_, escaped @ ('"' | '\\' | '$' | '`'))) => text.push(escaped),
+                Some((_, other)) => {
                     text.push('\\');
                     text.push(other);
                 }
                 None => return None,
             },
-            Some(inner) => text.push(inner),
+            Some((_, inner)) => text.push(inner),
             None => return None,
         }
     }
@@ -405,7 +515,7 @@ fn safe_diagnostic_shell(command: &str) -> bool {
     !segments.is_empty()
         && segments
             .into_iter()
-            .all(|segment| safe_diagnostic_command(&segment))
+            .all(|segment| safe_diagnostic_command(&segment.words))
 }
 
 fn harmless_redirection(word: &str) -> bool {
@@ -457,7 +567,7 @@ fn strip_redirections(segment: &[ShellWord]) -> Option<Vec<&str>> {
 fn fetches_over_network(command: &str) -> bool {
     split_simple_commands(command).is_some_and(|segments| {
         segments.iter().any(|segment| {
-            strip_redirections(segment).is_some_and(|words| {
+            strip_redirections(&segment.words).is_some_and(|words| {
                 words
                     .split_first()
                     .is_some_and(|(executable, arguments)| network_fetch(executable, arguments))
@@ -1032,7 +1142,7 @@ mod tests {
         };
         assert!(success);
         assert_eq!(denials[0].tool_use_id.as_deref(), Some("toolu_01A"));
-        assert_eq!(denials[0].exact_rule().unwrap(), "Edit(//tmp/a)");
+        assert_eq!(denials[0].exact_rules().unwrap(), vec!["Edit(//tmp/a)"]);
     }
 
     #[test]
@@ -1053,7 +1163,13 @@ mod tests {
         let denial = bash("cargo test && cargo clippy");
         assert!(denial.is_recovered_diagnostic());
         assert!(!denial.requires_terminal_attention(StageKind::Implementation));
-        assert!(denial.exact_rule().is_err());
+        assert_eq!(
+            denial.exact_rules().unwrap(),
+            vec![
+                "Bash(cargo test)".to_owned(),
+                "Bash(cargo clippy)".to_owned()
+            ],
+        );
     }
 
     // Real shapes below are copied structurally from native role_core_v3 logs.
@@ -1458,13 +1574,66 @@ mod tests {
         assert_eq!(denials[0].tool_use_id.as_deref(), Some("toolu_q"));
     }
 
+    /// A compound line is granted as its parts, never as one rule carrying
+    /// the separators: Claude Code splits the command itself and demands a
+    /// rule for every part, so the parts are what a grant has to name.
     #[test]
-    fn compound_bash_is_not_misrepresented_as_one_exact_rule() {
+    fn compound_bash_is_granted_as_one_rule_per_simple_command() {
         let denial = bash("printf x >> file && git diff");
-        assert!(matches!(
-            denial.exact_rule(),
-            Err(ClaudeProviderError::UnsafePermission(_))
-        ));
+        assert_eq!(
+            denial.exact_rules().unwrap(),
+            vec![
+                "Bash(printf x >> file)".to_owned(),
+                "Bash(git diff)".to_owned(),
+            ],
+        );
+    }
+
+    /// Rules are cut from the original text, not from parsed words: quote
+    /// removal would hand Claude Code a command it never denied.
+    #[test]
+    fn compound_bash_rules_keep_the_operators_own_quoting() {
+        let denial = bash(
+            "grep -rn \"HELP_CENTER; VARIATION\" client/ | head -5; yarn eslint 'client/a b.tsx' 2>&1 | tail -20",
+        );
+        assert_eq!(
+            denial.exact_rules().unwrap(),
+            vec![
+                "Bash(grep -rn \"HELP_CENTER; VARIATION\" client/)".to_owned(),
+                "Bash(head -5)".to_owned(),
+                "Bash(yarn eslint 'client/a b.tsx' 2>&1)".to_owned(),
+                "Bash(tail -20)".to_owned(),
+            ],
+        );
+    }
+
+    /// Shell the parser will not read stays ungrantable, and says which
+    /// command it refused so the operator can answer instead.
+    #[test]
+    fn unreadable_bash_is_still_refused_by_name() {
+        let denial = bash("rm -rf \"$(cat target)\"");
+        let Err(ClaudeProviderError::UnsafePermission(message)) = denial.exact_rules() else {
+            panic!("command substitution must not be grantable");
+        };
+        assert!(message.contains("rm -rf \"$(cat target)\""), "{message}");
+        for unreadable in [
+            "(cd /repo && make)",
+            "cat <<'EOF' > f\nbody\nEOF",
+            "echo `whoami`",
+        ] {
+            assert!(
+                bash(unreadable).exact_rules().is_err(),
+                "must refuse: {unreadable}"
+            );
+        }
+    }
+
+    /// A rule may not carry the syntax that ends it, or a wildcard that would
+    /// widen it past the call that was actually denied.
+    #[test]
+    fn rule_syntax_in_a_segment_makes_the_whole_line_ungrantable() {
+        assert!(bash("ls *.rs; echo done").exact_rules().is_err());
+        assert!(bash("ls; ls ?").exact_rules().is_err());
     }
 
     #[test]

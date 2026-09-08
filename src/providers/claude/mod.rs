@@ -1078,19 +1078,47 @@ impl<B: ProcessBackend> Provider for ClaudeProvider<B> {
     }
 }
 
+/// How much of a denied command or path the summary shows before eliding it.
+/// Long enough to recognise the call, short enough to stay one line.
+const SUBJECT_LIMIT: usize = 160;
+
 fn permission_summary(denials: &[PermissionDenial]) -> String {
     let names = denials
         .iter()
-        .map(|denial| denial.tool_name.as_str())
+        .map(|denial| match denial.subject() {
+            Some(subject) => format!("{} {}", denial.tool_name, elide(subject, SUBJECT_LIMIT)),
+            None => denial.tool_name.clone(),
+        })
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(" · ");
     let mut summary = format!("Claude Code requests permission for: {names}");
     if denials.iter().any(PermissionDenial::is_denied_acquisition) {
         summary.push_str(
             " \u{2014} the stage never got evidence it went looking for; approve it, or answer with --response to say what to do instead",
         );
     }
+    // Approving something that cannot be replayed as a rule fails, and it
+    // fails *after* the operator has already chosen to approve. Say so in the
+    // request itself, while the choice is still open.
+    if !denials.is_empty()
+        && !denials
+            .iter()
+            .any(|denial| denial.is_question() || denial.is_grantable())
+    {
+        summary.push_str(
+            " \u{2014} this cannot be granted as a permission rule: answer with what to do instead, or skip it",
+        );
+    }
     summary
+}
+
+/// Shortens `value` to `limit` characters, marking that it was cut.
+fn elide(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_owned();
+    }
+    let kept: String = value.chars().take(limit).collect();
+    format!("{kept}\u{2026}")
 }
 
 #[cfg(test)]
@@ -1632,13 +1660,16 @@ mod tests {
     }
 
     /// Regression: the real run 01M1F4S6V33DQHETQVRAHPQG1E. Claude asked for
-    /// two compound Bash commands, the operator approved, the resolution was
-    /// committed, and the resume command could never be built — the stage
-    /// read `running` for an hour with no process. Approval of an
-    /// unreplayable denial must fail *before* anything is committed, and the
-    /// run must still be answerable (stop/retry) afterwards.
+    /// Bash commands, the operator approved, the resolution was committed,
+    /// and the resume command could never be built — the stage read `running`
+    /// for an hour with no process. Approval of an unreplayable denial must
+    /// fail *before* anything is committed, and the run must still be
+    /// answerable (stop/retry) afterwards.
+    ///
+    /// Compound shell is no longer what strands a run — it is granted per
+    /// simple command. Shell no parser will read exactly still is.
     #[test]
-    fn approving_compound_bash_denial_fails_before_committing_resolution() {
+    fn approving_unreadable_bash_denial_fails_before_committing_resolution() {
         let backend = FixtureBackend::with_first_result(
             json!({
                 "type": "result",
@@ -1647,8 +1678,8 @@ mod tests {
                 "result": "Blocked on permission.",
                 "session_id": "native-session-1",
                 "permission_denials": [
-                    {"tool_name":"Bash","tool_input":{"command":"ls /repo | head -30; ls -d /repo/node_modules"}},
-                    {"tool_name":"Bash","tool_input":{"command":"yarn install 2>&1 | tail -20","run_in_background":true}}
+                    {"tool_name":"Bash","tool_input":{"command":"(cd /repo && ls -d node_modules)"}},
+                    {"tool_name":"Bash","tool_input":{"command":"yarn install --frozen-lockfile \"$(cat .yarnrc)\"","run_in_background":true}}
                 ]
             })
             .to_string(),
@@ -1697,10 +1728,149 @@ mod tests {
         );
     }
 
-    /// The operator's way out of an unreplayable permission: type an answer.
-    /// The session resumes on that text with nothing granted and finishes.
+    /// A permission request the operator cannot read is one they cannot
+    /// answer: the summary names the call, not just the tool.
     #[test]
-    fn operator_response_continues_past_compound_bash_without_granting() {
+    fn permission_summary_names_the_call_it_asks_about() {
+        let summary = permission_summary(&[
+            PermissionDenial {
+                tool_name: "Bash".to_owned(),
+                tool_use_id: None,
+                tool_input: json!({"command": "yarn prettier --check style.scss"}),
+            },
+            PermissionDenial {
+                tool_name: "Write".to_owned(),
+                tool_use_id: None,
+                tool_input: json!({"file_path": "/repo/src/lib.rs"}),
+            },
+        ]);
+        assert!(
+            summary.contains("Bash yarn prettier --check style.scss"),
+            "{summary}"
+        );
+        assert!(summary.contains("Write /repo/src/lib.rs"), "{summary}");
+        assert!(
+            !summary.contains("cannot be granted"),
+            "both are grantable: {summary}"
+        );
+    }
+
+    /// Approving something unreplayable fails, and it fails after the
+    /// operator has already chosen to approve. The request says so first.
+    #[test]
+    fn permission_summary_warns_before_an_approval_that_cannot_work() {
+        let summary = permission_summary(&[PermissionDenial {
+            tool_name: "Bash".to_owned(),
+            tool_use_id: None,
+            tool_input: json!({"command": "yarn install \"$(cat .yarnrc)\""}),
+        }]);
+        assert!(
+            summary.contains("yarn install \"$(cat .yarnrc)\""),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("cannot be granted as a permission rule"),
+            "{summary}"
+        );
+    }
+
+    /// A pathological command must not push the request out of every list it
+    /// is shown in.
+    #[test]
+    fn permission_summary_elides_a_runaway_command() {
+        let summary = permission_summary(&[PermissionDenial {
+            tool_name: "Bash".to_owned(),
+            tool_use_id: None,
+            tool_input: json!({"command": format!("grep -rn {} .", "x".repeat(4_000))}),
+        }]);
+        assert!(summary.chars().count() < 400, "{}", summary.len());
+        assert!(summary.contains('\u{2026}'), "{summary}");
+    }
+
+    /// Real shape from run 01M20KEZ6BYBJ2P5D6FQ12SYTG: the agent asked to run
+    /// a checked pipeline, the operator approved, and approval failed because
+    /// the line was compound. Claude Code splits a compound command and
+    /// requires a rule for every part (verified against the CLI: the same
+    /// call is allowed with both part rules and denied with one), so approval
+    /// grants the parts and the run carries on.
+    #[test]
+    fn approving_compound_bash_grants_one_rule_per_simple_command() {
+        let backend = FixtureBackend::with_first_result(
+            json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": "Blocked on permission.",
+                "session_id": "native-session-1",
+                "permission_denials": [
+                    {"tool_name":"Bash","tool_input":{"command":"git stash list >/dev/null; yarn prettier --check style.scss 2>&1 | tail -5"}}
+                ]
+            })
+            .to_string(),
+        );
+        let (_temp, _database, run_id, mut store, provider) = fixture_with_backend(backend, false);
+        let mut engine = WorkflowEngine::new(provider, "compound bash approval");
+        let request = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        // The operator can read what they are approving before approving it.
+        let summary = store
+            .load_run(run_id)
+            .unwrap()
+            .run
+            .attention_requests()
+            .iter()
+            .find(|attention| attention.id() == request)
+            .expect("pending attention")
+            .summary()
+            .to_owned();
+        assert!(
+            summary.contains("yarn prettier --check style.scss"),
+            "{summary}"
+        );
+
+        engine
+            .resolve_attention(&mut store, run_id, request)
+            .unwrap();
+        loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::Finished {
+                    run_status: RunStatus::Completed,
+                } => break,
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        }
+        let argv = all_argv(&store, run_id);
+        for rule in [
+            "Bash(git stash list >/dev/null)",
+            "Bash(yarn prettier --check style.scss 2>&1)",
+            "Bash(tail -5)",
+        ] {
+            assert!(
+                argv.iter().any(|arg| arg == rule),
+                "missing {rule}: {argv:?}"
+            );
+        }
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains(';') || arg.contains('*')),
+            "no rule spans the whole compound line or widens it: {argv:?}"
+        );
+    }
+
+    /// An answer is the operator's way past a permission request, and it is
+    /// not an approval: the session resumes on that text having granted
+    /// nothing — including when the call *could* have been granted exactly.
+    /// Skipping travels the same path, so a declined call is never handed the
+    /// rule that would have allowed it.
+    #[test]
+    fn operator_response_grants_nothing_even_when_the_call_is_grantable() {
         let backend = FixtureBackend::with_first_result(
             json!({
                 "type": "result",
