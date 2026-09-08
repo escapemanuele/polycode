@@ -17,6 +17,12 @@ pub(crate) enum Intent {
     BackTab,
     Backspace,
     Delete,
+    /// Clear the text left of the cursor (`Ctrl-U`).
+    DeleteToStart,
+    /// Clear the text right of the cursor (`Ctrl-K`).
+    DeleteToEnd,
+    /// Clear the word left of the cursor (`Ctrl-W` or `Alt-Backspace`).
+    DeleteWordBefore,
     NewRun,
     Runs,
     Resume,
@@ -104,8 +110,20 @@ pub(crate) fn map_text_key(event: KeyEvent) -> Intent {
         match event.code {
             KeyCode::Char('c') => return Intent::Quit,
             KeyCode::Char('s') => return Intent::Skip,
+            KeyCode::Char('u') => return Intent::DeleteToStart,
+            KeyCode::Char('k') => return Intent::DeleteToEnd,
+            KeyCode::Char('w') | KeyCode::Backspace => return Intent::DeleteWordBefore,
             _ => {}
         }
+    }
+    // Option-Backspace on macOS and Alt-Backspace elsewhere: delete a word.
+    if event.modifiers.contains(KeyModifiers::ALT) && event.code == KeyCode::Backspace {
+        return Intent::DeleteWordBefore;
+    }
+    // Cmd-Backspace and other supers reach us only on terminals that report
+    // them; treat them as the whole-line clear macOS users expect.
+    if event.modifiers.contains(KeyModifiers::SUPER) && event.code == KeyCode::Backspace {
+        return Intent::DeleteToStart;
     }
     match event.code {
         KeyCode::Up => Intent::Up,
@@ -146,6 +164,38 @@ mod tests {
         assert_eq!(
             map_text_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Intent::Quit
+        );
+    }
+
+    #[test]
+    fn text_mode_maps_readline_line_kills_and_leaves_plain_letters_alone() {
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Intent::DeleteToStart
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            Intent::DeleteToEnd
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Intent::DeleteWordBefore
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+            Intent::DeleteWordBefore
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER)),
+            Intent::DeleteToStart
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Intent::Backspace
+        );
+        assert_eq!(
+            map_text_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Intent::Character('u')
         );
     }
 
