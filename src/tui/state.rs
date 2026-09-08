@@ -205,6 +205,40 @@ impl TextField {
         self.text.replace_range(start..end, "");
     }
 
+    /// Clears everything left of the cursor (readline's `Ctrl-U`).
+    pub(crate) fn delete_to_start(&mut self) {
+        let end = byte_index(&self.text, self.cursor);
+        self.text.replace_range(..end, "");
+        self.cursor = 0;
+    }
+
+    /// Clears everything right of the cursor (readline's `Ctrl-K`).
+    pub(crate) fn delete_to_end(&mut self) {
+        let start = byte_index(&self.text, self.cursor);
+        self.text.truncate(start);
+    }
+
+    /// Clears the word left of the cursor (readline's `Ctrl-W`), skipping any
+    /// whitespace under the cursor first so a trailing space deletes the word
+    /// before it rather than the space alone.
+    pub(crate) fn delete_word_before(&mut self) {
+        let characters: Vec<char> = self.text.chars().collect();
+        let mut start = self.cursor;
+        while start > 0 && characters[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !characters[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        if start == self.cursor {
+            return;
+        }
+        let end_byte = byte_index(&self.text, self.cursor);
+        let start_byte = byte_index(&self.text, start);
+        self.text.replace_range(start_byte..end_byte, "");
+        self.cursor = start;
+    }
+
     pub(crate) fn delete(&mut self) {
         if self.cursor == self.text.chars().count() {
             return;
@@ -700,10 +734,19 @@ impl TuiState {
         if length == 0 {
             return;
         }
+        // The pipeline is a short ring: stepping past either end lands on the
+        // other, so reaching the last stage never means travelling back
+        // through every one before it.
         self.selected_stage_index = if forward {
-            (self.selected_stage_index + 1).min(length - 1)
+            if self.selected_stage_index + 1 >= length {
+                0
+            } else {
+                self.selected_stage_index + 1
+            }
+        } else if self.selected_stage_index == 0 {
+            length - 1
         } else {
-            self.selected_stage_index.saturating_sub(1)
+            self.selected_stage_index - 1
         };
         self.selected_stage = self
             .details
@@ -1011,6 +1054,39 @@ mod tests {
         field.home();
         field.delete();
         assert_eq!(field.text(), "aféè");
+    }
+
+    #[test]
+    fn line_kills_cut_only_their_side_of_the_cursor() {
+        let mut field = TextField::new("caffè latte");
+        field.left();
+        field.left();
+        field.delete_to_start();
+        assert_eq!(field.text(), "te");
+        assert_eq!(field.cursor(), 0);
+
+        let mut field = TextField::new("caffè latte");
+        field.home();
+        field.right();
+        field.delete_to_end();
+        assert_eq!(field.text(), "c");
+        assert_eq!(field.cursor(), 1);
+    }
+
+    #[test]
+    fn word_kill_skips_trailing_space_and_stops_at_the_previous_word() {
+        let mut field = TextField::new("fix the caffè ");
+        field.delete_word_before();
+        assert_eq!(field.text(), "fix the ");
+        assert_eq!(field.cursor(), 8);
+        field.delete_word_before();
+        assert_eq!(field.text(), "fix ");
+
+        let mut field = TextField::new("solo");
+        field.home();
+        field.delete_word_before();
+        assert_eq!(field.text(), "solo");
+        assert_eq!(field.cursor(), 0);
     }
 
     #[test]

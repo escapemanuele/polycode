@@ -399,6 +399,9 @@ impl TuiApp {
             Intent::Home => self.state.attention_response.home(),
             Intent::End => self.state.attention_response.end(),
             Intent::Backspace => self.state.attention_response.backspace(),
+            Intent::DeleteToStart => self.state.attention_response.delete_to_start(),
+            Intent::DeleteToEnd => self.state.attention_response.delete_to_end(),
+            Intent::DeleteWordBefore => self.state.attention_response.delete_word_before(),
             Intent::Delete => self.state.attention_response.delete(),
             Intent::Character(character) => self.state.attention_response.insert(character),
             Intent::Enter => {
@@ -448,6 +451,11 @@ impl TuiApp {
             Intent::Home => self.edit_text(super::state::TextField::home),
             Intent::End => self.edit_text(super::state::TextField::end),
             Intent::Backspace => self.edit_text(super::state::TextField::backspace),
+            Intent::DeleteToStart => self.edit_text(super::state::TextField::delete_to_start),
+            Intent::DeleteToEnd => self.edit_text(super::state::TextField::delete_to_end),
+            Intent::DeleteWordBefore => {
+                self.edit_text(super::state::TextField::delete_word_before);
+            }
             Intent::Delete => self.edit_text(super::state::TextField::delete),
             Intent::Character(character) => self.edit_text(|field| field.insert(character)),
             Intent::Enter => self.submit_new_run(),
@@ -665,6 +673,9 @@ impl TuiApp {
             Intent::Home => self.state.continue_instruction.home(),
             Intent::End => self.state.continue_instruction.end(),
             Intent::Backspace => self.state.continue_instruction.backspace(),
+            Intent::DeleteToStart => self.state.continue_instruction.delete_to_start(),
+            Intent::DeleteToEnd => self.state.continue_instruction.delete_to_end(),
+            Intent::DeleteWordBefore => self.state.continue_instruction.delete_word_before(),
             Intent::Delete => self.state.continue_instruction.delete(),
             Intent::Character(character) => self.state.continue_instruction.insert(character),
             Intent::Enter => {
@@ -2305,6 +2316,62 @@ mod tests {
         assert_eq!(
             app.state.new_run.effort, start,
             "Left steps back to where it was"
+        );
+    }
+
+    /// The pipeline is a ring: stepping back from the first stage lands on
+    /// the last, and forward from the last returns to the first, so the far
+    /// end of a long pipeline is always one key away.
+    #[test]
+    fn stage_selection_wraps_around_both_ends_of_the_pipeline() {
+        let mut details = details(RunStatus::Running, WorkflowKind::Standard);
+        let first = details.stages[0].clone();
+        for name in ["review", "decision"] {
+            let mut stage = first.clone();
+            stage.id = StageId::new(name).unwrap();
+            details.stages.push(stage);
+        }
+        let (mut app, _fixture) = app_with(details);
+        app.state.screen = Screen::RunDetail;
+        assert_eq!(
+            app.state.selected_stage_index, 0,
+            "a run opens at its first stage"
+        );
+
+        app.handle_intent(Intent::Up);
+        assert_eq!(
+            app.state.selected_stage_index, 2,
+            "stepping back from the first stage has to reach the last"
+        );
+        assert_eq!(
+            app.state.selected_stage.as_ref().map(StageId::as_str),
+            Some("decision"),
+            "the selected stage id has to follow the index"
+        );
+
+        app.handle_intent(Intent::Down);
+        assert_eq!(
+            app.state.selected_stage_index, 0,
+            "stepping forward from the last stage has to reach the first"
+        );
+    }
+
+    /// Backspacing a long task one character at a time is the complaint that
+    /// motivated the line kills; the composer's task field must answer them.
+    #[test]
+    fn the_composer_task_field_answers_the_readline_line_kills() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+        app.state.new_run.focus = 0;
+        app.state.new_run.task = crate::tui::state::TextField::new("rewrite the whole task");
+
+        app.handle_intent(Intent::DeleteWordBefore);
+        assert_eq!(app.state.new_run.task.text(), "rewrite the whole ");
+        app.handle_intent(Intent::DeleteToStart);
+        assert_eq!(
+            app.state.new_run.task.text(),
+            "",
+            "Ctrl-U must clear the line, not one character"
         );
     }
 
