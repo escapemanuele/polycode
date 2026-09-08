@@ -10,6 +10,7 @@ use crate::app::{
     RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, UniformProvider,
 };
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
+use crate::workspace::PullRequestStatus;
 
 /// How long POD reacts to a change before settling into the new state. Long
 /// enough to be seen, short enough that it is over before it is in the way.
@@ -47,6 +48,75 @@ pub(crate) enum Overlay {
     /// configured with, or one of the others. Retry is never automatic about
     /// this; the operator picks, then confirms.
     RetryRoute,
+    /// A pull request being published right now: commit, push, `gh pr
+    /// create`. Esc hides it; the work carries on behind the header's busy
+    /// label and comes back as [`Overlay::Published`] when it lands.
+    Publishing,
+    /// What the publish did, held open until dismissed so the URL can be
+    /// read, opened, or copied rather than caught in a four-second message.
+    Published,
+}
+
+/// A publish the operator is waiting on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublishInFlight {
+    pub run_id: RunId,
+    pub started: Instant,
+}
+
+/// How a publish ended, kept for the [`Overlay::Published`] card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    /// The branch reached origin; the pull request may or may not have.
+    Pushed {
+        run_id: RunId,
+        branch: String,
+        commit: String,
+        pull_request: PullRequestStatus,
+    },
+    /// Nothing reached origin.
+    Failed { run_id: RunId, error: String },
+}
+
+impl PublishOutcome {
+    /// The pull request's URL, when there is one to open or copy.
+    pub(crate) fn url(&self) -> Option<&str> {
+        match self {
+            Self::Pushed {
+                pull_request:
+                    PullRequestStatus::Created(url) | PullRequestStatus::AlreadyExists(url),
+                ..
+            } => Some(url.as_str()),
+            Self::Pushed { .. } | Self::Failed { .. } => None,
+        }
+    }
+
+    /// One line for the footer once the card is closed, so the result is
+    /// not lost the moment the operator dismisses it.
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::Pushed {
+                pull_request: PullRequestStatus::Created(url),
+                ..
+            } => format!("Pull request created: {url}"),
+            Self::Pushed {
+                pull_request: PullRequestStatus::AlreadyExists(url),
+                ..
+            } => format!("Branch pushed; pull request already open: {url}"),
+            Self::Pushed {
+                branch,
+                pull_request: PullRequestStatus::Unavailable(reason),
+                ..
+            } => format!("Branch {branch} pushed. {reason}"),
+            Self::Failed { run_id, error } => {
+                format!("Publishing pull request failed for {run_id}: {error}")
+            }
+        }
+    }
+
+    pub(crate) fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
 }
 
 /// One row of the `[t]` chooser.
@@ -545,6 +615,10 @@ pub(crate) struct TuiState {
     /// than a single slot: this interface can be working on several runs at
     /// once, and one run's action is no reason to refuse another's.
     pub in_flight: Vec<InFlightAction>,
+    /// The publish the [`Overlay::Publishing`] card is timing, if one is.
+    pub publishing: Option<PublishInFlight>,
+    /// The last publish's outcome, shown by [`Overlay::Published`].
+    pub published: Option<PublishOutcome>,
     /// Runs the operator has already decided to send back for a fix, chosen
     /// while the run was still working. Held here rather than in the store
     /// because nothing has happened yet: this is an intention about a run, not
@@ -614,6 +688,8 @@ impl TuiState {
             retry_route_choice: RetryRouteChoice::Configured,
             new_run: NewRunForm::new(repository),
             in_flight: Vec::new(),
+            publishing: None,
+            published: None,
             message: None,
             quiescent: None,
             update: None,
@@ -1156,6 +1232,7 @@ mod tests {
             Overlay::ApplyConfirm,
             Overlay::DiscardConfirm,
             Overlay::Update,
+            Overlay::Published,
         ] {
             let mut state = TuiState::new(std::path::Path::new("/repo"));
             state.screen = Screen::RunDetail;

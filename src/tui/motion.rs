@@ -152,8 +152,12 @@ pub(crate) fn motion_setting() -> MotionSetting {
 /// under the question stops moving too. Otherwise "reading surfaces never
 /// move" would hold only for as long as nobody looked past the overlay.
 pub(crate) const fn surface_ceiling(screen: Screen, overlay: Option<Overlay>) -> MotionAllowance {
-    if overlay.is_some() {
-        return MotionAllowance::Disabled;
+    match overlay {
+        // The publishing card exists to say "still working": its spinner is
+        // the whole point, so it keeps the operating surface's allowance.
+        Some(Overlay::Publishing) => return MotionAllowance::ActiveStateAndTransitions,
+        Some(_) => return MotionAllowance::Disabled,
+        None => {}
     }
     match screen {
         // Operating surfaces: what they show is work in progress, so time is
@@ -269,12 +273,13 @@ mod tests {
     ];
     const READING_SCREENS: [Screen; 4] =
         [Screen::Artifact, Screen::Logs, Screen::Diff, Screen::NewRun];
-    const ALL_OVERLAYS: [Overlay; 5] = [
+    const ALL_OVERLAYS: [Overlay; 6] = [
         Overlay::Help,
         Overlay::Attention,
         Overlay::ApplyConfirm,
         Overlay::DiscardConfirm,
         Overlay::Update,
+        Overlay::Published,
     ];
     const ALL_SETTINGS: [MotionSetting; 3] = [
         MotionSetting::Off,
@@ -312,6 +317,24 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The one overlay that is itself a sign of work: the publishing card
+    /// spins while the branch travels, over any screen, at the user's ceiling.
+    #[test]
+    fn the_publishing_card_keeps_moving_over_any_screen() {
+        for screen in ALL_SCREENS {
+            assert_eq!(
+                allowance(screen, Some(Overlay::Publishing), MotionSetting::Full),
+                MotionAllowance::ActiveStateAndTransitions,
+                "{screen:?} under the publishing card"
+            );
+            assert_eq!(
+                allowance(screen, Some(Overlay::Publishing), MotionSetting::Off),
+                MotionAllowance::Disabled,
+                "the user's preference still wins"
+            );
         }
     }
 

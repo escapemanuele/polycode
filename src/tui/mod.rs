@@ -2,6 +2,7 @@
 
 mod app;
 mod bottom_line;
+mod desktop;
 mod follow_ups;
 mod format;
 mod input;

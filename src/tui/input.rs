@@ -45,6 +45,8 @@ pub(crate) enum Intent {
     /// Delete the selected archived run for good.
     DeleteForever,
     DismissMessage,
+    /// Copy the pull request URL from the published card.
+    CopyUrl,
     ToggleRaw,
     ExpandTask,
     TechnicalDetails,
@@ -94,6 +96,7 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('A') => Intent::AutoApprove,
         KeyCode::Char('D') => Intent::DeleteForever,
         KeyCode::Char('x') => Intent::DismissMessage,
+        KeyCode::Char('y') => Intent::CopyUrl,
         KeyCode::Char('m') => Intent::ToggleRaw,
         KeyCode::Char('e') => Intent::ExpandTask,
         KeyCode::Char('i') => Intent::TechnicalDetails,
