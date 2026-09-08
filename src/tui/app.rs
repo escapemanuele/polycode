@@ -9,11 +9,16 @@ use crate::domain::{RunId, RunStatus, StageId, StageStatus};
 use crate::update::{InstallSource, UpdateInfo};
 
 use super::bottom_line;
+use super::desktop;
 use super::input::{Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
-use super::state::{Overlay, RetryRouteChoice, Screen, StageHeadline, TuiState, UiMessageKind};
+use super::state::{
+    Overlay, PublishInFlight, PublishOutcome, RetryRouteChoice, Screen, StageHeadline, TuiState,
+    UiMessageKind,
+};
 use super::terminal::TerminalSession;
+use super::worker::ActionKind;
 use super::worker::{Worker, WorkerCommand, WorkerResult, WorkerSuccess};
 
 const EVENT_POLL: Duration = Duration::from_millis(100);
@@ -284,6 +289,12 @@ impl TuiApp {
             self.handle_update_intent(intent);
             return;
         }
+        if overlay == Overlay::Published && intent == Intent::Escape {
+            // Esc closes the card the way Enter does: the summary still
+            // lands in the footer, so leaving is never losing the URL.
+            self.handle_published_intent(Intent::Enter);
+            return;
+        }
         if matches!(intent, Intent::Escape | Intent::Help) {
             self.state.overlay = None;
             return;
@@ -301,10 +312,18 @@ impl TuiApp {
             }
             Overlay::PublishConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
-                    self.dispatch(WorkerCommand::PublishRun { run_id });
                     self.state.overlay = None;
+                    if self.dispatch(WorkerCommand::PublishRun { run_id }) {
+                        self.state.publishing = Some(PublishInFlight {
+                            run_id,
+                            started: Instant::now(),
+                        });
+                        self.state.published = None;
+                        self.state.overlay = Some(Overlay::Publishing);
+                    }
                 }
             }
+            Overlay::Published => self.handle_published_intent(intent),
             Overlay::DiscardConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
                     self.dispatch(WorkerCommand::DiscardRun { run_id });
@@ -322,7 +341,80 @@ impl TuiApp {
             | Overlay::PublishConfirm
             | Overlay::DiscardConfirm
             | Overlay::DeleteConfirm
+            | Overlay::Publishing
             | Overlay::Update => {}
+        }
+    }
+
+    /// The published card: `o` opens the pull request, `y` copies its URL,
+    /// Enter closes. Closing leaves the summary in the footer so the URL is
+    /// still on screen for a moment after the card is gone.
+    fn handle_published_intent(&mut self, intent: Intent) {
+        let Some(outcome) = self.state.published.clone() else {
+            self.state.overlay = None;
+            return;
+        };
+        match intent {
+            Intent::Enter => {
+                self.state.overlay = None;
+                if outcome.is_failure() {
+                    self.state.set_error(outcome.summary());
+                } else {
+                    self.state.set_message(outcome.summary());
+                }
+            }
+            Intent::Artifact => {
+                let Some(url) = outcome.url() else {
+                    return;
+                };
+                match desktop::open_in_browser(url) {
+                    Ok(()) => self.state.set_message(format!("Opened {url}")),
+                    Err(reason) => self
+                        .state
+                        .set_error(format!("Could not open the browser: {reason}")),
+                }
+            }
+            Intent::Character('y') => {
+                let Some(url) = outcome.url() else {
+                    return;
+                };
+                match desktop::copy_to_clipboard(url) {
+                    Ok(()) => self.state.set_message("Pull request URL copied."),
+                    Err(reason) => self
+                        .state
+                        .set_error(format!("Could not copy the URL: {reason}")),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Hands a finished publish to the card when the operator is free to
+    /// look at it, or to the footer when something else has the screen.
+    ///
+    /// A card over another overlay would tear the operator away from an
+    /// answer they are typing; a card over the new-run form would cover the
+    /// task they are writing. In both cases the footer carries the result and
+    /// the card is skipped rather than queued.
+    fn present_publish(&mut self, outcome: PublishOutcome) {
+        let run_id = match &outcome {
+            PublishOutcome::Pushed { run_id, .. } | PublishOutcome::Failed { run_id, .. } => {
+                *run_id
+            }
+        };
+        if self.state.publishing.is_some_and(|p| p.run_id == run_id) {
+            self.state.publishing = None;
+        }
+        let free = matches!(self.state.overlay, None | Some(Overlay::Publishing))
+            && self.state.screen != Screen::NewRun;
+        if free {
+            self.state.published = Some(outcome);
+            self.state.overlay = Some(Overlay::Published);
+            self.state.message = None;
+        } else if outcome.is_failure() {
+            self.state.set_error(outcome.summary());
+        } else {
+            self.state.set_message(outcome.summary());
         }
     }
 
@@ -1044,17 +1136,16 @@ impl TuiApp {
                 }
                 let message = match success {
                     WorkerSuccess::Applied(outcome, _) => format!("Apply finished: {outcome:?}"),
-                    WorkerSuccess::Published(receipt, _) => match receipt.pull_request {
-                        crate::workspace::PullRequestStatus::Created(url) => {
-                            format!("Pull request created: {url}")
-                        }
-                        crate::workspace::PullRequestStatus::AlreadyExists(url) => {
-                            format!("Branch pushed; pull request already open: {url}")
-                        }
-                        crate::workspace::PullRequestStatus::Unavailable(reason) => {
-                            format!("Branch {} pushed. {reason}", receipt.branch)
-                        }
-                    },
+                    WorkerSuccess::Published(receipt, _) => {
+                        self.present_publish(PublishOutcome::Pushed {
+                            run_id,
+                            branch: receipt.branch,
+                            commit: receipt.commit,
+                            pull_request: receipt.pull_request,
+                        });
+                        self.refresh();
+                        return;
+                    }
                     WorkerSuccess::Execution(_) | WorkerSuccess::Purged(_) => {
                         format!("{} finished for {run_id}", result.action.label())
                     }
@@ -1062,6 +1153,11 @@ impl TuiApp {
                 self.state.set_message(message);
             }
             Err(error) => {
+                if let (ActionKind::Publish, Some(run_id)) = (result.action, result.run_id) {
+                    self.present_publish(PublishOutcome::Failed { run_id, error });
+                    self.refresh();
+                    return;
+                }
                 let scope = result
                     .run_id
                     .map_or(String::new(), |run_id| format!(" for {run_id}"));
@@ -1452,7 +1548,6 @@ mod tests {
     use crate::app::{RunDetails, RunListItem, StageSummary};
     use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
     use crate::tui::state::CONCURRENT_AGENTS;
-    use crate::tui::worker::ActionKind;
 
     /// A `TuiApp` wired to an empty temporary store: enough to drive intents
     /// without touching the user's data directory or any provider.
@@ -2589,6 +2684,197 @@ mod tests {
         assert!(
             app.state.in_flight.is_empty(),
             "the finished action stopped holding its run"
+        );
+    }
+
+    fn published(pull_request: crate::workspace::PullRequestStatus) -> WorkerResult {
+        WorkerResult {
+            action: ActionKind::Publish,
+            run_id: Some(RunId::from_u128(7)),
+            result: Ok(WorkerSuccess::Published(
+                crate::workspace::PublishReceipt {
+                    branch: "polycode/run-7".to_owned(),
+                    commit: "abcdef1234567890".to_owned(),
+                    pull_request,
+                },
+                crate::app::ExecutionReport {
+                    details: details(RunStatus::Completed, WorkflowKind::Standard),
+                    committed_events: Vec::new(),
+                    outcome: crate::app::QuiescentState::Completed,
+                },
+            )),
+        }
+    }
+
+    /// Confirming a publish is the start of a wait, and the wait is shown:
+    /// the card opens the moment the command is dispatched, times itself,
+    /// and Esc hides it without stopping anything.
+    #[test]
+    fn confirming_a_publish_opens_the_publishing_card_and_esc_only_hides_it() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        // The confirmation itself needs a diff preview from a seeded store;
+        // this is about what confirming does, so it starts from the card.
+        app.state.overlay = Some(Overlay::PublishConfirm);
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, Some(Overlay::Publishing));
+        assert_eq!(
+            app.state.publishing.map(|p| p.run_id),
+            Some(RunId::from_u128(7))
+        );
+        assert_eq!(
+            app.state.busy_label().as_deref(),
+            Some("publishing pull request")
+        );
+
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        assert!(
+            app.state.publishing.is_some(),
+            "hiding the card is not cancelling"
+        );
+        assert!(
+            !app.state.in_flight.is_empty(),
+            "the publish is still working"
+        );
+    }
+
+    /// The URL is the result, and a result belongs on a card that stays put:
+    /// the created pull request replaces the wait, and closing the card
+    /// leaves the URL in the footer rather than losing it.
+    #[test]
+    fn a_created_pull_request_lands_on_a_card_that_holds_its_url() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.overlay = Some(Overlay::Publishing);
+        app.state.publishing = Some(PublishInFlight {
+            run_id: RunId::from_u128(7),
+            started: Instant::now(),
+        });
+        app.state
+            .begin_action(ActionKind::Publish, Some(RunId::from_u128(7)));
+
+        app.handle_worker_result(published(crate::workspace::PullRequestStatus::Created(
+            "https://example.invalid/pull/7".to_owned(),
+        )));
+
+        assert_eq!(app.state.overlay, Some(Overlay::Published));
+        assert_eq!(app.state.publishing, None, "the wait is over");
+        assert!(app.state.in_flight.is_empty());
+        assert_eq!(
+            app.state.published.as_ref().and_then(PublishOutcome::url),
+            Some("https://example.invalid/pull/7")
+        );
+        assert!(
+            app.state.message.is_none(),
+            "the card speaks, not the footer"
+        );
+
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        let message = app
+            .state
+            .message
+            .as_ref()
+            .expect("the footer keeps the URL");
+        assert_eq!(message.kind, UiMessageKind::Success);
+        assert!(
+            message.text.contains("https://example.invalid/pull/7"),
+            "{}",
+            message.text
+        );
+    }
+
+    /// A publish that pushed but could not open the pull request, and one
+    /// that failed outright, both get the card too: the branch name or the
+    /// error is what the operator needs to read next, and a card does not
+    /// expire.
+    #[test]
+    fn a_short_publish_still_reports_on_the_card() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state
+            .begin_action(ActionKind::Publish, Some(RunId::from_u128(7)));
+        app.handle_worker_result(published(crate::workspace::PullRequestStatus::Unavailable(
+            "gh is not installed".to_owned(),
+        )));
+        assert_eq!(app.state.overlay, Some(Overlay::Published));
+        assert_eq!(
+            app.state.published.as_ref().and_then(PublishOutcome::url),
+            None
+        );
+        app.handle_intent(Intent::Escape);
+        let message = app.state.message.as_ref().unwrap();
+        assert!(message.text.contains("polycode/run-7"), "{}", message.text);
+        assert!(
+            message.text.contains("gh is not installed"),
+            "{}",
+            message.text
+        );
+
+        app.state
+            .begin_action(ActionKind::Publish, Some(RunId::from_u128(7)));
+        app.handle_worker_result(WorkerResult {
+            action: ActionKind::Publish,
+            run_id: Some(RunId::from_u128(7)),
+            result: Err("remote rejected the push".to_owned()),
+        });
+        assert_eq!(app.state.overlay, Some(Overlay::Published));
+        assert!(
+            app.state
+                .published
+                .as_ref()
+                .is_some_and(PublishOutcome::is_failure)
+        );
+        app.handle_intent(Intent::Enter);
+        let message = app.state.message.as_ref().unwrap();
+        assert_eq!(message.kind, UiMessageKind::Error);
+        assert!(
+            message.text.contains("remote rejected the push"),
+            "{}",
+            message.text
+        );
+    }
+
+    /// A card over the form the operator is typing into would cover their
+    /// task; over another overlay it would cover their answer. The footer
+    /// carries the result there, and the card is skipped, not queued.
+    #[test]
+    fn a_publish_finishing_while_the_operator_is_busy_elsewhere_stays_in_the_footer() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+        // A run other than the selected one: the selected run finishing
+        // already opens its deck, as for every other action.
+        app.state
+            .begin_action(ActionKind::Publish, Some(RunId::from_u128(8)));
+        let mut background = published(crate::workspace::PullRequestStatus::Created(
+            "https://example.invalid/pull/7".to_owned(),
+        ));
+        background.run_id = Some(RunId::from_u128(8));
+        if let Ok(WorkerSuccess::Published(_, report)) = &mut background.result {
+            report.details.id = RunId::from_u128(8);
+        }
+        app.handle_worker_result(background);
+        assert_eq!(app.state.screen, Screen::NewRun);
+        assert_eq!(app.state.overlay, None, "no card over the form");
+        assert!(app.state.published.is_none());
+        let message = app.state.message.as_ref().expect("the footer announces it");
+        assert!(
+            message.text.contains("https://example.invalid/pull/7"),
+            "{}",
+            message.text
+        );
+
+        app.state.screen = Screen::RunDetail;
+        app.state.overlay = Some(Overlay::Continue);
+        app.state
+            .begin_action(ActionKind::Publish, Some(RunId::from_u128(7)));
+        app.handle_worker_result(published(
+            crate::workspace::PullRequestStatus::AlreadyExists(
+                "https://example.invalid/pull/7".to_owned(),
+            ),
+        ));
+        assert_eq!(
+            app.state.overlay,
+            Some(Overlay::Continue),
+            "the answer being typed wins"
         );
     }
 

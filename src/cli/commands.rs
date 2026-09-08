@@ -97,17 +97,25 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             Ok(())
         }
         Some(Command::Pr { run_id }) => {
+            // Progress goes to stderr so a script reading stdout still gets
+            // only the receipt; a human at the terminal sees both.
+            eprintln!(
+                "Publishing run {run_id}: committing, pushing to origin, opening a pull request…"
+            );
+            let started = std::time::Instant::now();
             let (receipt, report) = service()?.publish_run(*run_id)?;
             println!(
-                "Pushed branch {} at {} to origin.",
-                receipt.branch, receipt.commit
+                "Pushed branch {} at {} to origin in {}s.",
+                receipt.branch,
+                receipt.commit,
+                started.elapsed().as_secs()
             );
             match receipt.pull_request {
                 crate::workspace::PullRequestStatus::Created(url) => {
-                    println!("Pull request created: {url}");
+                    println!("Pull request created:\n\n  {url}\n");
                 }
                 crate::workspace::PullRequestStatus::AlreadyExists(url) => {
-                    println!("Pull request already open: {url}");
+                    println!("Pull request already open:\n\n  {url}\n");
                 }
                 crate::workspace::PullRequestStatus::Unavailable(reason) => {
                     println!("Pull request not created: {reason}");

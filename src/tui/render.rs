@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use crate::app::{BlockedDependencyRef, RunDetails, StageDependencyRef, StageSummary};
 use crate::domain::{AttentionKind, DependencyOutcome, RunStatus, StageKind, StageStatus};
 
-use super::state::{Overlay, RetryRouteChoice, Screen, TuiState, UiMessageKind};
+use super::state::{Overlay, PublishOutcome, RetryRouteChoice, Screen, TuiState, UiMessageKind};
 use super::{format, markdown, mascot, theme};
+use crate::workspace::PullRequestStatus;
 
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 10;
@@ -1985,7 +1986,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation; the result card takes o open / y copy URL)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -1999,7 +2000,167 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::Continue => render_continue(frame, popup, state),
         Overlay::FollowUps => render_follow_ups(frame, popup, state),
         Overlay::RetryRoute => render_retry_route(frame, popup, state),
+        Overlay::Publishing => render_publishing(frame, area, state),
+        Overlay::Published => render_published(frame, area, state),
     }
+}
+
+/// The eight-tick spinner the publishing card turns while the branch
+/// travels. Tick 0 is the resting glyph, like every other piece of motion.
+const PUBLISH_SPINNER: [&str; 8] = ["◐", "◓", "◑", "◒", "◐", "◓", "◑", "◒"];
+
+/// A compact band that says the pull request is on its way: what is being
+/// done, for how long, and that hiding the card does not stop it. There is
+/// no step list because the workspace does not report steps; the elapsed
+/// time is what tells the operator the thing is still moving.
+fn render_publishing(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let spinner = PUBLISH_SPINNER[usize::from(state.motion_frame().active_phase()) % 8];
+    let elapsed = state
+        .publishing
+        .map(|publishing| publishing.started.elapsed().as_secs())
+        .unwrap_or_default();
+    let task = state
+        .details
+        .as_ref()
+        .and_then(|details| details.task.clone())
+        .unwrap_or_else(|| "this run".to_owned());
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "PUBLISHING PULL REQUEST",
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {elapsed}s"), theme::muted()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            task,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Committing the workspace, pushing the branch to origin, opening the pull request with gh.",
+            theme::text(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Esc hides this card; the publish carries on in the background.",
+            theme::muted(),
+        )),
+    ];
+    let popup = update_rect(area, &lines);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" PULL REQUEST ", theme::accent())),
+        popup,
+    );
+}
+
+/// What the publish did, with the URL as the headline. The card stays until
+/// dismissed so the URL can be read at leisure, opened with `o`, or copied
+/// with `y`; a footer message alone was gone in four seconds.
+fn render_published(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(outcome) = state.published.as_ref() else {
+        return;
+    };
+    let (title, color) = match outcome {
+        PublishOutcome::Pushed {
+            pull_request: PullRequestStatus::Created(_),
+            ..
+        } => ("PULL REQUEST CREATED", theme::success()),
+        PublishOutcome::Pushed {
+            pull_request: PullRequestStatus::AlreadyExists(_),
+            ..
+        } => ("PULL REQUEST UPDATED", theme::success()),
+        PublishOutcome::Pushed {
+            pull_request: PullRequestStatus::Unavailable(_),
+            ..
+        } => ("BRANCH PUSHED", theme::attention()),
+        PublishOutcome::Failed { .. } => ("PUBLISH FAILED", theme::danger()),
+    };
+    let mut lines = vec![Line::from(theme::chip(title, color)), Line::from("")];
+    match outcome {
+        PublishOutcome::Pushed {
+            branch,
+            commit,
+            pull_request,
+            ..
+        } => {
+            match pull_request {
+                PullRequestStatus::Created(url) | PullRequestStatus::AlreadyExists(url) => {
+                    lines.push(Line::from(Span::styled(
+                        url.clone(),
+                        Style::default()
+                            .fg(theme::accent())
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    )));
+                    if matches!(pull_request, PullRequestStatus::AlreadyExists(_)) {
+                        lines.push(Line::from(Span::styled(
+                            "The pull request was already open; the branch now carries the latest commit.",
+                            theme::muted(),
+                        )));
+                    }
+                }
+                PullRequestStatus::Unavailable(reason) => {
+                    lines.push(Line::from(Span::styled(
+                        "The branch is on origin, but no pull request was opened:",
+                        theme::text(),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        reason.clone(),
+                        Style::default().fg(theme::attention()),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("branch  ", theme::muted()),
+                Span::styled(branch.clone(), theme::text()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("commit  ", theme::muted()),
+                Span::styled(commit.chars().take(12).collect::<String>(), theme::text()),
+            ]));
+        }
+        PublishOutcome::Failed { error, .. } => {
+            lines.push(Line::from(Span::styled(
+                "Nothing reached origin.",
+                theme::text(),
+            )));
+            lines.push(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(theme::danger()),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    let mut actions = Vec::new();
+    if outcome.url().is_some() {
+        actions.extend(theme::action("o", "open in browser", color));
+        actions.push(Span::raw("   "));
+        actions.extend(theme::action("y", "copy URL", color));
+        actions.push(Span::raw("   "));
+    }
+    actions.extend(theme::action("Enter", "close", theme::muted_color()));
+    lines.push(Line::from(actions));
+    let popup = update_rect(area, &lines);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" PULL REQUEST ", color)),
+        popup,
+    );
 }
 
 fn render_retry_route(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -4731,6 +4892,69 @@ mod tests {
         assert!(render_text(&state, 120, 30).contains("Enter confirms apply"));
         state.overlay = Some(Overlay::DiscardConfirm);
         assert!(render_text(&state, 120, 30).contains("Enter confirms discard"));
+    }
+
+    /// The publishing card says the wait is a wait: what is happening, for
+    /// how long, and that hiding it stops nothing.
+    #[test]
+    fn the_publishing_card_names_the_work_and_its_clock() {
+        let mut state = completed_state();
+        state.overlay = Some(Overlay::Publishing);
+        state.publishing = Some(super::super::state::PublishInFlight {
+            run_id: RunId::from_u128(7),
+            started: std::time::Instant::now(),
+        });
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("PUBLISHING PULL REQUEST"), "{text}");
+        assert!(text.contains("pushing the branch to origin"), "{text}");
+        assert!(text.contains("0s"), "the clock is on screen: {text}");
+        assert!(text.contains("Esc hides this card"), "{text}");
+    }
+
+    /// The published card is built around the URL, and offers its two uses.
+    /// Without a URL, the offers go away and the reason takes their place.
+    #[test]
+    fn the_published_card_headlines_the_url_and_offers_open_and_copy() {
+        let mut state = completed_state();
+        state.overlay = Some(Overlay::Published);
+        state.published = Some(PublishOutcome::Pushed {
+            run_id: RunId::from_u128(7),
+            branch: "polycode/run-7".to_owned(),
+            commit: "abcdef1234567890".to_owned(),
+            pull_request: PullRequestStatus::Created("https://example.invalid/pull/7".to_owned()),
+        });
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("PULL REQUEST CREATED"), "{text}");
+        assert!(text.contains("https://example.invalid/pull/7"), "{text}");
+        assert!(text.contains("polycode/run-7"), "{text}");
+        assert!(text.contains("abcdef123456"), "commit is shortened: {text}");
+        assert!(!text.contains("abcdef1234567890"), "{text}");
+        assert!(
+            text.contains("open in browser") && text.contains("copy URL"),
+            "{text}"
+        );
+
+        state.published = Some(PublishOutcome::Pushed {
+            run_id: RunId::from_u128(7),
+            branch: "polycode/run-7".to_owned(),
+            commit: "abcdef1234567890".to_owned(),
+            pull_request: PullRequestStatus::Unavailable("gh is not installed".to_owned()),
+        });
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("BRANCH PUSHED"), "{text}");
+        assert!(text.contains("gh is not installed"), "{text}");
+        assert!(
+            !text.contains("open in browser") && !text.contains("copy URL"),
+            "{text}"
+        );
+
+        state.published = Some(PublishOutcome::Failed {
+            run_id: RunId::from_u128(7),
+            error: "remote rejected the push".to_owned(),
+        });
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("PUBLISH FAILED"), "{text}");
+        assert!(text.contains("remote rejected the push"), "{text}");
     }
 
     #[test]
