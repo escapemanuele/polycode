@@ -2319,6 +2319,43 @@ mod tests {
         );
     }
 
+    /// The pipeline is a ring: stepping back from the first stage lands on
+    /// the last, and forward from the last returns to the first, so the far
+    /// end of a long pipeline is always one key away.
+    #[test]
+    fn stage_selection_wraps_around_both_ends_of_the_pipeline() {
+        let mut details = details(RunStatus::Running, WorkflowKind::Standard);
+        let first = details.stages[0].clone();
+        for name in ["review", "decision"] {
+            let mut stage = first.clone();
+            stage.id = StageId::new(name).unwrap();
+            details.stages.push(stage);
+        }
+        let (mut app, _fixture) = app_with(details);
+        app.state.screen = Screen::RunDetail;
+        assert_eq!(
+            app.state.selected_stage_index, 0,
+            "a run opens at its first stage"
+        );
+
+        app.handle_intent(Intent::Up);
+        assert_eq!(
+            app.state.selected_stage_index, 2,
+            "stepping back from the first stage has to reach the last"
+        );
+        assert_eq!(
+            app.state.selected_stage.as_ref().map(StageId::as_str),
+            Some("decision"),
+            "the selected stage id has to follow the index"
+        );
+
+        app.handle_intent(Intent::Down);
+        assert_eq!(
+            app.state.selected_stage_index, 0,
+            "stepping forward from the last stage has to reach the first"
+        );
+    }
+
     /// Backspacing a long task one character at a time is the complaint that
     /// motivated the line kills; the composer's task field must answer them.
     #[test]

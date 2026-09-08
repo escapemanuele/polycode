@@ -734,10 +734,19 @@ impl TuiState {
         if length == 0 {
             return;
         }
+        // The pipeline is a short ring: stepping past either end lands on the
+        // other, so reaching the last stage never means travelling back
+        // through every one before it.
         self.selected_stage_index = if forward {
-            (self.selected_stage_index + 1).min(length - 1)
+            if self.selected_stage_index + 1 >= length {
+                0
+            } else {
+                self.selected_stage_index + 1
+            }
+        } else if self.selected_stage_index == 0 {
+            length - 1
         } else {
-            self.selected_stage_index.saturating_sub(1)
+            self.selected_stage_index - 1
         };
         self.selected_stage = self
             .details
