@@ -374,7 +374,7 @@ impl TuiApp {
                         .set_error(format!("Could not open the browser: {reason}")),
                 }
             }
-            Intent::Character('y') => {
+            Intent::CopyUrl => {
                 let Some(url) = outcome.url() else {
                     return;
                 };
