@@ -221,17 +221,19 @@ impl TuiApp {
             Intent::PageDown => self.state.scroll = self.state.scroll.saturating_add(10),
             Intent::Home if is_viewer(self.state.screen) => self.state.scroll = 0,
             Intent::End if is_viewer(self.state.screen) => self.state.scroll = u16::MAX,
-            Intent::Enter if self.state.screen == Screen::Runs => {
-                if self.state.selected_run.is_some() {
-                    self.state.screen = Screen::RunDetail;
-                    self.refresh_selected();
-                    self.state.focus_blocking_failure();
-                }
+            Intent::Enter | Intent::Right if self.state.screen == Screen::Runs => {
+                self.open_selected_run();
             }
             // Enter on a stage opens its primary result; open_artifact keeps
             // expected absence informational, so this never mutates anything.
-            Intent::Enter if self.state.screen == Screen::RunDetail => self.open_artifact(),
-            Intent::Escape => self.back(),
+            Intent::Enter | Intent::Right if self.state.screen == Screen::RunDetail => {
+                self.open_artifact();
+            }
+            // The arrows walk the same ladder Enter and Esc already walk, one
+            // rung per press: → goes into whatever the cursor is on, ← comes
+            // back out. Nothing on these screens edits text, so the arrows are
+            // free; the composer and the overlays take theirs first, above.
+            Intent::Escape | Intent::Left => self.back(),
             Intent::NewRun => {
                 self.state.screen = Screen::NewRun;
                 self.state.overlay = None;
@@ -599,6 +601,16 @@ impl TuiApp {
             self.state.new_run.task = super::state::TextField::default();
             self.state.new_run.focus = 0;
             self.state.screen = Screen::Runs;
+        }
+    }
+
+    /// Opens the selected run's detail screen, landing the cursor on whatever
+    /// is blocking it.
+    fn open_selected_run(&mut self) {
+        if self.state.selected_run.is_some() {
+            self.state.screen = Screen::RunDetail;
+            self.refresh_selected();
+            self.state.focus_blocking_failure();
         }
     }
 
@@ -2657,6 +2669,46 @@ mod tests {
             "the announcement says which run finished: {:?}",
             message.text
         );
+    }
+
+    /// One rung per press, in both directions: → is Enter's twin on a row the
+    /// cursor is sitting on, ← is Esc's.
+    #[test]
+    fn the_arrows_walk_in_and_out_of_a_run() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::Runs;
+
+        app.handle_intent(Intent::Right);
+        assert_eq!(app.state.screen, Screen::RunDetail);
+
+        app.handle_intent(Intent::Left);
+        assert_eq!(app.state.screen, Screen::Runs);
+    }
+
+    /// The arrows are navigation on every screen that is not editing text —
+    /// the viewers included, where ← is the only way back besides Esc.
+    #[test]
+    fn left_leaves_a_viewer_for_the_run_it_belongs_to() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::Logs;
+        app.state.scroll = 12;
+
+        app.handle_intent(Intent::Left);
+
+        assert_eq!(app.state.screen, Screen::RunDetail);
+        assert_eq!(app.state.scroll, 0);
+    }
+
+    /// The composer's fields are chosen and edited with the arrows, so it must
+    /// keep them: leaving the screen there is Esc's job alone.
+    #[test]
+    fn the_composer_keeps_the_arrows_for_its_own_fields() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Running, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+
+        app.handle_intent(Intent::Left);
+
+        assert_eq!(app.state.screen, Screen::NewRun);
     }
 
     /// The run on screen is the one the user is waiting on, so its result
