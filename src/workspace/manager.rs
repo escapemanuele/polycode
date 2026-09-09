@@ -734,6 +734,30 @@ impl WorkspaceManager {
             }
         }
 
+        // A workspace is `Preparing` on this path precisely because the first
+        // attempt did not finish, and setup failing is one of the ways it does
+        // not finish. Marking ready now, because the checkout itself
+        // validates, would hand over the half-built tree `[setup]` exists to
+        // prevent, and the run would look like it had recovered. Setup
+        // commands are meant to be idempotent, so running them over a worktree
+        // that got part of the way is the same work.
+        //
+        // A failure here leaves the workspace `Preparing` rather than breaking
+        // it: the usual cause is a `[setup]` command the user can correct, and
+        // the next resume should be free to try it again.
+        // A workspace is `Preparing` on this path precisely because the first
+        // attempt did not finish, and setup failing is one of the ways it does
+        // not finish. Marking ready now, because the checkout itself
+        // validates, would hand over the half-built tree `[setup]` exists to
+        // prevent, and the run would look like it had recovered. Setup
+        // commands are meant to be idempotent, so running them over a worktree
+        // that got part of the way is the same work.
+        //
+        // A failure here leaves the workspace `Preparing` rather than breaking
+        // it: the usual cause is a `[setup]` command the user can correct, and
+        // the next resume should be free to try it again.
+        setup::run_for(workspace.worktree_path(), workspace.source_repo_path())?;
+
         let loaded = store.load_run(workspace.run_id())?;
         if loaded.run.status() != RunStatus::Preparing {
             return Self::break_workspace(
@@ -1433,6 +1457,70 @@ mod tests {
                 .map(|workspace| workspace.status()),
             Some(WorkspaceStatus::Ready)
         );
+    }
+
+    /// Resuming a run whose setup failed is the operator saying "try again",
+    /// not "carry on without it". The worktree left behind validates as a
+    /// checkout, so reconciliation would otherwise mark ready the very tree
+    /// the failure was about.
+    #[test]
+    fn resuming_after_a_failed_setup_runs_setup_again_instead_of_handing_the_tree_over() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        fs::write(
+            fixture.source.join(".polycode.toml"),
+            "[setup]\ncommands = [\"ls /no-such-polycode-setup-path\"]\n",
+        )
+        .unwrap();
+        fixture.prepare_err();
+
+        let error = fixture
+            .manager()
+            .reconcile(&mut fixture.store, fixture.run_id)
+            .expect_err("reconciliation should have failed with the setup command");
+
+        assert!(
+            matches!(&error, WorkspaceError::SetupFailed { command, .. }
+                if command == "ls /no-such-polycode-setup-path"),
+            "{error}"
+        );
+        // Still Preparing rather than Broken: the operator can fix the
+        // command and resume, and rather than Ready: nothing is dispatched
+        // into the half-built tree.
+        assert_eq!(
+            fixture
+                .store
+                .load_workspace(fixture.run_id)
+                .unwrap()
+                .map(|workspace| workspace.status()),
+            Some(WorkspaceStatus::Preparing)
+        );
+    }
+
+    #[test]
+    fn a_corrected_setup_command_prepares_the_existing_worktree_on_the_next_resume() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let config = fixture.source.join(".polycode.toml");
+        fs::write(
+            &config,
+            "[setup]\ncommands = [\"ls /no-such-polycode-setup-path\"]\n",
+        )
+        .unwrap();
+        fixture.prepare_err();
+        fs::write(&config, "[setup]\ncommands = [\"touch built-artifact\"]\n").unwrap();
+
+        let outcome = fixture
+            .manager()
+            .reconcile(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        let ReconciliationOutcome::Ready(workspace) = outcome else {
+            panic!("expected the corrected setup to make the workspace ready: {outcome:?}");
+        };
+        assert!(
+            workspace.worktree_path().join("built-artifact").is_file(),
+            "setup must have run in the worktree before it was ready"
+        );
+        assert_eq!(workspace.status(), WorkspaceStatus::Ready);
     }
 
     #[test]
