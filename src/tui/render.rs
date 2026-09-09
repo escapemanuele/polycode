@@ -1853,14 +1853,17 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
 /// dropped when the row is tight — never the contextual actions.
 const fn navigation_hints(screen: Screen) -> (&'static str, &'static str) {
     match screen {
-        Screen::Runs => ("↑↓ runs · n new · ? help · q quit/detach", "↑↓ · ? help"),
+        Screen::Runs => (
+            "↑↓ runs · → open · n new · ? help · q quit/detach",
+            "↑↓ · → open",
+        ),
         Screen::RunDetail => (
-            "↑↓ stages · Esc runs · ? help · q quit/detach",
-            "↑↓ · Esc runs",
+            "↑↓ stages · → open · ←/Esc runs · ? help · q quit/detach",
+            "↑↓ · ←/Esc runs",
         ),
         Screen::Artifact | Screen::Logs | Screen::Diff => (
-            "↑↓/PgUp/PgDn scroll · Esc run detail · ? help",
-            "↑↓ scroll · Esc run detail",
+            "↑↓/PgUp/PgDn scroll · ←/Esc run detail · ? help",
+            "↑↓ scroll · ←/Esc run detail",
         ),
         Screen::NewRun => (
             "Tab/Shift-Tab fields · ←→ choices/edit · Ctrl-U clear line · ? help",
@@ -1986,7 +1989,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter        open/confirm\n  Esc          back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation; the result card takes o open / y copy URL)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation; the result card takes o open / y copy URL)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,

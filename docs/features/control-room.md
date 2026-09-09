@@ -20,7 +20,7 @@ Run `polycode` with no arguments in an interactive terminal, or `polycode tui`. 
 polycode
 polycode tui
 ```
-Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home`/`End` top/bottom in viewers, `Enter` open/confirm, `Esc` back/close, `n` new run, `R` runs screen, `x` dismiss notification, `?` help, `q` or `Ctrl-C` quit/detach.
+Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home`/`End` top/bottom in viewers, `Enter` or `→` open/confirm (one level in: a run from the list, a stage's result from run detail), `Esc` or `←` back/close (one level out; the composer keeps its own arrows, so `Esc` alone leaves it), `n` new run, `R` runs screen, `x` dismiss notification, `?` help, `q` or `Ctrl-C` quit/detach.
 Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage (chooser: Configured provider / Claude / Codex, Enter retries), `u` attention overlay, `A` arm/disarm automatic approval of this run's permission requests, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `P` pull request (Enter confirms; a spinning card times the publish, Esc hides it without stopping it; the result card holds the URL until dismissed: `o` opens it in the browser, `y` copies it, Enter/Esc close and leave the summary in the footer), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `e` expand the task in the rail, `i` technical details.
 Runs list: `h` archive/unarchive selected run, `H` show/hide archived runs, `D` delete an archived run for good (POD stands at the plunger; a second `D` goes through, Esc cancels). Only an archived run offers `D`.
 Artifact viewer: `m` toggle raw/rendered Markdown.
