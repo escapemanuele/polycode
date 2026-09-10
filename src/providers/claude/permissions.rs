@@ -20,6 +20,14 @@
 //! Polycode derives from a denial, so it is not re-parsed or widened here. The
 //! one thing refused is a rule that grants everything, because a permission
 //! model that can be turned off in a config file is not one.
+//!
+//! On top of whatever the repository says, every run also gets [`BASELINE`] —
+//! the tools an agent needs before it knows anything about the repository at
+//! all. Without it the first minutes of every run in every repository are the
+//! same denial storm: 342 denials across 33 measured runs, of which `grep`
+//! (58), `ls` (20), `cat`, `sed`, `find` and the read-only `git` subcommands
+//! account for well over a third, and `Edit`/`Write` for another 60. None of
+//! those is a decision a repository should have to make.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -37,6 +45,63 @@ pub(crate) use repo_config::CONFIG_FILE;
 
 /// Rules that would grant every tool, refused however they are spelled.
 const BLANKET_RULES: [&str; 2] = ["*", "Bash(*)"];
+
+/// The grants every run starts with, whatever the repository says.
+///
+/// Two kinds of thing, and nothing else:
+///
+///   * Reading the tree — searching it, listing it, printing files, and the
+///     `git` subcommands that only report. A run cannot begin without these
+///     and no repository has a reason to withhold them.
+///   * Changing the tree — `Edit`, `MultiEdit`, `Write`. Editing the checkout
+///     is the whole job, and the checkout is a throwaway worktree on a
+///     throwaway branch, so the blast radius of a bad edit is that worktree.
+///
+/// Deliberately absent: anything that installs, builds, runs a package
+/// script, or reaches the network. `node`, `python3`, `yarn`, `npm`, `npx`
+/// and `gh` all showed up in the measured denials, and all of them run
+/// arbitrary code chosen by something other than this list — they belong in
+/// a repository's own `[permissions]`, where a human decided the repository
+/// wanted them.
+///
+/// `sed` and `cat` can write through a shell redirection, and are listed
+/// anyway: `Edit` and `Write` are already granted here, so refusing them
+/// would protect nothing and only cost the round trip this list exists to
+/// remove.
+const BASELINE: &[&str] = &[
+    // Changing the tree.
+    "Edit",
+    "MultiEdit",
+    "Write",
+    // Searching and reading it.
+    "Bash(grep:*)",
+    "Bash(rg:*)",
+    "Bash(find:*)",
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(sed:*)",
+    "Bash(awk:*)",
+    "Bash(cut:*)",
+    "Bash(tr:*)",
+    "Bash(sort:*)",
+    "Bash(uniq:*)",
+    "Bash(wc:*)",
+    "Bash(diff:*)",
+    "Bash(jq:*)",
+    "Bash(echo:*)",
+    "Bash(printf:*)",
+    "Bash(basename:*)",
+    "Bash(dirname:*)",
+    // Reporting on history. Nothing that fetches, writes a ref, or moves the
+    // working tree — a run's own commits go through Polycode, not the agent.
+    "Bash(git status:*)",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+    "Bash(git diff:*)",
+    "Bash(git grep:*)",
+];
 
 #[derive(Debug, Error)]
 pub enum PermissionsConfigError {
@@ -65,10 +130,16 @@ struct PermissionsTable {
     allow: Vec<String>,
 }
 
-/// Reads the standing allowlist for one run.
+/// [`BASELINE`] as the set every caller compares against.
+pub(crate) fn baseline() -> BTreeSet<String> {
+    BASELINE.iter().map(|rule| (*rule).to_owned()).collect()
+}
+
+/// Reads the standing allowlist for one run: [`BASELINE`] plus whatever the
+/// repository adds to it.
 ///
-/// A missing file, or a file without a `[permissions]` table, is an empty
-/// allowlist rather than an error — most repositories have neither.
+/// A missing file, or a file without a `[permissions]` table, is the baseline
+/// alone rather than an error — most repositories have neither.
 ///
 /// # Errors
 /// A `.polycode.toml` that exists but cannot be read or parsed, an empty rule,
@@ -77,17 +148,18 @@ pub(crate) fn allow_rules(
     worktree: &Path,
     source_repo: Option<&Path>,
 ) -> Result<BTreeSet<String>, PermissionsConfigError> {
+    let baseline = baseline();
     let Some(found) = repo_config::locate(worktree, source_repo) else {
-        return Ok(BTreeSet::new());
+        return Ok(baseline);
     };
     let text = std::fs::read_to_string(&found.path)
         .map_err(|error| PermissionsConfigError::Unreadable(error.to_string()))?;
     let file: ConfigFile = toml::from_str(&text)
         .map_err(|error| PermissionsConfigError::Unreadable(error.message().to_owned()))?;
     let Some(table) = file.permissions else {
-        return Ok(BTreeSet::new());
+        return Ok(baseline);
     };
-    let mut rules = BTreeSet::new();
+    let mut rules = baseline;
     for (index, rule) in table.allow.iter().enumerate() {
         let rule = rule.trim();
         if rule.is_empty() {
@@ -114,17 +186,61 @@ mod tests {
         directory
     }
 
+    /// What a repository added, with the baseline taken back out — the only
+    /// part of the result its `.polycode.toml` is responsible for.
+    fn beyond_baseline(rules: &BTreeSet<String>) -> Vec<String> {
+        rules.difference(&baseline()).cloned().collect()
+    }
+
     #[test]
-    fn missing_file_and_missing_table_both_grant_nothing() {
+    fn missing_file_and_missing_table_both_grant_the_baseline() {
         let empty = tempfile::tempdir().expect("temp worktree");
-        assert!(allow_rules(empty.path(), None).expect("no file").is_empty());
+        assert_eq!(
+            allow_rules(empty.path(), None).expect("no file"),
+            baseline()
+        );
 
         let other_table = worktree_with("[verify]\ncommands = [\"cargo test\"]\n");
-        assert!(
-            allow_rules(other_table.path(), None)
-                .expect("verify-only config")
-                .is_empty()
+        assert_eq!(
+            allow_rules(other_table.path(), None).expect("verify-only config"),
+            baseline()
         );
+    }
+
+    /// The point of the baseline: a repository that has never heard of
+    /// Polycode still gets to search and read its own tree, and to edit it.
+    #[test]
+    fn the_baseline_covers_searching_reading_and_editing_without_any_config() {
+        let empty = tempfile::tempdir().expect("temp worktree");
+        let rules = allow_rules(empty.path(), None).expect("no file");
+
+        for granted in [
+            "Bash(grep:*)",
+            "Bash(ls:*)",
+            "Bash(git log:*)",
+            "Edit",
+            "Write",
+        ] {
+            assert!(rules.contains(granted), "baseline is missing {granted}");
+        }
+    }
+
+    /// The baseline is not a place to smuggle in a package manager. Anything
+    /// that installs, builds or reaches the network stays a decision the
+    /// repository makes in its own `[permissions]`.
+    #[test]
+    fn the_baseline_runs_nothing_that_installs_builds_or_reaches_the_network() {
+        for rule in BASELINE {
+            assert!(
+                ![
+                    "yarn", "npm", "npx", "pnpm", "node", "python", "python3", "cargo", "gh",
+                    "curl", "wget", "make", "docker", "ssh", "rm", "git"
+                ]
+                .iter()
+                .any(|program| *rule == format!("Bash({program}:*)")),
+                "{rule} grants more than reading or editing the tree"
+            );
+        }
     }
 
     #[test]
@@ -135,7 +251,7 @@ mod tests {
         let rules = allow_rules(worktree.path(), Some(source.path())).expect("source-repo grants");
 
         assert_eq!(
-            rules.into_iter().collect::<Vec<_>>(),
+            beyond_baseline(&rules),
             vec!["Bash(yarn jest:*)".to_owned()]
         );
     }
@@ -148,7 +264,7 @@ mod tests {
         let rules = allow_rules(worktree.path(), Some(source.path())).expect("worktree grants");
 
         assert_eq!(
-            rules.into_iter().collect::<Vec<_>>(),
+            beyond_baseline(&rules),
             vec!["Bash(cargo test:*)".to_owned()]
         );
     }
@@ -156,15 +272,20 @@ mod tests {
     #[test]
     fn rules_reach_the_command_verbatim_and_deduplicated() {
         let directory = worktree_with(
-            "[permissions]\nallow = [\"Bash(yarn jest:*)\", \" mcp__linear-server \", \"Bash(yarn jest:*)\"]\n",
+            "[permissions]\nallow = [\"Bash(yarn jest:*)\", \" mcp__linear-server \", \"Bash(yarn jest:*)\", \"Bash(grep:*)\"]\n",
         );
         let rules = allow_rules(directory.path(), None).expect("valid allowlist");
         assert_eq!(
-            rules.into_iter().collect::<Vec<_>>(),
+            beyond_baseline(&rules),
             vec![
                 "Bash(yarn jest:*)".to_owned(),
                 "mcp__linear-server".to_owned()
-            ]
+            ],
+            "a repository restating a baseline rule adds nothing"
+        );
+        assert_eq!(
+            rules.iter().filter(|rule| *rule == "Bash(grep:*)").count(),
+            1
         );
     }
 
