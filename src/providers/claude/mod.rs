@@ -1856,11 +1856,12 @@ mod tests {
                 "missing {rule}: {argv:?}"
             );
         }
+        let derived = without_baseline(&argv);
         assert!(
-            !argv
+            !derived
                 .iter()
                 .any(|arg| arg.contains(';') || arg.contains('*')),
-            "no rule spans the whole compound line or widens it: {argv:?}"
+            "no rule spans the whole compound line or widens it: {derived:?}"
         );
     }
 
@@ -1912,9 +1913,14 @@ mod tests {
         }
         let argv = all_argv(&store, run_id);
         assert!(argv.iter().any(|arg| arg == "--resume"), "{argv:?}");
+        // The launch still carries the standing baseline, as every launch
+        // does. What an answer must not add is the exact rule for the call the
+        // operator declined to approve.
         assert!(
-            !argv.iter().any(|arg| arg == "--allowedTools"),
-            "nothing granted: {argv:?}"
+            !without_baseline(&argv)
+                .iter()
+                .any(|arg| arg.starts_with("Edit(") || arg.starts_with("Write(")),
+            "an answer grants nothing beyond the baseline: {argv:?}"
         );
         assert_no_bash_or_broad_grants(&argv);
         assert_eq!(store.list_managed_processes(run_id).unwrap().len(), 2);
@@ -2368,7 +2374,32 @@ mod tests {
             .collect()
     }
 
+    /// The rules one launch was given: everything after `--allowedTools`,
+    /// which the adapter emits last and in sorted order.
+    fn granted_rules(argv: &[String]) -> Vec<String> {
+        argv.iter()
+            .skip_while(|arg| *arg != "--allowedTools")
+            .skip(1)
+            .cloned()
+            .collect()
+    }
+
+    /// One launch's argv with `permissions::BASELINE` taken back out — what is
+    /// left is the *derived* grants, the rules Polycode wrote itself in answer
+    /// to an approved denial. Every assertion about how far a grant reaches is
+    /// about those, so subtracting the standing baseline first is the
+    /// difference between checking the mechanism and checking the constant.
+    fn without_baseline(argv: &[String]) -> Vec<String> {
+        let baseline = permissions::baseline();
+        argv.iter()
+            .filter(|arg| !baseline.contains(*arg))
+            .cloned()
+            .collect()
+    }
+
     fn assert_no_bash_or_broad_grants(argv: &[String]) {
+        let argv = without_baseline(argv);
+        let argv = argv.as_slice();
         assert!(
             !argv.iter().any(|arg| arg.starts_with("Bash(")),
             "Bash must never be granted: {argv:?}"
@@ -2580,13 +2611,11 @@ mod tests {
             "{resumed:?}"
         );
         let expected_rule = format!("Edit(/{})", target.display());
-        let rules = resumed
-            .iter()
-            .skip_while(|arg| *arg != "--allowedTools")
-            .skip(1)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(rules, vec![expected_rule], "{resumed:?}");
+        assert_eq!(
+            without_baseline(&granted_rules(&resumed)),
+            vec![expected_rule],
+            "a whole history of denials still adds one exact rule: {resumed:?}"
+        );
         assert_no_bash_or_broad_grants(&resumed);
         let sessions = store.list_provider_sessions(run_id).unwrap();
         assert_eq!(sessions.len(), 1);
@@ -2717,13 +2746,11 @@ mod tests {
                 .any(|pair| pair == ["--resume", "native-session-1"]),
             "{resumed:?}"
         );
-        let rules = resumed
-            .iter()
-            .skip_while(|arg| *arg != "--allowedTools")
-            .skip(1)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(rules, vec![format!("Edit(/{})", target.display())]);
+        assert_eq!(
+            without_baseline(&granted_rules(&resumed)),
+            vec![format!("Edit(/{})", target.display())],
+            "the approval adds one exact rule to the baseline: {resumed:?}"
+        );
         assert_no_bash_or_broad_grants(&all_argv(&store, run_id));
         let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
         assert_eq!(session.invocation(), 2);
@@ -3313,13 +3340,13 @@ mod tests {
             .skip(1)
             .cloned()
             .collect::<Vec<_>>();
+        let mut expected = permissions::baseline();
+        expected.insert("Bash(yarn jest:*)".to_owned());
+        expected.insert("mcp__linear-server".to_owned());
         assert_eq!(
             rules,
-            vec![
-                "Bash(yarn jest:*)".to_owned(),
-                "mcp__linear-server".to_owned()
-            ],
-            "{argv:?}"
+            expected.into_iter().collect::<Vec<_>>(),
+            "the repository's rules reach the first command on top of the baseline: {argv:?}"
         );
     }
 
@@ -3394,8 +3421,8 @@ mod tests {
         assert_eq!(server["args"][2], socket);
         assert!(server.get("env").is_none());
         assert!(
-            argv.windows(2)
-                .any(|pair| pair == ["--allowedTools", "mcp__polycode_image__image_generate"])
+            granted_rules(&argv).contains(&"mcp__polycode_image__image_generate".to_owned()),
+            "{argv:?}"
         );
         let joined = argv.join("\n");
         assert!(!joined.contains("OPENAI"), "{joined}");
@@ -3406,8 +3433,8 @@ mod tests {
         assert!(!stdin.contains("sk-"));
     }
 
-    /// Without a grant the launch is byte-identical to before the tool
-    /// existed: no MCP flag, no allow rule, no prompt note.
+    /// Without a grant the launch carries nothing of the image tool: no MCP
+    /// flag, no allow rule beyond the standing baseline, no prompt note.
     #[test]
     fn an_ungranted_stage_launches_exactly_as_before() {
         let backend = FixtureBackend::default();
@@ -3417,14 +3444,18 @@ mod tests {
         drive_to_completion(&mut engine, &mut store, run_id);
         let processes = store.list_managed_processes(run_id).unwrap();
         let spec = processes[0].spec();
-        let joined = spec
+        let argv = spec
             .argv()
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        let joined = argv.join("\n");
         assert!(!joined.contains("mcp"), "{joined}");
-        assert!(!joined.contains("allowedTools"), "{joined}");
+        assert_eq!(
+            granted_rules(&argv),
+            permissions::baseline().into_iter().collect::<Vec<_>>(),
+            "an ungranted stage gets the standing baseline and nothing else: {joined}"
+        );
         assert!(spec.environment().is_empty());
         let stdin = std::fs::read_to_string(spec.stdin_path().unwrap()).unwrap();
         assert!(!stdin.contains("Image generation"));
