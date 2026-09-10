@@ -121,6 +121,9 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
                     println!("Pull request not created: {reason}");
                 }
             }
+            if let Some(note) = receipt.note {
+                println!("{note}");
+            }
             print_report(&report);
             Ok(())
         }

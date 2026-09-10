@@ -30,11 +30,11 @@ TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish (
 CLI `pr` prints its progress line to stderr and the receipt (branch, commit, elapsed, PR URL on its own line) to stdout.
 
 ## Where it lives
-- `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`, `ensure_verification_passed`.
+- `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`, `publish_target` (push onto a reviewed pull request's own branch), `ensure_verification_passed`.
 - `src/workspace/error.rs` — `WorkspaceError`, incl. `VerificationNotPassed`, `SetupConfig`, `SetupFailed`.
 - `src/workspace/setup.rs` — the `[setup]` table reader and its runner, called from `prepare_run_workspace` and from `reconcile_preparing` before the workspace is marked ready.
 - `src/workspace/model.rs` — `RunWorkspace`, `WorkspaceStatus`, apply operation records.
-- `src/workspace/github.rs` — `gh pr list --head` / `gh pr create` boundary.
+- `src/workspace/github.rs` — `gh pr list --head` / `gh pr view` / `gh pr create` boundary; `PullRequestRef` parses the pull request out of the task text.
 - `src/workspace/pull_request.rs` — `PullRequestDraft`, `extract` of the artifact's `## Pull request` section; `src/app/query.rs` `pull_request_draft` walks the editing artifacts newest first and takes the first that wrote the section. When none did, `publish_title`/`publish_body` in `manager.rs` name the run from the task with its links dropped, falling back to the linked issue.
 - `src/git/worktree.rs`, `src/git/patch.rs`, `src/git/remote.rs`, `src/git/repository.rs` — Git commands with direct argv.
 - `src/store/workspace.rs` — workspace and apply-intent persistence with CAS.
@@ -49,6 +49,8 @@ CLI `pr` prints its progress line to stderr and the receipt (branch, commit, ela
 - `pr` rejects runs whose latest verification did not pass, non-completed runs, detached (review) workspaces, empty deltas and repositories without an `origin` remote.
 - A Standard/Deep run can be `Completed` and still unapplicable: a failed verification completes the run (the decision's edge to it is optional) precisely so it can be fixed in place; `apply`/`pr` name verification until a later cycle's check passes. A Fast run with a failed verify is `Failed` instead; `retry` the verify stage there. PR failure (no `gh`, not authenticated) is reported in the receipt and never undoes the push.
 - `pr` never force-pushes; a diverged remote branch is an error by design. `GIT_TERMINAL_PROMPT=0` turns a credential prompt into an error instead of a hang.
+- When the run's task names a pull request, `pr` pushes the commit onto that pull request's own head branch instead of opening a second one for the same change — the shape of "review this PR" followed by a fix cycle. `publish_target` in `manager.rs` requires all four: `gh pr view` readable, the head not in a fork, `gh pr list --head <branch>` returning that same pull request (so a task merely mentioning somebody else's PR is left alone), and the branch's remote tip an ancestor of the commit, so the push fast-forwards. Any of them failing keeps the run's own branch and puts the reason in `PublishReceipt::note`, shown on the result card and printed by the CLI — the fallback is never silent. Nothing is ever force-pushed.
+- The fix cycle's worktree is based on the source checkout's `HEAD` at preparation, not on the pull request, so the fast-forward only holds when the checkout was on (or behind) that PR's branch when the run started. Otherwise the note says the branch moved ahead and a branch of the run's own is pushed.
 - After `pr` the run stays `Completed`, so apply, fix and discard remain available; publishing again after a fix updates the same branch and PR. The PR body is only written on creation: a fix's fresh draft changes the commit subject but not an already-open PR's text.
 - The drafted title is cut at 72 characters; a corrupt latest editing artifact fails the publish (artifact integrity fails closed) rather than silently publishing from the task.
 - Discard commits the logical disposition before cleanup; cleanup is idempotent and retains process files. Branch deletion needs persisted ownership and an unchanged tip, otherwise the workspace turns `Broken` and the branch is kept.

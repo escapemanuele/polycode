@@ -73,6 +73,9 @@ pub(crate) enum PublishOutcome {
         branch: String,
         commit: String,
         pull_request: PullRequestStatus,
+        /// Why the run's own branch was pushed although its task named a pull
+        /// request, when that happened.
+        note: Option<String>,
     },
     /// Nothing reached origin.
     Failed { run_id: RunId, error: String },
@@ -94,6 +97,18 @@ impl PublishOutcome {
     /// One line for the footer once the card is closed, so the result is
     /// not lost the moment the operator dismisses it.
     pub(crate) fn summary(&self) -> String {
+        let mut summary = self.headline();
+        if let Self::Pushed {
+            note: Some(note), ..
+        } = self
+        {
+            summary.push_str(" — ");
+            summary.push_str(note);
+        }
+        summary
+    }
+
+    fn headline(&self) -> String {
         match self {
             Self::Pushed {
                 pull_request: PullRequestStatus::Created(url),

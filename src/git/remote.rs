@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::GitError;
 use super::command::{Git, os, text_output};
+use super::repository::validate_commit;
 
 /// Returns the fetch URL of `remote` as configured for the repository owning
 /// `path`, or `None` when no such remote exists.
@@ -56,6 +57,105 @@ pub(crate) fn push_branch(
             os("--set-upstream"),
             os(remote),
             os(format!("{reference}:{reference}")),
+        ],
+        &[(os("GIT_TERMINAL_PROMPT"), os("0"))],
+    )?;
+    Ok(())
+}
+
+/// The ref a fetched publish target is parked on, inside Polycode's own
+/// namespace so nothing under `refs/heads` or `refs/remotes` is disturbed.
+const PUBLISH_TARGET_REF: &str = "refs/polycode/publish-target";
+
+/// Fetches `branch` from `remote` and returns the commit it points at, or
+/// `None` when the remote has no such branch.
+///
+/// The fetched tip is parked on a Polycode-owned ref rather than read back
+/// from `FETCH_HEAD`, whose per-worktree ownership is not something a publish
+/// should have to reason about. That ref is force-updated because it is a
+/// scratch pointer, never history anyone owns.
+pub(crate) fn fetch_branch(
+    git: &Git,
+    path: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<Option<String>, GitError> {
+    git.checked(path, &[os("check-ref-format"), os("--branch"), os(branch)])?;
+    let refspec = format!("+refs/heads/{branch}:{PUBLISH_TARGET_REF}");
+    let output = git.output(
+        path,
+        &[os("fetch"), os("--no-tags"), os(remote), os(refspec)],
+        &[(os("GIT_TERMINAL_PROMPT"), os("0"))],
+    )?;
+    if !output.status.success() {
+        // A branch the remote does not have is an answer, not a failure: the
+        // caller asked whether there was one to build on.
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if stderr.contains("couldn't find remote ref")
+            || stderr.contains("could not find remote ref")
+        {
+            return Ok(None);
+        }
+        return Err(output.into_failure());
+    }
+    let commit = text_output(git.checked(path, &[os("rev-parse"), os(PUBLISH_TARGET_REF)])?)?;
+    validate_commit(&commit)?;
+    Ok(Some(commit))
+}
+
+/// Whether `ancestor` is reachable from `descendant`, a commit counting as its
+/// own ancestor.
+pub(crate) fn is_ancestor(
+    git: &Git,
+    path: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, GitError> {
+    validate_commit(ancestor)?;
+    validate_commit(descendant)?;
+    let output = git.output(
+        path,
+        &[
+            os("merge-base"),
+            os("--is-ancestor"),
+            os(ancestor),
+            os(descendant),
+        ],
+        &[],
+    )?;
+    if output.status.success() {
+        Ok(true)
+    } else if output.status.code() == Some(1) {
+        Ok(false)
+    } else {
+        Err(output.into_failure())
+    }
+}
+
+/// Pushes one commit onto `branch` at `remote`, a branch Polycode does not own.
+///
+/// The counterpart to [`push_branch`] for a pull request the run was asked to
+/// fix: those commits belong on the branch that pull request already reads
+/// from, not on a branch of their own. Never force-pushes and never sets
+/// upstream — the local branch keeps its own identity, and a remote branch
+/// that moved ahead is somebody else's work, which the caller establishes is
+/// not the case before asking.
+pub(crate) fn push_commit_to_branch(
+    git: &Git,
+    path: &Path,
+    remote: &str,
+    commit: &str,
+    branch: &str,
+) -> Result<(), GitError> {
+    validate_commit(commit)?;
+    git.checked(path, &[os("check-ref-format"), os("--branch"), os(branch)])?;
+    git.checked_with(
+        path,
+        &[
+            os("push"),
+            os("--no-verify"),
+            os(remote),
+            os(format!("{commit}:refs/heads/{branch}")),
         ],
         &[(os("GIT_TERMINAL_PROMPT"), os("0"))],
     )?;

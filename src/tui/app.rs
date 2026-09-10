@@ -1154,6 +1154,7 @@ impl TuiApp {
                             branch: receipt.branch,
                             commit: receipt.commit,
                             pull_request: receipt.pull_request,
+                            note: receipt.note,
                         });
                         self.refresh();
                         return;
@@ -2748,6 +2749,7 @@ mod tests {
                     branch: "polycode/run-7".to_owned(),
                     commit: "abcdef1234567890".to_owned(),
                     pull_request,
+                    note: None,
                 },
                 crate::app::ExecutionReport {
                     details: details(RunStatus::Completed, WorkflowKind::Standard),

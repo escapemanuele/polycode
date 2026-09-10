@@ -2097,6 +2097,7 @@ fn render_published(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             branch,
             commit,
             pull_request,
+            note,
             ..
         } => {
             match pull_request {
@@ -2124,6 +2125,15 @@ fn render_published(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                         Style::default().fg(theme::attention()),
                     )));
                 }
+            }
+            if let Some(note) = note {
+                // The operator asked to fix a pull request and got a branch of
+                // its own instead; the card is where that has to be said.
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    note.clone(),
+                    Style::default().fg(theme::attention()),
+                )));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -4925,6 +4935,7 @@ mod tests {
             branch: "polycode/run-7".to_owned(),
             commit: "abcdef1234567890".to_owned(),
             pull_request: PullRequestStatus::Created("https://example.invalid/pull/7".to_owned()),
+            note: None,
         });
         let text = render_text(&state, 120, 30);
         assert!(text.contains("PULL REQUEST CREATED"), "{text}");
@@ -4942,6 +4953,7 @@ mod tests {
             branch: "polycode/run-7".to_owned(),
             commit: "abcdef1234567890".to_owned(),
             pull_request: PullRequestStatus::Unavailable("gh is not installed".to_owned()),
+            note: None,
         });
         let text = render_text(&state, 120, 30);
         assert!(text.contains("BRANCH PUSHED"), "{text}");
