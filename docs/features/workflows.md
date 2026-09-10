@@ -45,7 +45,7 @@ TUI run detail: `f` fix (or book a fix while the run is still working; press aga
 - There is no `continue` CLI command; continue and follow-ups are TUI-only (`c`, `w`).
 - Fix and continue require `RunStatus::Completed` and a Decision stage in the graph; `fast` runs have no decision, so `f`/`c`/`w` are refused with an explanation.
 - Fix cycles never re-run the reviews; start a `review` run over the result if you want them back. They do re-run verification (`verify_<n>`), and the fresh decision only optionally depends on it.
-- A failed Verify stage does not fail the run: the decision runs with the failure in evidence, the run completes, and `fix`/continue stay available. Only `apply`/`pr` are refused until the latest verification passes.
+- A failed Verify stage does not fail the run: the decision runs with the failure in evidence, the run completes, and `fix`/continue stay available. Only `apply` is refused until the latest verification passes; `pr` publishes regardless.
 - A run created before fix-cycle routing existed cannot execute a fix; `request_fix` checks this before committing anything.
 - Existing persisted runs keep their original stored graph, including legacy generic Review stages; only new runs use the current definitions.
 - The change handoff is derived evidence, not an artifact; oversized diffs are marked INCOMPLETE, never silently cut. Resume prompts do not re-inject it.

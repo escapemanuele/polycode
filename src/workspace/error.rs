@@ -63,7 +63,8 @@ pub enum WorkspaceError {
     /// The run's latest verify stage did not pass. A failed verification
     /// still completes the run — the decision only optionally depends on
     /// it — so this gate, not the run status, is what keeps unverified
-    /// changes out of the source checkout and off the remote.
+    /// changes out of the source checkout. Publish is not gated by it: a
+    /// branch and a pull request are where unverified work belongs.
     #[error("verification did not pass: stage {stage_id} is {status}")]
     VerificationNotPassed {
         stage_id: crate::domain::StageId,

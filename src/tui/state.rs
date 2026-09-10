@@ -1012,6 +1012,19 @@ impl TuiState {
         })
     }
 
+    /// The latest verify stage when it did not pass, for the publish
+    /// confirmation to say so.
+    ///
+    /// Publish no longer refuses on a failed verification — the workspace
+    /// layer stopped gating it — so the warning is what keeps pushing past a
+    /// red check a decision rather than a surprise.
+    pub(crate) fn failed_verification(&self) -> Option<&crate::app::query::StageSummary> {
+        self.details.as_ref()?.stages.iter().rev().find(|stage| {
+            stage.kind == crate::domain::StageKind::Verify
+                && stage.status != crate::domain::StageStatus::Completed
+        })
+    }
+
     /// Whether this run can be sent back to fix its own result.
     ///
     /// A completed run and a decision for the fix to answer. A workflow that

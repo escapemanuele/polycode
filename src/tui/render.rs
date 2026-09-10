@@ -2546,6 +2546,23 @@ fn render_confirmation(
             }
             lines.push(Line::from(""));
         }
+        if confirmation == Confirmation::Publish {
+            if let Some(stage) = state.failed_verification() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "Verification did not pass: stage {} is {}.",
+                        stage.id,
+                        format!("{:?}", stage.status).to_lowercase()
+                    ),
+                    theme::danger(),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Publishing anyway puts the change on a branch, not in your checkout.",
+                    theme::muted(),
+                )));
+                lines.push(Line::from(""));
+            }
+        }
         lines.push(Line::from(if confirmation == Confirmation::Apply {
             "Review [d] diff first when needed. Enter confirms apply."
         } else {
@@ -3297,6 +3314,42 @@ mod tests {
         assert!(empty.contains("2 archived runs."), "{empty}");
         assert!(empty.contains("Show archived runs"));
         assert!(!empty.contains("No runs yet"));
+    }
+
+    /// Publish no longer refuses a run whose checks failed, so the
+    /// confirmation is the only place the operator learns they are pushing
+    /// past a red verification. It names the stage and says where the change
+    /// is going — a branch, not their checkout.
+    #[test]
+    fn the_publish_confirmation_warns_when_verification_did_not_pass() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        let verify = stage(
+            "verify_2",
+            StageKind::Verify,
+            Role::Verifier,
+            StageStatus::Failed,
+        );
+        state.details = Some(details(RunStatus::Completed, vec![verify]));
+        state.overlay = Some(Overlay::PublishConfirm);
+
+        let text = render_text(&state, 120, 34);
+
+        assert!(
+            text.contains("Verification did not pass: stage verify_2 is failed."),
+            "{text}"
+        );
+        assert!(text.contains("not in your checkout"), "{text}");
+
+        // A run whose verification passed says nothing about it.
+        let verify = stage(
+            "verify_2",
+            StageKind::Verify,
+            Role::Verifier,
+            StageStatus::Completed,
+        );
+        state.details = Some(details(RunStatus::Completed, vec![verify]));
+        let text = render_text(&state, 120, 34);
+        assert!(!text.contains("Verification did not pass"), "{text}");
     }
 
     /// The last stop before a run is gone: POD stands over the plunger, the
