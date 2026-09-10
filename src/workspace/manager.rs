@@ -8,14 +8,14 @@ use crate::domain::{
 };
 use crate::git::{
     GitRepository, apply_patch, branch_exists, branch_tip, check_patch, commit_all_in_worktree,
-    create_branch_in_worktree, create_worktree, delete_owned_branch, detach_worktree,
-    generate_patch, generate_patch_preview, inspect_worktree, push_branch, remote_url,
-    remove_worktree, source_is_clean, tree_is_clean,
+    create_branch_in_worktree, create_worktree, delete_owned_branch, detach_worktree, fetch_branch,
+    generate_patch, generate_patch_preview, inspect_worktree, is_ancestor, push_branch,
+    push_commit_to_branch, remote_url, remove_worktree, source_is_clean, tree_is_clean,
 };
 use crate::store::{RunInput, RunRevision, SqliteStore, worktree_root};
 
 use super::branch_name;
-use super::github::GhClient;
+use super::github::{GhClient, PullRequestRef};
 use super::pull_request::PullRequestDraft;
 use super::setup;
 use super::{
@@ -29,6 +29,22 @@ pub struct PublishReceipt {
     pub branch: String,
     pub commit: String,
     pub pull_request: PullRequestStatus,
+    /// Why the run's own branch was pushed even though its task named a pull
+    /// request, when that happened. A run that reviewed a pull request and
+    /// then fixed it expects its commits to land on that pull request, so
+    /// opening a second one instead is never left unexplained.
+    pub note: Option<String>,
+}
+
+/// Where a publish's commit is meant to land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PublishTarget {
+    /// The head branch of the pull request the run was asked to fix, whose
+    /// commits the run is built on.
+    PullRequestBranch { branch: String, url: String },
+    /// The branch the run owns, with the reason the named pull request could
+    /// not be updated when there was one.
+    OwnBranch(Option<String>),
 }
 
 /// The pull-request half of a publish, which is allowed to fall short without
@@ -421,6 +437,12 @@ impl WorkspaceManager {
     /// publishing again after a fix cycle updates the same branch and pull
     /// request.
     ///
+    /// When the run's task names a pull request it can reach and fast-forward
+    /// — the shape of a review and the fix cycle after it — the commit lands
+    /// on that pull request's own head branch instead, so fixing a pull
+    /// request updates it rather than opening a second one for the same work.
+    /// See [`Self::publish_target`] for what has to hold first.
+    ///
     /// Push-first by design: pull-request failures (no `gh`, not
     /// authenticated) are reported inside the receipt, because by then the
     /// work is already safe on the remote.
@@ -502,26 +524,113 @@ impl WorkspaceManager {
         if commit == workspace.base_commit() {
             return Err(WorkspaceError::NothingToPublish);
         }
-        push_branch(&self.git, worktree, "origin", &branch)?;
-
-        let pull_request = match gh.existing_pull_request(worktree, &branch) {
-            Ok(Some(url)) => PullRequestStatus::AlreadyExists(url),
-            Ok(None) => {
-                let body = draft.filter(|draft| !draft.body.is_empty()).map_or_else(
-                    || publish_body(task.as_deref(), run_id),
-                    |draft| draft.body.clone(),
-                );
-                match gh.create_pull_request(worktree, &branch, &title, &body) {
-                    Ok(url) => PullRequestStatus::Created(url),
-                    Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
+        let (branch, pull_request, note) =
+            match self.publish_target(gh, worktree, task.as_deref(), &commit)? {
+                PublishTarget::PullRequestBranch {
+                    branch: head_branch,
+                    url,
+                } => {
+                    push_commit_to_branch(&self.git, worktree, "origin", &commit, &head_branch)?;
+                    (head_branch, PullRequestStatus::AlreadyExists(url), None)
                 }
-            }
-            Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
-        };
+                PublishTarget::OwnBranch(note) => {
+                    push_branch(&self.git, worktree, "origin", &branch)?;
+                    let pull_request = match gh.existing_pull_request(worktree, &branch) {
+                        Ok(Some(url)) => PullRequestStatus::AlreadyExists(url),
+                        Ok(None) => {
+                            let body = draft.filter(|draft| !draft.body.is_empty()).map_or_else(
+                                || publish_body(task.as_deref(), run_id),
+                                |draft| draft.body.clone(),
+                            );
+                            match gh.create_pull_request(worktree, &branch, &title, &body) {
+                                Ok(url) => PullRequestStatus::Created(url),
+                                Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
+                            }
+                        }
+                        Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
+                    };
+                    (branch, pull_request, note)
+                }
+            };
         Ok(PublishReceipt {
             branch,
             commit,
             pull_request,
+            note,
+        })
+    }
+
+    /// Decides whether this publish belongs on a pull request the run was
+    /// asked to fix, rather than on a branch of its own.
+    ///
+    /// A run whose task names a pull request — the shape of every review, and
+    /// of the fix cycle that follows one — is working on that pull request's
+    /// change. Pushing its commits to a fresh branch opens a second pull
+    /// request for the same work, which is never what the operator asked for.
+    ///
+    /// Four things have to hold before Polycode writes to a branch it does not
+    /// own, and each failure is an explanation rather than an error, because
+    /// publishing to the run's own branch remains a correct outcome:
+    /// the head branch must live in the repository `origin` points at, not in
+    /// a fork; that pull request must be the open one `origin` serves for the
+    /// branch, which rules out a task that merely mentions somebody else's;
+    /// the branch must still exist on the remote; and the branch's tip must be
+    /// an ancestor of the commit being published, so the push fast-forwards.
+    /// Nothing here force-pushes and nothing rewrites a branch that moved.
+    fn publish_target(
+        &self,
+        gh: &GhClient,
+        worktree: &Path,
+        task: Option<&str>,
+        commit: &str,
+    ) -> Result<PublishTarget, WorkspaceError> {
+        let Some(reference) = task.and_then(PullRequestRef::parse) else {
+            return Ok(PublishTarget::OwnBranch(None));
+        };
+        let url = reference.url();
+        let head = match gh.pull_request_head(worktree, &reference) {
+            Ok(head) => head,
+            Err(unavailable) => {
+                return Ok(PublishTarget::OwnBranch(Some(format!(
+                    "{url} could not be read, so this run kept its own branch: {}",
+                    unavailable.0
+                ))));
+            }
+        };
+        if head.cross_repository {
+            return Ok(PublishTarget::OwnBranch(Some(format!(
+                "{url} reads from a fork, which polycode cannot push to."
+            ))));
+        }
+        let open = match gh.existing_pull_request(worktree, &head.branch) {
+            Ok(open) => open,
+            Err(unavailable) => {
+                return Ok(PublishTarget::OwnBranch(Some(format!(
+                    "{url} could not be matched to this repository: {}",
+                    unavailable.0
+                ))));
+            }
+        };
+        if !open.is_some_and(|open| open.eq_ignore_ascii_case(&url)) {
+            return Ok(PublishTarget::OwnBranch(Some(format!(
+                "{url} is not an open pull request of this repository's origin."
+            ))));
+        }
+        let Some(tip) = fetch_branch(&self.git, worktree, "origin", &head.branch)? else {
+            return Ok(PublishTarget::OwnBranch(Some(format!(
+                "{url} has no branch {} on origin any more.",
+                head.branch
+            ))));
+        };
+        if !is_ancestor(&self.git, worktree, &tip, commit)? {
+            return Ok(PublishTarget::OwnBranch(Some(format!(
+                "{url} moved ahead of this run: {} carries commits this run is not built on, so pushing to it would need a merge or a rebase.",
+                head.branch
+            ))));
+        }
+        Ok(PublishTarget::PullRequestBranch {
+            branch: head.branch,
+            url,
         })
     }
 
@@ -1347,6 +1456,14 @@ mod tests {
                 store,
                 run_id,
             }
+        }
+
+        /// A run carrying task text, which is where the pull request a review
+        /// was pointed at is written down.
+        fn with_task(kind: WorkflowKind, task: &str) -> Self {
+            let mut fixture = Self::new(kind);
+            fixture.run_id = create_run_with_task(&mut fixture.store, kind, 2, task);
+            fixture
         }
 
         fn manager(&self) -> WorkspaceManager {
@@ -2747,9 +2864,11 @@ mod tests {
         origin
     }
 
-    /// A `gh` stand-in: `pr list` prints whatever `list-output` beside the
-    /// script holds, `pr create` prints a fixed URL. No stub ever reaches a
-    /// network.
+    /// A `gh` stand-in: `pr list --head <branch>` prints whatever
+    /// `list-<branch>` beside the script holds and falls back to
+    /// `list-output`, `pr view` prints `view-output`, and `pr create` prints a
+    /// fixed URL. A missing file is an unanswered question, which is what a
+    /// `gh` that cannot answer looks like. No stub ever reaches a network.
     fn stub_gh(directory: &Path) -> GhClient {
         use std::os::unix::fs::PermissionsExt;
         let script = directory.join("gh");
@@ -2758,7 +2877,9 @@ mod tests {
             "#!/bin/sh\n\
              dir=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
              case \"$1 $2\" in\n\
-             \"pr list\") cat \"$dir/list-output\" 2>/dev/null; exit 0 ;;\n\
+             \"pr list\") head=$(printf '%s' \"$4\" | tr / _)\n\
+             cat \"$dir/list-$head\" 2>/dev/null || cat \"$dir/list-output\" 2>/dev/null; exit 0 ;;\n\
+             \"pr view\") cat \"$dir/view-output\" 2>/dev/null || exit 1; exit 0 ;;\n\
              \"pr create\") printf '%s\\n' \"$@\" > \"$dir/create-args\"; echo \"https://example.invalid/pull/7\"; exit 0 ;;\n\
              *) exit 1 ;;\n\
              esac\n",
@@ -2766,6 +2887,39 @@ mod tests {
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         GhClient::with_executable(script)
+    }
+
+    /// The pull request a review names, as the task text carries it.
+    const REVIEWED_PULL_REQUEST: &str = "https://github.com/owner/repo/pull/7";
+
+    /// The branch a run owns, which a publish falls back to.
+    fn own_branch(fixture: &Fixture) -> String {
+        let task = fixture
+            .store
+            .load_run_input(fixture.run_id)
+            .unwrap()
+            .map(|input| input.task().to_owned());
+        branch_name::branch_name(fixture.run_id, task.as_deref())
+    }
+
+    /// Everything a run that was asked to fix `REVIEWED_PULL_REQUEST` needs to
+    /// publish onto it: the pull request's branch on origin at the worktree's
+    /// base, and a `gh` that reports that branch as the pull request's head.
+    fn arrange_reviewed_pull_request(fixture: &Fixture, directory: &Path, cross_repository: bool) {
+        git(
+            &fixture.source,
+            ["push", "origin", "HEAD:refs/heads/pull-request-branch"],
+        );
+        fs::write(
+            directory.join("view-output"),
+            format!("pull-request-branch\t{cross_repository}\n"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("list-pull-request-branch"),
+            format!("{REVIEWED_PULL_REQUEST}\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2925,6 +3079,151 @@ mod tests {
         ));
         let reference = format!("refs/heads/polycode/run-{}", fixture.run_id);
         assert_eq!(git_text(&origin, ["rev-parse", &reference]), receipt.commit);
+    }
+
+    /// The whole point: fixing a reviewed pull request updates it.
+    #[test]
+    fn publishing_a_run_that_fixes_a_pull_request_pushes_onto_that_pull_request() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
+        );
+        let origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), false);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "fixed\n").unwrap();
+
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
+            .unwrap();
+
+        assert_eq!(receipt.branch, "pull-request-branch");
+        assert_eq!(receipt.note, None);
+        assert_eq!(
+            receipt.pull_request,
+            PullRequestStatus::AlreadyExists(REVIEWED_PULL_REQUEST.to_owned())
+        );
+        assert_eq!(
+            git_text(&origin, ["rev-parse", "refs/heads/pull-request-branch"]),
+            receipt.commit,
+            "the fix did not reach the pull request's own branch"
+        );
+        // No second pull request, and no branch of its own on origin to open
+        // one from: that duplication is what this exists to prevent.
+        assert!(
+            !fixture.temp.path().join("create-args").exists(),
+            "a second pull request was opened for the same change"
+        );
+        let own = format!("refs/heads/polycode/run-{}", fixture.run_id);
+        assert!(
+            !git_ok(&origin, ["rev-parse", "--verify", "--quiet", &own]),
+            "the run's own branch reached origin as well"
+        );
+    }
+
+    /// A pull request whose branch moved on is somebody else's work: the run
+    /// keeps its own branch, and says why rather than opening a duplicate
+    /// silently.
+    #[test]
+    fn a_pull_request_branch_that_moved_ahead_falls_back_with_a_reason() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
+        );
+        let origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), false);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        // Somebody pushed to the pull request after this run started.
+        fs::write(fixture.source.join("theirs.txt"), "theirs\n").unwrap();
+        git(&fixture.source, ["add", "-A"]);
+        git(&fixture.source, ["commit", "-m", "theirs"]);
+        git(
+            &fixture.source,
+            ["push", "origin", "HEAD:refs/heads/pull-request-branch"],
+        );
+        fs::write(workspace.worktree_path().join("README.md"), "fixed\n").unwrap();
+
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
+            .unwrap();
+
+        assert_eq!(receipt.branch, own_branch(&fixture));
+        let note = receipt.note.expect("the fallback went unexplained");
+        assert!(note.contains(REVIEWED_PULL_REQUEST), "{note}");
+        assert!(note.contains("moved ahead"), "{note}");
+        assert_eq!(
+            receipt.pull_request,
+            PullRequestStatus::Created("https://example.invalid/pull/7".to_owned())
+        );
+        let reference = format!("refs/heads/{}", own_branch(&fixture));
+        assert_eq!(git_text(&origin, ["rev-parse", &reference]), receipt.commit);
+        // The pull request's branch is untouched: nothing was force-pushed
+        // over the commit that arrived while the run was working.
+        assert_ne!(
+            git_text(&origin, ["rev-parse", "refs/heads/pull-request-branch"]),
+            receipt.commit
+        );
+    }
+
+    /// A fork's branch is not a branch `origin` can be pushed to.
+    #[test]
+    fn a_pull_request_from_a_fork_keeps_the_runs_own_branch() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
+        );
+        add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), true);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "fixed\n").unwrap();
+
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
+            .unwrap();
+
+        assert_eq!(receipt.branch, own_branch(&fixture));
+        let note = receipt.note.expect("the fallback went unexplained");
+        assert!(note.contains("fork"), "{note}");
+    }
+
+    /// A task that merely mentions a pull request of another repository must
+    /// not have its commits pushed at that pull request.
+    #[test]
+    fn a_pull_request_origin_does_not_serve_is_left_alone() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Port the fix from {REVIEWED_PULL_REQUEST} to this repository"),
+        );
+        add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), false);
+        // Origin's open pull request for that branch is a different one.
+        fs::write(
+            fixture.temp.path().join("list-pull-request-branch"),
+            "https://github.com/owner/repo/pull/99\n",
+        )
+        .unwrap();
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "ported\n").unwrap();
+
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
+            .unwrap();
+
+        assert_eq!(receipt.branch, own_branch(&fixture));
+        let note = receipt.note.expect("the fallback went unexplained");
+        assert!(note.contains("not an open pull request"), "{note}");
     }
 
     #[test]
@@ -3175,6 +3474,18 @@ mod tests {
             "git failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Whether a Git command succeeds, for asking a question whose answer is
+    /// allowed to be no — "is there such a ref".
+    fn git_ok<const N: usize>(cwd: &Path, args: [&str; N]) -> bool {
+        Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success()
     }
 
     fn git_text<const N: usize>(cwd: &Path, args: [&str; N]) -> String {

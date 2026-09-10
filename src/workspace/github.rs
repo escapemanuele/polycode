@@ -13,6 +13,15 @@ use std::process::{Command, Stdio};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GhUnavailable(pub String);
 
+/// Where one pull request reads its commits from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PullRequestHead {
+    pub branch: String,
+    /// True when the head branch lives in a fork. Polycode pushes to `origin`
+    /// alone, so a fork's branch is not a branch it can update.
+    pub cross_repository: bool,
+}
+
 pub struct GhClient {
     executable: OsString,
 }
@@ -55,6 +64,42 @@ impl GhClient {
             ],
         )?;
         Ok(stdout.lines().next().map(str::to_owned))
+    }
+
+    /// Reads the head of `pull_request`: the branch its commits are read from,
+    /// and whether that branch lives in a fork rather than in the repository
+    /// the pull request targets.
+    pub(crate) fn pull_request_head(
+        &self,
+        cwd: &Path,
+        pull_request: &PullRequestRef,
+    ) -> Result<PullRequestHead, GhUnavailable> {
+        let url = pull_request.url();
+        let stdout = self.run(
+            cwd,
+            &[
+                OsStr::new("pr"),
+                OsStr::new("view"),
+                OsStr::new(&url),
+                OsStr::new("--json"),
+                OsStr::new("headRefName,isCrossRepository"),
+                OsStr::new("--jq"),
+                OsStr::new(".headRefName + \"\\t\" + (.isCrossRepository | tostring)"),
+            ],
+        )?;
+        let line = stdout.lines().next().unwrap_or_default();
+        let (branch, cross) = line.split_once('\t').ok_or_else(|| {
+            GhUnavailable(format!("gh pr view reported an unreadable head: {stdout}"))
+        })?;
+        if branch.is_empty() {
+            return Err(GhUnavailable(
+                "gh pr view reported a pull request with no head branch".to_owned(),
+            ));
+        }
+        Ok(PullRequestHead {
+            branch: branch.to_owned(),
+            cross_repository: cross.trim() == "true",
+        })
     }
 
     /// Opens a pull request from `branch` against the repository's default
