@@ -572,7 +572,8 @@ where
     /// The parallel-friendly alternative to `apply_run`: nothing serializes on
     /// the operator's checkout, so any number of completed runs can publish
     /// concurrently. The run stays `Completed` — apply, fix, and discard all
-    /// remain available afterwards.
+    /// remain available afterwards. Unlike apply, a failed verification does
+    /// not refuse: the remote is where a change gets graded.
     ///
     /// # Errors
     /// Returns workspace ownership, lifecycle, Git, remote, or store errors.
@@ -1784,9 +1785,9 @@ mod tests {
     }
 
     /// A failing check does not dead-end the run: the decision still runs
-    /// (verification is an optional edge into it), the run completes, and
-    /// both ways of moving the change out of the worktree refuse by naming
-    /// verification — while a fix cycle stays available to answer it.
+    /// (verification is an optional edge into it), the run completes, apply
+    /// refuses by naming verification, publish is free to carry the change to
+    /// a branch anyway — and a fix cycle stays available to answer it.
     #[test]
     fn a_failing_verify_command_completes_the_run_apply_names_verification_and_a_fix_is_available()
     {
@@ -1826,24 +1827,29 @@ mod tests {
                 .contains("## Bottom line\nfailed — false exited 1\n")
         );
 
-        for result in [
-            service.apply_run(report.details.id).map(|_| ()),
-            service.publish_run(report.details.id).map(|_| ()),
-        ] {
-            let error = result.unwrap_err();
-            assert!(
-                matches!(
-                    &error,
-                    AppError::Workspace(WorkspaceError::VerificationNotPassed { stage_id, status })
-                        if stage_id.as_str() == "verify" && status == "failed"
-                ),
-                "{error}"
-            );
-            assert_eq!(
-                error.to_string(),
-                "verification did not pass: stage verify is failed"
-            );
-        }
+        let error = service.apply_run(report.details.id).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AppError::Workspace(WorkspaceError::VerificationNotPassed { stage_id, status })
+                    if stage_id.as_str() == "verify" && status == "failed"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "verification did not pass: stage verify is failed"
+        );
+
+        // Publish is deliberately not gated on verification: a branch and a
+        // pull request are where an unverified change belongs. This fixture
+        // has no `origin`, so publish gets as far as the remote check — which
+        // is proof enough that verification stopped refusing it.
+        let error = service.publish_run(report.details.id).unwrap_err();
+        assert!(
+            matches!(&error, AppError::Workspace(WorkspaceError::NoRemote(_))),
+            "{error}"
+        );
 
         let fixed = service.request_fix(report.details.id).unwrap();
         assert!(

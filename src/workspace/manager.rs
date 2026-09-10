@@ -447,6 +447,16 @@ impl WorkspaceManager {
     /// authenticated) are reported inside the receipt, because by then the
     /// work is already safe on the remote.
     ///
+    /// Verification does not gate this the way it gates apply. Apply writes
+    /// the operator's own checkout, where a failed check means a tree nobody
+    /// asked for; publish writes a branch and a pull request, which is exactly
+    /// where unfinished work is meant to be graded — by CI, by a reviewer,
+    /// and against a `[verify]` table that is often failing for reasons the
+    /// change never caused (a worktree whose setup did not run, a repository
+    /// red on its own trunk). Refusing there stranded the delta in a worktree
+    /// with no way out but a manual push. The confirmation says verification
+    /// failed, so publishing past it is a choice rather than an accident.
+    ///
     /// # Errors
     /// Rejects non-completed runs, detached/review workspaces, workspaces with
     /// nothing to publish, and repositories without an `origin` remote.
@@ -471,7 +481,6 @@ impl WorkspaceManager {
         gh: &GhClient,
     ) -> Result<PublishReceipt, WorkspaceError> {
         let loaded = store.load_run(run_id)?;
-        ensure_verification_passed(&loaded.run)?;
         if loaded.run.status() != RunStatus::Completed {
             return Err(invalid_run_status(&loaded.run, "publish"));
         }
@@ -843,17 +852,6 @@ impl WorkspaceManager {
             }
         }
 
-        // A workspace is `Preparing` on this path precisely because the first
-        // attempt did not finish, and setup failing is one of the ways it does
-        // not finish. Marking ready now, because the checkout itself
-        // validates, would hand over the half-built tree `[setup]` exists to
-        // prevent, and the run would look like it had recovered. Setup
-        // commands are meant to be idempotent, so running them over a worktree
-        // that got part of the way is the same work.
-        //
-        // A failure here leaves the workspace `Preparing` rather than breaking
-        // it: the usual cause is a `[setup]` command the user can correct, and
-        // the next resume should be free to try it again.
         // A workspace is `Preparing` on this path precisely because the first
         // attempt did not finish, and setup failing is one of the ways it does
         // not finish. Marking ready now, because the checkout itself
@@ -1345,6 +1343,7 @@ fn issue_url(task: &str) -> Option<&str> {
 /// on verification, so a failed check completes the run, reaches the lead
 /// as evidence, and leaves fix and continue available; this gate is what
 /// keeps such a run from being applied or published in the meantime.
+/// Apply's gate. Publish deliberately does not use it — see [`WorkspaceManager::publish`].
 fn ensure_verification_passed(run: &Run) -> Result<(), WorkspaceError> {
     let Some(latest) = run
         .stages()
