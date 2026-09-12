@@ -7,6 +7,8 @@ Every run works in its own Git worktree; the source checkout changes only when y
 - modes: implementation workflows own a `polycode/<slug>-<id-tail>` branch — `<slug>` is the issue key from a Linear or GitHub URL or bare `KEY-123` in the task (`dotcom-17972`), else the task's first words; `<id-tail>` is the last 6 characters of the run id, and a run without input falls back to `polycode/run-<run-id>`; review workflows use a detached worktree.
 - setup: the `[setup]` table of `.polycode.toml` (`commands`, `timeout_seconds`, default 3600 s), found worktree-then-source-repository like every other table, runs in the new worktree after validation and before the workspace is marked `Ready` — so no stage ever sees a tree whose gitignored build output is missing. Argv, no shell, stops at the first failure. A failing command raises `SetupFailed` carrying the command, why it failed, and the last 20 lines of each stream; a table that cannot be read raises `SetupConfig`. Preparation fails in both cases and the workspace never reaches `Ready`. Resuming that run runs setup again over the worktree that is already there rather than handing it over — the failure leaves the workspace `Preparing`, not `Broken`, so correcting the command and pressing `r` is the recovery. Repositories with no `[setup]` table are unaffected.
 - apply: patch transfer from base commit to a clean source checkout; no staging, no commit.
+- rebase: `polycode rebase <run-id>` (TUI `b`) replays a completed run's delta on the source checkout's current `HEAD`, for the checkout that moved on while the run was working and now refuses the patch. The delta is committed on the run's own branch first (as publish commits it), then `git rebase --onto <HEAD> <base>`; a conflict aborts, changes nothing, and keeps the old base. The workspace's `base_commit` moves, the spent `failed` apply intent is dropped with it, and a `WorkspaceRebased` event records the move.
+- rebase-verification: the move makes an earlier passed verification stale — it ran over the old base — so apply refuses with `verification predates the rebase onto <commit>` until a later cycle's verify stage completes after the rebase. `fix` and `continue` both append one. `pr` is not gated by it, exactly as it is not gated by a failed verification.
 - verification-gate: `apply` refuses unless the run's latest Verify stage — the last one in the graph, since every fix or continue cycle appends its own — is `Completed` (`verification did not pass: stage verify is failed`). Older verify stages do not count: a failed `verify` answered by a passed `verify_1` no longer blocks. Checked before the run-status check. `pr` does not share the gate: it writes a branch and a pull request rather than the operator's checkout, so a red check is something CI and the reviewer see, not a reason to strand the delta in a worktree.
 - pr: commit the delta on the run's branch, push to `origin`, open a PR through `gh`; source checkout untouched.
 - pr-draft: the PR title and description are quoted from the `## Pull request` section of the latest editing stage's artifact (Implementation, Simplification, Fix, FollowUp); the task's first line and text stand in when no stage wrote one.
@@ -21,29 +23,33 @@ Nothing is required to get a worktree; every run gets one. When a run is `Comple
 ## Driving it
 ```bash
 polycode apply <run-id>
+polycode rebase <run-id>
 polycode pr <run-id>
 polycode discard <run-id>
 polycode status <run-id>      # Workspace and Base lines
 ```
-TUI run detail: `d` diff preview, `a` then Enter apply, `P` then Enter publish (publishing card while it runs, then a result card with the PR URL: `o` open, `y` copy), `X` then Enter discard.
+TUI run detail: `d` diff preview, `a` then Enter apply, `b` then Enter rebase onto HEAD, `P` then Enter publish (publishing card while it runs, then a result card with the PR URL: `o` open, `y` copy), `X` then Enter discard.
 
 CLI `pr` prints its progress line to stderr and the receipt (branch, commit, elapsed, PR URL on its own line) to stdout.
 
 ## Where it lives
-- `src/workspace/manager.rs` — prepare/apply/publish/discard sagas, `publish`, `publish_target` (push onto a reviewed pull request's own branch), `ensure_verification_passed` (apply only).
-- `src/workspace/error.rs` — `WorkspaceError`, incl. `VerificationNotPassed`, `SetupConfig`, `SetupFailed`.
+- `src/workspace/manager.rs` — prepare/apply/rebase/publish/discard sagas, `publish`, `publish_target` (push onto a reviewed pull request's own branch), `rebase`, `patch_refusal_reason` (why `git apply --check` said no), `ensure_verification_passed` and `ensure_verification_follows_rebase` (apply only).
+- `src/workspace/error.rs` — `WorkspaceError`, incl. `VerificationNotPassed`, `VerificationPrecedesRebase`, `RebaseAlreadyCurrent`, `RebaseBaseNotAncestor`, `RebaseConflict`, `RebaseBlockedByApply`, `SetupConfig`, `SetupFailed`.
 - `src/workspace/setup.rs` — the `[setup]` table reader and its runner, called from `prepare_run_workspace` and from `reconcile_preparing` before the workspace is marked ready.
 - `src/workspace/model.rs` — `RunWorkspace`, `WorkspaceStatus`, apply operation records.
 - `src/workspace/github.rs` — `gh pr list --head` / `gh pr view` / `gh pr create` boundary; `PullRequestRef` parses the pull request out of the task text.
 - `src/workspace/pull_request.rs` — `PullRequestDraft`, `extract` of the artifact's `## Pull request` section; `src/app/query.rs` `pull_request_draft` walks the editing artifacts newest first and takes the first that wrote the section. When none did, `publish_title`/`publish_body` in `manager.rs` name the run from the task with its links dropped, falling back to the linked issue.
 - `src/git/worktree.rs`, `src/git/patch.rs`, `src/git/remote.rs`, `src/git/repository.rs` — Git commands with direct argv.
-- `src/store/workspace.rs` — workspace and apply-intent persistence with CAS.
+- `src/store/workspace.rs` — workspace and apply-intent persistence with CAS; `rebase_workspace_base` moves the base and drops the superseded `failed` intent in one transaction.
 - `src/store/path.rs` — `worktree_root`, `POLYCODE_DATA_DIR`.
-- `src/app/run_service.rs` — `apply_run`, `publish_run`, `discard_run`, `preview_run_diff`.
+- `src/app/run_service.rs` — `apply_run`, `rebase_run`, `publish_run`, `discard_run`, `preview_run_diff`.
 - `src/tui/state.rs` `PublishInFlight`/`PublishOutcome`, `src/tui/render.rs` `render_publishing`/`render_published`, `src/tui/desktop.rs` `open_in_browser`/`copy_to_clipboard` (platform `open`/`xdg-open`, `pbcopy`/`wl-copy`/`xclip`).
 - `tests/codex_cli.rs` — `native_codex_fixture_runs_through_tmux_preserves_source_then_applies`.
 
 ## Gotchas
+- A refused apply says why in the same sentence: how far the checkout moved past the run's base, and that `polycode rebase <run>` moves the change to meet it.
+- Rebase refuses a `prepared` or `applied_to_source` intent (`RebaseBlockedByApply`): part of the old patch may already be in the checkout. It also refuses a run already on `HEAD`, and a checkout that no longer contains the run's base (rewound or moved to unrelated history).
+- A conflicting rebase leaves the delta as a commit on the run's branch — the commit is made before the rebase and survives the abort — but the base, the checkout and the apply intent are untouched.
 - Apply requires a fully clean source checkout; preparation does not (the worktree starts from committed `HEAD`).
 - Apply never stages or commits; an empty diff is a successful no-op (`No workspace changes to apply.`).
 - `pr` rejects non-completed runs, detached (review) workspaces, empty deltas and repositories without an `origin` remote. A failed verification is not among them.

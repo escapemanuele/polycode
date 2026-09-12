@@ -1232,6 +1232,8 @@ fn hero_actions(
         spans.push(Span::raw("   "));
         spans.extend(theme::action("a", "Apply changes", theme::success()));
         spans.push(Span::raw("   "));
+        spans.extend(theme::action("b", "Rebase onto HEAD", theme::attention()));
+        spans.push(Span::raw("   "));
         spans.extend(theme::action("P", "Pull request", theme::success()));
         if let Some(label) = fix.label() {
             spans.push(Span::raw("   "));
@@ -1768,6 +1770,7 @@ fn run_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)
     } else if state.run_is_applyable() {
         push("d", "Review diff", theme::accent());
         push("a", "Apply", theme::success());
+        push("b", "Rebase", theme::attention());
         push("P", "Pull request", theme::success());
         if let Some(label) = FixOffer::of(state).label() {
             push("f", label, theme::attention());
@@ -1997,6 +2000,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::Attention => render_attention(frame, popup, state),
         Overlay::Update => render_update(frame, area, state),
         Overlay::ApplyConfirm => render_confirmation(frame, popup, state, Confirmation::Apply),
+        Overlay::RebaseConfirm => render_confirmation(frame, popup, state, Confirmation::Rebase),
         Overlay::PublishConfirm => render_confirmation(frame, popup, state, Confirmation::Publish),
         Overlay::DiscardConfirm => render_confirmation(frame, popup, state, Confirmation::Discard),
         Overlay::DeleteConfirm => render_delete_confirmation(frame, popup, state),
@@ -2484,6 +2488,7 @@ fn render_follow_ups(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirmation {
     Apply,
+    Rebase,
     Publish,
     Discard,
 }
@@ -2499,6 +2504,7 @@ fn render_confirmation(
     };
     let (action, color) = match confirmation {
         Confirmation::Apply => ("APPLY", theme::success()),
+        Confirmation::Rebase => ("REBASE", theme::attention()),
         Confirmation::Publish => ("PULL REQUEST", theme::success()),
         Confirmation::Discard => ("DISCARD", theme::danger()),
     };
@@ -2563,11 +2569,17 @@ fn render_confirmation(
                 lines.push(Line::from(""));
             }
         }
-        lines.push(Line::from(if confirmation == Confirmation::Apply {
-            "Review [d] diff first when needed. Enter confirms apply."
-        } else {
-            "Commits on the run's branch, pushes to origin, opens a pull request. \
-             Your checkout is untouched. Enter confirms."
+        lines.push(Line::from(match confirmation {
+            Confirmation::Apply => "Review [d] diff first when needed. Enter confirms apply.",
+            Confirmation::Rebase => {
+                "Replays this run's change on your checkout's current HEAD, on the run's own \
+                 branch. A conflict stops and changes nothing. Verification has to run again \
+                 afterwards before apply. Enter confirms."
+            }
+            _ => {
+                "Commits on the run's branch, pushes to origin, opens a pull request. \
+                 Your checkout is untouched. Enter confirms."
+            }
         }));
     }
     lines.push(Line::from(Span::styled("Esc cancels", theme::muted())));
@@ -2577,6 +2589,7 @@ fn render_confirmation(
             .block(overlay_block(
                 match confirmation {
                     Confirmation::Apply => " APPLY ",
+                    Confirmation::Rebase => " REBASE ",
                     Confirmation::Publish => " PULL REQUEST ",
                     Confirmation::Discard => " DISCARD ",
                 },

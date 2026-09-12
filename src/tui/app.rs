@@ -10,6 +10,7 @@ use crate::update::{InstallSource, UpdateInfo};
 
 use super::bottom_line;
 use super::desktop;
+use super::format::short_commit;
 use super::input::{Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
@@ -252,6 +253,7 @@ impl TuiApp {
             Intent::Logs => self.open_logs(),
             Intent::Diff => self.open_diff(),
             Intent::Apply => self.open_apply_confirmation(),
+            Intent::Rebase => self.open_rebase_confirmation(),
             Intent::Publish => self.open_publish_confirmation(),
             Intent::Fix => self.request_fix(),
             Intent::Continue => self.open_continue(),
@@ -312,6 +314,12 @@ impl TuiApp {
                     self.state.overlay = None;
                 }
             }
+            Overlay::RebaseConfirm if intent == Intent::Enter => {
+                if let Some(run_id) = self.state.selected_run {
+                    self.dispatch(WorkerCommand::RebaseRun { run_id });
+                    self.state.overlay = None;
+                }
+            }
             Overlay::PublishConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
                     self.state.overlay = None;
@@ -340,6 +348,7 @@ impl TuiApp {
             }
             Overlay::Help
             | Overlay::ApplyConfirm
+            | Overlay::RebaseConfirm
             | Overlay::PublishConfirm
             | Overlay::DiscardConfirm
             | Overlay::DeleteConfirm
@@ -1064,6 +1073,22 @@ impl TuiApp {
         }
     }
 
+    /// Rebase shares apply's gate — a completed branch run — because it
+    /// exists for the run apply just refused; the workspace layer decides
+    /// whether there is in fact a newer `HEAD` to move onto, and says so by
+    /// name when there is not.
+    fn open_rebase_confirmation(&mut self) {
+        if self.state.selected_run.is_none() {
+            return;
+        }
+        if self.state.run_is_applyable() {
+            self.state.overlay = Some(Overlay::RebaseConfirm);
+        } else {
+            self.state
+                .notify(UiMessageKind::Info, apply_unavailable_reason(&self.state));
+        }
+    }
+
     /// Publish shares apply's gate — a completed branch run — because both
     /// transport the same delta; they differ only in where it lands.
     fn open_publish_confirmation(&mut self) {
@@ -1159,6 +1184,15 @@ impl TuiApp {
                         self.refresh();
                         return;
                     }
+                    // The rebase itself is half the news: the other half is
+                    // that apply is now waiting on a check that has not run
+                    // yet, which the operator would otherwise meet as a
+                    // refusal the next time they press `a`.
+                    WorkerSuccess::Rebased(receipt, _) => format!(
+                        "Change moved onto {}, {} commit(s) ahead — verify again before applying.",
+                        short_commit(&receipt.to_base),
+                        receipt.commits_gained
+                    ),
                     WorkerSuccess::Execution(_) | WorkerSuccess::Purged(_) => {
                         format!("{} finished for {run_id}", result.action.label())
                     }

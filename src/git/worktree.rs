@@ -207,6 +207,70 @@ pub(crate) fn delete_owned_branch(
     Ok(true)
 }
 
+/// Moves the commits one worktree's branch carries since `base` onto `onto`,
+/// returning the branch's new tip.
+///
+/// The second machine-owned history rewrite, and the only one that can fail
+/// on the operator's content rather than on Git: a conflicting rebase leaves
+/// a sequencer mid-flight, so a failure aborts it and restores the branch
+/// before returning. The caller therefore sees either a moved branch or the
+/// branch it had, never a worktree stopped inside a rebase.
+///
+/// Hooks and signing are off for the same reason [`commit_all_in_worktree`]
+/// turns them off: the operator's hooks were written for their checkout, and
+/// a signing prompt beneath the alternate screen would hang.
+pub(crate) fn rebase_worktree_onto(
+    git: &Git,
+    path: &Path,
+    base: &str,
+    onto: &str,
+) -> Result<String, GitError> {
+    validate_commit(base)?;
+    validate_commit(onto)?;
+    let output = git.output(
+        path,
+        &[
+            os("-c"),
+            os("core.hooksPath=/dev/null"),
+            os("rebase"),
+            os("--no-gpg-sign"),
+            os("--onto"),
+            os(onto),
+            os(base),
+        ],
+        &[],
+    )?;
+    if !output.status.success() {
+        let failure = output.into_failure();
+        abort_rebase(git, path)?;
+        return Err(failure);
+    }
+    let head = text_output(git.checked(path, &[os("rev-parse"), os("HEAD")])?)?;
+    validate_commit(&head)?;
+    Ok(head)
+}
+
+/// Returns a worktree to the state it had before a failed rebase.
+///
+/// `git rebase --abort` fails when there is nothing to abort, which is what a
+/// rebase that refused before it started leaves behind. That is not a
+/// recovery failure, so it is only reported as one when a sequencer is in
+/// fact still there.
+fn abort_rebase(git: &Git, path: &Path) -> Result<(), GitError> {
+    let output = git.output(path, &[os("rebase"), os("--abort")], &[])?;
+    if output.status.success() || !rebase_in_progress(git, path)? {
+        Ok(())
+    } else {
+        Err(output.into_failure())
+    }
+}
+
+fn rebase_in_progress(git: &Git, path: &Path) -> Result<bool, GitError> {
+    let git_dir = text_output(git.checked(path, &[os("rev-parse"), os("--absolute-git-dir")])?)?;
+    let git_dir = PathBuf::from(git_dir);
+    Ok(git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists())
+}
+
 fn branch_is_checked_out(
     git: &Git,
     repository: &GitRepository,

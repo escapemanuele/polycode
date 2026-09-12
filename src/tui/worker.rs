@@ -7,7 +7,7 @@ use crate::app::{
     PurgeReceipt, RetryRoute, RunService,
 };
 use crate::domain::{AttentionRequestId, RunId, StageId, WorkflowKind};
-use crate::workspace::PublishReceipt;
+use crate::workspace::{PublishReceipt, RebaseReceipt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionKind {
@@ -19,6 +19,7 @@ pub(crate) enum ActionKind {
     Continue,
     ResolveAttention,
     Apply,
+    Rebase,
     Publish,
     Discard,
     Purge,
@@ -35,6 +36,7 @@ impl ActionKind {
             Self::Continue => "continuing run",
             Self::ResolveAttention => "resolving attention",
             Self::Apply => "applying changes",
+            Self::Rebase => "rebasing workspace",
             Self::Publish => "publishing pull request",
             Self::Discard => "discarding run",
             Self::Purge => "deleting run",
@@ -55,7 +57,12 @@ impl ActionKind {
             | Self::Fix
             | Self::Continue
             | Self::ResolveAttention => true,
-            Self::Stop | Self::Apply | Self::Publish | Self::Discard | Self::Purge => false,
+            Self::Stop
+            | Self::Apply
+            | Self::Rebase
+            | Self::Publish
+            | Self::Discard
+            | Self::Purge => false,
         }
     }
 }
@@ -97,6 +104,10 @@ pub(crate) enum WorkerCommand {
     ApplyRun {
         run_id: RunId,
     },
+    /// Moves a completed run's change onto the checkout's current `HEAD`.
+    RebaseRun {
+        run_id: RunId,
+    },
     PublishRun {
         run_id: RunId,
     },
@@ -120,6 +131,7 @@ impl WorkerCommand {
             Self::RequestContinue { .. } => ActionKind::Continue,
             Self::ResolveAttention { .. } => ActionKind::ResolveAttention,
             Self::ApplyRun { .. } => ActionKind::Apply,
+            Self::RebaseRun { .. } => ActionKind::Rebase,
             Self::PublishRun { .. } => ActionKind::Publish,
             Self::DiscardRun { .. } => ActionKind::Discard,
             Self::PurgeRun { .. } => ActionKind::Purge,
@@ -136,6 +148,7 @@ impl WorkerCommand {
             | Self::RequestContinue { run_id, .. }
             | Self::ResolveAttention { run_id, .. }
             | Self::ApplyRun { run_id }
+            | Self::RebaseRun { run_id }
             | Self::PublishRun { run_id }
             | Self::DiscardRun { run_id }
             | Self::PurgeRun { run_id } => Some(*run_id),
@@ -148,6 +161,7 @@ pub(crate) enum WorkerSuccess {
     Execution(ExecutionReport),
     Applied(ApplyOutcome, ExecutionReport),
     Published(PublishReceipt, ExecutionReport),
+    Rebased(RebaseReceipt, ExecutionReport),
     /// A purge leaves no run to report on: the rows it would describe are
     /// the ones it deleted.
     Purged(PurgeReceipt),
@@ -157,9 +171,10 @@ impl WorkerSuccess {
     /// The run this action left behind, when it left one.
     pub(crate) const fn report(&self) -> Option<&ExecutionReport> {
         match self {
-            Self::Execution(report) | Self::Applied(_, report) | Self::Published(_, report) => {
-                Some(report)
-            }
+            Self::Execution(report)
+            | Self::Applied(_, report)
+            | Self::Published(_, report)
+            | Self::Rebased(_, report) => Some(report),
             Self::Purged(_) => None,
         }
     }
@@ -331,6 +346,9 @@ where
         WorkerCommand::ApplyRun { run_id } => service
             .apply_run(run_id)
             .map(|(outcome, report)| WorkerSuccess::Applied(outcome, report)),
+        WorkerCommand::RebaseRun { run_id } => service
+            .rebase_run(run_id)
+            .map(|(receipt, report)| WorkerSuccess::Rebased(receipt, report)),
         WorkerCommand::PublishRun { run_id } => service
             .publish_run(run_id)
             .map(|(receipt, report)| WorkerSuccess::Published(receipt, report)),

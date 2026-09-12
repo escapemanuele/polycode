@@ -526,6 +526,37 @@ impl Run {
         ))
     }
 
+    /// Records that this run's workspace was moved onto a newer base commit.
+    ///
+    /// Not a lifecycle transition: the run stays `Completed`, keeps its
+    /// stages and its artifacts, and only the commit its delta is read
+    /// against has changed. What the event is for is elsewhere — a passed
+    /// verification describes checks that ran over the old base, so the apply
+    /// gate compares this event's position in the log with the latest
+    /// verification's and refuses a run whose checks predate the move.
+    ///
+    /// # Errors
+    /// Rejects runs that have not completed, and runs already applied or
+    /// discarded: the first has a workspace still being written, and the
+    /// other two have nothing left to apply the moved delta to.
+    pub fn workspace_rebased(
+        &mut self,
+        metadata: EventMetadata,
+        from_base: String,
+        to_base: String,
+    ) -> Result<DomainEvent, RunRebaseError> {
+        if self.status != RunStatus::Completed {
+            return Err(RunRebaseError::RunNotCompleted(self.status));
+        }
+        self.updated_at = metadata.occurred_at();
+        Ok(DomainEvent::new(
+            metadata,
+            self.id,
+            None,
+            DomainEventKind::WorkspaceRebased { from_base, to_base },
+        ))
+    }
+
     /// Grows a completed run by one remediation cycle and reopens it.
     ///
     /// A run whose decision the operator rejects has everything the fix needs
@@ -1274,6 +1305,12 @@ pub enum RunFixError {
     TooManyCycles,
     #[error(transparent)]
     Workflow(#[from] WorkflowDefinitionError),
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RunRebaseError {
+    #[error("only a completed run's workspace can be rebased; this run is {0:?}")]
+    RunNotCompleted(RunStatus),
 }
 
 /// Private working set shared by the mutating and read-only dependency

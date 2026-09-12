@@ -189,6 +189,19 @@ pub enum DomainEventKind {
     RunContinueRequested {
         stage_ids: Vec<StageId>,
     },
+    /// An operator moved a completed run's workspace onto the source
+    /// checkout's current `HEAD`, because the checkout had moved on since the
+    /// run started and its patch no longer applied there.
+    ///
+    /// Recorded on the run rather than only on the workspace row because it
+    /// is what makes an earlier passed verification stale: the checks ran
+    /// over `from_base` plus the delta, and the delta now stands on
+    /// `to_base`. The apply gate reads this event's position in the log
+    /// against the latest verification's, so the fact has to be in the log.
+    WorkspaceRebased {
+        from_base: String,
+        to_base: String,
+    },
     UsageUpdated,
     /// What the native runtime's own records say it ran for this stage.
     ///

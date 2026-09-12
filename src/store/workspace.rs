@@ -141,6 +141,75 @@ impl SqliteStore {
         Ok(WorkspaceRevision::new(next_revision))
     }
 
+    /// Records one workspace standing on a new base commit, dropping the
+    /// spent apply intent that was written against the old one.
+    ///
+    /// The base is creation-time identity everywhere else — [`update_workspace`]
+    /// refuses to move it on purpose, the way it refuses to move the branch —
+    /// so rebase carries its own statement rather than widening the general
+    /// update for callers that must never touch it.
+    ///
+    /// The delete is part of the same transaction because the two facts are
+    /// one fact: an apply intent pins the patch hash of the base it was
+    /// written against, and a rebase makes that patch unreachable. Leaving it
+    /// behind would answer the next apply with a hash mismatch it could never
+    /// resolve. Only a `failed` intent is ever cleared; a `prepared` or
+    /// `applied_to_source` one means changes may already be in the checkout,
+    /// and the caller refuses the rebase before reaching here.
+    ///
+    /// [`update_workspace`]: Self::update_workspace
+    ///
+    /// # Errors
+    /// Returns typed `SQLite` errors, or concurrent modification when another
+    /// writer has moved the workspace or the run on.
+    pub(crate) fn rebase_workspace_base(
+        &mut self,
+        workspace: &RunWorkspace,
+        expected_revision: WorkspaceRevision,
+        run: &Run,
+        expected_run_revision: RunRevision,
+        event: &DomainEvent,
+    ) -> Result<CommitResult, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let next_revision = expected_revision
+            .value()
+            .checked_add(1)
+            .ok_or(StoreError::IntegerRange("next workspace revision"))?;
+        let changed = transaction.execute(
+            "UPDATE run_workspaces
+             SET base_commit = ?1, revision = ?2, updated_at = ?3
+             WHERE run_id = ?4 AND revision = ?5",
+            params![
+                workspace.base_commit(),
+                u64_to_i64(next_revision, "next workspace revision")?,
+                format_timestamp(workspace.updated_at()),
+                workspace.run_id().to_string(),
+                u64_to_i64(expected_revision.value(), "expected workspace revision")?,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::WorkspaceConcurrentModification {
+                run_id: workspace.run_id(),
+                expected: expected_revision.value(),
+            });
+        }
+        transaction.execute(
+            "DELETE FROM run_apply_operations WHERE run_id = ?1 AND status = 'failed'",
+            [workspace.run_id().to_string()],
+        )?;
+        let result = commit_run_update_transaction(
+            &transaction,
+            run,
+            expected_run_revision,
+            std::slice::from_ref(event),
+            false,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Loads persisted recoverable apply intent for one run.
     ///
     /// # Errors

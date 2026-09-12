@@ -14,8 +14,8 @@ use crate::store::{
     worktree_root,
 };
 use crate::workspace::{
-    GhClient, PullRequestReach, PullRequestRef, ReconciliationOutcome, WorkspaceError,
-    WorkspaceManager, WorkspaceStatus,
+    GhClient, PullRequestReach, PullRequestRef, RebaseReceipt, ReconciliationOutcome,
+    WorkspaceError, WorkspaceManager, WorkspaceStatus,
 };
 
 use super::provider_factory::{ProviderFactory, ProviderResolver};
@@ -516,6 +516,24 @@ where
         self.reclaim_workspace(&mut store, run_id);
         let report = Self::report(&mut store, run_id, before, None)?;
         Ok((outcome, report))
+    }
+
+    /// Moves a completed run's changes onto the source checkout's current
+    /// `HEAD`, so a checkout that moved on can still take them.
+    ///
+    /// Unlike apply, this leaves the workspace in place and the run
+    /// `Completed`: the point is to make a later apply possible, not to be
+    /// one. That later apply still has to wait for a verification that ran
+    /// after the move.
+    ///
+    /// # Errors
+    /// Returns workspace ownership, lifecycle, conflict, Git, or store errors.
+    pub fn rebase_run(&self, run_id: RunId) -> Result<(RebaseReceipt, ExecutionReport), AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let before = last_sequence(&store, run_id)?;
+        let receipt = WorkspaceManager::new(&self.worktrees).rebase(&mut store, run_id)?;
+        let report = Self::report(&mut store, run_id, before, None)?;
+        Ok((receipt, report))
     }
 
     /// Returns the worktree of a run that is finished with it, keeping the

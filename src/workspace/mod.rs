@@ -11,7 +11,8 @@ mod setup;
 pub use error::WorkspaceError;
 pub use github::{GhClient, PullRequestReach, PullRequestRef};
 pub use manager::{
-    BranchDisposition, PublishReceipt, PullRequestStatus, ReconciliationOutcome, WorkspaceManager,
+    BranchDisposition, PublishReceipt, PullRequestStatus, RebaseReceipt, ReconciliationOutcome,
+    WorkspaceManager,
 };
 pub use model::{
     ApplyStatus, RunApplyOperation, RunWorkspace, WorkspaceMode, WorkspaceRevision, WorkspaceStatus,

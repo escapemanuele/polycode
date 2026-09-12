@@ -4,13 +4,15 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::domain::{
-    EventId, EventMetadata, Run, RunId, RunStatus, RunTransition, StageKind, StageStatus,
+    DomainEventKind, EventId, EventMetadata, Run, RunId, RunStatus, RunTransition, StageKind,
+    StageStatus,
 };
 use crate::git::{
     GitRepository, apply_patch, branch_exists, branch_tip, check_patch, commit_all_in_worktree,
-    create_branch_in_worktree, create_worktree, delete_owned_branch, detach_worktree, fetch_branch,
-    generate_patch, generate_patch_preview, inspect_worktree, is_ancestor, push_branch,
-    push_commit_to_branch, remote_url, remove_worktree, source_is_clean, tree_is_clean,
+    count_commits_between, create_branch_in_worktree, create_worktree, delete_owned_branch,
+    detach_worktree, fetch_branch, generate_patch, generate_patch_preview, inspect_worktree,
+    is_ancestor, push_branch, push_commit_to_branch, rebase_worktree_onto, remote_url,
+    remove_worktree, source_is_clean, tree_is_clean,
 };
 use crate::store::{RunInput, RunRevision, SqliteStore, worktree_root};
 
@@ -34,6 +36,15 @@ pub struct PublishReceipt {
     /// then fixed it expects its commits to land on that pull request, so
     /// opening a second one instead is never left unexplained.
     pub note: Option<String>,
+}
+
+/// What one rebase moved: the base the run's delta stood on, the base it
+/// stands on now, and how many commits the checkout had gained in between.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebaseReceipt {
+    pub from_base: String,
+    pub to_base: String,
+    pub commits_gained: u64,
 }
 
 /// Where a publish's commit is meant to land.
@@ -354,6 +365,8 @@ impl WorkspaceManager {
             return Err(WorkspaceError::ApplyAlreadyPerformed(run_id));
         }
         ensure_verification_passed(&loaded.run)?;
+        ensure_verification_follows_rebase(store, &loaded.run)?;
+
         if loaded.run.status() != RunStatus::Completed {
             return Err(invalid_run_status(&loaded.run, "apply"));
         }
@@ -398,7 +411,9 @@ impl WorkspaceManager {
                 Some("git apply --check failed"),
                 now(),
             )?;
-            return Err(WorkspaceError::PatchCheckFailed);
+            return Err(WorkspaceError::PatchCheckFailed {
+                reason: self.patch_refusal_reason(&repository, &workspace),
+            });
         }
         if !source_is_clean(&self.git, &repository)? {
             store.update_apply_operation(
@@ -424,6 +439,91 @@ impl WorkspaceManager {
         let operation =
             store.update_apply_operation(&operation, ApplyStatus::AppliedToSource, None, now())?;
         Self::finalize_apply(store, loaded.run, loaded.revision, &operation)
+    }
+
+    /// Moves a completed run's delta onto the source checkout's current
+    /// `HEAD`, so a change written against a base the checkout has since left
+    /// behind can still be applied.
+    ///
+    /// Apply transfers an exact patch and refuses anything less, which is the
+    /// right answer for a checkout that changed underneath a run — Polycode
+    /// will not guess how the two edits combine. This is the operator saying
+    /// how: take the run's commits and replay them on what the checkout has
+    /// now, and let Git refuse if the two really do disagree about the same
+    /// lines. Nothing is merged silently; a conflict aborts and the run keeps
+    /// the base it had.
+    ///
+    /// The delta is committed on the run's branch first, exactly as publish
+    /// commits it, because commits are what a rebase moves. That commit
+    /// survives a conflicting rebase — the branch keeps the work, only the
+    /// base stays put.
+    ///
+    /// Verification is what this costs. The checks ran over the old base, so
+    /// the event this records makes them stale and the apply gate refuses
+    /// until a later cycle's verification passes on the new one.
+    ///
+    /// # Errors
+    /// Rejects non-completed/review runs, workspaces whose base the checkout
+    /// no longer contains, runs already based on `HEAD`, live apply intents,
+    /// and conflicting rebases.
+    pub fn rebase(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+    ) -> Result<RebaseReceipt, WorkspaceError> {
+        let loaded = store.load_run(run_id)?;
+        if loaded.run.status() != RunStatus::Completed {
+            return Err(invalid_run_status(&loaded.run, "rebase"));
+        }
+        let mut workspace = Self::ready_workspace(store, run_id)?;
+        if workspace.mode() != WorkspaceMode::Branch {
+            return Err(WorkspaceError::ReviewWorkspaceNotApplicable);
+        }
+        self.validate_workspace(&workspace, false)?;
+        let repository = self.validate_source(&workspace)?;
+        // A `Prepared` or `AppliedToSource` intent means the patch written
+        // against the old base may already be in the checkout, half-way or
+        // whole. Moving the base under it would leave nothing able to tell
+        // which. Only a `Failed` intent is spent, and the store drops it with
+        // the same transaction that moves the base.
+        if let Some(operation) = store.load_apply_operation(run_id)?
+            && operation.status() != ApplyStatus::Failed
+        {
+            return Err(WorkspaceError::RebaseBlockedByApply(run_id));
+        }
+        let base = workspace.base_commit().to_owned();
+        let head = repository.head_commit().to_owned();
+        if head == base {
+            return Err(WorkspaceError::RebaseAlreadyCurrent { run_id, base });
+        }
+        if !is_ancestor(&self.git, repository.source_path(), &base, &head)? {
+            return Err(WorkspaceError::RebaseBaseNotAncestor { base, head });
+        }
+        let gained = count_commits_between(&self.git, repository.source_path(), &base, &head)?;
+        let worktree = workspace.worktree_path();
+        if !tree_is_clean(&self.git, worktree)? {
+            let message = format!("Polycode run {run_id}");
+            commit_all_in_worktree(&self.git, worktree, &message)?;
+        }
+        rebase_worktree_onto(&self.git, worktree, &base, &head).map_err(|error| {
+            WorkspaceError::RebaseConflict {
+                run_id,
+                base: base.clone(),
+                head: head.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        let prior_revision = workspace.revision();
+        workspace.rebase_onto(head.clone(), now());
+        let mut run = loaded.run;
+        let at = next_time(&run);
+        let event = run.workspace_rebased(metadata(at), base.clone(), head.clone())?;
+        store.rebase_workspace_base(&workspace, prior_revision, &run, loaded.revision, &event)?;
+        Ok(RebaseReceipt {
+            from_base: base,
+            to_base: head,
+            commits_gained: gained,
+        })
     }
 
     /// Publishes a completed run as a remote branch and pull request, never
@@ -1041,6 +1141,45 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    /// Why `git apply --check` refused, in the terms the operator can act on.
+    ///
+    /// Best effort by construction: this runs while an apply is already
+    /// failing, and a Git call that fails here must not replace the real
+    /// refusal with a worse one. Every probe that cannot answer is simply
+    /// left out of the sentence.
+    fn patch_refusal_reason(&self, repository: &GitRepository, workspace: &RunWorkspace) -> String {
+        let base = workspace.base_commit();
+        let head = repository.head_commit();
+        if head == base {
+            return "the checkout is still on this run's base, so the change conflicts with what \
+                    is already in it"
+                .to_owned();
+        }
+        let path = repository.source_path();
+        match is_ancestor(&self.git, path, base, head) {
+            Ok(true) => {
+                let moved = count_commits_between(&self.git, path, base, head).map_or_else(
+                    |_| "moved past".to_owned(),
+                    |count| format!("moved {count} commit(s) past"),
+                );
+                format!(
+                    "the checkout {moved} this run's base {}, and the two edits touch the same \
+                     lines — `polycode rebase {}` replays the change on the checkout's HEAD",
+                    short(base),
+                    workspace.run_id()
+                )
+            }
+            Ok(false) => format!(
+                "the checkout's HEAD {} does not contain this run's base {}",
+                short(head),
+                short(base)
+            ),
+            Err(_) => {
+                "the checkout no longer matches the base this change was written against".to_owned()
+            }
+        }
+    }
+
     fn ready_workspace(store: &SqliteStore, run_id: RunId) -> Result<RunWorkspace, WorkspaceError> {
         let workspace = store
             .load_workspace(run_id)?
@@ -1316,6 +1455,11 @@ fn publish_body(task: Option<&str>, run_id: RunId) -> String {
     }
 }
 
+/// One commit hash cut to the length a person reads, for messages only.
+fn short(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
+}
+
 /// The first issue link in the task, as written.
 fn issue_url(task: &str) -> Option<&str> {
     task.split_whitespace()
@@ -1325,6 +1469,63 @@ fn issue_url(task: &str) -> Option<&str> {
                 && (word.contains("linear.app/") || word.contains("github.com/"))
                 && issue_headline(word).is_some()
         })
+}
+
+/// Refuses a run whose latest verification ran before its workspace was
+/// rebased.
+///
+/// A passed verification is a statement about a tree: these checks ran over
+/// that base plus this delta. A rebase replaces the base, so the statement
+/// stops covering what apply would move — the delta may be identical and
+/// still break against commits the checkout gained. The two facts are both
+/// in the event log with a total order over them, so the gate is a
+/// comparison rather than a stored flag: the run is blocked when its most
+/// recent verify stage completed earlier in the log than the most recent
+/// rebase, or never completed at all.
+///
+/// Clearing it means running the checks again on the new base, which is what
+/// a fix or continue cycle's own verify stage does.
+fn ensure_verification_follows_rebase(
+    store: &SqliteStore,
+    run: &Run,
+) -> Result<(), WorkspaceError> {
+    let Some(latest) = run
+        .stages()
+        .iter()
+        .rev()
+        .find(|stage| stage.kind() == StageKind::Verify)
+    else {
+        return Ok(());
+    };
+    let events = store.load_events(run.id())?;
+    let Some((rebased_at, base)) =
+        events
+            .iter()
+            .rev()
+            .find_map(|sequenced| match sequenced.event.kind() {
+                DomainEventKind::WorkspaceRebased { to_base, .. } => {
+                    Some((sequenced.sequence, to_base.clone()))
+                }
+                _ => None,
+            })
+    else {
+        return Ok(());
+    };
+    let verified_at = events
+        .iter()
+        .rev()
+        .find(|sequenced| {
+            sequenced.event.stage_id() == Some(latest.id())
+                && matches!(sequenced.event.kind(), DomainEventKind::StageCompleted)
+        })
+        .map(|sequenced| sequenced.sequence);
+    if verified_at.is_none_or(|verified_at| verified_at < rebased_at) {
+        return Err(WorkspaceError::VerificationPrecedesRebase {
+            stage_id: latest.id().clone(),
+            base,
+        });
+    }
+    Ok(())
 }
 
 /// Refuses to move a run's changes anywhere unless its latest verification
@@ -1477,6 +1678,15 @@ mod tests {
 
         fn complete(&mut self) {
             complete_run(&mut self.store, self.run_id);
+        }
+
+        /// A run whose workflow actually carries a verify stage, which the
+        /// single-stage fixtures do not — the gates that read verification
+        /// have nothing to read without one.
+        fn with_verification() -> Self {
+            let mut fixture = Self::new(WorkflowKind::Standard);
+            fixture.run_id = create_verified_run(&mut fixture.store, 3);
+            fixture
         }
 
         /// Attempts preparation and hands back the error, for the cases
@@ -1948,6 +2158,191 @@ mod tests {
         );
     }
 
+    /// The shape this exists for: the operator's checkout moved while the run
+    /// was working, close enough to the run's own edit that the patch no
+    /// longer applies, but not on the same lines. Apply is right to refuse —
+    /// and rebase is how the operator answers it without redoing the work.
+    #[test]
+    fn a_rebase_replays_the_change_on_a_checkout_that_moved_and_apply_then_lands_it() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        fs::write(fixture.source.join("lines.txt"), "1\n2\n3\n4\n5\n6\n7\n").unwrap();
+        git(&fixture.source, ["add", "lines.txt"]);
+        git(&fixture.source, ["commit", "-m", "lines"]);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        let base = workspace.base_commit().to_owned();
+        fs::write(
+            workspace.worktree_path().join("lines.txt"),
+            "run\n2\n3\n4\n5\n6\n7\n",
+        )
+        .unwrap();
+        // Four lines below the run's edit: inside the patch's context, so
+        // `git apply` refuses, but not a line both sides changed.
+        fs::write(
+            fixture.source.join("lines.txt"),
+            "1\n2\n3\nsource\n5\n6\n7\n",
+        )
+        .unwrap();
+        git(&fixture.source, ["add", "lines.txt"]);
+        git(&fixture.source, ["commit", "-m", "advance source"]);
+        let head = git_text(&fixture.source, ["rev-parse", "HEAD"]);
+
+        let refusal = fixture
+            .manager()
+            .apply(&mut fixture.store, fixture.run_id)
+            .expect_err("the moved checkout must refuse the patch");
+        assert!(matches!(refusal, WorkspaceError::PatchCheckFailed { .. }));
+
+        let receipt = fixture
+            .manager()
+            .rebase(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert_eq!(receipt.from_base, base);
+        assert_eq!(receipt.to_base, head);
+        assert_eq!(receipt.commits_gained, 1);
+        assert_eq!(
+            fixture
+                .store
+                .load_workspace(fixture.run_id)
+                .unwrap()
+                .unwrap()
+                .base_commit(),
+            head
+        );
+        // The spent intent is gone with the base it was written against;
+        // leaving it would answer the next apply with a hash mismatch.
+        assert!(
+            fixture
+                .store
+                .load_apply_operation(fixture.run_id)
+                .unwrap()
+                .is_none()
+        );
+
+        fixture
+            .manager()
+            .apply(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(fixture.source.join("lines.txt")).unwrap(),
+            "run\n2\n3\nsource\n5\n6\n7\n",
+            "both edits must survive the move"
+        );
+    }
+
+    /// Nothing is merged on the operator's behalf. When the two edits really
+    /// do disagree, the rebase aborts and the run keeps the base it had, so
+    /// the next apply refuses for the same honest reason as the first.
+    #[test]
+    fn a_conflicting_rebase_aborts_and_leaves_the_workspace_on_its_own_base() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        let base = workspace.base_commit().to_owned();
+        fs::write(workspace.worktree_path().join("README.md"), "run change\n").unwrap();
+        fs::write(fixture.source.join("README.md"), "source advanced\n").unwrap();
+        git(&fixture.source, ["add", "README.md"]);
+        git(&fixture.source, ["commit", "-m", "advance source"]);
+
+        let error = fixture
+            .manager()
+            .rebase(&mut fixture.store, fixture.run_id)
+            .expect_err("edits on the same line must not be merged silently");
+
+        assert!(matches!(error, WorkspaceError::RebaseConflict { .. }));
+        assert_eq!(
+            fixture
+                .store
+                .load_workspace(fixture.run_id)
+                .unwrap()
+                .unwrap()
+                .base_commit(),
+            base
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.worktree_path().join("README.md")).unwrap(),
+            "run change\n",
+            "the run's work must survive the aborted rebase"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.source.join("README.md")).unwrap(),
+            "source advanced\n"
+        );
+    }
+
+    #[test]
+    fn a_run_already_based_on_head_is_refused_by_name_rather_than_rebased_onto_itself() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "run change\n").unwrap();
+
+        let error = fixture
+            .manager()
+            .rebase(&mut fixture.store, fixture.run_id)
+            .expect_err("there is no newer HEAD to move onto");
+
+        assert!(matches!(error, WorkspaceError::RebaseAlreadyCurrent { .. }));
+    }
+
+    /// A checkout that was rewound or moved to unrelated history does not
+    /// contain the run's base, so there is no "since the base" to replay.
+    #[test]
+    fn a_checkout_that_no_longer_contains_the_base_cannot_be_rebased_onto() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        fs::write(fixture.source.join("second.txt"), "second\n").unwrap();
+        git(&fixture.source, ["add", "second.txt"]);
+        git(&fixture.source, ["commit", "-m", "second"]);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("README.md"), "run change\n").unwrap();
+        git(&fixture.source, ["reset", "--hard", "HEAD~1"]);
+
+        let error = fixture
+            .manager()
+            .rebase(&mut fixture.store, fixture.run_id)
+            .expect_err("a rewound checkout has no path from the run's base");
+
+        assert!(matches!(
+            error,
+            WorkspaceError::RebaseBaseNotAncestor { .. }
+        ));
+    }
+
+    /// The price of the move: checks that passed over the old base say
+    /// nothing about the new one, so apply waits for a fresh verification
+    /// rather than trusting a stale green.
+    #[test]
+    fn apply_refuses_a_verification_that_ran_before_the_rebase() {
+        let mut fixture = Fixture::with_verification();
+        let workspace = fixture.prepare();
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("run.txt"), "run change\n").unwrap();
+        fs::write(fixture.source.join("source.txt"), "source\n").unwrap();
+        git(&fixture.source, ["add", "source.txt"]);
+        git(&fixture.source, ["commit", "-m", "advance source"]);
+
+        fixture
+            .manager()
+            .rebase(&mut fixture.store, fixture.run_id)
+            .unwrap();
+        let error = fixture
+            .manager()
+            .apply(&mut fixture.store, fixture.run_id)
+            .expect_err("verification predates the move");
+
+        assert!(matches!(
+            error,
+            WorkspaceError::VerificationPrecedesRebase { .. }
+        ));
+        assert!(
+            !fixture.source.join("run.txt").exists(),
+            "nothing may reach the checkout while the gate is closed"
+        );
+    }
+
     #[test]
     fn preflight_conflict_records_failure_and_does_not_partially_apply() {
         let mut fixture = Fixture::new(WorkflowKind::Standard);
@@ -1960,7 +2355,13 @@ mod tests {
 
         let result = fixture.manager().apply(&mut fixture.store, fixture.run_id);
 
-        assert!(matches!(result, Err(WorkspaceError::PatchCheckFailed)));
+        let Err(WorkspaceError::PatchCheckFailed { reason }) = result else {
+            panic!("a source checkout that moved past the base must refuse the patch");
+        };
+        assert!(
+            reason.contains("moved 1 commit(s) past") && reason.contains("polycode rebase"),
+            "the refusal must say what moved and what moves the run to meet it: {reason}"
+        );
         assert_eq!(
             fs::read_to_string(fixture.source.join("README.md")).unwrap(),
             "source advanced\n"
@@ -2818,6 +3219,38 @@ mod tests {
         run_id
     }
 
+    /// An implementation stage followed by the verify stage that checks it,
+    /// which is the smallest workflow the verification gates can see.
+    fn create_verified_run(store: &mut SqliteStore, id: u128) -> RunId {
+        let run_id = RunId::from_u128(id);
+        let implementation = StageId::new("implementation").unwrap();
+        let workflow = WorkflowDefinition::new(
+            WorkflowKind::Standard,
+            vec![
+                StageDefinition::new(
+                    implementation.clone(),
+                    StageKind::Implementation,
+                    Role::Implementer,
+                    vec![],
+                ),
+                StageDefinition::new(
+                    StageId::new("verify").unwrap(),
+                    StageKind::Verify,
+                    Role::Verifier,
+                    vec![crate::domain::Dependency::required(implementation)],
+                ),
+            ],
+        )
+        .unwrap();
+        let created_at = now();
+        let config_id = ConfigSnapshotId::new(format!("config-{id}")).unwrap();
+        let run = Run::new(run_id, workflow, config_id.clone(), created_at);
+        let config = ResolvedConfigSnapshot::new(config_id, 1, json!({}), created_at).unwrap();
+        let event = run.created_event(metadata(created_at));
+        store.create_run(&run, &config, &[event]).unwrap();
+        run_id
+    }
+
     fn complete_run(store: &mut SqliteStore, run_id: RunId) {
         let loaded = store.load_run(run_id).unwrap();
         let mut run = loaded.run;
@@ -2828,20 +3261,26 @@ mod tests {
             .commit_run_update(&run, revision, &[event])
             .unwrap()
             .revision();
-        let stage = run.stages()[0].id().clone();
-        for transition in [
-            StageTransition::MarkReady,
-            StageTransition::Start,
-            StageTransition::Complete,
-        ] {
-            let at = *run.updated_at() + Duration::milliseconds(1);
-            let event = run
-                .transition_stage(&stage, transition, metadata(at))
-                .unwrap();
-            revision = store
-                .commit_run_update(&run, revision, &[event])
-                .unwrap()
-                .revision();
+        let stages = run
+            .stages()
+            .iter()
+            .map(|stage| stage.id().clone())
+            .collect::<Vec<_>>();
+        for stage in stages {
+            for transition in [
+                StageTransition::MarkReady,
+                StageTransition::Start,
+                StageTransition::Complete,
+            ] {
+                let at = *run.updated_at() + Duration::milliseconds(1);
+                let event = run
+                    .transition_stage(&stage, transition, metadata(at))
+                    .unwrap();
+                revision = store
+                    .commit_run_update(&run, revision, &[event])
+                    .unwrap()
+                    .revision();
+            }
         }
         let at = *run.updated_at() + Duration::milliseconds(1);
         let event = run
