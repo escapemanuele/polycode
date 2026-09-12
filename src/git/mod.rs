@@ -10,6 +10,8 @@ mod worktree;
 pub use error::GitError;
 pub use repository::GitRepository;
 
+pub(crate) use repository::count_commits_between;
+
 pub(crate) use command::{Git, git_version};
 #[cfg(test)]
 pub(crate) use patch::ChangeKind;
@@ -22,5 +24,6 @@ pub(crate) use remote::{
 };
 pub(crate) use worktree::{
     WorktreeIdentity, branch_exists, branch_tip, commit_all_in_worktree, create_branch_in_worktree,
-    create_worktree, delete_owned_branch, detach_worktree, inspect_worktree, remove_worktree,
+    create_worktree, delete_owned_branch, detach_worktree, inspect_worktree, rebase_worktree_onto,
+    remove_worktree,
 };

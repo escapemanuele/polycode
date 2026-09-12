@@ -256,6 +256,17 @@ impl RunWorkspace {
         self.updated_at = now.max(self.updated_at);
     }
 
+    /// Records that the worktree's delta now stands on a different commit.
+    ///
+    /// The base is otherwise creation-time identity: every patch this run
+    /// produces is read against it, so moving it is moving what the run's
+    /// change means. Rebase is the single caller allowed to, and only after
+    /// Git has already moved the worktree there.
+    pub(crate) fn rebase_onto(&mut self, base: String, now: DateTime<Utc>) {
+        self.base_commit = base;
+        self.updated_at = now.max(self.updated_at);
+    }
+
     /// Gives up the claim on the branch, so removal takes the worktree and
     /// leaves the branch standing.
     ///

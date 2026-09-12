@@ -32,6 +32,8 @@ pub(crate) enum Overlay {
     Help,
     Attention,
     ApplyConfirm,
+    /// The last stop before a run's change is replayed on a newer base.
+    RebaseConfirm,
     PublishConfirm,
     DiscardConfirm,
     /// The last stop before a run is deleted for good.

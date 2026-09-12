@@ -96,6 +96,19 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
             print_report(&report);
             Ok(())
         }
+        Some(Command::Rebase { run_id }) => {
+            let (receipt, report) = service()?.rebase_run(*run_id)?;
+            println!(
+                "Moved the change from {} onto {}, {} commit(s) ahead.",
+                receipt.from_base, receipt.to_base, receipt.commits_gained
+            );
+            println!(
+                "Verification now predates the move, so `apply` waits for a fresh check: \
+                 `polycode fix {run_id}`."
+            );
+            print_report(&report);
+            Ok(())
+        }
         Some(Command::Pr { run_id }) => {
             // Progress goes to stderr so a script reading stdout still gets
             // only the receipt; a human at the terminal sees both.
@@ -1001,6 +1014,7 @@ fn event_name(kind: &DomainEventKind) -> &'static str {
         DomainEventKind::RunFailed => "run failed",
         DomainEventKind::RunApplied => "run applied",
         DomainEventKind::RunDiscarded => "run discarded",
+        DomainEventKind::WorkspaceRebased { .. } => "workspace rebased",
         DomainEventKind::RunFixRequested { .. } => "fix requested",
         DomainEventKind::RunContinueRequested { .. } => "continue requested",
         DomainEventKind::StageReady { .. } => "ready",

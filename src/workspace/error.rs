@@ -76,8 +76,51 @@ pub enum WorkspaceError {
     NothingToPublish,
     #[error("repository at {0} has no 'origin' remote to publish to")]
     NoRemote(PathBuf),
-    #[error("patch cannot be applied cleanly")]
-    PatchCheckFailed,
+    /// `git apply --check` refused the run's delta over the source checkout.
+    ///
+    /// The reason is almost always the checkout moving on underneath a run
+    /// that was still working, so the message carries what is known about
+    /// that — how far it moved, and the command that moves the run to meet
+    /// it — rather than leaving the operator to diff two trees by hand.
+    #[error("patch cannot be applied cleanly: {reason}")]
+    PatchCheckFailed { reason: String },
+    /// The run's verification passed over a base the workspace no longer
+    /// stands on, because a rebase moved it afterwards.
+    #[error(
+        "verification predates the rebase onto {base}: stage {stage_id} checked the change on its \
+         old base, so it no longer says this change passes"
+    )]
+    VerificationPrecedesRebase {
+        stage_id: crate::domain::StageId,
+        base: String,
+    },
+    #[error("run lifecycle rejected the rebase: {0}")]
+    RunRebase(#[from] crate::domain::RunRebaseError),
+    /// The source checkout is not ahead of the run's base, so there is no
+    /// newer `HEAD` to move onto.
+    #[error("run {run_id} is already based on the source checkout's HEAD {base}")]
+    RebaseAlreadyCurrent { run_id: RunId, base: String },
+    /// The run's base is not reachable from the source checkout's `HEAD`: the
+    /// checkout was rewound, force-updated, or moved to an unrelated branch.
+    #[error(
+        "source checkout HEAD {head} does not contain this run's base {base}, so the change cannot \
+         be moved onto it"
+    )]
+    RebaseBaseNotAncestor { base: String, head: String },
+    /// The delta and the commits the checkout gained touch the same lines.
+    #[error(
+        "rebasing run {run_id} onto {head} conflicts, so the workspace was left on {base}: \
+         {reason}"
+    )]
+    RebaseConflict {
+        run_id: RunId,
+        base: String,
+        head: String,
+        reason: String,
+    },
+    /// A rebase would move the base an apply intent already committed to.
+    #[error("run {0} has an apply operation in progress, so its workspace cannot be rebased")]
+    RebaseBlockedByApply(RunId),
     #[error("apply state is ambiguous; manual recovery required")]
     AmbiguousApplyState,
     #[error("run {0} was already applied")]

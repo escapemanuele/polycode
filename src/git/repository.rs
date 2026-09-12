@@ -74,6 +74,28 @@ impl GitRepository {
     }
 }
 
+/// How many commits `descendant` carries that `ancestor` does not.
+///
+/// Diagnostic only: the number a refused apply reports so the operator reads
+/// "the checkout moved 3 commits" instead of two hashes to compare by eye.
+pub(crate) fn count_commits_between(
+    git: &Git,
+    path: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<u64, GitError> {
+    validate_commit(ancestor)?;
+    validate_commit(descendant)?;
+    let range = format!("{ancestor}..{descendant}");
+    let output = text_output(git.checked(
+        path,
+        &[os("rev-list"), os("--count"), OsString::from(range)],
+    )?)?;
+    output
+        .parse()
+        .map_err(|_| GitError::InvalidOutput(format!("rev-list --count returned {output:?}")))
+}
+
 pub(crate) fn validate_commit(commit: &str) -> Result<(), GitError> {
     if matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())

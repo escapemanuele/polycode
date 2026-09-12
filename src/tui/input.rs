@@ -33,6 +33,8 @@ pub(crate) enum Intent {
     Logs,
     Diff,
     Apply,
+    /// Move the selected run's change onto the checkout's current HEAD.
+    Rebase,
     Publish,
     Fix,
     Continue,
@@ -86,6 +88,7 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('l') => Intent::Logs,
         KeyCode::Char('d') => Intent::Diff,
         KeyCode::Char('a') => Intent::Apply,
+        KeyCode::Char('b') => Intent::Rebase,
         KeyCode::Char('P') => Intent::Publish,
         KeyCode::Char('f') => Intent::Fix,
         KeyCode::Char('c') => Intent::Continue,

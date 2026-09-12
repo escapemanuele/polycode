@@ -8,7 +8,7 @@ Watch and drive every run from one terminal screen without touching the database
 - activity-strip: one prose sentence for what is happening now — a failed stage's own reason ("Implementation failed: compile failed"), or why a stage has not started ("Waiting on: Architecture", "Blocked: Quality review failed, Spec review was skipped", "Waiting on you", "Stage suspended", "Stage skipped by the workflow").
 - viewers: artifact (`o`/Enter, `m` raw/rendered), raw process logs (`l`), workspace diff (`d`).
 - composer: `n` opens the new-run form (Task, Workflow, Repository, Execution, Effort).
-- actions: resume, stop, retry, attention, apply, publish, fix, continue, follow-ups, discard, delete, all through one serialized worker.
+- actions: resume, stop, retry, attention, apply, rebase, publish, fix, continue, follow-ups, discard, delete, all through one serialized worker.
 - update-prompt: an overlay offering to install a newer official release; lowest priority overlay.
 - help: `?` overlay listing every key.
 
@@ -21,7 +21,7 @@ polycode
 polycode tui
 ```
 Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home`/`End` top/bottom in viewers, `Enter` or `→` open/confirm (one level in: a run from the list, a stage's result from run detail), `Esc` or `←` back/close (one level out; the composer keeps its own arrows, so `Esc` alone leaves it), `n` new run, `R` runs screen, `x` dismiss notification, `?` help, `q` or `Ctrl-C` quit/detach.
-Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage (chooser: Configured provider / Claude / Codex, Enter retries), `u` attention overlay, `A` arm/disarm automatic approval of this run's permission requests, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `P` pull request (Enter confirms; a spinning card times the publish, Esc hides it without stopping it; the result card holds the URL until dismissed: `o` opens it in the browser, `y` copies it, Enter/Esc close and leave the summary in the footer), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `e` expand the task in the rail, `i` technical details.
+Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage (chooser: Configured provider / Claude / Codex, Enter retries), `u` attention overlay, `A` arm/disarm automatic approval of this run's permission requests, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `b` rebase the run's change onto the checkout's current HEAD (Enter confirms; a conflict changes nothing, and verification has to run again before apply), `P` pull request (Enter confirms; a spinning card times the publish, Esc hides it without stopping it; the result card holds the URL until dismissed: `o` opens it in the browser, `y` copies it, Enter/Esc close and leave the summary in the footer), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `e` expand the task in the rail, `i` technical details.
 Runs list: `h` archive/unarchive selected run, `H` show/hide archived runs, `D` delete an archived run for good (POD stands at the plunger; a second `D` goes through, Esc cancels). Only an archived run offers `D`.
 Artifact viewer: `m` toggle raw/rendered Markdown.
 Composer: `Tab`/`Shift-Tab` move fields, `←`/`→` cycle Workflow, Execution and Effort, typing/paste edits Task and Repository, `Enter` submits, `Esc` back.
@@ -47,4 +47,4 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 - The TUI caps concurrently working agents at 4 (`CONCURRENT_AGENTS`); a booked fix that cannot start yet stays booked silently. The CLI has no such cap.
 - Attention overlays outrank the update overlay; the update prompt is shown at most once per process.
 - The activity strip is width-bounded: a long provider reason is cut with an ellipsis, and the prefix naming the stage always survives the cut. The full text is in the failed stage's hero (`WHY IT FAILED`), the Runs-screen overview, the logs (`l`) and `polycode status`.
-- Stop dispatches without confirmation; apply, publish and discard require Enter in a confirmation overlay.
+- Stop dispatches without confirmation; apply, rebase, publish and discard require Enter in a confirmation overlay.

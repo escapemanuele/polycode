@@ -28,8 +28,9 @@ pub use rehydration::{
 pub use role::Role;
 pub use run::{
     BlockedDependency, CompletionBlocker, CompletionBlockerReason, DependencyOutcome, Run,
-    RunAttentionError, RunFixError, RunInvariantError, RunProviderEventError, RunRehydrationError,
-    RunStageError, RunStatus, RunTransition, RunTransitionError, StageDependencyReport,
+    RunAttentionError, RunFixError, RunInvariantError, RunProviderEventError, RunRebaseError,
+    RunRehydrationError, RunStageError, RunStatus, RunTransition, RunTransitionError,
+    StageDependencyReport,
 };
 pub use stage::{
     Stage, StageRehydrationError, StageRouteOverride, StageStatus, StageTransition,

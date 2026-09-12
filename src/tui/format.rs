@@ -69,6 +69,11 @@ pub(crate) fn format_units(units: u64) -> String {
 
 /// Concise repository identity for operational rows; the full path stays in
 /// technical mode.
+/// One commit hash cut to the length a status line can carry.
+pub(crate) fn short_commit(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
+}
+
 pub(crate) fn repository_name(path: &std::path::Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
