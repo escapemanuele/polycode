@@ -1701,8 +1701,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("cannot be granted as an exact rule") && error.contains("yarn install"),
-            "operator must see which command was refused: {error}"
+            error.contains("cannot be granted as an exact rule")
+                && error.contains("(cd /repo && ls -d node_modules)"),
+            "operator must see the first command that was refused: {error}"
         );
 
         // Nothing committed: run still needs the user, attention still open.

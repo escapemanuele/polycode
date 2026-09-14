@@ -201,7 +201,13 @@ pub(crate) fn grant_rules(
     {
         match denial.exact_rules() {
             Ok(granted) => rules.extend(granted),
-            Err(error) => unsafe_permission = Some(error),
+            // The first ungrantable denial, not the last: the operator reads
+            // the pending requests in order, and a refusal has to name the
+            // one at the top of that list rather than whichever happened to
+            // be scanned last.
+            Err(error) => {
+                unsafe_permission.get_or_insert(error);
+            }
         }
     }
     let has_response = response.is_some_and(|response| !response.trim().is_empty());
@@ -425,6 +431,69 @@ mod tests {
             grant_rules(&denials, Some("  ")).is_err(),
             "blank response is not an answer"
         );
+    }
+
+    /// A pending set holding one ungrantable Bash line no longer sinks the
+    /// approval: the MCP calls beside it are granted, and the resume says
+    /// part of the request was refused.
+    #[test]
+    fn mcp_denials_are_granted_beside_an_ungrantable_bash_line() {
+        let denials = vec![
+            PermissionDenial {
+                tool_name: "Bash".to_owned(),
+                tool_input: json!({"command": "cd src && cat -n b.ts; ls utils/test*"}),
+                tool_use_id: None,
+            },
+            PermissionDenial {
+                tool_name: "mcp__linear-server__get_issue".to_owned(),
+                tool_input: json!({"id": "DOTSUP-99"}),
+                tool_use_id: None,
+            },
+            PermissionDenial {
+                tool_name: "mcp__linear-server__list_comments".to_owned(),
+                tool_input: json!({"issueId": "DOTSUP-99"}),
+                tool_use_id: None,
+            },
+        ];
+        let rules = grant_rules(&denials, None).unwrap();
+        assert_eq!(
+            rules.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "mcp__linear-server__get_issue".to_owned(),
+                "mcp__linear-server__list_comments".to_owned(),
+            ],
+        );
+        let command = resume(
+            &ProviderSessionId::new("s").unwrap(),
+            &denials,
+            None,
+            &BTreeSet::new(),
+            None,
+            EffortSetting::NativeDefault,
+            None,
+        )
+        .unwrap();
+        assert_eq!(command.stdin, PARTIAL_RESUME_PROMPT.as_bytes());
+    }
+
+    /// When nothing is grantable, the refusal names the first pending
+    /// request, not whichever was scanned last.
+    #[test]
+    fn refusal_names_the_first_ungrantable_request() {
+        let denials = vec![
+            PermissionDenial {
+                tool_name: "Bash".to_owned(),
+                tool_input: json!({"command": "echo `whoami`"}),
+                tool_use_id: None,
+            },
+            PermissionDenial {
+                tool_name: "Bash".to_owned(),
+                tool_input: json!({"command": "rm -rf \"$(cat target)\""}),
+                tool_use_id: None,
+            },
+        ];
+        let refused = grant_rules(&denials, None).unwrap_err().to_string();
+        assert!(refused.contains("echo `whoami`"), "{refused}");
     }
 
     #[test]

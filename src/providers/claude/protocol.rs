@@ -263,6 +263,13 @@ impl PermissionDenial {
                 .and_then(Value::as_str)
                 .and_then(|url| url.split('/').nth(2))
                 .map(|domain| vec![format!("WebFetch(domain:{domain})")]),
+            // An MCP tool name is already the whole rule Claude Code reads:
+            // `mcp__<server>__<tool>` grants that one tool and nothing else,
+            // so the denied call replays exactly. No arguments enter the
+            // rule, so there is no wider call it could let through.
+            name if name.starts_with("mcp__") && safe_rule_value(name) => {
+                Some(vec![name.to_owned()])
+            }
             _ => None,
         };
         target.filter(|rules| !rules.is_empty()).ok_or_else(|| {
@@ -1634,6 +1641,32 @@ mod tests {
     fn rule_syntax_in_a_segment_makes_the_whole_line_ungrantable() {
         assert!(bash("ls *.rs; echo done").exact_rules().is_err());
         assert!(bash("ls; ls ?").exact_rules().is_err());
+    }
+
+    /// An MCP call is grantable as its own tool name: the rule names that one
+    /// tool on that one server, which is exactly the denied call.
+    #[test]
+    fn mcp_tool_is_granted_by_its_own_name() {
+        let denial = tool(
+            "mcp__linear-server__get_issue",
+            serde_json::json!({ "id": "DOTSUP-99" }),
+        );
+        assert!(denial.is_grantable());
+        assert_eq!(
+            denial.exact_rules().unwrap(),
+            vec!["mcp__linear-server__get_issue".to_owned()],
+        );
+    }
+
+    /// The tool name still goes through the rule-value gate: a name carrying
+    /// rule syntax would end the rule early and grant something else.
+    #[test]
+    fn mcp_tool_name_with_rule_syntax_is_refused() {
+        assert!(
+            tool("mcp__server__do(*)", serde_json::json!({}))
+                .exact_rules()
+                .is_err()
+        );
     }
 
     #[test]
