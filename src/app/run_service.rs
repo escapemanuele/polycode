@@ -1304,14 +1304,15 @@ fn remote_names_pull_request(
 /// A matching checkout that is dirty is not a usable answer, for the same
 /// reason [`AppError::DirtySourceRepository`] refuses `chosen` itself when
 /// nothing gets switched — so a dirty match is skipped in favour of a clean
-/// one, and if every match found is dirty, that is reported by name rather
-/// than silently falling through to `chosen`.
+/// one. A candidate Git cannot answer about is skipped too: it is somebody
+/// else's folder, and its trouble must not stop this run from starting.
 ///
-/// When nothing matches at all, a workflow that edits is refused: it needs to
-/// write into the pull request's own repository, which no checkout on hand
-/// can provide. A read-only workflow keeps today's behaviour and starts in
-/// `chosen` regardless — reviewing a remote pull request over the network is
-/// a legitimate run.
+/// When no clean checkout matches, a workflow that edits is refused: it needs
+/// to write into the pull request's own repository, which no checkout on
+/// hand can provide — and if dirty matches exist, the refusal names them
+/// rather than suggesting a clone that already exists. A read-only workflow
+/// keeps today's behaviour and starts in `chosen` regardless — reviewing a
+/// remote pull request over the network is a legitimate run.
 fn resolve_pull_request_checkout(
     previously_used: Vec<PathBuf>,
     git: &crate::git::Git,
@@ -1325,13 +1326,17 @@ fn resolve_pull_request_checkout(
             // No longer exists, or is not a Git repository: not a checkout.
             continue;
         };
-        if !remote_names_pull_request(git, &repository, pull_request)? {
+        if !remote_names_pull_request(git, &repository, pull_request).unwrap_or(false) {
             continue;
         }
-        if crate::git::source_is_clean(git, &repository)? {
-            return Ok(repository);
+        match crate::git::source_is_clean(git, &repository) {
+            Ok(true) => return Ok(repository),
+            Ok(false) => dirty.push(repository.source_path().to_path_buf()),
+            Err(_) => {}
         }
-        dirty.push(repository.source_path().to_path_buf());
+    }
+    if !workflow.requires_writable_workspace() {
+        return Ok(chosen);
     }
     if !dirty.is_empty() {
         return Err(AppError::PullRequestCheckoutsDirty {
@@ -1339,20 +1344,17 @@ fn resolve_pull_request_checkout(
             checkouts: dirty,
         });
     }
-    if workflow.requires_writable_workspace() {
-        return Err(AppError::NoLocalCheckoutForPullRequest {
-            url: pull_request.url(),
-            repository: format!(
-                "{}/{}/{}",
-                pull_request.host, pull_request.owner, pull_request.repository
-            ),
-            searched_parent: chosen
-                .source_path()
-                .parent()
-                .map_or_else(|| chosen.source_path().to_path_buf(), Path::to_path_buf),
-        });
-    }
-    Ok(chosen)
+    Err(AppError::NoLocalCheckoutForPullRequest {
+        url: pull_request.url(),
+        repository: format!(
+            "{}/{}/{}",
+            pull_request.host, pull_request.owner, pull_request.repository
+        ),
+        searched_parent: chosen
+            .source_path()
+            .parent()
+            .map_or_else(|| chosen.source_path().to_path_buf(), Path::to_path_buf),
+    })
 }
 
 /// Candidate checkout paths worth discovering as Git repositories while
@@ -2773,6 +2775,52 @@ mod tests {
         assert!(
             !fixture.database.exists(),
             "a refused start created a database"
+        );
+    }
+
+    /// A review only reads, so a dirty matching checkout is no reason to
+    /// refuse it: it starts in the chosen checkout, exactly as it would have
+    /// before Polycode looked for the pull request's own.
+    #[test]
+    fn a_review_whose_only_matching_checkout_is_dirty_starts_where_it_was_asked() {
+        let fixture = Fixture::new();
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/other/repo.git",
+            ],
+        );
+        let sibling = fixture.temp.path().join("jetpack");
+        init_checkout(&sibling);
+        git(
+            &sibling,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Automattic/jetpack.git",
+            ],
+        );
+        fs::write(sibling.join("README.md"), "uncommitted\n").unwrap();
+
+        let report = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"))
+            .start_run(
+                WorkflowKind::Review,
+                JETPACK_PULL_REQUEST,
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+        assert_eq!(
+            report.details.repository.as_deref(),
+            Some(fixture.repo.canonicalize().unwrap().as_path())
         );
     }
 
