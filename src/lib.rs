@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod exec;
 
 pub mod app;
 pub mod domain;

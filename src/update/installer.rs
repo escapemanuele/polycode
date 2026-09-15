@@ -343,10 +343,13 @@ fn make_executable(_path: &Path) -> Result<(), InstallError> {
 /// a mislabelled or mismatched asset cannot be installed. The checksum has
 /// already matched the release's own manifest at this point.
 fn verify_reported_version(staged: &Path, expected: &Version) -> Result<(), InstallError> {
-    let output = std::process::Command::new(staged)
-        .arg("--version")
-        .output()
-        .map_err(|error| InstallError::Staging(error.to_string()))?;
+    // Tests stage the freshly written binary and run it immediately, which
+    // can race another test thread's fork still holding its write fd open
+    // (`ETXTBSY`); retry_busy clears that window without hiding a real
+    // failure.
+    let output =
+        crate::exec::retry_busy(|| std::process::Command::new(staged).arg("--version").output())
+            .map_err(|error| InstallError::Staging(error.to_string()))?;
     let reported = String::from_utf8_lossy(&output.stdout);
     let computed = reported
         .split_whitespace()

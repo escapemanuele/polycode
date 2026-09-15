@@ -138,14 +138,20 @@ impl GhClient {
     }
 
     fn run(&self, cwd: &Path, args: &[&OsStr]) -> Result<String, GhUnavailable> {
-        let output = Command::new(&self.executable)
-            .current_dir(cwd)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|source| match source.kind() {
+        // Tests exec a stub `gh` script the moment they write it, which can
+        // still race another test thread's fork holding the write fd open
+        // (`ETXTBSY`); retry_busy clears that window without hiding a real
+        // failure.
+        let output = crate::exec::retry_busy(|| {
+            Command::new(&self.executable)
+                .current_dir(cwd)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        })
+        .map_err(|source| match source.kind() {
                 std::io::ErrorKind::NotFound => GhUnavailable(
                     "GitHub CLI (gh) is not installed — the branch is pushed; open the pull request manually or install gh".to_owned(),
                 ),
@@ -255,19 +261,23 @@ impl GhClient {
             repository,
             number,
         } = pull_request;
-        let output = Command::new(&self.executable)
-            .args([
-                OsString::from("api"),
-                OsString::from(format!("repos/{owner}/{repository}/pulls/{number}")),
-                OsString::from("--hostname"),
-                OsString::from(host),
-                OsString::from("--jq"),
-                OsString::from(".number"),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
+        // See the comment in `run`: a stub `gh` can still be draining an
+        // inherited write fd from another test's fork when this execs it.
+        let output = crate::exec::retry_busy(|| {
+            Command::new(&self.executable)
+                .args([
+                    OsString::from("api"),
+                    OsString::from(format!("repos/{owner}/{repository}/pulls/{number}")),
+                    OsString::from("--hostname"),
+                    OsString::from(host),
+                    OsString::from("--jq"),
+                    OsString::from(".number"),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        });
         match output {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 PullRequestReach::Unknown

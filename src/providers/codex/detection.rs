@@ -97,7 +97,11 @@ impl CodexInstallation {
 }
 
 fn command_output(executable: &Path, args: &[&str]) -> std::io::Result<Output> {
-    Command::new(executable).args(args).output()
+    // Tests exec a freshly written stub `codex` immediately, which can race
+    // another test thread's fork still holding its write fd open
+    // (`ETXTBSY`); retry_busy clears that window without hiding a real
+    // failure.
+    crate::exec::retry_busy(|| Command::new(executable).args(args).output())
 }
 
 fn require_capability(
