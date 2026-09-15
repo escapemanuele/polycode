@@ -566,11 +566,13 @@ fn sprite_grid(
 ) -> Vec<String> {
     let expr = expression(state, motion.is_blinking(), motion.is_reacting());
     // The prop is worked, not just worn: its two frames alternate only while
-    // the stage is actually Running — every other state rests the tools.
-    let prop_frame = if matches!(state, MascotState::Running) {
-        motion.prop_frame()
-    } else {
-        0
+    // the stage is actually Running. Finished work holds the worked frame
+    // still — the gavel has come down, the last box is ticked — and every
+    // other state rests the tools.
+    let prop_frame = match state {
+        MascotState::Running => motion.prop_frame(),
+        MascotState::Completed => 1,
+        _ => 0,
     };
     let hat = hat_rows(activity);
     let face = face_rows(activity, &expr);
@@ -1122,9 +1124,9 @@ mod tests {
     }
 
     /// While a stage Runs, POD works its prop: every scene has a second
-    /// frame and it differs from the resting one. Any other state rests the
-    /// tools — a prop swinging beside finished or failed work would claim
-    /// activity that is not there.
+    /// frame and it differs from the resting one. Any other state holds its
+    /// tools still — a prop swinging beside finished or failed work would
+    /// claim activity that is not there.
     #[test]
     fn a_running_scene_works_its_prop_and_every_other_state_rests_it() {
         for activity in ALL_ACTIVITIES {
@@ -1144,6 +1146,34 @@ mod tests {
                         "{state:?} is not working, yet {activity:?}'s prop moved"
                     );
                 }
+            }
+        }
+    }
+
+    /// Done means the job was done: the finished scene shows the tool's
+    /// worked frame — the gavel down, the last box ticked — while every
+    /// state that has not finished shows it at rest.
+    #[test]
+    fn finished_work_shows_the_tool_after_the_job_and_nothing_else_does() {
+        let panel = |state, activity| -> Vec<String> {
+            scene(state, Some(activity))[5..]
+                .iter()
+                .map(|row| row[BODY_COLUMN..].to_owned())
+                .collect()
+        };
+        for activity in ALL_ACTIVITIES {
+            assert_eq!(
+                panel(MascotState::Completed, activity),
+                prop_rows(activity, 1),
+                "{activity:?} is DONE with its tool still at rest"
+            );
+            for state in [
+                MascotState::Idle,
+                MascotState::Waiting,
+                MascotState::NeedsUser,
+                MascotState::Failed,
+            ] {
+                assert_eq!(panel(state, activity), prop_rows(activity, 0));
             }
         }
     }
