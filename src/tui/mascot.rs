@@ -39,11 +39,15 @@ use ratatui::text::{Line, Span};
 use crate::domain::{RunStatus, StageKind, StageStatus};
 
 /// Every variant renders exactly this many terminal cells per art row:
-/// a 17-pixel body column plus a 9-pixel prop panel.
+/// a 15-pixel body column plus an 11-pixel panel where POD's arm holds the
+/// job's tool.
 pub(crate) const MASCOT_WIDTH: u16 = 26;
 
 /// Seven art rows (14 pixel rows at two pixels per cell) plus one label row.
 pub(crate) const MASCOT_HEIGHT: u16 = 8;
+
+/// Pixels of the face rows kept beside a tool; the arm panel starts here.
+const BODY_COLUMN: usize = 15;
 
 /// Pixel rows in a sprite; always twice the art rows.
 const SPRITE_ROWS: usize = 14;
@@ -296,21 +300,23 @@ const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
     }
 }
 
-/// The prop drawn beside POD, nine pixel rows of nine pixels, in two
-/// frames: frame 0 is the prop at rest, frame 1 is the prop being worked —
-/// the pair the running loop alternates so the job looks *done*, not just
-/// named.
+/// POD's arm and the tool it holds, nine pixel rows of eleven pixels, in
+/// two frames: frame 0 is the tool at rest, frame 1 is the tool being
+/// worked — the pair the running loop alternates so the job looks *done*,
+/// not just named. The first two columns sit against POD's side, so the
+/// `G` arm pixels join the body; a tool on the ground ends on the feet row.
 ///
-/// - Research: a stack of three books; the top book slides out.
-/// - Architecture: a pencil drawing its line; it lifts and the line grows.
-/// - Implementation: a hammer raised over an open laptop; it comes down
+/// - Research: an open book held up over a stack of books; a page turns.
+/// - Architecture: a pencil held to its line; the stroke moves on.
+/// - Implementation: a hammer raised beside an open laptop; it comes down
 ///   and the screen cracks.
-/// - `QualityReview`: a magnifying glass, lens and handle; it sweeps.
-/// - `SpecReview`: a checklist with ticked boxes; the next box gets ticked.
-/// - Verify: a terminal window with a prompt; output scrolls in and a
-///   check lands at the bottom.
-/// - Synthesis: the balance scales; the pans tilt as they weigh.
-/// - Decision: the gavel resting on its block; it lifts to strike.
+/// - `QualityReview`: a magnifying glass held by its handle; the lens sweeps.
+/// - `SpecReview`: a clipboard checklist held by its edge; the next box gets
+///   ticked.
+/// - Verify: a terminal with POD's hand on the keyboard; the hand lifts and
+///   output scrolls in.
+/// - Synthesis: the balance scales gripped by the pole; the pans tilt.
+/// - Decision: a gavel lifted over its block; it comes down to strike.
 const fn prop_rows(activity: MascotActivity, frame: u8) -> [&'static str; 9] {
     if frame == 1 {
         working_prop_rows(activity)
@@ -323,92 +329,92 @@ const fn prop_rows(activity: MascotActivity, frame: u8) -> [&'static str; 9] {
 const fn resting_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
     match activity {
         MascotActivity::Research => [
-            ".........",
-            ".........",
-            ".YYYYYYW.",
-            ".YYYYYYW.",
-            "BBBBBBBW.",
-            "BBBBBBBW.",
-            ".DDDDDDW.",
-            ".DDDDDDW.",
-            ".........",
+            "...........",
+            "..WW....WW.",
+            "..WWWW.WWWW",
+            ".GYWWWWWWWY",
+            "GGGYYYYYYY.",
+            "GG.........",
+            "....BBBBBBB",
+            "....BWWWWWB",
+            "...DDDDDDDD",
         ],
         MascotActivity::Architecture => [
-            "......WW.",
-            ".....WYYW",
-            "....YYYY.",
-            "...YYYY..",
-            "..YYYY...",
-            ".DYYY....",
-            ".DD......",
-            "D........",
-            "DDDD.....",
+            ".....WW....",
+            ".....WYY...",
+            "GG.GGGYYY..",
+            "GGGGGGYYYY.",
+            "........YYY",
+            ".........YD",
+            "..........D",
+            "...........",
+            "...DDDDDDD.",
         ],
         MascotActivity::Implementation => [
-            "......YYY",
-            "......YYY",
-            "BBBBBB.DD",
-            "BWWWWB.DD",
-            "BWWWWB...",
-            "BWWWWB...",
-            "BBBBBB...",
-            ".DDDDDDD.",
-            "DDDDDDDDD",
+            ".YYY.......",
+            ".YYY.......",
+            "..D........",
+            "GGGG.......",
+            "GGGG.BBBBBB",
+            "..D..BWWWWB",
+            ".....BWWWWB",
+            ".....BBBBBB",
+            "...DDDDDDDD",
         ],
         MascotActivity::QualityReview => [
-            ".BBBBB...",
-            "BBWWWBB..",
-            "BWWWWWB..",
-            "BWWWWWB..",
-            "BBWWWBB..",
-            ".BBBBB...",
-            "....BBB..",
-            ".....BBB.",
-            "......BBB",
+            ".....BBBBB.",
+            "....BWWWWWB",
+            "....BWWWWWB",
+            "....BWWWWWB",
+            "...GBBBBBB.",
+            "GGGGGB.....",
+            "GG.GG......",
+            "...........",
+            "...........",
         ],
         MascotActivity::SpecReview => [
-            "WWWWWWWWW",
-            "WYYWDDDDW",
-            "WWWWWWWWW",
-            "WYYWDDDDW",
-            "WWWWWWWWW",
-            "WYYWDDDDW",
-            "WWWWWWWWW",
-            "WWWWWWWWW",
-            ".........",
+            "......BB...",
+            "...WWWWWWWW",
+            "...WYYWDDDW",
+            "GGGGWWWWWWW",
+            "GGGGYYWDDDW",
+            "...WWWWWWWW",
+            "...WDDWDDDW",
+            "...WWWWWWWW",
+            "...........",
         ],
         MascotActivity::Verify => [
-            "BBBBBBBBB",
-            "BDDDDDDDB",
-            "BDYDDDDDB",
-            "BDDDDDDDB",
-            "BDDDDDDDB",
-            "BDDDDDDDB",
-            "BDDDDDDDB",
-            "BBBBBBBBB",
-            ".........",
+            "...BBBBBBBB",
+            "...BDDDDDDB",
+            "...BDYDDDDB",
+            "...BDDDDDDB",
+            "GG.BDDDDDDB",
+            "GGGBBBBBBBB",
+            "..GG...D...",
+            "..GGG.DDD..",
+            "..DDDDDDDDD",
         ],
         MascotActivity::Synthesis => [
-            "....Y....",
-            ".YYYYYYY.",
-            ".Y..Y..Y.",
-            ".Y..Y..Y.",
-            "YYY.Y.YYY",
-            "....Y....",
-            "....Y....",
-            "...YYY...",
-            ".DDDDDDD.",
+            "......Y....",
+            "...YYYYYYY.",
+            "...Y..Y..Y.",
+            "...Y..Y..Y.",
+            "..YYY.Y.YYY",
+            "GGGGGGG....",
+            "GG...GG....",
+            ".....YYY...",
+            "....DDDDD..",
         ],
         MascotActivity::Decision => [
-            ".........",
-            ".YYYYYYY.",
-            ".YYYYYYY.",
-            ".YYYYYYY.",
-            "...DDD...",
-            "...DDD...",
-            "...DDD...",
-            "DDDDDDDDD",
-            "DDDDDDDDD",
+            "....YYYYY..",
+            "....YYYYY..",
+            "...GD......",
+            "GGGGG......",
+            "GG.........",
+            "...........",
+            "...........",
+            ".....BBBBB.",
+            "...DDDDDDDD",
         ],
     }
 }
@@ -418,92 +424,92 @@ const fn resting_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
 const fn working_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
     match activity {
         MascotActivity::Research => [
-            ".........",
-            ".........",
-            "..YYYYYYW",
-            "..YYYYYYW",
-            "BBBBBBBW.",
-            "BBBBBBBW.",
-            ".DDDDDDW.",
-            ".DDDDDDW.",
-            ".........",
+            "......W....",
+            "..WW..W.WW.",
+            "..WWWWWWWWW",
+            ".GYWWWWWWWY",
+            "GGGYYYYYYY.",
+            "GG.........",
+            "....BBBBBBB",
+            "....BWWWWWB",
+            "...DDDDDDDD",
         ],
         MascotActivity::Architecture => [
-            ".....WYYW",
-            "....YYYY.",
-            "...YYYY..",
-            "..YYYY...",
-            ".DYYY....",
-            ".DD......",
-            "D........",
-            ".........",
-            "DDDDDD...",
+            "....WW.....",
+            "....WYY....",
+            "GGGGGYYY...",
+            "GGGGGYYYY..",
+            ".......YYY.",
+            "........YD.",
+            ".........D.",
+            "...........",
+            "...DDDDD...",
         ],
         MascotActivity::Implementation => [
-            ".........",
-            ".........",
-            "BBBBBB...",
-            "BW.WWB.DD",
-            "BWW.WB.DD",
-            "BWWW.BYYY",
-            "BBBBBBYYY",
-            ".DDDDDDD.",
-            "DDDDDDDDD",
+            "...........",
+            "...........",
+            "...........",
+            ".....BBBBBB",
+            "GG.GDDYYWWB",
+            "GGGGDDYYW.B",
+            ".....BWKWWB",
+            ".....BBBBBB",
+            "...DDDDDDDD",
         ],
         MascotActivity::QualityReview => [
-            "..BBBBB..",
-            ".BBWWWBB.",
-            ".BWWWWWB.",
-            ".BWWWWWB.",
-            ".BBWWWBB.",
-            "..BBBBB..",
-            ".....BBB.",
-            "......BBB",
-            ".......BB",
+            "...........",
+            ".....BBBBB.",
+            "....BWWWWWB",
+            "....BWWWWWB",
+            "....BWWWWWB",
+            "GGGGGBBBBB.",
+            "GGGGB......",
+            "...........",
+            "...........",
         ],
         MascotActivity::SpecReview => [
-            "WWWWWWWWW",
-            "WYYWDDDDW",
-            "WWWWWWWWW",
-            "WYYWDDDDW",
-            "WWWWWWWWW",
-            "WYYWDDDDW",
-            "WWWWWWWWW",
-            "WYYWWWWWW",
-            ".........",
+            "......BB...",
+            "...WWWWWWWW",
+            "...WYYWDDDW",
+            "GGGGWWWWWWW",
+            "GGGGYYWDDDW",
+            "...WWWWWWWW",
+            "...WYYWDDDW",
+            "...WWWWWWWW",
+            "...........",
         ],
         MascotActivity::Verify => [
-            "BBBBBBBBB",
-            "BDDDDDDDB",
-            "BDYDWWWDB",
-            "BDDDDDDDB",
-            "BDWWWWDDB",
-            "BDDDDDDDB",
-            "BDDDDDYDB",
-            "BBBBBBBBB",
-            ".........",
+            "...BBBBBBBB",
+            "...BDYDWWDB",
+            "...BDDDDDDB",
+            "...BDWWWDDB",
+            "GG.BDDDDDDB",
+            "GGGBBBBBBBB",
+            "..GGG..D...",
+            "......DDD..",
+            "..DDDDDDDDD",
         ],
         MascotActivity::Synthesis => [
-            "....Y....",
-            ".YYYYYYY.",
-            ".Y..Y..Y.",
-            "YYY.Y..Y.",
-            "....Y..Y.",
-            "....Y.YYY",
-            "....Y....",
-            "...YYY...",
-            ".DDDDDDD.",
+            "......Y....",
+            "...YYYYYYY.",
+            "...Y..Y..Y.",
+            "..YYY.Y..Y.",
+            "......Y..Y.",
+            "GGGGGGG.YYY",
+            "GG...GG....",
+            ".....YYY...",
+            "....DDDDD..",
         ],
         MascotActivity::Decision => [
-            ".YYYYYYY.",
-            ".YYYYYYY.",
-            ".YYYYYYY.",
-            ".........",
-            "...DDD...",
-            "...DDD...",
-            "...DDD...",
-            "DDDDDDDDD",
-            "DDDDDDDDD",
+            "...........",
+            "...........",
+            "...........",
+            "......YYY..",
+            "..GG..YYY..",
+            "GGGGDDYYY..",
+            "GG.GG.YYY..",
+            ".....BBBBB.",
+            "...DDDDDDDD",
         ],
     }
 }
@@ -524,10 +530,10 @@ fn face_rows(activity: Option<MascotActivity>, expr: &Expression) -> [String; 9]
     let crown_row = format!("...GGG{brow}GGG{brow}GG..");
     let (top, eyes_top, eyes_bottom, under) = if glasses {
         (
-            "...GGWWWWGWWWWG..".to_owned(),
-            format!("...GGW{eye_top}WWW{eye_top}WG.."),
-            format!("...GGW{eye_bottom}WWW{eye_bottom}WG.."),
-            "...GGWWWWGWWWWG..".to_owned(),
+            crown_row,
+            format!("...GGW{eye_top}WGW{eye_top}WG.."),
+            format!("...GGW{eye_bottom}WGW{eye_bottom}WG.."),
+            "...GGWWWWWWWWWG..".to_owned(),
         )
     } else {
         (
@@ -576,7 +582,7 @@ fn sprite_grid(
                 grid.push(format!("{row}........."));
             }
             for (face_row, prop_row) in face.iter().zip(prop) {
-                grid.push(format!("{face_row}{prop_row}"));
+                grid.push(format!("{}{prop_row}", &face_row[..BODY_COLUMN]));
             }
         }
         None => {
@@ -588,30 +594,32 @@ fn sprite_grid(
     grid
 }
 
-/// The plunger at rest, handle up and the charge still quiet.
+/// The plunger at rest, POD's hand on the raised handle and the charge still
+/// quiet.
 const PLUNGER_ARMED: [&str; 9] = [
-    "..BBBBB..",
-    "....B....",
-    "....B....",
-    "....B....",
-    ".DDDDDDD.",
-    ".DDDDDDD.",
-    ".DDDDDDD.",
-    ".........",
-    "....YYYYY",
+    "GGGGBBBBB..",
+    "GG....B....",
+    "......B....",
+    "......B....",
+    "...DDDDDDD.",
+    "...DDDDDDD.",
+    "...DDDDDDD.",
+    "...........",
+    "......YYYYY",
 ];
 
-/// The plunger driven home: the handle is down and the charge has caught.
+/// The plunger driven home: POD's hand pushed the handle down and the charge
+/// has caught.
 const PLUNGER_FIRED: [&str; 9] = [
-    ".........",
-    ".........",
-    "..BBBBB..",
-    "....B....",
-    ".DDDDDDD.",
-    ".DDDDDDD.",
-    ".DDDDDDD.",
-    "......YWY",
-    "....YYYYY",
+    "...........",
+    "GG.........",
+    "GGGGBBBBB..",
+    "......B....",
+    "...DDDDDDD.",
+    "...DDDDDDD.",
+    "...DDDDDDD.",
+    "........YWY",
+    "......YYYYY",
 ];
 
 /// POD at the plunger, for the one action that destroys a run.
@@ -633,7 +641,7 @@ pub(crate) fn demolition_lines(motion: MotionFrame) -> Vec<Line<'static>> {
         .map(|row| format!("{row}........."))
         .collect();
     for (face_row, prop_row) in face_rows(None, &expr).iter().zip(prop) {
-        grid.push(format!("{face_row}{prop_row}"));
+        grid.push(format!("{}{prop_row}", &face_row[..BODY_COLUMN]));
     }
     let body = theme::danger();
     let mut lines: Vec<Line<'static>> = grid
@@ -642,12 +650,28 @@ pub(crate) fn demolition_lines(motion: MotionFrame) -> Vec<Line<'static>> {
         .collect();
     lines.push(
         Line::from(Span::styled(
-            "DEMOLITION",
+            label_text("DEMOLITION", true),
             Style::new().fg(body).add_modifier(Modifier::BOLD),
         ))
         .alignment(ratatui::layout::Alignment::Center),
     );
     lines
+}
+
+/// Pixel column POD's body is centered on when a prop stands beside it.
+const BODY_CENTER: usize = 10;
+
+/// The label row, padded to the sprite's width. Beside a prop the text sits
+/// under POD's body, not in the gap between POD and the prop; alone, POD
+/// already stands centered, so the text does too.
+fn label_text(text: &str, beside_prop: bool) -> String {
+    let width = MASCOT_WIDTH as usize;
+    if !beside_prop {
+        return text.to_owned();
+    }
+    let lead = BODY_CENTER.saturating_sub(text.len().div_ceil(2));
+    let lead = lead.min(width.saturating_sub(text.len()));
+    format!("{:lead$}{text:<rest$}", "", rest = width - lead)
 }
 
 /// The color a pixel token resolves to; `None` is punched through to the
@@ -708,7 +732,7 @@ pub(crate) fn mascot_lines(
         .collect();
     lines.push(
         Line::from(Span::styled(
-            label(state, activity),
+            label_text(label(state, activity), activity.is_some()),
             state_style(state).add_modifier(Modifier::BOLD),
         ))
         .alignment(ratatui::layout::Alignment::Center),
@@ -941,20 +965,39 @@ mod tests {
     #[test]
     fn state_overrides_activity_in_the_label() {
         let needs = rows(MascotState::NeedsUser, Some(MascotActivity::Implementation));
-        assert_eq!(needs[7], "NEEDS YOU");
+        assert_eq!(needs[7].trim(), "NEEDS YOU");
 
         let failed = rows(MascotState::Failed, Some(MascotActivity::Implementation));
-        assert_eq!(failed[7], "FAILED");
+        assert_eq!(failed[7].trim(), "FAILED");
 
         let done = rows(MascotState::Completed, Some(MascotActivity::Decision));
-        assert_eq!(done[7], "DONE");
+        assert_eq!(done[7].trim(), "DONE");
 
         let running = rows(MascotState::Running, Some(MascotActivity::Implementation));
-        assert_eq!(running[7], "BUILDING");
+        assert_eq!(running[7].trim(), "BUILDING");
 
         assert_eq!(rows(MascotState::Running, None)[7], "RUNNING");
         assert_eq!(rows(MascotState::Idle, None)[7], "READY");
         assert_eq!(rows(MascotState::Waiting, None)[7], "WAITING");
+    }
+
+    /// Beside a prop, the label centers under POD's body so it names POD,
+    /// not the gap between POD and the tool.
+    #[test]
+    fn a_label_beside_a_prop_sits_under_the_body() {
+        for activity in ALL_ACTIVITIES {
+            for state in ALL_STATES {
+                let row = &rows(state, Some(activity))[7];
+                assert_eq!(row.chars().count(), MASCOT_WIDTH as usize);
+                let text = row.trim();
+                let start = row.find(text).unwrap();
+                let center = start * 2 + text.len();
+                assert!(
+                    center.abs_diff(BODY_CENTER * 2) <= 1,
+                    "{text:?} is not under POD's body: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]
