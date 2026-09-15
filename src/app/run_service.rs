@@ -257,7 +257,12 @@ where
         store.create_run_with_input(&run, &input, config, &[created])?;
 
         let manager = WorkspaceManager::new(&self.worktrees);
-        manager.prepare_run_workspace(&mut store, run_id, repository.source_path())?;
+        manager.prepare_run_workspace_with(
+            &mut store,
+            run_id,
+            repository.source_path(),
+            Some(&self.gh),
+        )?;
         let status = self.drive(&mut store, run_id, ResumeAction::Continue)?;
         self.settle(&mut store, run_id, 0, status.as_ref())
     }

@@ -8,11 +8,11 @@ use crate::domain::{
     StageStatus,
 };
 use crate::git::{
-    GitRepository, apply_patch, branch_exists, branch_tip, check_patch, commit_all_in_worktree,
-    count_commits_between, create_branch_in_worktree, create_worktree, delete_owned_branch,
-    detach_worktree, fetch_branch, generate_patch, generate_patch_preview, inspect_worktree,
-    is_ancestor, push_branch, push_commit_to_branch, rebase_worktree_onto, remote_url,
-    remove_worktree, source_is_clean, tree_is_clean,
+    GitRepository, PUBLISH_TARGET_REF, apply_patch, branch_exists, branch_tip, check_patch,
+    commit_all_in_worktree, count_commits_between, create_branch_in_worktree, create_worktree,
+    delete_owned_branch, delete_ref, detach_worktree, fetch_branch, generate_patch,
+    generate_patch_preview, inspect_worktree, is_ancestor, push_branch, push_commit_to_branch,
+    rebase_worktree_onto, remote_url, remove_worktree, source_is_clean, tree_is_clean,
 };
 use crate::store::{RunInput, RunRevision, SqliteStore, worktree_root};
 
@@ -23,6 +23,13 @@ use super::setup;
 use super::{
     ApplyStatus, RunApplyOperation, RunWorkspace, WorkspaceError, WorkspaceMode, WorkspaceStatus,
 };
+
+/// The head of a pull request `origin` serves: its branch and the commit that
+/// branch pointed at when it was fetched.
+struct PullRequestTip {
+    branch: String,
+    commit: String,
+}
 
 /// What one publish actually did: the branch and commit that reached the
 /// remote, and what became of the pull request.
@@ -138,6 +145,30 @@ impl WorkspaceManager {
         run_id: RunId,
         repository_path: impl AsRef<Path>,
     ) -> Result<RunWorkspace, WorkspaceError> {
+        self.prepare_run_workspace_with(store, run_id, repository_path, None)
+    }
+
+    /// [`Self::prepare_run_workspace`], starting from the pull request the
+    /// task names when `gh` can resolve it.
+    ///
+    /// A run asked about a pull request is working on that pull request's
+    /// change, so its worktree has to hold that change. Started from the
+    /// operator's checkout instead, the stages never see the code under
+    /// review — an editing stage rewrites it from scratch — and publish can
+    /// never fast-forward the pull request's branch, so it opens a second
+    /// pull request for the same work. The same conditions publish checks
+    /// apply here (see [`Self::pull_request_tip`]); when any fails, the run
+    /// starts from the checkout's HEAD exactly as before.
+    ///
+    /// # Errors
+    /// Returns typed lifecycle, persistence, repository, ownership, or Git errors.
+    pub fn prepare_run_workspace_with(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        repository_path: impl AsRef<Path>,
+        gh: Option<&GhClient>,
+    ) -> Result<RunWorkspace, WorkspaceError> {
         if store.load_workspace(run_id)?.is_some() {
             return Err(WorkspaceError::WorkspaceAlreadyExists(run_id));
         }
@@ -163,25 +194,71 @@ impl WorkspaceManager {
         if path.exists() {
             return Err(WorkspaceError::WorkspacePathConflict(path));
         }
+        let base_ref = format!("refs/polycode/pull-request-base/{run_id}");
+        let pull_request_base = match (
+            gh,
+            input.as_ref().and_then(|i| PullRequestRef::parse(i.task())),
+        ) {
+            // Any failure to resolve — including a fetch that errors outright —
+            // is a reason to start from the checkout, never to refuse the run:
+            // before a run could start from a pull request, nothing here
+            // touched the network at all.
+            (Some(gh), Some(reference)) => self
+                .pull_request_tip(gh, repository.source_path(), &reference, &base_ref)
+                .ok()
+                .and_then(Result::ok)
+                .map(|tip| tip.commit),
+            _ => None,
+        };
+        let base_commit = pull_request_base
+            .clone()
+            .unwrap_or_else(|| repository.head_commit().to_owned());
 
         let intent_time = next_time(&loaded.run);
-        let mut workspace = RunWorkspace::preparing(
+        let mut run = loaded.run;
+        let intent = RunWorkspace::preparing(
             run_id,
             repository.source_path().to_path_buf(),
             repository.git_common_dir().to_path_buf(),
-            repository.head_commit().to_owned(),
+            base_commit,
             path,
             branch,
             mode,
             intent_time,
-        )?;
-        let mut run = loaded.run;
-        let begin_event = run.transition(RunTransition::BeginPreparation, metadata(intent_time))?;
-        let begin =
-            store.begin_workspace_preparation(&workspace, &run, loaded.revision, &begin_event)?;
+        )
+        .and_then(|workspace| {
+            let begin_event =
+                run.transition(RunTransition::BeginPreparation, metadata(intent_time))?;
+            let begin = store.begin_workspace_preparation(
+                &workspace,
+                &run,
+                loaded.revision,
+                &begin_event,
+            )?;
+            Ok((workspace, begin))
+        });
+        let (mut workspace, begin) = match intent {
+            Ok(intent) => intent,
+            Err(error) => {
+                // No intent was persisted, so nothing will ever come back for
+                // the commit the scratch ref holds. Once intent is persisted
+                // the ref stays until the worktree exists, because a crash
+                // before then is recovered by recreating the worktree from it.
+                if pull_request_base.is_some() {
+                    let _ = delete_ref(&self.git, repository.source_path(), &base_ref);
+                }
+                return Err(error);
+            }
+        };
         self.fault(FaultPoint::WorkspaceIntent)?;
 
         self.create_intended_worktree(&repository, &workspace)?;
+        if pull_request_base.is_some() {
+            // The worktree's HEAD holds the commit now; the scratch ref that
+            // kept it reachable until then is only clutter. Best effort — a
+            // leftover ref under Polycode's namespace harms nothing.
+            let _ = delete_ref(&self.git, repository.source_path(), &base_ref);
+        }
         self.fault(FaultPoint::WorktreeCreated)?;
         self.validate_workspace(&workspace, true)?;
         // Before the workspace is ready, so no stage ever sees a tree the
@@ -677,14 +754,11 @@ impl WorkspaceManager {
     /// change. Pushing its commits to a fresh branch opens a second pull
     /// request for the same work, which is never what the operator asked for.
     ///
-    /// Four things have to hold before Polycode writes to a branch it does not
-    /// own, and each failure is an explanation rather than an error, because
-    /// publishing to the run's own branch remains a correct outcome:
-    /// the head branch must live in the repository `origin` points at, not in
-    /// a fork; that pull request must be the open one `origin` serves for the
-    /// branch, which rules out a task that merely mentions somebody else's;
-    /// the branch must still exist on the remote; and the branch's tip must be
-    /// an ancestor of the commit being published, so the push fast-forwards.
+    /// Before Polycode writes to a branch it does not own, the pull request
+    /// has to resolve (see [`Self::pull_request_tip`]) and the branch's tip
+    /// must be an ancestor of the commit being published, so the push
+    /// fast-forwards. Each failure is an explanation rather than an error,
+    /// because publishing to the run's own branch remains a correct outcome.
     /// Nothing here force-pushes and nothing rewrites a branch that moved.
     fn publish_target(
         &self,
@@ -696,51 +770,79 @@ impl WorkspaceManager {
         let Some(reference) = task.and_then(PullRequestRef::parse) else {
             return Ok(PublishTarget::OwnBranch(None));
         };
+        let tip = match self.pull_request_tip(gh, worktree, &reference, PUBLISH_TARGET_REF)? {
+            Ok(tip) => tip,
+            Err(reason) => return Ok(PublishTarget::OwnBranch(Some(reason))),
+        };
         let url = reference.url();
-        let head = match gh.pull_request_head(worktree, &reference) {
-            Ok(head) => head,
-            Err(unavailable) => {
-                return Ok(PublishTarget::OwnBranch(Some(format!(
-                    "{url} could not be read, so this run kept its own branch: {}",
-                    unavailable.0
-                ))));
-            }
-        };
-        if head.cross_repository {
-            return Ok(PublishTarget::OwnBranch(Some(format!(
-                "{url} reads from a fork, which polycode cannot push to."
-            ))));
-        }
-        let open = match gh.existing_pull_request(worktree, &head.branch) {
-            Ok(open) => open,
-            Err(unavailable) => {
-                return Ok(PublishTarget::OwnBranch(Some(format!(
-                    "{url} could not be matched to this repository: {}",
-                    unavailable.0
-                ))));
-            }
-        };
-        if !open.is_some_and(|open| open.eq_ignore_ascii_case(&url)) {
-            return Ok(PublishTarget::OwnBranch(Some(format!(
-                "{url} is not an open pull request of this repository's origin."
-            ))));
-        }
-        let Some(tip) = fetch_branch(&self.git, worktree, "origin", &head.branch)? else {
-            return Ok(PublishTarget::OwnBranch(Some(format!(
-                "{url} has no branch {} on origin any more.",
-                head.branch
-            ))));
-        };
-        if !is_ancestor(&self.git, worktree, &tip, commit)? {
+        if !is_ancestor(&self.git, worktree, &tip.commit, commit)? {
             return Ok(PublishTarget::OwnBranch(Some(format!(
                 "{url} moved ahead of this run: {} carries commits this run is not built on, so pushing to it would need a merge or a rebase.",
-                head.branch
+                tip.branch
             ))));
         }
         Ok(PublishTarget::PullRequestBranch {
-            branch: head.branch,
+            branch: tip.branch,
             url,
         })
+    }
+
+    /// Resolves the pull request `reference` names to its head branch on
+    /// `origin` and fetches that branch's tip onto `target_ref`.
+    ///
+    /// Three things have to hold, and each failure comes back as an
+    /// explanation rather than an error, because building on the run's own
+    /// base remains a correct outcome: the head branch must live in the
+    /// repository `origin` points at, not in a fork; that pull request must be
+    /// the open one `origin` serves for the branch, which rules out a task that
+    /// merely mentions somebody else's; and the branch must still exist on the
+    /// remote.
+    fn pull_request_tip(
+        &self,
+        gh: &GhClient,
+        cwd: &Path,
+        reference: &PullRequestRef,
+        target_ref: &str,
+    ) -> Result<Result<PullRequestTip, String>, WorkspaceError> {
+        let url = reference.url();
+        let head = match gh.pull_request_head(cwd, reference) {
+            Ok(head) => head,
+            Err(unavailable) => {
+                return Ok(Err(format!(
+                    "{url} could not be read, so this run kept its own branch: {}",
+                    unavailable.0
+                )));
+            }
+        };
+        if head.cross_repository {
+            return Ok(Err(format!(
+                "{url} reads from a fork, which polycode cannot push to."
+            )));
+        }
+        let open = match gh.existing_pull_request(cwd, &head.branch) {
+            Ok(open) => open,
+            Err(unavailable) => {
+                return Ok(Err(format!(
+                    "{url} could not be matched to this repository: {}",
+                    unavailable.0
+                )));
+            }
+        };
+        if !open.is_some_and(|open| open.eq_ignore_ascii_case(&url)) {
+            return Ok(Err(format!(
+                "{url} is not an open pull request of this repository's origin."
+            )));
+        }
+        let Some(commit) = fetch_branch(&self.git, cwd, "origin", &head.branch, target_ref)? else {
+            return Ok(Err(format!(
+                "{url} has no branch {} on origin any more.",
+                head.branch
+            )));
+        };
+        Ok(Ok(PullRequestTip {
+            branch: head.branch,
+            commit,
+        }))
     }
 
     /// Builds a bounded read-only preview from same temporary-index delta used by apply.
@@ -3560,6 +3662,131 @@ mod tests {
             !git_ok(&origin, ["rev-parse", "--verify", "--quiet", &own]),
             "the run's own branch reached origin as well"
         );
+    }
+
+    /// The pull request's change is not in the operator's checkout — the usual
+    /// case, since nobody checks out a branch before asking for it to be
+    /// fixed. The run still starts from that change, so its stages see the
+    /// code under review and publishing fast-forwards the pull request.
+    #[test]
+    fn a_run_on_a_pull_request_starts_from_its_head_and_publishes_onto_it() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
+        );
+        let origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        // The pull request's commit lives on origin only: the checkout stays
+        // on the commit before it.
+        fs::write(fixture.source.join("change.txt"), "the pull request\n").unwrap();
+        git(&fixture.source, ["add", "-A"]);
+        git(&fixture.source, ["commit", "-m", "the pull request"]);
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), false);
+        let tip = git_text(&fixture.source, ["rev-parse", "HEAD"]);
+        git(&fixture.source, ["reset", "--hard", "HEAD~1"]);
+        let before = source_snapshot(&fixture.source);
+
+        let workspace = fixture
+            .manager()
+            .prepare_run_workspace_with(
+                &mut fixture.store,
+                fixture.run_id,
+                &fixture.source,
+                Some(&gh),
+            )
+            .unwrap();
+
+        assert_eq!(workspace.base_commit(), tip);
+        assert_eq!(
+            fs::read_to_string(workspace.worktree_path().join("change.txt")).unwrap(),
+            "the pull request\n",
+            "the run cannot see the change it was asked about"
+        );
+        assert_eq!(source_snapshot(&fixture.source), before);
+        let scratch = format!("refs/polycode/pull-request-base/{}", fixture.run_id);
+        assert!(!git_ok(
+            &fixture.source,
+            ["rev-parse", "--verify", "--quiet", &scratch]
+        ));
+
+        fixture.complete();
+        fs::write(workspace.worktree_path().join("change.txt"), "fixed\n").unwrap();
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
+            .unwrap();
+
+        assert_eq!(receipt.branch, "pull-request-branch");
+        assert_eq!(receipt.note, None);
+        assert_eq!(
+            git_text(&origin, ["rev-parse", "refs/heads/pull-request-branch"]),
+            receipt.commit
+        );
+        assert!(!fixture.temp.path().join("create-args").exists());
+    }
+
+    /// A pull request `gh` resolves but whose branch cannot be fetched — an
+    /// origin that is down, a network that drops — is not a reason to refuse
+    /// the run. It starts from the checkout, as it did before runs could start
+    /// from a pull request at all.
+    #[test]
+    fn a_pull_request_that_cannot_be_fetched_starts_from_the_checkout() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
+        );
+        add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), false);
+        let unreachable = fixture.temp.path().join("gone.git");
+        git(
+            &fixture.source,
+            ["remote", "set-url", "origin", unreachable.to_str().unwrap()],
+        );
+        let head = git_text(&fixture.source, ["rev-parse", "HEAD"]);
+
+        let workspace = fixture
+            .manager()
+            .prepare_run_workspace_with(
+                &mut fixture.store,
+                fixture.run_id,
+                &fixture.source,
+                Some(&gh),
+            )
+            .unwrap();
+
+        assert_eq!(workspace.base_commit(), head);
+    }
+
+    /// A pull request the run cannot build on leaves the start as it always
+    /// was: the operator's checkout.
+    #[test]
+    fn a_run_on_a_fork_pull_request_starts_from_the_checkout() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
+        );
+        add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        fs::write(fixture.source.join("change.txt"), "the pull request\n").unwrap();
+        git(&fixture.source, ["add", "-A"]);
+        git(&fixture.source, ["commit", "-m", "the pull request"]);
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), true);
+        git(&fixture.source, ["reset", "--hard", "HEAD~1"]);
+        let head = git_text(&fixture.source, ["rev-parse", "HEAD"]);
+
+        let workspace = fixture
+            .manager()
+            .prepare_run_workspace_with(
+                &mut fixture.store,
+                fixture.run_id,
+                &fixture.source,
+                Some(&gh),
+            )
+            .unwrap();
+
+        assert_eq!(workspace.base_commit(), head);
+        assert!(!workspace.worktree_path().join("change.txt").exists());
     }
 
     /// A pull request whose branch moved on is somebody else's work: the run
