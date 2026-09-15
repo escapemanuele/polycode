@@ -1234,7 +1234,7 @@ fn hero_actions(
         spans.push(Span::raw("   "));
         spans.extend(theme::action("b", "Rebase onto HEAD", theme::attention()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("P", "Pull request", theme::success()));
+        spans.extend(theme::action("P", "Push to PR", theme::success()));
         if let Some(label) = fix.label() {
             spans.push(Span::raw("   "));
             spans.extend(theme::action("f", label, theme::attention()));
@@ -1771,7 +1771,7 @@ fn run_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)
         push("d", "Review diff", theme::accent());
         push("a", "Apply", theme::success());
         push("b", "Rebase", theme::attention());
-        push("P", "Pull request", theme::success());
+        push("P", "Push to PR", theme::success());
         if let Some(label) = FixOffer::of(state).label() {
             push("f", label, theme::attention());
         }
@@ -2040,7 +2040,7 @@ fn render_publishing(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "PUBLISHING PULL REQUEST",
+                "PUSHING TO PR",
                 Style::default()
                     .fg(theme::accent())
                     .add_modifier(Modifier::BOLD),
@@ -2068,7 +2068,7 @@ fn render_publishing(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(overlay_block(" PULL REQUEST ", theme::accent())),
+            .block(overlay_block(" PUSH TO PR ", theme::accent())),
         popup,
     );
 }
@@ -2505,7 +2505,7 @@ fn render_confirmation(
     let (action, color) = match confirmation {
         Confirmation::Apply => ("APPLY", theme::success()),
         Confirmation::Rebase => ("REBASE", theme::attention()),
-        Confirmation::Publish => ("PULL REQUEST", theme::success()),
+        Confirmation::Publish => ("PUSH TO PR", theme::success()),
         Confirmation::Discard => ("DISCARD", theme::danger()),
     };
     let mut lines = vec![
@@ -2590,7 +2590,7 @@ fn render_confirmation(
                 match confirmation {
                     Confirmation::Apply => " APPLY ",
                     Confirmation::Rebase => " REBASE ",
-                    Confirmation::Publish => " PULL REQUEST ",
+                    Confirmation::Publish => " PUSH TO PR ",
                     Confirmation::Discard => " DISCARD ",
                 },
                 color,
@@ -4984,7 +4984,7 @@ mod tests {
             started: std::time::Instant::now(),
         });
         let text = render_text(&state, 120, 30);
-        assert!(text.contains("PUBLISHING PULL REQUEST"), "{text}");
+        assert!(text.contains("PUSHING TO PR"), "{text}");
         assert!(text.contains("pushing the branch to origin"), "{text}");
         assert!(text.contains("0s"), "the clock is on screen: {text}");
         assert!(text.contains("Esc hides this card"), "{text}");
