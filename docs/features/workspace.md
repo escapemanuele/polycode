@@ -28,7 +28,7 @@ polycode pr <run-id>
 polycode discard <run-id>
 polycode status <run-id>      # Workspace and Base lines
 ```
-TUI run detail: `d` diff preview, `a` then Enter apply, `b` then Enter rebase onto HEAD, `P` then Enter publish (publishing card while it runs, then a result card with the PR URL: `o` open, `y` copy), `X` then Enter discard.
+TUI run detail: `d` diff preview, `a` then Enter apply, `b` then Enter rebase onto HEAD, `P` then Enter push to PR (a "pushing to PR" card while it runs, then a result card with the PR URL: `o` open, `y` copy), `X` then Enter discard.
 
 CLI `pr` prints its progress line to stderr and the receipt (branch, commit, elapsed, PR URL on its own line) to stdout.
 

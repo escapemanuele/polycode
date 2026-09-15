@@ -165,7 +165,7 @@ Key bindings:
 | Global | `x` | Dismiss notification |
 | Run | `r`, `s`, `t`, `u` | Resume/recover, stop (keeps the run and its work), retry selected failed stage, attention |
 | Run | `o`, `l`, `d`, `i` | Verified artifact, raw logs, diff, toggle technical details |
-| Run | `a`, `P`, `X` | Apply, publish pull request, or discard with confirmation |
+| Run | `a`, `P`, `X` | Apply, push to PR, or discard with confirmation |
 | Run | `f`, `c`, `w` | Fix a completed run's decision, continue it with a new instruction, work on its decision's Follow-ups |
 | Runs list | `h`, `H` | Hide/unhide selected run, show/hide hidden runs |
 | Viewer | `↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End` | Scroll |
