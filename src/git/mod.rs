@@ -20,7 +20,8 @@ pub(crate) use patch::{
     generate_patch, generate_patch_preview, source_is_clean, tree_is_clean,
 };
 pub(crate) use remote::{
-    fetch_branch, is_ancestor, push_branch, push_commit_to_branch, remote_url,
+    PUBLISH_TARGET_REF, delete_ref, fetch_branch, is_ancestor, push_branch, push_commit_to_branch,
+    remote_url,
 };
 pub(crate) use worktree::{
     WorktreeIdentity, branch_exists, branch_tip, commit_all_in_worktree, create_branch_in_worktree,

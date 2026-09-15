@@ -65,13 +65,13 @@ pub(crate) fn push_branch(
 
 /// The ref a fetched publish target is parked on, inside Polycode's own
 /// namespace so nothing under `refs/heads` or `refs/remotes` is disturbed.
-const PUBLISH_TARGET_REF: &str = "refs/polycode/publish-target";
+pub(crate) const PUBLISH_TARGET_REF: &str = "refs/polycode/publish-target";
 
-/// Fetches `branch` from `remote` and returns the commit it points at, or
-/// `None` when the remote has no such branch.
+/// Fetches `branch` from `remote` onto `target_ref` and returns the commit it
+/// points at, or `None` when the remote has no such branch.
 ///
 /// The fetched tip is parked on a Polycode-owned ref rather than read back
-/// from `FETCH_HEAD`, whose per-worktree ownership is not something a publish
+/// from `FETCH_HEAD`, whose per-worktree ownership is not something a caller
 /// should have to reason about. That ref is force-updated because it is a
 /// scratch pointer, never history anyone owns.
 pub(crate) fn fetch_branch(
@@ -79,9 +79,10 @@ pub(crate) fn fetch_branch(
     path: &Path,
     remote: &str,
     branch: &str,
+    target_ref: &str,
 ) -> Result<Option<String>, GitError> {
     git.checked(path, &[os("check-ref-format"), os("--branch"), os(branch)])?;
-    let refspec = format!("+refs/heads/{branch}:{PUBLISH_TARGET_REF}");
+    let refspec = format!("+refs/heads/{branch}:{target_ref}");
     let output = git.output(
         path,
         &[os("fetch"), os("--no-tags"), os(remote), os(refspec)],
@@ -98,9 +99,15 @@ pub(crate) fn fetch_branch(
         }
         return Err(output.into_failure());
     }
-    let commit = text_output(git.checked(path, &[os("rev-parse"), os(PUBLISH_TARGET_REF)])?)?;
+    let commit = text_output(git.checked(path, &[os("rev-parse"), os(target_ref)])?)?;
     validate_commit(&commit)?;
     Ok(Some(commit))
+}
+
+/// Deletes a scratch ref Polycode parked a fetched commit on.
+pub(crate) fn delete_ref(git: &Git, path: &Path, reference: &str) -> Result<(), GitError> {
+    git.checked(path, &[os("update-ref"), os("-d"), os(reference)])?;
+    Ok(())
 }
 
 /// Whether `ancestor` is reachable from `descendant`, a commit counting as its
