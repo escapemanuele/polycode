@@ -116,18 +116,24 @@ impl CodexImageGenerator {
     fn run(&self, instruction: &str) -> Result<CodexOutput, ImageBackendError> {
         let scratch = tempfile::tempdir()
             .map_err(|error| ImageBackendError::Network(format!("scratch dir: {error}")))?;
-        let mut child = Command::new(&self.executable)
-            // Sandbox and approval are root options; the working directory and
-            // the git check belong to `exec` (`codex exec --help`).
-            .args(["--sandbox", "read-only", "--ask-for-approval", "never"])
-            .args(["exec", "--skip-git-repo-check", "-C"])
-            .arg(scratch.path())
-            .args(["--json", "--color", "never", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| ImageBackendError::Network(format!("codex launch: {error}")))?;
+        // Tests exec a freshly written stub `codex` script immediately, which
+        // can race another test thread's fork still holding its write fd
+        // open (`ETXTBSY`); retry_busy clears that window without hiding a
+        // real failure.
+        let mut child = crate::exec::retry_busy(|| {
+            Command::new(&self.executable)
+                // Sandbox and approval are root options; the working directory
+                // and the git check belong to `exec` (`codex exec --help`).
+                .args(["--sandbox", "read-only", "--ask-for-approval", "never"])
+                .args(["exec", "--skip-git-repo-check", "-C"])
+                .arg(scratch.path())
+                .args(["--json", "--color", "never", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .map_err(|error| ImageBackendError::Network(format!("codex launch: {error}")))?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(instruction.as_bytes())

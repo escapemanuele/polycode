@@ -100,7 +100,11 @@ pub(crate) fn run(
         use std::os::unix::process::CommandExt as _;
         spawn.process_group(0);
     }
-    let mut child = match spawn.spawn() {
+    // Tests exec a freshly written stub script immediately, which can race
+    // another test thread's fork still holding its write fd open
+    // (`ETXTBSY`); retry_busy clears that window before this falls back to
+    // reporting the program as unable to start.
+    let mut child = match crate::exec::retry_busy(|| spawn.spawn()) {
         Ok(child) => child,
         Err(error) => {
             return Ok(CommandReport {
