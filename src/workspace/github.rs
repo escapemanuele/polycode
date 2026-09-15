@@ -227,6 +227,69 @@ impl PullRequestRef {
     }
 }
 
+/// Host, owner, and repository name read from a Git remote URL, in whichever
+/// of the three shapes Git accepts: `https://host/owner/repo(.git)(/)`,
+/// scp-style `git@host:owner/repo(.git)`, or `ssh://git@host/owner/repo(.git)`.
+///
+/// A checkout's `origin` and a pull request's URL name the same repository
+/// through whichever shape their author's Git configuration happened to
+/// prefer, so choosing between local checkouts by string-comparing raw remote
+/// URLs would miss every match that used a different shape than the pull
+/// request's own `https://` URL does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteRepository {
+    host: String,
+    owner: String,
+    repository: String,
+}
+
+impl RemoteRepository {
+    /// Parses a Git remote URL, or returns `None` for a shape this does not
+    /// recognise — a local path, a shorthand alias, anything other than the
+    /// three forms above.
+    #[must_use]
+    pub(crate) fn parse(url: &str) -> Option<Self> {
+        let rest = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .or_else(|| url.strip_prefix("ssh://git@"))
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                let (host, path) = url.strip_prefix("git@")?.split_once(':')?;
+                Some(format!("{host}/{path}"))
+            })?;
+        let mut segments = rest
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty());
+        let host = segments.next()?;
+        let owner = segments.next()?;
+        let repository = segments.next()?.trim_end_matches(".git");
+        if host.is_empty() || owner.is_empty() || repository.is_empty() {
+            return None;
+        }
+        Some(Self {
+            host: host.to_owned(),
+            owner: owner.to_owned(),
+            repository: repository.to_owned(),
+        })
+    }
+
+    /// Whether this remote names the same repository as `pull_request`.
+    ///
+    /// Compared case-insensitively: GitHub treats host, owner, and repository
+    /// names case-insensitively, so a remote configured with different casing
+    /// than a pull request's own URL still names the repository it belongs to.
+    #[must_use]
+    pub(crate) fn names(&self, pull_request: &PullRequestRef) -> bool {
+        self.host.eq_ignore_ascii_case(&pull_request.host)
+            && self.owner.eq_ignore_ascii_case(&pull_request.owner)
+            && self
+                .repository
+                .eq_ignore_ascii_case(&pull_request.repository)
+    }
+}
+
 /// Result of asking whether a run's stages could read the pull request at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PullRequestReach {
@@ -386,5 +449,90 @@ mod pull_request_ref_tests {
             gh.pull_request_reach(&pull_request()),
             PullRequestReach::Unknown
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_repository_tests {
+    use super::*;
+
+    fn jetpack() -> PullRequestRef {
+        PullRequestRef {
+            host: "github.com".to_owned(),
+            owner: "Automattic".to_owned(),
+            repository: "jetpack".to_owned(),
+            number: 52_322,
+        }
+    }
+
+    #[test]
+    fn parses_an_https_remote_with_or_without_the_git_suffix_or_trailing_slash() {
+        for url in [
+            "https://github.com/Automattic/jetpack",
+            "https://github.com/Automattic/jetpack.git",
+            "https://github.com/Automattic/jetpack/",
+            "https://github.com/Automattic/jetpack.git/",
+        ] {
+            let remote = RemoteRepository::parse(url).unwrap_or_else(|| panic!("{url}"));
+            assert_eq!(
+                remote,
+                RemoteRepository {
+                    host: "github.com".to_owned(),
+                    owner: "Automattic".to_owned(),
+                    repository: "jetpack".to_owned(),
+                },
+                "{url}"
+            );
+            assert!(remote.names(&jetpack()), "{url}");
+        }
+    }
+
+    #[test]
+    fn parses_an_http_remote() {
+        let remote = RemoteRepository::parse("http://github.com/Automattic/jetpack.git")
+            .expect("an http remote");
+        assert!(remote.names(&jetpack()));
+    }
+
+    #[test]
+    fn parses_the_scp_style_shorthand() {
+        let remote = RemoteRepository::parse("git@github.com:Automattic/jetpack.git")
+            .expect("an scp-style remote");
+        assert!(remote.names(&jetpack()));
+    }
+
+    #[test]
+    fn parses_an_explicit_ssh_url() {
+        let remote = RemoteRepository::parse("ssh://git@github.com/Automattic/jetpack.git")
+            .expect("an ssh remote");
+        assert!(remote.names(&jetpack()));
+    }
+
+    /// GitHub treats host, owner, and repository names case-insensitively, so
+    /// a remote must still be recognised when its casing differs from the
+    /// pull request URL's own.
+    #[test]
+    fn matching_ignores_case() {
+        let remote = RemoteRepository::parse("https://GitHub.com/automattic/JetPack.git")
+            .expect("a differently-cased remote");
+        assert!(remote.names(&jetpack()));
+    }
+
+    #[test]
+    fn a_remote_naming_a_different_repository_does_not_match() {
+        let remote = RemoteRepository::parse("https://github.com/Automattic/wp-calypso").unwrap();
+        assert!(!remote.names(&jetpack()));
+    }
+
+    #[test]
+    fn unrecognised_shapes_parse_to_none() {
+        for url in [
+            "../relative/path",
+            "/absolute/path",
+            "not a url at all",
+            "https://github.com/only-owner",
+        ] {
+            assert!(RemoteRepository::parse(url).is_none(), "{url}");
+        }
     }
 }

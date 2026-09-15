@@ -22,6 +22,32 @@ impl SqliteStore {
         load_workspace_from(&self.connection, run_id)
     }
 
+    /// Every distinct source-checkout path a run has ever been started from,
+    /// most recently used first.
+    ///
+    /// The natural place to look for a local checkout of a repository a task
+    /// names but the chosen checkout does not hold: every path here is a
+    /// checkout the operator has already pointed Polycode at, so it is
+    /// reachable filesystem, not a guess. Ordered by the most recent
+    /// `run_workspaces.created_at` for that path, because the checkout the
+    /// operator used most recently is the one most likely to still be the
+    /// right one.
+    ///
+    /// # Errors
+    /// Returns typed `SQLite` errors.
+    pub(crate) fn distinct_source_repository_paths(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_repo_path, MAX(created_at) AS last_used
+             FROM run_workspaces
+             GROUP BY source_repo_path
+             ORDER BY last_used DESC",
+        )?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(paths.into_iter().map(PathBuf::from).collect())
+    }
+
     pub(crate) fn begin_workspace_preparation(
         &mut self,
         workspace: &RunWorkspace,

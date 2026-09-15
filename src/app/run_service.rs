@@ -15,7 +15,7 @@ use crate::store::{
 };
 use crate::workspace::{
     GhClient, PullRequestReach, PullRequestRef, RebaseReceipt, ReconciliationOutcome,
-    WorkspaceError, WorkspaceManager, WorkspaceStatus,
+    RemoteRepository, WorkspaceError, WorkspaceManager, WorkspaceStatus,
 };
 
 use super::provider_factory::{ProviderFactory, ProviderResolver};
@@ -214,6 +214,19 @@ where
         )
     }
 
+    /// Every distinct source-checkout path a run has ever been started from,
+    /// most recently used first — or nothing at all when no run has ever
+    /// started, since [`SqliteStore::open`] creates the database on first
+    /// touch and a read performed only to look for a pull request's checkout
+    /// must not itself become the reason a fresh install grows one. Mirrors
+    /// [`Self::list_runs`]'s own guard for the same reason.
+    fn previously_used_source_repositories(&self) -> Result<Vec<PathBuf>, AppError> {
+        if !self.database.exists() {
+            return Ok(Vec::new());
+        }
+        Ok(SqliteStore::open(&self.database)?.distinct_source_repository_paths()?)
+    }
+
     fn start_run_with_config_at(
         &self,
         workflow: WorkflowDefinition,
@@ -223,14 +236,41 @@ where
         run_id: RunId,
         created_at: DateTime<Utc>,
     ) -> Result<ExecutionReport, AppError> {
-        let repository = GitRepository::discover(repository_path)?;
+        let git = crate::git::Git::default();
+        let mut repository = GitRepository::discover(repository_path)?;
+        // A task naming a pull request is a task whose evidence — and, for a
+        // workflow that edits, whose destination — belongs to a specific
+        // repository. The chosen checkout need not be it: run 01M2JTBB08W8VXP3RM1V7Z9YQ2
+        // was started in a Calypso checkout on a Jetpack pull request, and the
+        // Fix stage that later ran there changed nothing because the worktree
+        // held the wrong repository's history from the start. When the
+        // chosen checkout's own `origin` does not name the pull request's
+        // repository, look for a local checkout that does and start there
+        // instead — before anything about the run becomes durable, in the
+        // same window as the dirty-source and reachability checks below, so a
+        // refusal here leaves nothing behind either.
+        let pull_request = PullRequestRef::parse(&task);
+        if let Some(pull_request) = pull_request.as_ref() {
+            if !remote_names_pull_request(&git, &repository, pull_request)? {
+                let previously_used = self.previously_used_source_repositories()?;
+                repository = resolve_pull_request_checkout(
+                    previously_used,
+                    &git,
+                    repository,
+                    pull_request,
+                    &workflow,
+                )?;
+            }
+        }
         // A managed worktree is created from the source repository's committed
         // HEAD, so uncommitted work would be invisible to the agent while
         // remaining visible to the user. Apply already refuses a dirty source;
         // refusing at the start means the disagreement never happens, and it
         // runs before any run ID, config, input, event, or workspace intent is
-        // persisted, so a rejected start leaves nothing behind.
-        if !crate::git::source_is_clean(&crate::git::Git::default(), &repository)? {
+        // persisted, so a rejected start leaves nothing behind. Applies to the
+        // repository the run actually starts from, which the search above may
+        // have switched away from what the operator chose.
+        if !crate::git::source_is_clean(&git, &repository)? {
             return Err(AppError::DirtySourceRepository);
         }
         // A task naming a pull request is a task whose evidence lives outside
@@ -239,7 +279,7 @@ where
         // it, every stage produces the same "I was blocked" artifact and the
         // run reaches its end looking successful. Refuse here, in the same
         // window as the dirty-source check, so nothing is persisted.
-        if let Some(pull_request) = PullRequestRef::parse(&task) {
+        if let Some(pull_request) = pull_request {
             if let PullRequestReach::Unreachable(detail) = self.gh.pull_request_reach(&pull_request)
             {
                 return Err(AppError::PullRequestUnreachable {
@@ -1232,6 +1272,116 @@ where
             outcome => return outcome,
         }
     }
+}
+
+/// Whether `repository`'s `origin` remote names the same repository as
+/// `pull_request`. A checkout with no `origin` configured at all does not
+/// name it either.
+fn remote_names_pull_request(
+    git: &crate::git::Git,
+    repository: &GitRepository,
+    pull_request: &PullRequestRef,
+) -> Result<bool, AppError> {
+    let remote = crate::git::remote_url(git, repository.source_path(), "origin")?;
+    Ok(remote
+        .as_deref()
+        .and_then(RemoteRepository::parse)
+        .is_some_and(|remote| remote.names(pull_request)))
+}
+
+/// Chooses which local checkout a run whose task names a pull request should
+/// actually start from, given that `chosen`'s own `origin` does not name that
+/// pull request's repository.
+///
+/// Searches, in order and de-duplicated, `previously_used` — every distinct
+/// source-checkout path a run has ever been started from, most recently used
+/// first, see [`RunService::previously_used_source_repositories`] — then the
+/// immediate subdirectories of `chosen`'s own parent directory. Neither tier
+/// recurses or scans the rest of disk: a checkout Polycode has never heard of
+/// and that is not sitting right next to the one the operator chose is not
+/// one this can be expected to find.
+///
+/// A matching checkout that is dirty is not a usable answer, for the same
+/// reason [`AppError::DirtySourceRepository`] refuses `chosen` itself when
+/// nothing gets switched — so a dirty match is skipped in favour of a clean
+/// one, and if every match found is dirty, that is reported by name rather
+/// than silently falling through to `chosen`.
+///
+/// When nothing matches at all, a workflow that edits is refused: it needs to
+/// write into the pull request's own repository, which no checkout on hand
+/// can provide. A read-only workflow keeps today's behaviour and starts in
+/// `chosen` regardless — reviewing a remote pull request over the network is
+/// a legitimate run.
+fn resolve_pull_request_checkout(
+    previously_used: Vec<PathBuf>,
+    git: &crate::git::Git,
+    chosen: GitRepository,
+    pull_request: &PullRequestRef,
+    workflow: &WorkflowDefinition,
+) -> Result<GitRepository, AppError> {
+    let mut dirty = Vec::new();
+    for candidate in candidate_checkout_paths(previously_used, &chosen) {
+        let Ok(repository) = GitRepository::discover_with(git, &candidate) else {
+            // No longer exists, or is not a Git repository: not a checkout.
+            continue;
+        };
+        if !remote_names_pull_request(git, &repository, pull_request)? {
+            continue;
+        }
+        if crate::git::source_is_clean(git, &repository)? {
+            return Ok(repository);
+        }
+        dirty.push(repository.source_path().to_path_buf());
+    }
+    if !dirty.is_empty() {
+        return Err(AppError::PullRequestCheckoutsDirty {
+            url: pull_request.url(),
+            checkouts: dirty,
+        });
+    }
+    if workflow.requires_writable_workspace() {
+        return Err(AppError::NoLocalCheckoutForPullRequest {
+            url: pull_request.url(),
+            repository: format!(
+                "{}/{}/{}",
+                pull_request.host, pull_request.owner, pull_request.repository
+            ),
+            searched_parent: chosen
+                .source_path()
+                .parent()
+                .map_or_else(|| chosen.source_path().to_path_buf(), Path::to_path_buf),
+        });
+    }
+    Ok(chosen)
+}
+
+/// Candidate checkout paths worth discovering as Git repositories while
+/// looking for one that carries a pull request's repository, de-duplicated in
+/// the order they are tried. See [`resolve_pull_request_checkout`].
+fn candidate_checkout_paths(previously_used: Vec<PathBuf>, chosen: &GitRepository) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates = Vec::new();
+    for path in previously_used {
+        if seen.insert(path.clone()) {
+            candidates.push(path);
+        }
+    }
+    if let Some(parent) = chosen.source_path().parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let mut siblings: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir() && path.as_path() != chosen.source_path())
+                .collect();
+            siblings.sort();
+            for path in siblings {
+                if seen.insert(path.clone()) {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+    candidates
 }
 
 fn last_sequence(store: &SqliteStore, run_id: RunId) -> Result<u64, AppError> {
@@ -2353,6 +2503,311 @@ mod tests {
             )
             .unwrap();
         assert_ne!(started.details.status, RunStatus::Failed);
+    }
+
+    /// Initialises a fresh Git repository at `path` with one commit, so it is
+    /// a discoverable checkout of its own — a stand-in for the sibling
+    /// checkouts and previously-used repositories the pull-request-checkout
+    /// search looks for.
+    fn init_checkout(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.email", "test@example.com"]);
+        git(path, &["config", "user.name", "Test"]);
+        fs::write(path.join("README.md"), "baseline\n").unwrap();
+        git(path, &["add", "README.md"]);
+        git(path, &["commit", "-qm", "initial"]);
+    }
+
+    const JETPACK_PULL_REQUEST: &str = "https://github.com/Automattic/jetpack/pull/52322";
+
+    /// The shape of run `01M2JTBB08W8VXP3RM1V7Z9YQ2`: the operator opened
+    /// Polycode in a checkout of one repository (Calypso) and started a run
+    /// whose task named a pull request belonging to another (Jetpack), with a
+    /// checkout of that other repository sitting right next to the one
+    /// chosen. The Fix stage that later ran there changed nothing, because
+    /// the worktree held the wrong repository's history from the start. The
+    /// run must switch to the sibling checkout before anything is persisted.
+    #[test]
+    fn a_pull_request_from_elsewhere_switches_to_a_sibling_checkout_that_matches() {
+        let fixture = Fixture::new();
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/other/repo.git",
+            ],
+        );
+        let sibling = fixture.temp.path().join("jetpack");
+        init_checkout(&sibling);
+        git(
+            &sibling,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Automattic/jetpack.git",
+            ],
+        );
+
+        let report = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"))
+            .start_run(
+                WorkflowKind::Fast,
+                JETPACK_PULL_REQUEST,
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+
+        assert_ne!(report.details.status, RunStatus::Failed);
+        assert_eq!(
+            report.details.repository.as_deref(),
+            Some(sibling.canonicalize().unwrap().as_path())
+        );
+    }
+
+    /// A run started from history rather than a sibling: no directory next to
+    /// the chosen checkout matches, but a checkout Polycode has previously
+    /// started a run from does. The store, not the filesystem next door, is
+    /// what finds it.
+    #[test]
+    fn a_pull_request_from_elsewhere_switches_to_a_previously_used_checkout() {
+        let fixture = Fixture::new();
+        let elsewhere = fixture.temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let previous = elsewhere.join("jetpack");
+        init_checkout(&previous);
+        git(
+            &previous,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Automattic/jetpack.git",
+            ],
+        );
+        let service = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"));
+        // Records `previous` in `run_workspaces` as a source checkout, with no
+        // pull request involved.
+        service
+            .start_run(
+                WorkflowKind::Fast,
+                "an ordinary task",
+                &previous,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/other/repo.git",
+            ],
+        );
+        let report = service
+            .start_run(
+                WorkflowKind::Fast,
+                JETPACK_PULL_REQUEST,
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+
+        assert_ne!(report.details.status, RunStatus::Failed);
+        assert_eq!(
+            report.details.repository.as_deref(),
+            Some(previous.canonicalize().unwrap().as_path())
+        );
+    }
+
+    /// No checkout anywhere matches the pull request's repository, and the
+    /// workflow edits — it needs to write into that repository's own history,
+    /// which nothing on hand can provide. Refused before anything durable
+    /// exists, naming the repository and where Polycode looked.
+    #[test]
+    fn a_pull_request_from_elsewhere_with_no_local_checkout_refuses_an_editing_workflow() {
+        let fixture = Fixture::new();
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/other/repo.git",
+            ],
+        );
+        let error = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"))
+            .start_run(
+                WorkflowKind::Fast,
+                JETPACK_PULL_REQUEST,
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap_err();
+        let AppError::NoLocalCheckoutForPullRequest {
+            ref url,
+            ref repository,
+            ..
+        } = error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(url, JETPACK_PULL_REQUEST);
+        assert_eq!(repository, "github.com/Automattic/jetpack");
+        let message = error.to_string();
+        assert!(message.contains("clone"), "{message}");
+
+        assert!(
+            !fixture.database.exists(),
+            "a refused start created a database"
+        );
+        assert!(
+            !fixture.worktrees.exists(),
+            "a refused start created workspace resources"
+        );
+    }
+
+    /// No checkout anywhere matches, but the workflow is read-only: reviewing
+    /// a remote pull request over the network is legitimate, so the run keeps
+    /// today's behaviour and starts in the checkout the operator chose.
+    #[test]
+    fn a_pull_request_from_elsewhere_with_no_local_checkout_still_starts_a_review() {
+        let fixture = Fixture::new();
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/other/repo.git",
+            ],
+        );
+        let report = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"))
+            .start_run(
+                WorkflowKind::Review,
+                JETPACK_PULL_REQUEST,
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+        assert_ne!(report.details.status, RunStatus::Failed);
+        assert_eq!(
+            report.details.repository.as_deref(),
+            Some(fixture.repo.canonicalize().unwrap().as_path())
+        );
+    }
+
+    /// The one local checkout that matches is dirty: not a usable answer, for
+    /// the same reason a dirty chosen checkout is refused. Named, not
+    /// silently skipped.
+    #[test]
+    fn a_pull_request_matching_only_a_dirty_checkout_is_refused_by_name() {
+        let fixture = Fixture::new();
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/other/repo.git",
+            ],
+        );
+        let sibling = fixture.temp.path().join("jetpack");
+        init_checkout(&sibling);
+        git(
+            &sibling,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Automattic/jetpack.git",
+            ],
+        );
+        fs::write(sibling.join("README.md"), "uncommitted\n").unwrap();
+
+        let error = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"))
+            .start_run(
+                WorkflowKind::Fast,
+                JETPACK_PULL_REQUEST,
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap_err();
+        let AppError::PullRequestCheckoutsDirty {
+            ref url,
+            ref checkouts,
+        } = error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(url, JETPACK_PULL_REQUEST);
+        assert_eq!(*checkouts, vec![sibling.canonicalize().unwrap()]);
+
+        assert!(
+            !fixture.database.exists(),
+            "a refused start created a database"
+        );
+    }
+
+    /// The chosen checkout's own `origin` already names the pull request's
+    /// repository: no search is needed or performed, and the run starts
+    /// exactly where the operator pointed it, unchanged.
+    #[test]
+    fn a_pull_request_matching_the_chosen_repository_needs_no_search() {
+        let fixture = Fixture::new();
+        git(
+            &fixture.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Automattic/jetpack.git",
+            ],
+        );
+        let report = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(fixture.temp.path(), "echo 164318"))
+            .start_run(
+                WorkflowKind::Fast,
+                JETPACK_PULL_REQUEST,
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+            )
+            .unwrap();
+        assert_ne!(report.details.status, RunStatus::Failed);
+        assert_eq!(
+            report.details.repository.as_deref(),
+            Some(fixture.repo.canonicalize().unwrap().as_path())
+        );
     }
 
     /// Review workflows read the source too, so they take the same preflight.
