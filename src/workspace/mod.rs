@@ -9,6 +9,7 @@ mod pull_request;
 mod setup;
 
 pub use error::WorkspaceError;
+pub(crate) use github::RemoteRepository;
 pub use github::{GhClient, PullRequestReach, PullRequestRef};
 pub use manager::{
     BranchDisposition, PublishReceipt, PullRequestStatus, RebaseReceipt, ReconciliationOutcome,

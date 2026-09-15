@@ -113,6 +113,28 @@ evidence a signal needs within {waited_ms}ms. The process may still be running; 
         process_id: crate::process::ManagedProcessId,
         waited_ms: u128,
     },
+    #[error(
+        "Pull request {url} belongs to {repository}, and no local checkout of it was found.\n  \
+Looked at every checkout Polycode has run from before, and at the folders next to {searched_parent}.\n  \
+Fix: clone {repository} locally and start the run from that folder."
+    )]
+    NoLocalCheckoutForPullRequest {
+        url: String,
+        /// `host/owner/repo`, folded into one string at the point this is
+        /// built rather than carried as three fields just to be joined again
+        /// for the message.
+        repository: String,
+        searched_parent: std::path::PathBuf,
+    },
+    #[error(
+        "Pull request {url} belongs to a repository this checkout's origin does not match, and \
+every local checkout of it that was found has uncommitted changes: {checkouts:?}\n  \
+Commit or stash the changes there before starting a Polycode run from it."
+    )]
+    PullRequestCheckoutsDirty {
+        url: String,
+        checkouts: Vec<std::path::PathBuf>,
+    },
 }
 
 impl AppError {
