@@ -11,7 +11,7 @@ use crate::domain::{AttentionKind, DependencyOutcome, RunStatus, StageKind, Stag
 
 use super::state::{Overlay, PublishOutcome, RetryRouteChoice, Screen, TuiState, UiMessageKind};
 use super::{format, markdown, mascot, theme};
-use crate::workspace::PullRequestStatus;
+use crate::workspace::{PullRequestRef, PullRequestStatus};
 
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 10;
@@ -2493,6 +2493,26 @@ enum Confirmation {
     Discard,
 }
 
+/// What a publish is about to do, in the terms of this run's own task.
+///
+/// A run asked about a pull request pushes onto that pull request when it
+/// can, so promising "opens a pull request" read as a threat to open a second
+/// one for work that already has one. Where the task names no pull request,
+/// the run's own branch and a new pull request remain the whole story.
+fn publish_confirmation_line(task: Option<&str>) -> String {
+    match task.and_then(PullRequestRef::parse) {
+        Some(reference) => format!(
+            "Commits on the run's branch and pushes onto {}, unless that branch moved ahead of \
+             this run — then it opens a pull request of its own and says so. Your checkout is \
+             untouched. Enter confirms.",
+            reference.url()
+        ),
+        None => "Commits on the run's branch, pushes to origin, opens a pull request. Your \
+                 checkout is untouched. Enter confirms."
+            .to_owned(),
+    }
+}
+
 fn render_confirmation(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2570,16 +2590,16 @@ fn render_confirmation(
             }
         }
         lines.push(Line::from(match confirmation {
-            Confirmation::Apply => "Review [d] diff first when needed. Enter confirms apply.",
+            Confirmation::Apply => {
+                "Review [d] diff first when needed. Enter confirms apply.".to_owned()
+            }
             Confirmation::Rebase => {
                 "Replays this run's change on your checkout's current HEAD, on the run's own \
                  branch. A conflict stops and changes nothing. Verification has to run again \
                  afterwards before apply. Enter confirms."
+                    .to_owned()
             }
-            _ => {
-                "Commits on the run's branch, pushes to origin, opens a pull request. \
-                 Your checkout is untouched. Enter confirms."
-            }
+            _ => publish_confirmation_line(details.task.as_deref()),
         }));
     }
     lines.push(Line::from(Span::styled("Esc cancels", theme::muted())));
@@ -2809,6 +2829,26 @@ mod tests {
     /// anyone without colour. So the two ways of reaching past it are closed
     /// here — `StatusVisual` may only produce spans, and production code may
     /// not read its colour field directly.
+    /// The publish confirmation has to describe the publish this run will
+    /// actually do: a run asked about a pull request pushes onto that pull
+    /// request, and saying "opens a pull request" read as a promise to open a
+    /// second one for work that already has one.
+    #[test]
+    fn the_publish_confirmation_names_the_pull_request_the_task_carries() {
+        let named =
+            publish_confirmation_line(Some("Review https://github.com/owner/repo/pull/7 please"));
+        assert!(
+            named.contains("https://github.com/owner/repo/pull/7"),
+            "{named}"
+        );
+        assert!(named.contains("pushes onto"), "{named}");
+
+        let plain = publish_confirmation_line(Some("Tidy the parser"));
+        assert!(plain.contains("opens a pull request"), "{plain}");
+        assert!(!plain.contains("pushes onto"), "{plain}");
+        assert_eq!(plain, publish_confirmation_line(None));
+    }
+
     #[test]
     fn a_status_visual_never_hands_out_a_bare_colour() {
         let source = include_str!("render.rs");
