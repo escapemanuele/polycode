@@ -2540,7 +2540,7 @@ mod tests {
         assert!(detail.contains("i/o timeout"), "{detail}");
         let message = error.to_string();
         assert!(message.contains("not started"), "{message}");
-        assert!(message.contains("gh auth login"), "{message}");
+        assert!(message.contains("gh auth status"), "{message}");
 
         assert!(
             !fixture.database.exists(),
