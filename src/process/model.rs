@@ -1199,10 +1199,12 @@ fn decode_unix_hex(value: &str) -> Result<OsString, ProcessError> {
     }
     let bytes = value
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_digit(pair[0])?;
-            let low = hex_digit(pair[1])?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            let high = hex_digit(high)?;
+            let low = hex_digit(low)?;
             Ok((high << 4) | low)
         })
         .collect::<Result<Vec<_>, ProcessError>>()?;
