@@ -69,6 +69,24 @@ pub struct PurgeReceipt {
     pub files_removed: bool,
 }
 
+/// What a run's start is doing, in the order it does it.
+///
+/// Everything before [`StartProgress::PreparingWorkspace`] happens before the
+/// run exists anywhere, so a start refused there leaves nothing behind for a
+/// list or a detail screen to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartProgress {
+    /// The chosen checkout is not the pull request's repository; looking for
+    /// a local one that is.
+    FindingCheckout { repository: String },
+    /// Asking `gh` whether the pull request can be read at all.
+    CheckingPullRequest { url: String, host: String },
+    /// The run is persisted; its worktree is being created.
+    PreparingWorkspace(RunId),
+    /// The workspace is ready and the first stage is on its way.
+    Running(RunId),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionReport {
     pub details: RunDetails,
@@ -174,6 +192,40 @@ where
     where
         F: ProviderFactory,
     {
+        self.start_run_observed(
+            workflow_kind,
+            task,
+            repository_path,
+            selection,
+            effort,
+            image,
+            &|_| {},
+        )
+    }
+
+    /// [`Self::start_run`], telling `observe` what the start is doing while
+    /// it does it.
+    ///
+    /// The checks before a run exists can take as long as a network timeout,
+    /// and until the run is persisted nothing else can show that anything is
+    /// happening at all.
+    ///
+    /// # Errors
+    /// Returns validation, repository, persistence, workspace, or engine errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_run_observed(
+        &self,
+        workflow_kind: WorkflowKind,
+        task: impl Into<String>,
+        repository_path: impl AsRef<Path>,
+        selection: Option<ExecutionSelection>,
+        effort: impl Into<EffortRequest>,
+        image: &ImageGenerationPlan,
+        observe: &dyn Fn(StartProgress),
+    ) -> Result<ExecutionReport, AppError>
+    where
+        F: ProviderFactory,
+    {
         let created_at = now();
         let workflow = WorkflowDefinition::built_in(workflow_kind);
         let run_id = RunId::new();
@@ -194,6 +246,7 @@ where
             &config,
             run_id,
             created_at,
+            observe,
         )
     }
 
@@ -211,6 +264,7 @@ where
             config,
             RunId::new(),
             now(),
+            &|_| {},
         )
     }
 
@@ -227,6 +281,7 @@ where
         Ok(SqliteStore::open(&self.database)?.distinct_source_repository_paths()?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_run_with_config_at(
         &self,
         workflow: WorkflowDefinition,
@@ -235,6 +290,7 @@ where
         config: &ResolvedConfigSnapshot,
         run_id: RunId,
         created_at: DateTime<Utc>,
+        observe: &dyn Fn(StartProgress),
     ) -> Result<ExecutionReport, AppError> {
         let git = crate::git::Git::default();
         let mut repository = GitRepository::discover(repository_path)?;
@@ -252,6 +308,9 @@ where
         let pull_request = PullRequestRef::parse(&task);
         if let Some(pull_request) = pull_request.as_ref() {
             if !remote_names_pull_request(&git, &repository, pull_request)? {
+                observe(StartProgress::FindingCheckout {
+                    repository: format!("{}/{}", pull_request.owner, pull_request.repository),
+                });
                 let previously_used = self.previously_used_source_repositories()?;
                 repository = resolve_pull_request_checkout(
                     previously_used,
@@ -280,6 +339,10 @@ where
         // run reaches its end looking successful. Refuse here, in the same
         // window as the dirty-source check, so nothing is persisted.
         if let Some(pull_request) = pull_request {
+            observe(StartProgress::CheckingPullRequest {
+                url: pull_request.url(),
+                host: pull_request.host.clone(),
+            });
             if let PullRequestReach::Unreachable(detail) = self.gh.pull_request_reach(&pull_request)
             {
                 return Err(AppError::PullRequestUnreachable {
@@ -295,6 +358,7 @@ where
         let created = run.created_event(EventMetadata::new(EventId::new(), created_at));
         let mut store = SqliteStore::open(&self.database)?;
         store.create_run_with_input(&run, &input, config, &[created])?;
+        observe(StartProgress::PreparingWorkspace(run_id));
 
         let manager = WorkspaceManager::new(&self.worktrees);
         manager.prepare_run_workspace_with(
@@ -303,6 +367,7 @@ where
             repository.source_path(),
             Some(&self.gh),
         )?;
+        observe(StartProgress::Running(run_id));
         let status = self.drive(&mut store, run_id, ResumeAction::Continue)?;
         self.settle(&mut store, run_id, 0, status.as_ref())
     }
@@ -2484,6 +2549,72 @@ mod tests {
         assert!(
             !fixture.worktrees.exists(),
             "a refused start created workspace resources"
+        );
+    }
+
+    /// The pull request check is what a start waits on while its host is
+    /// silent, so it is reported before it runs — and a refusal reports
+    /// nothing after it, since no run ever came to exist.
+    #[test]
+    fn a_start_reports_its_pull_request_check_and_stops_reporting_when_refused() {
+        let fixture = Fixture::new();
+        let service = fixture
+            .default_service()
+            .probing_pull_requests_with(stub_gh(
+                fixture.temp.path(),
+                "echo 'dial tcp 192.0.80.209:443: i/o timeout' >&2\nexit 1",
+            ));
+        let seen = std::cell::RefCell::new(Vec::new());
+        service
+            .start_run_observed(
+                WorkflowKind::Review,
+                "https://github.a8c.com/Automattic/wpcom/pull/241491",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+                &|progress| seen.borrow_mut().push(progress),
+            )
+            .unwrap_err();
+        assert_eq!(
+            seen.into_inner(),
+            vec![
+                StartProgress::FindingCheckout {
+                    repository: "Automattic/wpcom".to_owned(),
+                },
+                StartProgress::CheckingPullRequest {
+                    url: "https://github.a8c.com/Automattic/wpcom/pull/241491".to_owned(),
+                    host: "github.a8c.com".to_owned(),
+                },
+            ]
+        );
+    }
+
+    /// A start that gets through its checks names its run as soon as the run
+    /// exists, and again once the run is actually running.
+    #[test]
+    fn a_start_names_its_run_once_it_exists_and_once_it_runs() {
+        let fixture = Fixture::new();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let report = fixture
+            .default_service()
+            .start_run_observed(
+                WorkflowKind::Standard,
+                "no pull request here",
+                &fixture.repo,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortSetting::NativeDefault,
+                &ImageGenerationPlan::disabled(),
+                &|progress| seen.borrow_mut().push(progress),
+            )
+            .unwrap();
+        let run_id = report.details.id;
+        assert_eq!(
+            seen.into_inner(),
+            vec![
+                StartProgress::PreparingWorkspace(run_id),
+                StartProgress::Running(run_id),
+            ]
         );
     }
 

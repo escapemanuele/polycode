@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::{
     ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, ProviderFactory,
-    PurgeReceipt, RetryRoute, RunService,
+    PurgeReceipt, RetryRoute, RunService, StartProgress,
 };
 use crate::domain::{AttentionRequestId, RunId, StageId, WorkflowKind};
 use crate::workspace::{PublishReceipt, RebaseReceipt};
@@ -182,13 +182,25 @@ impl WorkerSuccess {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkerResult {
+    /// The ticket [`Worker::send`] handed out for the command this answers.
+    pub ticket: u64,
     pub action: ActionKind,
     pub run_id: Option<RunId>,
     pub result: Result<WorkerSuccess, String>,
 }
 
-/// Starts one command, given somewhere to report its outcome.
-type Start = Box<dyn Fn(WorkerCommand, Sender<WorkerResult>)>;
+/// Where one start has got to, tagged with the ticket of the command it
+/// belongs to. A start has no run id until its run exists, so the ticket is
+/// the only name the interface has for it until then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartUpdate {
+    pub ticket: u64,
+    pub progress: StartProgress,
+}
+
+/// Starts one command, given its ticket and somewhere to report its progress
+/// and outcome.
+type Start = Box<dyn Fn(u64, WorkerCommand, Sender<WorkerResult>, Sender<StartUpdate>)>;
 
 pub(crate) struct Worker {
     /// Starts one command on a thread of its own. Boxed so `Worker` carries
@@ -198,6 +210,10 @@ pub(crate) struct Worker {
     /// disconnect: every action reports into a receiver that still exists.
     results: Sender<WorkerResult>,
     receiver: Receiver<WorkerResult>,
+    /// Same lifetime argument as `results`.
+    progress: Sender<StartUpdate>,
+    progress_receiver: Receiver<StartUpdate>,
+    next_ticket: std::cell::Cell<u64>,
 }
 
 /// Guarantees the interface hears back about every command it started.
@@ -208,6 +224,7 @@ pub(crate) struct Worker {
 /// doing. Reporting from `Drop` closes that gap: the outcome is sent exactly
 /// once, whether the action returned or unwound.
 struct Report {
+    ticket: u64,
     action: ActionKind,
     run_id: Option<RunId>,
     results: Sender<WorkerResult>,
@@ -215,8 +232,14 @@ struct Report {
 }
 
 impl Report {
-    const fn new(action: ActionKind, run_id: Option<RunId>, results: Sender<WorkerResult>) -> Self {
+    const fn new(
+        ticket: u64,
+        action: ActionKind,
+        run_id: Option<RunId>,
+        results: Sender<WorkerResult>,
+    ) -> Self {
         Self {
+            ticket,
             action,
             run_id,
             results,
@@ -233,6 +256,7 @@ impl Report {
         // A closed receiver means the interface is already gone, and there is
         // nobody left to tell.
         let _ = self.results.send(WorkerResult {
+            ticket: self.ticket,
             action: self.action,
             run_id: self.run_id,
             result,
@@ -258,11 +282,20 @@ impl Worker {
         // service, and they no longer take turns holding it.
         let service = Arc::new(service);
         let (results, receiver) = mpsc::channel::<WorkerResult>();
-        let start: Start = Box::new(move |command, results| {
+        let (progress, progress_receiver) = mpsc::channel::<StartUpdate>();
+        let start: Start = Box::new(move |ticket, command, results, progress| {
             let service = Arc::clone(&service);
             std::thread::spawn(move || {
-                let mut report = Report::new(command.kind(), command.run_id(), results);
-                let outcome = execute(&service, command).map_err(|error| error.to_string());
+                let mut report = Report::new(ticket, command.kind(), command.run_id(), results);
+                let observe = |update| {
+                    // A closed receiver means nobody is left to show it to.
+                    let _ = progress.send(StartUpdate {
+                        ticket,
+                        progress: update,
+                    });
+                };
+                let outcome =
+                    execute(&service, command, &observe).map_err(|error| error.to_string());
                 report.settle(outcome);
             });
         });
@@ -270,6 +303,9 @@ impl Worker {
             start,
             results,
             receiver,
+            progress,
+            progress_receiver,
+            next_ticket: std::cell::Cell::new(0),
         }
     }
 
@@ -278,8 +314,13 @@ impl Worker {
     /// Actions run concurrently by construction. Which of them may overlap is
     /// the caller's judgement, not this one's: the worker starts what it is
     /// handed and nothing here queues behind anything else.
-    pub(crate) fn send(&self, command: WorkerCommand) {
-        (self.start)(command, self.results.clone());
+    ///
+    /// Returns the ticket its progress and outcome will carry.
+    pub(crate) fn send(&self, command: WorkerCommand) -> u64 {
+        let ticket = self.next_ticket.get();
+        self.next_ticket.set(ticket + 1);
+        (self.start)(ticket, command, self.results.clone(), self.progress.clone());
+        ticket
     }
 
     /// Takes the next action that has finished, if one has reported back.
@@ -290,11 +331,17 @@ impl Worker {
     pub(crate) fn try_recv(&self) -> Option<WorkerResult> {
         self.receiver.try_recv().ok()
     }
+
+    /// Takes the next progress report from a start, if one has arrived.
+    pub(crate) fn try_recv_progress(&self) -> Option<StartUpdate> {
+        self.progress_receiver.try_recv().ok()
+    }
 }
 
 fn execute<F>(
     service: &RunService<F>,
     command: WorkerCommand,
+    observe: &dyn Fn(StartProgress),
 ) -> Result<WorkerSuccess, crate::app::AppError>
 where
     F: ProviderFactory,
@@ -307,13 +354,14 @@ where
             selection,
             effort,
         } => service
-            .start_run(
+            .start_run_observed(
                 workflow,
                 task,
                 repository,
                 Some(selection),
                 effort,
                 &crate::app::ImageGenerationPlan::disabled(),
+                observe,
             )
             .map(WorkerSuccess::Execution),
         WorkerCommand::ResumeRun { run_id } => {
@@ -449,7 +497,7 @@ mod tests {
     fn an_action_that_never_reports_still_settles() {
         let (results, receiver) = mpsc::channel();
         let run_id = Some(RunId::from_u128(3));
-        drop(Report::new(ActionKind::Apply, run_id, results));
+        drop(Report::new(0, ActionKind::Apply, run_id, results));
 
         let result = receiver.try_recv().expect("the guard reported for it");
         assert_eq!(result.action, ActionKind::Apply);

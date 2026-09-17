@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 
-use crate::app::{AppError, ArtifactSummary, RunListItem, RunService, RuntimeProviderFactory};
+use crate::app::{
+    AppError, ArtifactSummary, RunListItem, RunService, RuntimeProviderFactory, StartProgress,
+};
 use crate::domain::{RunId, RunStatus, StageId, StageStatus};
 use crate::update::{InstallSource, UpdateInfo};
 
@@ -15,12 +17,12 @@ use super::input::{Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
 use super::state::{
-    Overlay, PublishInFlight, PublishOutcome, RetryRouteChoice, Screen, StageHeadline, TuiState,
-    UiMessageKind,
+    Overlay, PublishInFlight, PublishOutcome, RetryRouteChoice, Screen, StageHeadline,
+    StartFailure, StartInFlight, TuiState, UiMessageKind,
 };
 use super::terminal::TerminalSession;
 use super::worker::ActionKind;
-use super::worker::{Worker, WorkerCommand, WorkerResult, WorkerSuccess};
+use super::worker::{StartUpdate, Worker, WorkerCommand, WorkerResult, WorkerSuccess};
 
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -74,6 +76,9 @@ impl TuiApp {
         spawn_workspace_reclaim();
         self.refresh();
         while !self.state.quit {
+            // Progress first: a start's last step must land before the
+            // outcome that ends it, or a refusal would be followed by a step.
+            self.receive_start_progress();
             self.receive_worker_results();
             self.receive_update();
             self.receive_install();
@@ -293,6 +298,12 @@ impl TuiApp {
             self.handle_update_intent(intent);
             return;
         }
+        if overlay == Overlay::StartFailed {
+            if matches!(intent, Intent::Enter | Intent::Escape) {
+                self.close_start_failure();
+            }
+            return;
+        }
         if overlay == Overlay::Published && intent == Intent::Escape {
             // Esc closes the card the way Enter does: the summary still
             // lands in the footer, so leaving is never losing the URL.
@@ -353,6 +364,8 @@ impl TuiApp {
             | Overlay::DiscardConfirm
             | Overlay::DeleteConfirm
             | Overlay::Publishing
+            | Overlay::Starting
+            | Overlay::StartFailed
             | Overlay::Update => {}
         }
     }
@@ -596,13 +609,21 @@ impl TuiApp {
             self.state.set_error("Repository cannot be empty");
             return;
         }
-        if self.dispatch(WorkerCommand::StartRun {
+        if let Some(ticket) = self.dispatch_ticketed(WorkerCommand::StartRun {
             workflow: self.state.new_run.workflow,
-            task,
+            task: task.clone(),
             repository: PathBuf::from(repository),
             selection: self.state.new_run.execution.selection(),
             effort: self.state.new_run.effort.into(),
         }) {
+            self.state.starting = Some(StartInFlight {
+                ticket,
+                task,
+                started: Instant::now(),
+                progress: None,
+            });
+            self.state.start_failure = None;
+            self.state.overlay = Some(Overlay::Starting);
             // The task belongs to the run that was just dispatched; leaving it
             // in the composer makes the next run open on another run's words.
             // Repository, workflow, execution and effort stay: those are the
@@ -1118,14 +1139,87 @@ impl TuiApp {
     /// Returns whether the command was dispatched, so a caller that navigates
     /// on success can tell a started action from a refused one.
     fn dispatch(&mut self, command: WorkerCommand) -> bool {
+        self.dispatch_ticketed(command).is_some()
+    }
+
+    /// [`Self::dispatch`], returning the ticket the command's progress and
+    /// outcome will carry.
+    fn dispatch_ticketed(&mut self, command: WorkerCommand) -> Option<u64> {
         if let Some(refusal) = self.state.action_refusal(&command) {
             self.state.set_error(refusal.reason());
-            return false;
+            return None;
         }
         self.state.begin_action(command.kind(), command.run_id());
-        self.worker.send(command);
+        let ticket = self.worker.send(command);
         self.state.message = None;
-        true
+        Some(ticket)
+    }
+
+    fn receive_start_progress(&mut self) {
+        while let Some(update) = self.worker.try_recv_progress() {
+            self.handle_start_progress(update);
+        }
+    }
+
+    /// Moves the starting card on by one step.
+    ///
+    /// Once the run is running the wait the card was showing is over: a card
+    /// still on screen hands over to the new run's detail, which is what the
+    /// operator was waiting to see; a hidden one only says so in the footer,
+    /// leaving the screen where the operator put it.
+    fn handle_start_progress(&mut self, update: StartUpdate) {
+        let Some(starting) = self
+            .state
+            .starting
+            .as_mut()
+            .filter(|starting| starting.ticket == update.ticket)
+        else {
+            return;
+        };
+        match update.progress {
+            StartProgress::Running(run_id) => {
+                self.state.starting = None;
+                if self.state.overlay == Some(Overlay::Starting) {
+                    self.state.overlay = None;
+                    self.state.selected_run = Some(run_id);
+                    self.state.screen = Screen::RunDetail;
+                } else {
+                    self.state.set_message(format!("Run {run_id} started."));
+                }
+                self.refresh();
+            }
+            StartProgress::PreparingWorkspace(_) => {
+                starting.progress = Some(update.progress);
+                // The run exists now; let the list show it.
+                self.refresh();
+            }
+            progress => starting.progress = Some(progress),
+        }
+    }
+
+    /// Hands a refused start to the card when the operator is free to read
+    /// it, or to the footer when something else has the screen — the same
+    /// rule [`Self::present_publish`] follows, for the same reasons.
+    fn present_start_failure(&mut self, task: String, error: String) {
+        let free = matches!(self.state.overlay, None | Some(Overlay::Starting))
+            && self.state.screen != Screen::NewRun;
+        if free {
+            self.state.start_failure = Some(StartFailure { task, error });
+            self.state.overlay = Some(Overlay::StartFailed);
+            self.state.message = None;
+        } else {
+            self.state.set_error(format!("Run not started: {error}"));
+        }
+    }
+
+    /// Closing the refusal leaves its first line in the footer, so the reason
+    /// is still on screen for a moment after the card is gone.
+    fn close_start_failure(&mut self) {
+        self.state.overlay = None;
+        if let Some(failure) = self.state.start_failure.take() {
+            let headline = failure.error.lines().next().unwrap_or_default().to_owned();
+            self.state.set_error(format!("Run not started: {headline}"));
+        }
     }
 
     fn receive_worker_results(&mut self) {
@@ -1136,6 +1230,15 @@ impl TuiApp {
 
     fn handle_worker_result(&mut self, result: WorkerResult) {
         self.state.settle_action(result.action, result.run_id);
+        let start = self
+            .state
+            .starting
+            .take_if(|starting| starting.ticket == result.ticket);
+        if let (Some(start), Err(error)) = (start, &result.result) {
+            self.present_start_failure(start.task, error.clone());
+            self.refresh();
+            return;
+        }
         match result.result {
             Ok(success) => {
                 if let WorkerSuccess::Purged(receipt) = success {
@@ -2676,6 +2779,7 @@ mod tests {
         );
 
         app.handle_worker_result(WorkerResult {
+            ticket: u64::MAX,
             action: ActionKind::Start,
             run_id: None,
             result: Ok(WorkerSuccess::Execution(crate::app::ExecutionReport {
@@ -2754,6 +2858,7 @@ mod tests {
         app.state.screen = Screen::Runs;
 
         app.handle_worker_result(WorkerResult {
+            ticket: u64::MAX,
             action: ActionKind::Resume,
             run_id: Some(RunId::from_u128(7)),
             result: Ok(WorkerSuccess::Execution(crate::app::ExecutionReport {
@@ -2776,6 +2881,7 @@ mod tests {
 
     fn published(pull_request: crate::workspace::PullRequestStatus) -> WorkerResult {
         WorkerResult {
+            ticket: u64::MAX,
             action: ActionKind::Publish,
             run_id: Some(RunId::from_u128(7)),
             result: Ok(WorkerSuccess::Published(
@@ -2792,6 +2898,175 @@ mod tests {
                 },
             )),
         }
+    }
+
+    /// A start used to show nothing at all until it either ran or failed, and
+    /// its pull request check can wait out a thirty-second network timeout.
+    /// The card opens the moment the start is dispatched and follows the
+    /// start's own steps.
+    #[test]
+    fn submitting_a_run_opens_the_starting_card_and_follows_its_steps() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+        app.state.new_run.task = super::super::state::TextField::new(
+            "Review https://github.a8c.com/Automattic/wpcom/pull/241491",
+        );
+        app.state.new_run.repository =
+            super::super::state::TextField::new("/nonexistent/polycode-test-repo");
+        app.submit_new_run();
+
+        assert_eq!(app.state.overlay, Some(Overlay::Starting));
+        let ticket = app
+            .state
+            .starting
+            .as_ref()
+            .expect("a start to follow")
+            .ticket;
+        assert_eq!(app.state.busy_label().as_deref(), Some("starting run"));
+
+        let checking = StartProgress::CheckingPullRequest {
+            url: "https://github.a8c.com/Automattic/wpcom/pull/241491".to_owned(),
+            host: "github.a8c.com".to_owned(),
+        };
+        app.handle_start_progress(StartUpdate {
+            ticket: ticket + 1,
+            progress: StartProgress::FindingCheckout {
+                repository: "someone/else".to_owned(),
+            },
+        });
+        assert_eq!(
+            app.state.starting.as_ref().unwrap().progress,
+            None,
+            "another start's step is not this card's"
+        );
+        app.handle_start_progress(StartUpdate {
+            ticket,
+            progress: checking.clone(),
+        });
+        assert_eq!(
+            app.state.starting.as_ref().unwrap().progress,
+            Some(checking)
+        );
+
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        assert!(
+            app.state.starting.is_some(),
+            "hiding the card is not cancelling"
+        );
+    }
+
+    /// Once the run is running the wait is over, and what the operator was
+    /// waiting for is the run itself.
+    #[test]
+    fn a_running_start_closes_its_card_onto_the_new_run() {
+        let (fixture, database, worktrees, _repo, started) = real_completed_standard_run();
+        let mut app = tui_app_over(fixture.path(), database, worktrees, started.clone());
+        app.state.screen = Screen::Runs;
+        app.state.selected_run = None;
+        app.state.details = None;
+        app.state.overlay = Some(Overlay::Starting);
+        app.state.starting = Some(StartInFlight {
+            ticket: 4,
+            task: "Review it".to_owned(),
+            started: Instant::now(),
+            progress: None,
+        });
+        let run_id = started.id;
+        app.handle_start_progress(StartUpdate {
+            ticket: 4,
+            progress: StartProgress::Running(run_id),
+        });
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.starting, None);
+        assert_eq!(app.state.selected_run, Some(run_id));
+        assert_eq!(app.state.screen, Screen::RunDetail);
+        assert_eq!(
+            app.state.details.as_ref().map(|details| details.id),
+            Some(run_id)
+        );
+    }
+
+    /// A refused start is the other way the wait ends, and its reason — with
+    /// the fix on the lines after the first — lands on a card that stays put.
+    #[test]
+    fn a_refused_start_replaces_its_card_with_the_reason() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::Runs;
+        app.state.overlay = Some(Overlay::Starting);
+        app.state.starting = Some(StartInFlight {
+            ticket: 4,
+            task: "Review it".to_owned(),
+            started: Instant::now(),
+            progress: None,
+        });
+        app.state.begin_action(ActionKind::Start, None);
+        let error = "Pull request https://github.a8c.com/Automattic/wpcom/pull/241491 cannot be read.\n  dial tcp: i/o timeout\n  Fix: restore access".to_owned();
+        app.handle_worker_result(WorkerResult {
+            ticket: 4,
+            action: ActionKind::Start,
+            run_id: None,
+            result: Err(error.clone()),
+        });
+
+        assert_eq!(app.state.overlay, Some(Overlay::StartFailed));
+        assert_eq!(app.state.starting, None, "the wait is over");
+        assert!(app.state.in_flight.is_empty());
+        assert_eq!(
+            app.state
+                .start_failure
+                .as_ref()
+                .map(|failure| failure.error.as_str()),
+            Some(error.as_str())
+        );
+        assert!(
+            app.state.message.is_none(),
+            "the card speaks, not the footer"
+        );
+
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.start_failure, None);
+        let footer = app
+            .state
+            .message
+            .as_ref()
+            .expect("the reason stays a moment")
+            .text
+            .clone();
+        assert!(footer.contains("cannot be read"), "{footer}");
+    }
+
+    /// A refusal never covers a task the operator is already writing: with
+    /// the new-run form open, it goes to the footer instead.
+    #[test]
+    fn a_refused_start_behind_the_new_run_form_goes_to_the_footer() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+        app.state.overlay = None;
+        app.state.starting = Some(StartInFlight {
+            ticket: 4,
+            task: "Review it".to_owned(),
+            started: Instant::now(),
+            progress: None,
+        });
+        app.state.begin_action(ActionKind::Start, None);
+        app.handle_worker_result(WorkerResult {
+            ticket: 4,
+            action: ActionKind::Start,
+            run_id: None,
+            result: Err("Repository has uncommitted changes.".to_owned()),
+        });
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.screen, Screen::NewRun);
+        let footer = app
+            .state
+            .message
+            .as_ref()
+            .expect("a footer error")
+            .text
+            .clone();
+        assert!(footer.contains("uncommitted changes"), "{footer}");
     }
 
     /// Confirming a publish is the start of a wait, and the wait is shown:
@@ -2900,6 +3175,7 @@ mod tests {
         app.state
             .begin_action(ActionKind::Publish, Some(RunId::from_u128(7)));
         app.handle_worker_result(WorkerResult {
+            ticket: u64::MAX,
             action: ActionKind::Publish,
             run_id: Some(RunId::from_u128(7)),
             result: Err("remote rejected the push".to_owned()),

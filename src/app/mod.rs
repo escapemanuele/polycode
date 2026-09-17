@@ -30,5 +30,5 @@ pub use routing::{
 };
 pub use run_service::{
     ApplyOutcome, ExecutionReport, PurgeReceipt, QuiescentState, RunService,
-    SKIP_ATTENTION_RESPONSE,
+    SKIP_ATTENTION_RESPONSE, StartProgress,
 };
