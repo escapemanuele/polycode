@@ -2,7 +2,7 @@
 name = "polycode"
 version = "0.1.45"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.85"
 default-run = "polycode"
 description = "Local-first orchestrator for native coding-agent CLIs"
 license = "MIT OR Apache-2.0"
