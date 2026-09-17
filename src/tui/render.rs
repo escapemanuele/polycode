@@ -787,7 +787,8 @@ fn seat_mascot(
     details: &RunDetails,
     selected: &StageSummary,
 ) {
-    let seat = mascot::MASCOT_HEIGHT as usize + 3;
+    let caption = pull_request_caption(state, details, width);
+    let seat = mascot::MASCOT_HEIGHT as usize + 3 + usize::from(caption.is_some());
     let wrapped_rows: usize = lines
         .iter()
         .map(|line| {
@@ -806,7 +807,40 @@ fn seat_mascot(
             Some(mascot::mascot_activity(selected.kind)),
             state.motion_frame(),
         ));
+        if let Some(caption) = caption {
+            lines.push(caption);
+        }
     }
+}
+
+/// The pull request POD is working on, under POD's label: its title once
+/// `gh` has answered, and the repository and number until then — or for
+/// good, when it cannot answer. One row, cut to the panel's width.
+fn pull_request_caption(
+    state: &TuiState,
+    details: &RunDetails,
+    width: u16,
+) -> Option<Line<'static>> {
+    let pull_request = details
+        .task
+        .as_deref()
+        .and_then(crate::workspace::PullRequestRef::parse)?;
+    let number = format!("#{}", pull_request.number);
+    let text = match state
+        .pull_request_titles
+        .get(&pull_request.url())
+        .and_then(Option::as_deref)
+    {
+        Some(title) => format!("{number} {}", format::viewer_line(title)),
+        None => format!("{} {number}", pull_request.repository),
+    };
+    Some(
+        Line::from(Span::styled(
+            format::truncate_title(&text, (width as usize).saturating_sub(1).max(1)),
+            theme::muted(),
+        ))
+        .alignment(Alignment::Center),
+    )
 }
 
 /// The hero's opening statement: which stage, in what state, for how long.
@@ -4550,6 +4584,31 @@ mod tests {
             "POD's hand is raised beside the builder's laptop"
         );
         assert!(!render_text(&running, 70, 24).contains(POD_SHELL));
+    }
+
+    /// POD's seat has room for what POD is working on: the pull request's
+    /// title once `gh` has answered, its repository and number until then.
+    #[test]
+    fn pod_names_the_pull_request_it_works_on() {
+        let mut state = running_state();
+        let url = "https://github.a8c.com/Automattic/wpcom/pull/241491";
+        state.details.as_mut().unwrap().task = Some(format!("Review {url}"));
+
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains(POD_SHELL), "{text}");
+        assert!(text.contains("wpcom #241491"), "{text}");
+
+        state
+            .pull_request_titles
+            .insert(url.to_owned(), Some("Fix the checkout race".to_owned()));
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("#241491 Fix the checkout race"), "{text}");
+
+        state.details.as_mut().unwrap().task = Some("Add OAuth provider support".to_owned());
+        assert!(
+            !render_text(&state, 160, 40).contains("#241491"),
+            "a task naming no pull request gets no caption"
+        );
     }
 
     /// The palette has to arrive through the accessors, not merely resolve

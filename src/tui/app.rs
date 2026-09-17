@@ -52,6 +52,22 @@ pub(crate) struct TuiApp {
     /// Their drivers died with the instance that started them, so this one
     /// resumes each of them; `None` until that first look is taken.
     orphaned: Option<Vec<RunId>>,
+    /// Pull request title lookups running in the background.
+    titles: TitleLookups,
+}
+
+/// Where background pull request title lookups report back: the URL they
+/// looked up and the title, if one came back.
+struct TitleLookups {
+    sender: mpsc::Sender<(String, Option<String>)>,
+    receiver: Receiver<(String, Option<String>)>,
+}
+
+impl Default for TitleLookups {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self { sender, receiver }
+    }
 }
 
 impl TuiApp {
@@ -69,6 +85,7 @@ impl TuiApp {
                 .unwrap_or_else(Instant::now),
             started: Instant::now(),
             orphaned: None,
+            titles: TitleLookups::default(),
         })
     }
 
@@ -81,6 +98,7 @@ impl TuiApp {
             self.receive_start_progress();
             self.receive_worker_results();
             self.receive_update();
+            self.receive_pull_request_titles();
             self.receive_install();
             self.state.clear_expired_message(Instant::now());
             if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
@@ -1476,12 +1494,40 @@ impl TuiApp {
         self.last_refresh = Instant::now();
     }
 
+    /// Starts looking up the title of the pull request `task` names, once
+    /// per URL per session. `gh` can take as long as a network timeout, so
+    /// the lookup never runs on this thread.
+    fn look_up_pull_request_title(&mut self, task: Option<&str>) {
+        let Some(pull_request) = task.and_then(crate::workspace::PullRequestRef::parse) else {
+            return;
+        };
+        let url = pull_request.url();
+        if self.state.pull_request_titles.contains_key(&url) {
+            return;
+        }
+        self.state.pull_request_titles.insert(url.clone(), None);
+        let sender = self.titles.sender.clone();
+        std::thread::spawn(move || {
+            let title = crate::workspace::GhClient::default().pull_request_title(&pull_request);
+            let _ = sender.send((url, title));
+        });
+    }
+
+    fn receive_pull_request_titles(&mut self) {
+        while let Ok((url, title)) = self.titles.receiver.try_recv() {
+            self.state.pull_request_titles.insert(url, title);
+        }
+    }
+
     fn refresh_selected(&mut self) {
         let Some(run_id) = self.state.selected_run else {
             return;
         };
         match self.reader.inspect_run(run_id) {
-            Ok(details) => self.state.replace_details(details),
+            Ok(details) => {
+                self.look_up_pull_request_title(details.task.as_deref());
+                self.state.replace_details(details);
+            }
             Err(error) => {
                 // The panel must never keep narrating a different run than the
                 // one selected. When the selected run cannot be inspected, its
@@ -1811,6 +1857,7 @@ mod tests {
             last_refresh: Instant::now(),
             started: Instant::now(),
             orphaned: None,
+            titles: TitleLookups::default(),
         };
         (app, fixture)
     }
@@ -2117,6 +2164,7 @@ mod tests {
             last_refresh: Instant::now(),
             started: Instant::now(),
             orphaned: None,
+            titles: TitleLookups::default(),
         };
         assert!(app.state.run_is_applyable());
         app.handle_intent(Intent::Apply);
@@ -2319,6 +2367,7 @@ mod tests {
             last_refresh: Instant::now(),
             started: Instant::now(),
             orphaned: None,
+            titles: TitleLookups::default(),
         }
     }
 
