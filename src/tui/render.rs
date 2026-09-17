@@ -2,7 +2,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -210,7 +212,11 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             now,
         ))
     });
-    frame.render_widget(
+    // Stateful so the list scrolls to keep the cursor in view: a plain list
+    // always draws from the first run, and a cursor past the last visible row
+    // moved onto a run nobody could see.
+    let mut list_state = ListState::default().with_selected(Some(state.selected_run_index));
+    frame.render_stateful_widget(
         List::new(items).block(
             Block::default()
                 .borders(Borders::RIGHT)
@@ -218,6 +224,7 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .padding(Padding::new(1, 1, 1, 0)),
         ),
         columns[0],
+        &mut list_state,
     );
     if let Some(details) = state.details.as_ref() {
         render_run_overview(frame, columns[1], details, now);
@@ -2110,6 +2117,13 @@ fn render_start_failed(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         };
         lines.push(Line::from(Span::styled(line.trim().to_owned(), style)));
     }
+    if failure.draft_restored {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Your task is back in the new run form: press n to edit it and try again.",
+            theme::muted(),
+        )));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(theme::action(
         "Enter",
@@ -3389,6 +3403,34 @@ mod tests {
         assert!(text.contains("▸ "), "the selected run carries a cursor");
         state.overlay = Some(Overlay::Help);
         assert!(render_text(&state, 120, 30).contains("Help · Esc closes"));
+    }
+
+    /// A cursor past the last row that fits must scroll the list, not walk off
+    /// the bottom of it onto a run nobody can see.
+    #[test]
+    fn the_selected_run_stays_on_screen_in_a_list_taller_than_the_terminal() {
+        let mut state = TuiState::new(std::path::Path::new("/repo"));
+        state.replace_runs(
+            (1..=40)
+                .map(|index| RunListItem {
+                    id: RunId::from_u128(index),
+                    workflow: WorkflowKind::Standard,
+                    status: RunStatus::Completed,
+                    task_summary: format!("task number {index:02}"),
+                    repository: Some(std::path::PathBuf::from("/repo")),
+                    updated_at: at(12, 0, 0),
+                    archived: false,
+                })
+                .collect(),
+        );
+        state.selected_run_index = 39;
+        state.selected_run = Some(RunId::from_u128(40));
+        let text = render_text(&state, 120, 24);
+        assert!(text.contains("task number 40"), "{text}");
+        assert!(
+            !text.contains("task number 01"),
+            "scrolled past the top: {text}"
+        );
     }
 
     /// Archiving has four visible surfaces: the footer offers the keys, a run
@@ -5142,6 +5184,7 @@ mod tests {
         state.start_failure = Some(super::super::state::StartFailure {
             task: "Review the wpcom change".to_owned(),
             error: "Pull request cannot be read.\n  i/o timeout\n  Fix: restore access".to_owned(),
+            draft_restored: true,
         });
         let text = render_text(&state, 120, 40);
         assert!(text.contains("RUN NOT STARTED"), "{text}");

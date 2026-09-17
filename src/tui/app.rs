@@ -13,7 +13,7 @@ use crate::update::{InstallSource, UpdateInfo};
 use super::bottom_line;
 use super::desktop;
 use super::format::short_commit;
-use super::input::{Intent, map_key, map_text_key};
+use super::input::{self, Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
 use super::state::{
@@ -196,6 +196,9 @@ impl TuiApp {
                 } else {
                     map_key(key)
                 };
+                if key.kind == KeyEventKind::Repeat && !input::repeats(intent) {
+                    return;
+                }
                 self.handle_intent(intent);
             }
             Event::Paste(text) => self.handle_paste(&text),
@@ -588,13 +591,17 @@ impl TuiApp {
         }
     }
 
+    /// Pastes into whatever field has the operator's attention. An open
+    /// overlay has it even when it takes no text: the form behind a card is
+    /// not where a paste belongs.
     fn handle_paste(&mut self, text: &str) {
-        if self.state.overlay == Some(Overlay::Attention) {
-            self.state.attention_response.paste(text);
-        } else if self.state.overlay == Some(Overlay::Continue) {
-            self.state.continue_instruction.paste(text);
-        } else if self.state.screen == Screen::NewRun {
-            self.edit_text(|field| field.paste(text));
+        match self.state.overlay {
+            Some(Overlay::Attention) => self.state.attention_response.paste(text),
+            Some(Overlay::Continue) => self.state.continue_instruction.paste(text),
+            None if self.state.screen == Screen::NewRun => {
+                self.edit_text(|field| field.paste(text));
+            }
+            Some(_) | None => {}
         }
     }
 
@@ -616,6 +623,7 @@ impl TuiApp {
             selection: self.state.new_run.execution.selection(),
             effort: self.state.new_run.effort.into(),
         }) {
+            let draft = task.clone();
             self.state.starting = Some(StartInFlight {
                 ticket,
                 task,
@@ -624,6 +632,9 @@ impl TuiApp {
             });
             self.state.start_failure = None;
             self.state.overlay = Some(Overlay::Starting);
+            // Held until the run exists, so a start refused before then can
+            // give the words back.
+            self.state.start_drafts.push((ticket, draft));
             // The task belongs to the run that was just dispatched; leaving it
             // in the composer makes the next run open on another run's words.
             // Repository, workflow, execution and effort stay: those are the
@@ -1168,6 +1179,15 @@ impl TuiApp {
     /// operator was waiting to see; a hidden one only says so in the footer,
     /// leaving the screen where the operator put it.
     fn handle_start_progress(&mut self, update: StartUpdate) {
+        if matches!(
+            update.progress,
+            StartProgress::PreparingWorkspace(_) | StartProgress::Running(_)
+        ) {
+            // The run holds the task now; there is no draft left to give back.
+            self.state
+                .start_drafts
+                .retain(|(ticket, _)| *ticket != update.ticket);
+        }
         let Some(starting) = self
             .state
             .starting
@@ -1200,16 +1220,44 @@ impl TuiApp {
     /// Hands a refused start to the card when the operator is free to read
     /// it, or to the footer when something else has the screen — the same
     /// rule [`Self::present_publish`] follows, for the same reasons.
-    fn present_start_failure(&mut self, task: String, error: String) {
+    fn present_start_failure(&mut self, task: String, error: String, draft_restored: bool) {
         let free = matches!(self.state.overlay, None | Some(Overlay::Starting))
             && self.state.screen != Screen::NewRun;
         if free {
-            self.state.start_failure = Some(StartFailure { task, error });
+            self.state.start_failure = Some(StartFailure {
+                task,
+                error,
+                draft_restored,
+            });
             self.state.overlay = Some(Overlay::StartFailed);
             self.state.message = None;
+        } else if draft_restored {
+            self.state.set_error(format!(
+                "Run not started: {error} Your task is back in the new run form."
+            ));
         } else {
             self.state.set_error(format!("Run not started: {error}"));
         }
+    }
+
+    /// Gives a refused start's task back to the composer, unless the operator
+    /// has already begun writing another one there: several starts can be
+    /// refused in any order, and none of them may overwrite a newer draft.
+    fn restore_start_draft(&mut self, ticket: u64) -> bool {
+        let Some(index) = self
+            .state
+            .start_drafts
+            .iter()
+            .position(|(draft, _)| *draft == ticket)
+        else {
+            return false;
+        };
+        let (_, task) = self.state.start_drafts.remove(index);
+        if !self.state.new_run.task.text().trim().is_empty() {
+            return false;
+        }
+        self.state.new_run.task = super::state::TextField::new(task);
+        true
     }
 
     /// Closing the refusal leaves its first line in the footer, so the reason
@@ -1230,12 +1278,23 @@ impl TuiApp {
 
     fn handle_worker_result(&mut self, result: WorkerResult) {
         self.state.settle_action(result.action, result.run_id);
+        let draft_restored = result.action == ActionKind::Start
+            && result.result.is_err()
+            && self.restore_start_draft(result.ticket);
         let start = self
             .state
             .starting
             .take_if(|starting| starting.ticket == result.ticket);
         if let (Some(start), Err(error)) = (start, &result.result) {
-            self.present_start_failure(start.task, error.clone());
+            self.present_start_failure(start.task, error.clone(), draft_restored);
+            self.refresh();
+            return;
+        }
+        if let (true, Err(error)) = (draft_restored, &result.result) {
+            // A start whose card was already handed to a newer one.
+            self.state.set_error(format!(
+                "Run not started: {error} Your task is back in the new run form."
+            ));
             self.refresh();
             return;
         }
@@ -1261,18 +1320,24 @@ impl TuiApp {
                 // An action finishing is not a reason to move the user. Only
                 // the run they are already looking at — or the first run this
                 // session has, when they are looking at nothing — opens on its
-                // own; anything else running in the background reports through
-                // the message line and the refreshed list, leaving the screen
-                // where the user put it.
-                if self
-                    .state
-                    .selected_run
-                    .is_none_or(|selected| selected == run_id)
-                {
+                // own, and only from the runs list or that run's detail with
+                // nothing open over them; a task being written, an artifact
+                // being read or a question being answered stays where it is.
+                // Anything else reports through the message line and the
+                // refreshed list, leaving the screen where the user put it.
+                let operational = matches!(self.state.screen, Screen::Runs | Screen::RunDetail)
+                    && matches!(
+                        self.state.overlay,
+                        None | Some(Overlay::Publishing | Overlay::Starting)
+                    );
+                let selected = self.state.selected_run;
+                if selected == Some(run_id) || (selected.is_none() && operational) {
                     self.state.selected_run = Some(run_id);
                     self.state.replace_details(report.details.clone());
                     self.state.quiescent = Some(report.outcome.clone());
-                    self.state.screen = Screen::RunDetail;
+                    if operational {
+                        self.state.screen = Screen::RunDetail;
+                    }
                 }
                 let message = match success {
                     WorkerSuccess::Applied(outcome, _) => format!("Apply finished: {outcome:?}"),
@@ -2898,6 +2963,130 @@ mod tests {
                 },
             )),
         }
+    }
+
+    /// A paste lands in the field that has the operator's attention, and a
+    /// card open over the new-run form has it — the form behind stays as it
+    /// was.
+    #[test]
+    fn a_paste_behind_an_overlay_leaves_the_new_run_form_alone() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        app.state.screen = Screen::NewRun;
+        app.state.overlay = Some(Overlay::Help);
+        app.handle_paste("stray text");
+        assert_eq!(app.state.new_run.task.text(), "");
+
+        app.state.overlay = None;
+        app.handle_paste("line one\nline two");
+        assert_eq!(app.state.new_run.task.text(), "line one line two");
+    }
+
+    /// A run finishing used to open its detail over whatever the operator
+    /// was doing. Its data is refreshed wherever they are; only the runs
+    /// list or its own detail, with nothing open, moves to show it.
+    #[test]
+    fn a_finished_run_never_pulls_the_operator_out_of_a_draft_or_a_viewer() {
+        let (fixture, database, worktrees, _repo, finished) = real_completed_standard_run();
+        for (screen, overlay) in [
+            (Screen::NewRun, None),
+            (Screen::Artifact, None),
+            (Screen::Logs, None),
+            (Screen::Diff, None),
+            (Screen::Runs, Some(Overlay::Help)),
+        ] {
+            let mut app = tui_app_over(
+                fixture.path(),
+                database.clone(),
+                worktrees.clone(),
+                finished.clone(),
+            );
+            app.state.screen = screen;
+            app.state.overlay = overlay;
+            app.state
+                .begin_action(ActionKind::Resume, Some(finished.id));
+            app.handle_worker_result(WorkerResult {
+                ticket: u64::MAX,
+                action: ActionKind::Resume,
+                run_id: Some(finished.id),
+                result: Ok(WorkerSuccess::Execution(crate::app::ExecutionReport {
+                    details: finished.clone(),
+                    committed_events: Vec::new(),
+                    outcome: crate::app::QuiescentState::Completed,
+                })),
+            });
+            assert_eq!(app.state.screen, screen, "{screen:?} under {overlay:?}");
+            assert_eq!(app.state.overlay, overlay, "{screen:?} under {overlay:?}");
+        }
+
+        let mut app = tui_app_over(fixture.path(), database, worktrees, finished.clone());
+        app.state.screen = Screen::Runs;
+        app.handle_worker_result(WorkerResult {
+            ticket: u64::MAX,
+            action: ActionKind::Resume,
+            run_id: Some(finished.id),
+            result: Ok(WorkerSuccess::Execution(crate::app::ExecutionReport {
+                details: finished.clone(),
+                committed_events: Vec::new(),
+                outcome: crate::app::QuiescentState::Completed,
+            })),
+        });
+        assert_eq!(
+            app.state.screen,
+            Screen::RunDetail,
+            "the runs list still opens it"
+        );
+    }
+
+    /// A start refused before its run exists used to take the task with it:
+    /// the composer was cleared on dispatch. The words come back — but never
+    /// over a newer draft, since starts overlap and fail in any order.
+    #[test]
+    fn a_start_refused_before_its_run_exists_gives_its_task_back() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let refuse = |app: &mut TuiApp, ticket: u64| {
+            app.state.begin_action(ActionKind::Start, None);
+            app.handle_worker_result(WorkerResult {
+                ticket,
+                action: ActionKind::Start,
+                run_id: None,
+                result: Err("Repository has uncommitted changes.".to_owned()),
+            });
+        };
+        app.state.start_drafts = vec![
+            (1, "first task".to_owned()),
+            (2, "second task".to_owned()),
+            (3, "third task".to_owned()),
+        ];
+
+        refuse(&mut app, 2);
+        assert_eq!(app.state.new_run.task.text(), "second task");
+        let footer = app
+            .state
+            .message
+            .as_ref()
+            .expect("a footer error")
+            .text
+            .clone();
+        assert!(footer.contains("back in the new run form"), "{footer}");
+
+        refuse(&mut app, 1);
+        assert_eq!(
+            app.state.new_run.task.text(),
+            "second task",
+            "an older refusal never overwrites the draft in the form"
+        );
+
+        app.handle_start_progress(StartUpdate {
+            ticket: 3,
+            progress: StartProgress::PreparingWorkspace(RunId::from_u128(3)),
+        });
+        assert!(
+            app.state.start_drafts.is_empty(),
+            "a run that exists holds its own task"
+        );
+        app.state.new_run.task = super::super::state::TextField::default();
+        refuse(&mut app, 3);
+        assert_eq!(app.state.new_run.task.text(), "", "nothing to give back");
     }
 
     /// A start used to show nothing at all until it either ran or failed, and
