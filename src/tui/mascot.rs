@@ -306,7 +306,10 @@ const fn hat_rows(activity: Option<MascotActivity>) -> [&'static str; 5] {
 /// not just named. The first two columns sit against POD's side, so the
 /// `G` arm pixels join the body; a tool on the ground ends on the feet row.
 ///
-/// - Research: an open book held up over a stack of books; a page turns.
+/// - Research: an open book held out to read, lines of text on both pages;
+///   the right page turns over to a fresh one. It used to be a small book
+///   held over a stack of books, which at this size read as a tray above a
+///   box.
 /// - Architecture: a pencil held to its line; the stroke moves on.
 /// - Implementation: a hammer raised beside an open laptop; it comes down
 ///   and the screen cracks.
@@ -330,14 +333,14 @@ const fn resting_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
     match activity {
         MascotActivity::Research => [
             "...........",
-            "..WW....WW.",
             "..WWWW.WWWW",
-            ".GYWWWWWWWY",
-            "GGGYYYYYYY.",
-            "GG.........",
-            "....BBBBBBB",
-            "....BWWWWWB",
-            "...DDDDDDDD",
+            "..WDDWYWDDW",
+            "GGWWWWYWWWW",
+            "GGWDDWYWDDW",
+            "..WWWWYWWWW",
+            "..YYYYYYYYY",
+            "...........",
+            "...........",
         ],
         MascotActivity::Architecture => [
             ".....WW....",
@@ -424,15 +427,15 @@ const fn resting_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
 const fn working_prop_rows(activity: MascotActivity) -> [&'static str; 9] {
     match activity {
         MascotActivity::Research => [
-            "......W....",
-            "..WW..W.WW.",
-            "..WWWWWWWWW",
-            ".GYWWWWWWWY",
-            "GGGYYYYYYY.",
-            "GG.........",
-            "....BBBBBBB",
-            "....BWWWWWB",
-            "...DDDDDDDD",
+            "...........",
+            "..WWWW.WWWW",
+            "..WDDWYWWWW",
+            "GGWWWWYWDDW",
+            "GGWDDWYWWWW",
+            "..WWWWYWDDW",
+            "..YYYYYYYYY",
+            "...........",
+            "...........",
         ],
         MascotActivity::Architecture => [
             "....WW.....",
