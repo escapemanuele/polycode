@@ -988,13 +988,13 @@ fn validate_event_batch(
                 actual: event.run_id(),
             });
         }
-        if let Some(stage_id) = event.stage_id() {
-            if run.stage(stage_id).is_none() {
-                return Err(StoreError::EventStageMismatch {
-                    event_id: event.id(),
-                    stage_id: stage_id.clone(),
-                });
-            }
+        if let Some(stage_id) = event.stage_id()
+            && run.stage(stage_id).is_none()
+        {
+            return Err(StoreError::EventStageMismatch {
+                event_id: event.id(),
+                stage_id: stage_id.clone(),
+            });
         }
         if event.occurred_at() < &last {
             return Err(StoreError::EventTimestampRegression {

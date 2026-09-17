@@ -40,21 +40,20 @@ fn issue_key(task: &str) -> Option<String> {
         if let Some(rest) = token.split_once("linear.app/").map(|(_, rest)| rest) {
             let mut parts = rest.split('/');
             let _org = parts.next();
-            if parts.next() == Some("issue") {
-                if let Some(key) = parts.next().filter(|key| is_bare_key(key)) {
-                    return Some(key.to_ascii_lowercase());
-                }
+            if parts.next() == Some("issue")
+                && let Some(key) = parts.next().filter(|key| is_bare_key(key))
+            {
+                return Some(key.to_ascii_lowercase());
             }
         }
         if let Some(rest) = token.split_once("github.com/").map(|(_, rest)| rest) {
             let parts: Vec<&str> = rest.split('/').collect();
-            if let [_owner, repo, kind, number, ..] = parts.as_slice() {
-                if matches!(*kind, "issues" | "pull")
-                    && !number.is_empty()
-                    && number.chars().all(|c| c.is_ascii_digit())
-                {
-                    return Some(format!("{}-{number}", repo.to_ascii_lowercase()));
-                }
+            if let [_owner, repo, kind, number, ..] = parts.as_slice()
+                && matches!(*kind, "issues" | "pull")
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+            {
+                return Some(format!("{}-{number}", repo.to_ascii_lowercase()));
             }
         }
     }

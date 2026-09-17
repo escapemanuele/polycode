@@ -2680,22 +2680,22 @@ fn render_confirmation(
             }
             lines.push(Line::from(""));
         }
-        if confirmation == Confirmation::Publish {
-            if let Some(stage) = state.failed_verification() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "Verification did not pass: stage {} is {}.",
-                        stage.id,
-                        format!("{:?}", stage.status).to_lowercase()
-                    ),
-                    theme::danger(),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "Publishing anyway puts the change on a branch, not in your checkout.",
-                    theme::muted(),
-                )));
-                lines.push(Line::from(""));
-            }
+        if confirmation == Confirmation::Publish
+            && let Some(stage) = state.failed_verification()
+        {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Verification did not pass: stage {} is {}.",
+                    stage.id,
+                    format!("{:?}", stage.status).to_lowercase()
+                ),
+                theme::danger(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Publishing anyway puts the change on a branch, not in your checkout.",
+                theme::muted(),
+            )));
+            lines.push(Line::from(""));
         }
         lines.push(Line::from(match confirmation {
             Confirmation::Apply => "Review [d] diff first when needed. Enter confirms apply.",

@@ -325,10 +325,10 @@ impl Stage {
         match self.status {
             StageStatus::NeedsUser => self.status = StageStatus::Running,
             StageStatus::Paused | StageStatus::Interrupted => {
-                if let Some(suspension) = &mut self.suspension {
-                    if suspension.resume_to == ResumableStageStatus::NeedsUser {
-                        suspension.resume_to = ResumableStageStatus::Running;
-                    }
+                if let Some(suspension) = &mut self.suspension
+                    && suspension.resume_to == ResumableStageStatus::NeedsUser
+                {
+                    suspension.resume_to = ResumableStageStatus::Running;
                 }
             }
             _ => {}

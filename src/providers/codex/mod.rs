@@ -130,17 +130,17 @@ impl<B> CodexProvider<B> {
     /// Idempotent, so a Polycode process that restarted and re-attached to a
     /// running agent re-authorizes the same stage without a new invocation.
     fn arm_image_tool(&self, store: &SqliteStore, request: &ProviderRequest) {
-        if let Some(host) = &self.image_tool {
-            if let Some(database) = store.database_path() {
-                host.activate(ImageToolScope {
-                    run_id: request.run_id(),
-                    stage_id: request.stage_id().clone(),
-                    attempt: request.attempt(),
-                    role: request.role(),
-                    worktree: request.workspace_path().to_path_buf(),
-                    database,
-                });
-            }
+        if let Some(host) = &self.image_tool
+            && let Some(database) = store.database_path()
+        {
+            host.activate(ImageToolScope {
+                run_id: request.run_id(),
+                stage_id: request.stage_id().clone(),
+                attempt: request.attempt(),
+                role: request.role(),
+                worktree: request.workspace_path().to_path_buf(),
+                database,
+            });
         }
     }
 

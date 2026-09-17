@@ -306,20 +306,20 @@ where
         // same window as the dirty-source and reachability checks below, so a
         // refusal here leaves nothing behind either.
         let pull_request = PullRequestRef::parse(&task);
-        if let Some(pull_request) = pull_request.as_ref() {
-            if !remote_names_pull_request(&git, &repository, pull_request)? {
-                observe(StartProgress::FindingCheckout {
-                    repository: format!("{}/{}", pull_request.owner, pull_request.repository),
-                });
-                let previously_used = self.previously_used_source_repositories()?;
-                repository = resolve_pull_request_checkout(
-                    previously_used,
-                    &git,
-                    repository,
-                    pull_request,
-                    &workflow,
-                )?;
-            }
+        if let Some(pull_request) = pull_request.as_ref()
+            && !remote_names_pull_request(&git, &repository, pull_request)?
+        {
+            observe(StartProgress::FindingCheckout {
+                repository: format!("{}/{}", pull_request.owner, pull_request.repository),
+            });
+            let previously_used = self.previously_used_source_repositories()?;
+            repository = resolve_pull_request_checkout(
+                previously_used,
+                &git,
+                repository,
+                pull_request,
+                &workflow,
+            )?;
         }
         // A managed worktree is created from the source repository's committed
         // HEAD, so uncommitted work would be invisible to the agent while
@@ -1433,18 +1433,18 @@ fn candidate_checkout_paths(previously_used: Vec<PathBuf>, chosen: &GitRepositor
             candidates.push(path);
         }
     }
-    if let Some(parent) = chosen.source_path().parent() {
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            let mut siblings: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir() && path.as_path() != chosen.source_path())
-                .collect();
-            siblings.sort();
-            for path in siblings {
-                if seen.insert(path.clone()) {
-                    candidates.push(path);
-                }
+    if let Some(parent) = chosen.source_path().parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        let mut siblings: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.as_path() != chosen.source_path())
+            .collect();
+        siblings.sort();
+        for path in siblings {
+            if seen.insert(path.clone()) {
+                candidates.push(path);
             }
         }
     }

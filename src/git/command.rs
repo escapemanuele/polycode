@@ -190,6 +190,9 @@ pub(crate) fn os(value: impl AsRef<OsStr>) -> OsString {
     value.as_ref().to_os_string()
 }
 
+// Debug on purpose: quoting each argument keeps its boundaries visible when
+// one contains a space.
+#[allow(clippy::unnecessary_debug_formatting)]
 fn describe_command(executable: &OsStr, cwd: &Path, args: &[OsString]) -> String {
     let arguments = args
         .iter()

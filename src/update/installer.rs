@@ -184,10 +184,10 @@ fn digest_of(path: &Path) -> Result<String, InstallError> {
 /// Removes a staging file, ignoring failures: the install already failed and
 /// a leftover temporary must not mask the real error.
 fn discard(path: &Path) {
-    if let Err(error) = std::fs::remove_file(path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::debug!(%error, "staging file not removed");
-        }
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(%error, "staging file not removed");
     }
 }
 

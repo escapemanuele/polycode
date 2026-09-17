@@ -1194,15 +1194,17 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(unix)]
 fn decode_unix_hex(value: &str) -> Result<OsString, ProcessError> {
     use std::os::unix::ffi::OsStringExt;
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(ProcessError::InvalidSpec("invalid Unix byte encoding"));
     }
     let bytes = value
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_digit(pair[0])?;
-            let low = hex_digit(pair[1])?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            let high = hex_digit(high)?;
+            let low = hex_digit(low)?;
             Ok((high << 4) | low)
         })
         .collect::<Result<Vec<_>, ProcessError>>()?;
