@@ -311,6 +311,41 @@ pub enum PullRequestReach {
 }
 
 impl GhClient {
+    /// The title of `pull_request`, when `gh` can read it.
+    ///
+    /// Decoration, not evidence: every failure — no `gh`, no login, no
+    /// network — is simply no title.
+    #[must_use]
+    pub fn pull_request_title(&self, pull_request: &PullRequestRef) -> Option<String> {
+        let PullRequestRef {
+            host,
+            owner,
+            repository,
+            number,
+        } = pull_request;
+        let output = crate::exec::retry_busy(|| {
+            Command::new(&self.executable)
+                .args([
+                    OsString::from("api"),
+                    OsString::from(format!("repos/{owner}/{repository}/pulls/{number}")),
+                    OsString::from("--hostname"),
+                    OsString::from(host),
+                    OsString::from("--jq"),
+                    OsString::from(".title"),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+        })
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let title = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!title.is_empty()).then_some(title)
+    }
+
     /// Whether `gh` can read `pull_request` right now.
     ///
     /// Runs before a run persists anything, so a pull request behind an
@@ -432,6 +467,21 @@ mod pull_request_ref_tests {
             gh.pull_request_reach(&pull_request()),
             PullRequestReach::Reachable
         );
+    }
+
+    #[test]
+    fn a_pull_request_title_is_read_and_any_failure_is_no_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let gh = stub_gh(temp.path(), "echo 'Fix the checkout race'");
+        assert_eq!(
+            gh.pull_request_title(&pull_request()).as_deref(),
+            Some("Fix the checkout race")
+        );
+        let failing = tempfile::tempdir().unwrap();
+        let gh = stub_gh(failing.path(), "echo 'i/o timeout' >&2\nexit 1");
+        assert_eq!(gh.pull_request_title(&pull_request()), None);
+        let missing = GhClient::with_executable(temp.path().join("no-such-gh"));
+        assert_eq!(missing.pull_request_title(&pull_request()), None);
     }
 
     /// The real failure behind run `01M1K8KAJ1HMS47H7WR8YMN2PW`: the host is

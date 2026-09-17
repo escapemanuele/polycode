@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -672,6 +672,9 @@ pub(crate) struct TuiState {
     /// The start the [`Overlay::Starting`] card follows, until its run is
     /// running or it is refused.
     pub starting: Option<StartInFlight>,
+    /// Pull request titles by URL, for the line under POD. `None` while the
+    /// lookup is out or after it came back empty; asked once per session.
+    pub pull_request_titles: HashMap<String, Option<String>>,
     /// The refused start shown by [`Overlay::StartFailed`].
     pub start_failure: Option<StartFailure>,
     /// The task of every start whose run does not exist yet, by worker
@@ -751,6 +754,7 @@ impl TuiState {
             published: None,
             starting: None,
             start_failure: None,
+            pull_request_titles: HashMap::new(),
             start_drafts: Vec::new(),
             message: None,
             quiescent: None,
