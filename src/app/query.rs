@@ -1202,10 +1202,10 @@ pub(crate) fn summarize_diff(text: String, total_bytes: u64, truncated: bool) ->
                     binary: false,
                 });
             }
-        } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
-            if let Some(file) = changed_files.last_mut() {
-                file.binary = true;
-            }
+        } else if (line.starts_with("Binary files ") || line == "GIT binary patch")
+            && let Some(file) = changed_files.last_mut()
+        {
+            file.binary = true;
         }
     }
     RunDiffPreview {

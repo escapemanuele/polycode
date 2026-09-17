@@ -185,10 +185,10 @@ impl WorkspaceManager {
         let input = store.load_run_input(run_id)?;
         let branch = (mode == WorkspaceMode::Branch)
             .then(|| branch_name::branch_name(run_id, input.as_ref().map(RunInput::task)));
-        if let Some(branch) = branch.as_deref() {
-            if branch_exists(&self.git, &repository, branch)? {
-                return Err(WorkspaceError::BranchConflict(branch.to_owned()));
-            }
+        if let Some(branch) = branch.as_deref()
+            && branch_exists(&self.git, &repository, branch)?
+        {
+            return Err(WorkspaceError::BranchConflict(branch.to_owned()));
         }
         let path = self.workspace_path(&repository, run_id)?;
         if path.exists() {
@@ -1037,14 +1037,14 @@ impl WorkspaceManager {
                 return Self::break_workspace(store, workspace, error.to_string());
             }
         } else {
-            if let Some(branch) = workspace.branch_name() {
-                if branch_exists(&self.git, &repository, branch)? {
-                    return Self::break_workspace(
-                        store,
-                        workspace,
-                        "intended branch exists without intended worktree",
-                    );
-                }
+            if let Some(branch) = workspace.branch_name()
+                && branch_exists(&self.git, &repository, branch)?
+            {
+                return Self::break_workspace(
+                    store,
+                    workspace,
+                    "intended branch exists without intended worktree",
+                );
             }
             if let Err(error) = self.create_intended_worktree(&repository, &workspace) {
                 return Self::break_workspace(store, workspace, error.to_string());
@@ -1518,13 +1518,12 @@ fn issue_headline(line: &str) -> Option<String> {
         }
         if let Some(rest) = word.split_once("github.com/").map(|(_, rest)| rest) {
             let parts: Vec<&str> = rest.split('/').collect();
-            if let [_owner, repo, kind, number, ..] = parts.as_slice() {
-                if matches!(*kind, "issues" | "pull")
-                    && !number.is_empty()
-                    && number.chars().all(|c| c.is_ascii_digit())
-                {
-                    return Some(format!("{repo}#{number}"));
-                }
+            if let [_owner, repo, kind, number, ..] = parts.as_slice()
+                && matches!(*kind, "issues" | "pull")
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_digit())
+            {
+                return Some(format!("{repo}#{number}"));
             }
         }
     }

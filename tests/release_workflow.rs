@@ -166,10 +166,10 @@ fn job_dependencies() -> std::collections::BTreeMap<String, Option<String>> {
         if indent == 2 && trimmed.ends_with(':') && !trimmed.starts_with('#') {
             current = Some(trimmed.trim_end_matches(':').to_owned());
             jobs.insert(current.clone().unwrap(), None);
-        } else if indent == 4 {
-            if let (Some(name), Some(needs)) = (current.as_ref(), trimmed.strip_prefix("needs:")) {
-                jobs.insert(name.clone(), Some(needs.trim().to_owned()));
-            }
+        } else if indent == 4
+            && let (Some(name), Some(needs)) = (current.as_ref(), trimmed.strip_prefix("needs:"))
+        {
+            jobs.insert(name.clone(), Some(needs.trim().to_owned()));
         }
     }
     jobs

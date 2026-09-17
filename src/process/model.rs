@@ -1194,7 +1194,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(unix)]
 fn decode_unix_hex(value: &str) -> Result<OsString, ProcessError> {
     use std::os::unix::ffi::OsStringExt;
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(ProcessError::InvalidSpec("invalid Unix byte encoding"));
     }
     let bytes = value

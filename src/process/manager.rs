@@ -232,11 +232,11 @@ impl<B: ProcessBackend> ProcessManager<B> {
         if process.backend_kind() != self.backend.kind() {
             return Err(ProcessError::InvalidStoredProcess("backend kind mismatch"));
         }
-        if process.status() == ManagedProcessStatus::Preparing {
-            if let Err(error) = Self::materialize(&process) {
-                Self::persist_broken(store, &process, "process files conflict")?;
-                return Err(error);
-            }
+        if process.status() == ManagedProcessStatus::Preparing
+            && let Err(error) = Self::materialize(&process)
+        {
+            Self::persist_broken(store, &process, "process files conflict")?;
+            return Err(error);
         }
 
         // Observe supervisor state before exit evidence. Managed runner durably writes exit.json

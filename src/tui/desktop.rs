@@ -61,11 +61,11 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
                 continue;
             }
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(source) = stdin.write_all(text.as_bytes()) {
-                last = format!("{program}: {source}");
-                continue;
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(source) = stdin.write_all(text.as_bytes())
+        {
+            last = format!("{program}: {source}");
+            continue;
         }
         match child.wait() {
             Ok(status) if status.success() => return Ok(()),

@@ -1467,12 +1467,11 @@ impl TuiApp {
             }
             Err(error) => self.state.set_error(error.to_string()),
         }
-        if self.state.screen == Screen::Logs {
-            if let Some((run_id, stage_id)) = self.selected_stage_identity() {
-                if let Ok(logs) = self.reader.read_process_log_tail(run_id, &stage_id) {
-                    self.state.logs = Some(logs);
-                }
-            }
+        if self.state.screen == Screen::Logs
+            && let Some((run_id, stage_id)) = self.selected_stage_identity()
+            && let Ok(logs) = self.reader.read_process_log_tail(run_id, &stage_id)
+        {
+            self.state.logs = Some(logs);
         }
         self.last_refresh = Instant::now();
     }
