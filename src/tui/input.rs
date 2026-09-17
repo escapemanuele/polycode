@@ -63,6 +63,12 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
     if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
         return Intent::Quit;
     }
+    // Every command here is a bare key. A chord is not that key pressed
+    // harder: Ctrl-S must not stop a run the way `s` does, so anything held
+    // besides Shift means the key is not a command at all.
+    if !(event.modifiers - KeyModifiers::SHIFT).is_empty() {
+        return Intent::Ignore;
+    }
     match event.code {
         KeyCode::Up | KeyCode::Char('k') => Intent::Up,
         KeyCode::Down | KeyCode::Char('j') => Intent::Down,
@@ -156,9 +162,83 @@ pub(crate) fn map_text_key(event: KeyEvent) -> Intent {
     }
 }
 
+/// Whether a held-down key may repeat `intent`.
+///
+/// Moving and editing are meant to repeat. Everything else is a decision, and
+/// a key still held from the press that opened a confirmation must not also
+/// answer it. Terminals that report a held key as fresh presses cannot be
+/// told apart here.
+pub(crate) const fn repeats(intent: Intent) -> bool {
+    matches!(
+        intent,
+        Intent::Up
+            | Intent::Down
+            | Intent::Left
+            | Intent::Right
+            | Intent::PageUp
+            | Intent::PageDown
+            | Intent::Home
+            | Intent::End
+            | Intent::Backspace
+            | Intent::Delete
+            | Intent::DeleteWordBefore
+            | Intent::Character(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_letter_held_with_a_modifier_is_not_the_command() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for code in [KeyCode::Char('s'), KeyCode::Char('X'), KeyCode::Enter] {
+                assert_eq!(
+                    map_key(KeyEvent::new(code, modifiers)),
+                    Intent::Ignore,
+                    "{code:?} with {modifiers:?}"
+                );
+            }
+        }
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Intent::Stop
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT)),
+            Intent::Discard
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Intent::BackTab
+        );
+        assert_eq!(
+            map_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Intent::Quit
+        );
+    }
+
+    #[test]
+    fn only_moving_and_editing_repeat() {
+        for intent in [Intent::Down, Intent::Backspace, Intent::Character('a')] {
+            assert!(repeats(intent), "{intent:?}");
+        }
+        for intent in [
+            Intent::Enter,
+            Intent::Discard,
+            Intent::DeleteForever,
+            Intent::Stop,
+            Intent::Quit,
+        ] {
+            assert!(!repeats(intent), "{intent:?}");
+        }
+    }
 
     #[test]
     fn text_mode_ctrl_s_skips_and_plain_s_still_types() {

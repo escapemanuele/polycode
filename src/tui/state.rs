@@ -84,6 +84,8 @@ pub(crate) struct StartInFlight {
 pub(crate) struct StartFailure {
     pub task: String,
     pub error: String,
+    /// Whether the task went back into the new-run form.
+    pub draft_restored: bool,
 }
 
 /// A publish the operator is waiting on.
@@ -300,13 +302,17 @@ impl TextField {
         self.cursor += 1;
     }
 
+    /// Inserts pasted text at the cursor in one edit.
+    ///
+    /// Every field is a single line, so each line break becomes one space:
+    /// dropping them used to glue the last word of one line to the first
+    /// word of the next. The insert is one splice rather than one per
+    /// character, each of which walked the text from the start again.
     pub(crate) fn paste(&mut self, value: &str) {
-        for character in value
-            .chars()
-            .filter(|character| !matches!(character, '\r' | '\n'))
-        {
-            self.insert(character);
-        }
+        let text = value.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        let byte = byte_index(&self.text, self.cursor);
+        self.text.insert_str(byte, &text);
+        self.cursor += text.chars().count();
     }
 
     pub(crate) fn backspace(&mut self) {
@@ -668,6 +674,10 @@ pub(crate) struct TuiState {
     pub starting: Option<StartInFlight>,
     /// The refused start shown by [`Overlay::StartFailed`].
     pub start_failure: Option<StartFailure>,
+    /// The task of every start whose run does not exist yet, by worker
+    /// ticket. Keyed rather than a single slot because starts overlap and
+    /// can be refused out of order.
+    pub start_drafts: Vec<(u64, String)>,
     /// Runs the operator has already decided to send back for a fix, chosen
     /// while the run was still working. Held here rather than in the store
     /// because nothing has happened yet: this is an intention about a run, not
@@ -741,6 +751,7 @@ impl TuiState {
             published: None,
             starting: None,
             start_failure: None,
+            start_drafts: Vec::new(),
             message: None,
             quiescent: None,
             update: None,
@@ -1152,6 +1163,17 @@ mod tests {
 
     use super::*;
     use crate::domain::RunStatus;
+
+    /// Every field is one line, so a pasted line break is a space between
+    /// words, never nothing, and the cursor lands after the pasted text.
+    #[test]
+    fn a_pasted_line_break_becomes_one_space_at_the_cursor() {
+        let mut field = TextField::new("ab");
+        field.left();
+        field.paste("one\r\ntwo\nthree\rfour é");
+        assert_eq!(field.text(), "aone two three four éb");
+        assert_eq!(field.cursor(), "aone two three four é".chars().count());
+    }
 
     fn run(id: u128, task: &str) -> RunListItem {
         RunListItem {
