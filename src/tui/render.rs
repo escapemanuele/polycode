@@ -6,7 +6,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph
 
 use chrono::{DateTime, Utc};
 
-use crate::app::{BlockedDependencyRef, RunDetails, StageDependencyRef, StageSummary};
+use crate::app::{
+    BlockedDependencyRef, RunDetails, StageDependencyRef, StageSummary, StartProgress,
+};
 use crate::domain::{AttentionKind, DependencyOutcome, RunStatus, StageKind, StageStatus};
 
 use super::state::{Overlay, PublishOutcome, RetryRouteChoice, Screen, TuiState, UiMessageKind};
@@ -2009,7 +2011,119 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::RetryRoute => render_retry_route(frame, popup, state),
         Overlay::Publishing => render_publishing(frame, area, state),
         Overlay::Published => render_published(frame, area, state),
+        Overlay::Starting => render_starting(frame, area, state),
+        Overlay::StartFailed => render_start_failed(frame, area, state),
     }
+}
+
+/// How long a pull request check may go unanswered before the starting card
+/// says what usually causes that. `gh` gives up on its own after about thirty
+/// seconds; this is well inside that, and well past a healthy answer.
+const SLOW_PULL_REQUEST_CHECK: u64 = 8;
+
+/// A compact band that says a run is on its way: which step the start is on,
+/// for how long, and that hiding the card does not stop it.
+fn render_starting(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(starting) = state.starting.as_ref() else {
+        return;
+    };
+    let spinner = PUBLISH_SPINNER[usize::from(state.motion_frame().active_phase()) % 8];
+    let elapsed = starting.started.elapsed().as_secs();
+    let step = match &starting.progress {
+        None => "Checking the repository and the task.".to_owned(),
+        Some(StartProgress::FindingCheckout { repository }) => {
+            format!("Looking for a local checkout of {repository}.")
+        }
+        Some(StartProgress::CheckingPullRequest { url, .. }) => {
+            format!("Checking that gh can read {url}.")
+        }
+        Some(StartProgress::PreparingWorkspace(_)) => "Creating the run's worktree.".to_owned(),
+        Some(StartProgress::Running(_)) => "Starting the first stage.".to_owned(),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "STARTING RUN",
+                Style::default()
+                    .fg(theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {elapsed}s"), theme::muted()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            starting.task.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(step, theme::text())),
+    ];
+    if let Some(StartProgress::CheckingPullRequest { host, .. }) = &starting.progress
+        && elapsed >= SLOW_PULL_REQUEST_CHECK
+    {
+        lines.push(Line::from(Span::styled(
+            format!("No answer from {host} yet. VPN or proxy off? gh gives up after about 30s."),
+            Style::default().fg(theme::attention()),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Esc hides this card; the run keeps starting in the background.",
+        theme::muted(),
+    )));
+    let popup = update_rect(area, &lines);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" NEW RUN ", theme::accent())),
+        popup,
+    );
+}
+
+/// Why a start was refused, in full. Refusals carry their own fix on the
+/// lines after the first, so every line is kept.
+fn render_start_failed(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(failure) = state.start_failure.as_ref() else {
+        return;
+    };
+    let mut lines = vec![
+        Line::from(theme::chip("RUN NOT STARTED", theme::danger())),
+        Line::from(""),
+        Line::from(Span::styled(
+            failure.task.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (index, line) in failure.error.lines().enumerate() {
+        let style = if index == 0 {
+            Style::default().fg(theme::danger())
+        } else {
+            theme::text()
+        };
+        lines.push(Line::from(Span::styled(line.trim().to_owned(), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(theme::action(
+        "Enter",
+        "close",
+        theme::muted_color(),
+    )));
+    let popup = update_rect(area, &lines);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" NEW RUN ", theme::danger())),
+        popup,
+    );
 }
 
 /// The eight-tick spinner the publishing card turns while the branch
@@ -4988,6 +5102,53 @@ mod tests {
         assert!(text.contains("pushing the branch to origin"), "{text}");
         assert!(text.contains("0s"), "the clock is on screen: {text}");
         assert!(text.contains("Esc hides this card"), "{text}");
+    }
+
+    /// The starting card names the step the start is on, and once a pull
+    /// request check has gone quiet for a while, the usual reason why.
+    #[test]
+    fn the_starting_card_names_its_step_and_explains_a_silent_host() {
+        let mut state = completed_state();
+        state.overlay = Some(Overlay::Starting);
+        state.starting = Some(super::super::state::StartInFlight {
+            ticket: 0,
+            task: "Review the wpcom change".to_owned(),
+            started: std::time::Instant::now(),
+            progress: Some(StartProgress::CheckingPullRequest {
+                url: "https://github.a8c.com/Automattic/wpcom/pull/241491".to_owned(),
+                host: "github.a8c.com".to_owned(),
+            }),
+        });
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("STARTING RUN"), "{text}");
+        assert!(text.contains("Review the wpcom change"), "{text}");
+        assert!(text.contains("Checking that gh can read"), "{text}");
+        assert!(!text.contains("No answer from"), "not yet: {text}");
+        assert!(text.contains("Esc hides this card"), "{text}");
+
+        state.starting.as_mut().unwrap().started = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(SLOW_PULL_REQUEST_CHECK))
+            .unwrap();
+        let text = render_text(&state, 120, 30);
+        assert!(text.contains("No answer from github.a8c.com yet"), "{text}");
+    }
+
+    /// The refusal card keeps every line of the reason, because the fix is
+    /// never on the first one.
+    #[test]
+    fn the_start_failed_card_keeps_the_whole_reason() {
+        let mut state = completed_state();
+        state.overlay = Some(Overlay::StartFailed);
+        state.start_failure = Some(super::super::state::StartFailure {
+            task: "Review the wpcom change".to_owned(),
+            error: "Pull request cannot be read.\n  i/o timeout\n  Fix: restore access".to_owned(),
+        });
+        let text = render_text(&state, 120, 40);
+        assert!(text.contains("RUN NOT STARTED"), "{text}");
+        assert!(text.contains("Pull request cannot be read."), "{text}");
+        assert!(text.contains("i/o timeout"), "{text}");
+        assert!(text.contains("Fix: restore access"), "{text}");
+        assert!(text.contains("Enter"), "{text}");
     }
 
     /// The published card is built around the URL, and offers its two uses.

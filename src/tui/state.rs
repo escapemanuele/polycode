@@ -7,7 +7,8 @@ use super::motion::{self, MotionFrame};
 use super::worker::{ActionKind, WorkerCommand};
 use crate::app::{
     ArtifactSummary, ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RetryRoute,
-    RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, UniformProvider,
+    RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, StartProgress,
+    UniformProvider,
 };
 use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
 use crate::workspace::PullRequestStatus;
@@ -57,6 +58,32 @@ pub(crate) enum Overlay {
     /// What the publish did, held open until dismissed so the URL can be
     /// read, opened, or copied rather than caught in a four-second message.
     Published,
+    /// A run being started: the checks before it exists, then its worktree.
+    /// Those checks can wait out a network timeout with nothing else on
+    /// screen to show it. Esc hides it; the start carries on behind the
+    /// header's busy label.
+    Starting,
+    /// Why a start was refused, held open until dismissed: the reason is
+    /// usually several lines with a fix in them, too much for the footer.
+    StartFailed,
+}
+
+/// A start the operator is waiting on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartInFlight {
+    /// The worker ticket the start's progress and outcome carry.
+    pub ticket: u64,
+    pub task: String,
+    pub started: Instant,
+    /// The last step the start reported, if it has reported one.
+    pub progress: Option<StartProgress>,
+}
+
+/// A start that was refused, kept for the [`Overlay::StartFailed`] card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartFailure {
+    pub task: String,
+    pub error: String,
 }
 
 /// A publish the operator is waiting on.
@@ -636,6 +663,11 @@ pub(crate) struct TuiState {
     pub publishing: Option<PublishInFlight>,
     /// The last publish's outcome, shown by [`Overlay::Published`].
     pub published: Option<PublishOutcome>,
+    /// The start the [`Overlay::Starting`] card follows, until its run is
+    /// running or it is refused.
+    pub starting: Option<StartInFlight>,
+    /// The refused start shown by [`Overlay::StartFailed`].
+    pub start_failure: Option<StartFailure>,
     /// Runs the operator has already decided to send back for a fix, chosen
     /// while the run was still working. Held here rather than in the store
     /// because nothing has happened yet: this is an intention about a run, not
@@ -707,6 +739,8 @@ impl TuiState {
             in_flight: Vec::new(),
             publishing: None,
             published: None,
+            starting: None,
+            start_failure: None,
             message: None,
             quiescent: None,
             update: None,

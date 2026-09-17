@@ -153,9 +153,12 @@ pub(crate) fn motion_setting() -> MotionSetting {
 /// move" would hold only for as long as nobody looked past the overlay.
 pub(crate) const fn surface_ceiling(screen: Screen, overlay: Option<Overlay>) -> MotionAllowance {
     match overlay {
-        // The publishing card exists to say "still working": its spinner is
-        // the whole point, so it keeps the operating surface's allowance.
-        Some(Overlay::Publishing) => return MotionAllowance::ActiveStateAndTransitions,
+        // The publishing and starting cards exist to say "still working":
+        // their spinner is the whole point, so they keep the operating
+        // surface's allowance.
+        Some(Overlay::Publishing | Overlay::Starting) => {
+            return MotionAllowance::ActiveStateAndTransitions;
+        }
         Some(_) => return MotionAllowance::Disabled,
         None => {}
     }
