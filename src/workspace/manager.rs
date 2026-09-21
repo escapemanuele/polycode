@@ -374,11 +374,25 @@ impl WorkspaceManager {
     /// recoverable. Broken is what was observed, not a property the workspace
     /// acquired, so it is observed again; a workspace that still fails stays
     /// broken and reports the current reason rather than the original one.
+    /// A run whose preparation never finished is put back on the preparing
+    /// path instead, because there the missing worktree is built rather than
+    /// reported.
     fn reconcile_broken(
         &self,
         store: &mut SqliteStore,
         mut workspace: RunWorkspace,
     ) -> Result<ReconciliationOutcome, WorkspaceError> {
+        // A run still `Preparing` broke before it was ever handed a worktree,
+        // and observing is not what it needs: preparation is the only path
+        // that builds a worktree and the only path that ends the run's
+        // preparation, so observation could only report the same missing
+        // worktree forever while the run sat in `Preparing` with no way out
+        // that did not edit the store by hand. Preparing re-checks every
+        // condition that breaks a workspace, so nothing unsafe is healed by
+        // going back to it.
+        if store.load_run(workspace.run_id())?.run.status() == RunStatus::Preparing {
+            return self.reconcile_preparing(store, workspace);
+        }
         if let Err(reason) = self.observe(&workspace) {
             if workspace.last_error() != Some(reason.as_str()) {
                 Self::persist_broken(store, &mut workspace, reason)?;
@@ -2941,6 +2955,60 @@ mod tests {
         assert!(
             healed.last_error().is_none(),
             "a recovered workspace stops reporting the failure it recovered from"
+        );
+    }
+
+    /// The one thing observation cannot heal is a worktree that was never
+    /// built, and breaking during preparation is exactly when that happens:
+    /// the run stayed `Preparing` while every later reconcile reported a
+    /// "ready" worktree that had never been ready.
+    #[test]
+    fn a_workspace_broken_before_its_worktree_existed_is_built_and_handed_over() {
+        let mut fixture = Fixture::new(WorkflowKind::Standard);
+        let crashing = WorkspaceManager::with_fault(&fixture.root, FaultPoint::WorkspaceIntent);
+        assert!(
+            crashing
+                .prepare_run_workspace(&mut fixture.store, fixture.run_id, &fixture.source)
+                .is_err()
+        );
+        let intended = fixture
+            .store
+            .load_workspace(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        // Something foreign at the intended path breaks the workspace while
+        // the run is still `Preparing` and the worktree still does not exist.
+        init_repository(intended.worktree_path());
+        assert!(matches!(
+            fixture
+                .manager()
+                .reconcile(&mut fixture.store, fixture.run_id)
+                .unwrap(),
+            ReconciliationOutcome::Broken(_)
+        ));
+
+        fs::remove_dir_all(intended.worktree_path()).unwrap();
+
+        let outcome = fixture
+            .manager()
+            .reconcile(&mut fixture.store, fixture.run_id)
+            .unwrap();
+
+        assert!(matches!(outcome, ReconciliationOutcome::Ready(_)));
+        let healed = fixture
+            .store
+            .load_workspace(fixture.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(healed.status(), WorkspaceStatus::Ready);
+        assert!(
+            healed.worktree_path().join("README.md").exists(),
+            "the worktree the run never got is built, not reported missing"
+        );
+        assert_eq!(
+            fixture.store.load_run(fixture.run_id).unwrap().run.status(),
+            RunStatus::Ready,
+            "and the run finally leaves preparation"
         );
     }
 
