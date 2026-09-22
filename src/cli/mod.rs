@@ -213,6 +213,19 @@ pub enum MissionCommand {
         mission_id: MissionId,
         package_id: WorkPackageId,
     },
+    /// Send a delivered package's run back to fix its own review findings.
+    Fix {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+    },
+    /// Send a delivered package's run back with an instruction.
+    Continue {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        instruction: String,
+    },
+    /// Resume every package run that is waiting to be driven, then observe.
+    Resume { mission_id: MissionId },
     /// Cancel a package nothing depends on and no run is serving.
     CancelPackage {
         mission_id: MissionId,

@@ -86,6 +86,11 @@ impl ResolvedConfigSnapshot {
     }
 }
 
+/// Recursively key-sorts objects so equal content hashes equally.
+pub(crate) fn canonical_value(value: Value) -> Value {
+    canonicalize(value)
+}
+
 fn canonicalize(value: Value) -> Value {
     match value {
         Value::Object(object) => {

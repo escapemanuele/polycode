@@ -7,9 +7,9 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     DecisionAuthor, DecisionId, Mission, MissionAttention, MissionId, MissionStatus, RunId,
-    RunStatus, WorkPackage, WorkPackageId, WorkPackageStatus, WorkflowKind,
+    RunStatus, WorkPackage, WorkPackageId, WorkPackageResult, WorkPackageStatus, WorkflowKind,
 };
-use crate::store::{LoadedMission, MissionRevision, SqliteStore};
+use crate::store::{LoadedMission, MissionHandoffRecord, MissionRevision, SqliteStore};
 
 use super::AppError;
 
@@ -54,7 +54,26 @@ pub struct WorkPackageSummary {
     /// Committed status of the current run, read at projection time.
     pub run_status: Option<RunStatus>,
     pub reason: Option<String>,
+    /// Evidence captured when the current run delivered.
+    pub result: Option<WorkPackageResult>,
+    /// What the current run was told, when the mission rendered its task.
+    pub handoff: Option<HandoffSummary>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The recorded handoff of one run, with whether the package's contract
+/// still hashes to what the run was given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffSummary {
+    pub run_id: RunId,
+    pub task_sha256: String,
+    pub task_size: u64,
+    pub decisions_named: usize,
+    /// False when the contract was revised after the handoff, which cannot
+    /// happen through the aggregate but is the fact this record exists to
+    /// check.
+    pub contract_current: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,12 +139,13 @@ pub(crate) fn details(
     loaded: &LoadedMission,
 ) -> Result<MissionDetails, AppError> {
     let mission = &loaded.mission;
+    let handoffs = store.list_mission_handoffs(mission.id())?;
     let mut packages = Vec::with_capacity(mission.packages().len());
     for id in mission.topological_order() {
         let Some(package) = mission.package(&id) else {
             continue;
         };
-        packages.push(package_summary(store, package)?);
+        packages.push(package_summary(store, package, &handoffs)?);
     }
     Ok(MissionDetails {
         id: mission.id(),
@@ -156,12 +176,28 @@ pub(crate) fn details(
 fn package_summary(
     store: &mut SqliteStore,
     package: &WorkPackage,
+    handoffs: &[MissionHandoffRecord],
 ) -> Result<WorkPackageSummary, AppError> {
     let run_status = match package.current_run() {
         Some(run_id) => Some(store.load_run(run_id)?.run.status()),
         None => None,
     };
     let contract = package.contract();
+    let handoff = package
+        .current_run()
+        .and_then(|run_id| handoffs.iter().find(|handoff| handoff.run_id == run_id))
+        .map(|handoff| {
+            Ok::<_, AppError>(HandoffSummary {
+                run_id: handoff.run_id,
+                task_sha256: handoff.task_sha256.clone(),
+                task_size: handoff.task_size,
+                decisions_named: handoff.decision_ids.len(),
+                contract_current: crate::store::contract_sha256(contract)?
+                    == handoff.contract_sha256,
+                created_at: handoff.created_at,
+            })
+        })
+        .transpose()?;
     Ok(WorkPackageSummary {
         id: package.id().clone(),
         title: contract.title.clone(),
@@ -177,6 +213,8 @@ fn package_summary(
         current_run: package.current_run(),
         run_status,
         reason: package.reason().map(str::to_owned),
+        result: package.result().cloned(),
+        handoff,
         updated_at: *package.updated_at(),
     })
 }

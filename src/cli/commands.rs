@@ -4,8 +4,8 @@ use clap::CommandFactory;
 use crate::app::{
     AppError, ApplyOutcome, BlockedDependencyRef, ExecutionReport, ExecutionSelection,
     MissionDetails, MissionListItem, MissionService, NewWorkPackage, QuiescentState, RetryRoute,
-    RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef, StageWaitingSummary,
-    UniformProvider, WorkPackageSummary,
+    Rework, RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef,
+    StageWaitingSummary, UniformProvider, WorkPackageSummary,
 };
 use crate::domain::{
     DecisionAuthor, DependencyOutcome, DomainEventKind, ModelId, StageStatus, WorkPackageContract,
@@ -779,7 +779,41 @@ fn mission(command: &MissionCommand) -> Result<()> {
             mission_id,
             package_id,
         } => {
-            let details = missions.integrate_package(&service()?, *mission_id, package_id)?;
+            let details = missions.integrate_package(*mission_id, package_id)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Fix {
+            mission_id,
+            package_id,
+        } => {
+            let (report, details) =
+                missions.rework_package(&service()?, *mission_id, package_id, Rework::Fix)?;
+            print_report(&report);
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Continue {
+            mission_id,
+            package_id,
+            instruction,
+        } => {
+            let (report, details) = missions.rework_package(
+                &service()?,
+                *mission_id,
+                package_id,
+                Rework::Continue(instruction.clone()),
+            )?;
+            print_report(&report);
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Resume { mission_id } => {
+            let (reports, details) = missions.resume_mission(&service()?, *mission_id)?;
+            for report in &reports {
+                print_report(report);
+            }
+            println!("Resumed {} run(s).", reports.len());
             print_mission(&details);
             Ok(())
         }
@@ -885,6 +919,53 @@ fn parse_decision_author(word: &str) -> Result<DecisionAuthor> {
     }
 }
 
+/// The delivered package's evidence: counts and committed statuses, then
+/// the stages' own bottom lines quoted verbatim.
+fn print_result(result: &crate::domain::WorkPackageResult) {
+    let files = if result.changes_complete {
+        format!("{} file(s) changed", result.changed_files.len())
+    } else {
+        format!("{}+ file(s) changed (list cut)", result.changed_files.len())
+    };
+    let verification = result
+        .verification
+        .as_ref()
+        .map_or_else(|| "no verify stage".to_owned(), |v| enum_text(v.status));
+    let reviews = if result.reviews.is_empty() {
+        "no reviews".to_owned()
+    } else {
+        result
+            .reviews
+            .iter()
+            .map(|review| format!("{} {}", review.stage_id, enum_text(review.status)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!("      delivered: {files}; verify {verification}; {reviews}");
+    if let Some(line) = &result.bottom_line {
+        println!("      said: {}", first_line(line));
+    }
+    if let Some(decision) = result
+        .decision
+        .as_ref()
+        .and_then(|d| d.bottom_line.as_deref())
+    {
+        println!("      decision: {}", first_line(decision));
+    }
+    if result.open_questions.is_some() {
+        println!(
+            "      open: the decision left follow-ups; `polycode mission continue` carries them"
+        );
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+}
+
 fn print_mission_list(items: &[MissionListItem]) {
     if items.is_empty() {
         println!("No missions yet.");
@@ -958,6 +1039,9 @@ fn print_mission(details: &MissionDetails) {
         }
         if let Some(reason) = package.reason.as_deref() {
             println!("      reason: {reason}");
+        }
+        if let Some(result) = &package.result {
+            print_result(result);
         }
     }
 

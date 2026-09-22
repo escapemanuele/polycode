@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    DecisionId, EventId, EventMetadata, MissionId, RunId, RunStatus, WorkPackageId, WorkflowKind,
+    DecisionId, EventId, EventMetadata, MissionId, Role, RunId, RunStatus, StageId, StageStatus,
+    WorkPackageId, WorkflowKind,
 };
 
 /// Lifecycle of one mission.
@@ -155,6 +156,60 @@ pub enum IntegrationEvidence {
     NoChanges,
 }
 
+/// One file the delivering run changed against its base commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub binary: bool,
+}
+
+/// One stage's outcome as evidence: its committed status and, when the
+/// stage wrote an artifact with the contracted section, that section
+/// quoted verbatim. Never a summary anyone composed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageOutcome {
+    pub stage_id: StageId,
+    pub role: Role,
+    pub status: StageStatus,
+    /// The artifact's own `## Bottom line`, verbatim, when it wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_line: Option<String>,
+}
+
+/// What a delivered package's run actually produced, captured from the run
+/// store the moment the package is delivered and kept with the package, so
+/// it survives the run's worktree being released.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPackageResult {
+    pub run_id: RunId,
+    pub captured_at: DateTime<Utc>,
+    /// How many stages the run had when this was captured. Fix and continue
+    /// cycles append stages, so a run with more stages than this has been
+    /// reworked since, and the result no longer describes it.
+    pub stage_count: usize,
+    /// Files changed against the run's base commit, bounded; `changes_complete`
+    /// is false when the bound cut the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<ChangedFile>,
+    pub changes_complete: bool,
+    /// The newest editing stage's own bottom line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom_line: Option<String>,
+    /// The run's latest verification stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<StageOutcome>,
+    /// Every review stage, in workflow order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<StageOutcome>,
+    /// The run's latest decision stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<StageOutcome>,
+    /// The decision's `## Follow-ups` section, verbatim: what the lead left
+    /// open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_questions: Option<String>,
+}
+
 /// Who made a recorded decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,11 +240,18 @@ pub struct WorkPackage {
     runs: Vec<RunId>,
     /// Why the package is `Blocked` or `Failed`; cleared when it moves on.
     reason: Option<String>,
+    /// Evidence captured when the current run last delivered.
+    result: Option<WorkPackageResult>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
 
 impl WorkPackage {
+    #[must_use]
+    pub const fn result(&self) -> Option<&WorkPackageResult> {
+        self.result.as_ref()
+    }
+
     #[must_use]
     pub const fn id(&self) -> &WorkPackageId {
         &self.id
@@ -245,6 +307,7 @@ pub struct WorkPackageRehydrationData {
     pub status: WorkPackageStatus,
     pub runs: Vec<RunId>,
     pub reason: Option<String>,
+    pub result: Option<WorkPackageResult>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -360,6 +423,11 @@ pub enum MissionEventKind {
     PackageDelivered {
         run_id: RunId,
     },
+    /// A delivered package's run went back to work (a fix or continue
+    /// cycle); the package is in progress again on the same run.
+    PackageReworked {
+        run_id: RunId,
+    },
     PackageIntegrated {
         run_id: RunId,
         evidence: IntegrationEvidence,
@@ -467,6 +535,11 @@ pub enum MissionError {
         package_id: WorkPackageId,
         run_id: RunId,
     },
+    #[error("run {run_id} completed but package {package_id} was given no result to deliver")]
+    MissingResult {
+        package_id: WorkPackageId,
+        run_id: RunId,
+    },
     #[error("run {run_id} is already bound to package {package_id}")]
     RunAlreadyBound {
         package_id: WorkPackageId,
@@ -508,6 +581,8 @@ pub enum MissionInvariantError {
     ReadyWithUnintegratedDependency(WorkPackageId, WorkPackageId),
     #[error("package {0} is {1:?} without a reason")]
     MissingReason(WorkPackageId, WorkPackageStatus),
+    #[error("package {0} is delivered or integrated without a result from its current run")]
+    ResultMismatch(WorkPackageId),
     #[error("mission is {0:?} but package {1} is {2:?}")]
     PackageStatusConflictsWithMission(MissionStatus, WorkPackageId, WorkPackageStatus),
     #[error("completed mission integrated nothing")]
@@ -553,6 +628,7 @@ impl Mission {
                     status: package.status,
                     runs: package.runs,
                     reason: package.reason,
+                    result: package.result,
                     created_at: package.created_at,
                     updated_at: package.updated_at,
                 })
@@ -718,6 +794,12 @@ impl Mission {
                         package.id.clone(),
                         package.status,
                     ));
+                }
+                WorkPackageStatus::Delivered | WorkPackageStatus::Integrated
+                    if package.result.as_ref().map(|result| result.run_id)
+                        != package.current_run() =>
+                {
+                    return Err(MissionInvariantError::ResultMismatch(package.id.clone()));
                 }
                 WorkPackageStatus::Blocked | WorkPackageStatus::Failed
                     if package.reason.as_deref().is_none_or(str::is_empty) =>
@@ -909,6 +991,7 @@ impl Mission {
             status: WorkPackageStatus::Planned,
             runs: Vec::new(),
             reason: None,
+            result: None,
             created_at: now,
             updated_at: now,
         });
@@ -1025,6 +1108,7 @@ impl Mission {
         package.status = WorkPackageStatus::Running;
         package.runs.push(run_id);
         package.reason = None;
+        package.result = None;
         package.updated_at = now;
         let mut events =
             vec![self.event(Some(id), MissionEventKind::PackageStarted { run_id }, now)];
@@ -1038,19 +1122,22 @@ impl Mission {
 
     /// Reports the committed status of a package's current run. Package
     /// state follows the run: waiting for the user blocks it, completion
-    /// delivers it, failure or discard fails it. Anything else is progress
-    /// and changes nothing. Idempotent: repeating the same observation yields
-    /// no event.
+    /// delivers it with the `result` the caller captured from the run store,
+    /// failure or discard fails it, and a delivered package whose run is at
+    /// work again is reworked. Anything else is progress and changes
+    /// nothing. Idempotent: repeating the same observation yields no event.
     ///
     /// # Errors
-    /// Rejects unknown packages and runs that are not the package's current
-    /// run. A closed mission observes nothing and returns no change.
+    /// Rejects unknown packages, runs that are not the package's current run,
+    /// a result from another run, and a completion reported without a
+    /// result. A closed mission observes nothing and returns no change.
     pub fn observe_run(
         &mut self,
         id: &WorkPackageId,
         run_id: RunId,
         run_status: RunStatus,
         reason: Option<&str>,
+        result: Option<WorkPackageResult>,
         now: DateTime<Utc>,
     ) -> Result<MissionChange, MissionError> {
         if self.status.is_closed() {
@@ -1063,84 +1150,90 @@ impl Mission {
                 run_id,
             });
         }
-        if !package.status.has_active_run() {
+        if !package.status.has_active_run() && package.status != WorkPackageStatus::Delivered {
             return Ok(MissionChange { events: Vec::new() });
         }
-        let blocked_reason = || {
-            reason
-                .filter(|text| !text.trim().is_empty())
-                .map_or_else(|| "the run is waiting for you".to_owned(), str::to_owned)
-        };
-        let failed_reason = |fallback: &str| {
-            reason
-                .filter(|text| !text.trim().is_empty())
-                .map_or_else(|| fallback.to_owned(), str::to_owned)
-        };
-        let stopped_reason =
-            |what: &str| format!("the run is {what}; resume it (`polycode resume`) or discard it");
-        let block = |reason: String| {
-            Some((
-                WorkPackageStatus::Blocked,
-                Some(reason.clone()),
-                MissionEventKind::PackageBlocked { run_id, reason },
-            ))
-        };
-        // A blocked package whose run moved between waiting, paused and
-        // interrupted is blocked for a new reason; the same reason again is
-        // the same observation and yields nothing.
-        let block_unless_same = |reason: String| {
-            if package.status == WorkPackageStatus::Blocked
-                && package.reason.as_ref() == Some(&reason)
-            {
-                None
-            } else {
-                block(reason)
-            }
-        };
-        let next = match (package.status, run_status) {
-            (_, RunStatus::NeedsUser) => block_unless_same(blocked_reason()),
-            (_, RunStatus::Paused) => block_unless_same(stopped_reason("paused")),
-            (_, RunStatus::Interrupted) => block_unless_same(stopped_reason("interrupted")),
-            (
-                WorkPackageStatus::Blocked,
-                RunStatus::Running | RunStatus::Ready | RunStatus::Preparing | RunStatus::Created,
-            ) => Some((
-                WorkPackageStatus::Running,
-                None,
-                MissionEventKind::PackageUnblocked { run_id },
-            )),
-            (_, RunStatus::Completed | RunStatus::Applied) => Some((
-                WorkPackageStatus::Delivered,
-                None,
-                MissionEventKind::PackageDelivered { run_id },
-            )),
-            (_, RunStatus::Failed) => {
-                let reason = failed_reason("the run failed");
-                Some((
-                    WorkPackageStatus::Failed,
-                    Some(reason.clone()),
-                    MissionEventKind::PackageFailed { run_id, reason },
-                ))
-            }
-            (_, RunStatus::Discarded) => {
-                let reason = failed_reason("the run was discarded");
-                Some((
-                    WorkPackageStatus::Failed,
-                    Some(reason.clone()),
-                    MissionEventKind::PackageFailed { run_id, reason },
-                ))
-            }
-            _ => None,
-        };
+        if let Some(result) = &result
+            && result.run_id != run_id
+        {
+            return Err(MissionError::StaleRun {
+                package_id: id.clone(),
+                run_id: result.run_id,
+            });
+        }
+        if package.status == WorkPackageStatus::Delivered
+            && !matches!(run_status, RunStatus::Failed | RunStatus::Discarded)
+        {
+            return self.observe_delivered(id, run_id, run_status, reason, result, now);
+        }
+        let next = active_transition(
+            package.status,
+            package.reason.as_deref(),
+            run_id,
+            run_status,
+            reason,
+            result.is_some(),
+        )
+        .map_err(|()| MissionError::MissingResult {
+            package_id: id.clone(),
+            run_id,
+        })?;
         let Some((status, reason, kind)) = next else {
             return Ok(MissionChange { events: Vec::new() });
         };
         package.status = status;
         package.reason = reason;
+        // A result describes a delivery. A failed rework leaves no delivery
+        // to describe, so the old result goes with it rather than standing
+        // beside the failure as if it still held.
+        package.result = if status == WorkPackageStatus::Delivered {
+            result
+        } else {
+            None
+        };
         package.updated_at = now;
         let events = vec![self.event(Some(id), kind, now)];
         self.touch(now);
         Ok(MissionChange { events })
+    }
+
+    /// A delivered package's run moved on. At work again, the package is
+    /// reworked on the same run and in progress once more. Finished again
+    /// with more stages than the result covers (a cycle completed before
+    /// anyone looked), the caller's fresh capture replaces the result.
+    fn observe_delivered(
+        &mut self,
+        id: &WorkPackageId,
+        run_id: RunId,
+        run_status: RunStatus,
+        reason: Option<&str>,
+        result: Option<WorkPackageResult>,
+        now: DateTime<Utc>,
+    ) -> Result<MissionChange, MissionError> {
+        let package = self.package_mut(id)?;
+        if matches!(run_status, RunStatus::Completed | RunStatus::Applied) {
+            let Some(fresh) = result else {
+                return Ok(MissionChange { events: Vec::new() });
+            };
+            if package.result.as_ref().map(|r| r.stage_count) == Some(fresh.stage_count) {
+                return Ok(MissionChange { events: Vec::new() });
+            }
+            package.result = Some(fresh);
+            package.updated_at = now;
+            let events = vec![
+                self.event(Some(id), MissionEventKind::PackageReworked { run_id }, now),
+                self.event(Some(id), MissionEventKind::PackageDelivered { run_id }, now),
+            ];
+            self.touch(now);
+            return Ok(MissionChange { events });
+        }
+        package.status = WorkPackageStatus::Running;
+        package.updated_at = now;
+        let reworked = self.event(Some(id), MissionEventKind::PackageReworked { run_id }, now);
+        let mut change = self.observe_run(id, run_id, run_status, reason, None, now)?;
+        change.events.insert(0, reworked);
+        self.touch(now);
+        Ok(change)
     }
 
     /// Records that a delivered package's change reached the source checkout,
@@ -1208,6 +1301,7 @@ impl Mission {
         }
         package.status = WorkPackageStatus::Planned;
         package.reason = None;
+        package.result = None;
         package.updated_at = now;
         let mut events = vec![self.event(Some(id), MissionEventKind::PackageRetryScheduled, now)];
         self.settle_readiness(now, &mut events);
@@ -1412,6 +1506,72 @@ impl Mission {
     }
 }
 
+/// The next state of a package with a live run, given the run's committed
+/// status. `Err(())` is a completion reported without a result.
+#[allow(clippy::type_complexity, reason = "one transition triple, used once")]
+fn active_transition(
+    status: WorkPackageStatus,
+    current_reason: Option<&str>,
+    run_id: RunId,
+    run_status: RunStatus,
+    reason: Option<&str>,
+    has_result: bool,
+) -> Result<Option<(WorkPackageStatus, Option<String>, MissionEventKind)>, ()> {
+    let given = reason.filter(|text| !text.trim().is_empty());
+    let blocked_reason =
+        || given.map_or_else(|| "the run is waiting for you".to_owned(), str::to_owned);
+    let failed_reason = |fallback: &str| given.map_or_else(|| fallback.to_owned(), str::to_owned);
+    let stopped_reason =
+        |what: &str| format!("the run is {what}; resume it (`polycode resume`) or discard it");
+    // A blocked package whose run moved between waiting, paused and
+    // interrupted is blocked for a new reason; the same reason again is the
+    // same observation and yields nothing.
+    let block_unless_same = |reason: String| {
+        if status == WorkPackageStatus::Blocked && current_reason == Some(reason.as_str()) {
+            None
+        } else {
+            Some((
+                WorkPackageStatus::Blocked,
+                Some(reason.clone()),
+                MissionEventKind::PackageBlocked { run_id, reason },
+            ))
+        }
+    };
+    let fail = |reason: String| {
+        Some((
+            WorkPackageStatus::Failed,
+            Some(reason.clone()),
+            MissionEventKind::PackageFailed { run_id, reason },
+        ))
+    };
+    Ok(match (status, run_status) {
+        (_, RunStatus::NeedsUser) => block_unless_same(blocked_reason()),
+        (_, RunStatus::Paused) => block_unless_same(stopped_reason("paused")),
+        (_, RunStatus::Interrupted) => block_unless_same(stopped_reason("interrupted")),
+        (
+            WorkPackageStatus::Blocked,
+            RunStatus::Running | RunStatus::Ready | RunStatus::Preparing | RunStatus::Created,
+        ) => Some((
+            WorkPackageStatus::Running,
+            None,
+            MissionEventKind::PackageUnblocked { run_id },
+        )),
+        (_, RunStatus::Completed | RunStatus::Applied) => {
+            if !has_result {
+                return Err(());
+            }
+            Some((
+                WorkPackageStatus::Delivered,
+                None,
+                MissionEventKind::PackageDelivered { run_id },
+            ))
+        }
+        (_, RunStatus::Failed) => fail(failed_reason("the run failed")),
+        (_, RunStatus::Discarded) => fail(failed_reason("the run was discarded")),
+        _ => None,
+    })
+}
+
 fn visit(
     graph: &HashMap<&WorkPackageId, &[WorkPackageId]>,
     node: &WorkPackageId,
@@ -1460,6 +1620,25 @@ mod tests {
 
     fn id(value: &str) -> WorkPackageId {
         WorkPackageId::new(value).unwrap()
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "matches the observe_run parameter"
+    )]
+    fn result_of(run: RunId) -> Option<WorkPackageResult> {
+        Some(WorkPackageResult {
+            run_id: run,
+            captured_at: at(0),
+            stage_count: 2,
+            changed_files: vec![],
+            changes_complete: true,
+            bottom_line: None,
+            verification: None,
+            reviews: vec![],
+            decision: None,
+            open_questions: None,
+        })
     }
 
     fn kinds(change: &MissionChange) -> Vec<&MissionEventKind> {
@@ -1514,7 +1693,14 @@ mod tests {
         assert_eq!(mission.status(), MissionStatus::Active);
 
         let change = mission
-            .observe_run(&id("persistence"), run, RunStatus::Completed, None, at(4))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Completed,
+                None,
+                result_of(run),
+                at(4),
+            )
             .unwrap();
         assert!(matches!(
             kinds(&change).as_slice(),
@@ -1552,6 +1738,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one scenario, start to finish")]
     fn observing_a_run_is_idempotent_and_blocks_and_unblocks_with_the_run() {
         let mut mission = mission_with_chain();
         let run = RunId::from_u128(10);
@@ -1560,7 +1747,14 @@ mod tests {
             .unwrap();
 
         let change = mission
-            .observe_run(&id("persistence"), run, RunStatus::Running, None, at(4))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Running,
+                None,
+                None,
+                at(4),
+            )
             .unwrap();
         assert!(!change.changed());
 
@@ -1570,6 +1764,7 @@ mod tests {
                 run,
                 RunStatus::NeedsUser,
                 Some("permission: Bash"),
+                None,
                 at(5),
             )
             .unwrap();
@@ -1587,12 +1782,20 @@ mod tests {
                 run,
                 RunStatus::NeedsUser,
                 Some("permission: Bash"),
+                None,
                 at(6),
             )
             .unwrap();
         assert!(!again.changed());
         let stopped = mission
-            .observe_run(&id("persistence"), run, RunStatus::Interrupted, None, at(6))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Interrupted,
+                None,
+                None,
+                at(6),
+            )
             .unwrap();
         assert!(matches!(
             kinds(&stopped).as_slice(),
@@ -1600,13 +1803,27 @@ mod tests {
         ));
         assert!(
             !mission
-                .observe_run(&id("persistence"), run, RunStatus::Interrupted, None, at(6))
+                .observe_run(
+                    &id("persistence"),
+                    run,
+                    RunStatus::Interrupted,
+                    None,
+                    None,
+                    at(6)
+                )
                 .unwrap()
                 .changed()
         );
 
         let change = mission
-            .observe_run(&id("persistence"), run, RunStatus::Running, None, at(7))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Running,
+                None,
+                None,
+                at(7),
+            )
             .unwrap();
         assert!(matches!(
             kinds(&change).as_slice(),
@@ -1621,7 +1838,14 @@ mod tests {
         );
 
         let change = mission
-            .observe_run(&id("persistence"), run, RunStatus::Interrupted, None, at(8))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Interrupted,
+                None,
+                None,
+                at(8),
+            )
             .unwrap();
         assert!(matches!(
             kinds(&change).as_slice(),
@@ -1632,7 +1856,14 @@ mod tests {
             Err(MissionError::InvalidPackageTransition { .. })
         ));
         mission
-            .observe_run(&id("persistence"), run, RunStatus::Running, None, at(9))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Running,
+                None,
+                None,
+                at(9),
+            )
             .unwrap();
 
         let stale = mission
@@ -1641,10 +1872,178 @@ mod tests {
                 RunId::from_u128(99),
                 RunStatus::Completed,
                 None,
+                result_of(RunId::from_u128(99)),
                 at(8),
             )
             .unwrap_err();
         assert!(matches!(stale, MissionError::StaleRun { .. }));
+        mission.validate_invariants().unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one scenario, start to finish")]
+    fn delivery_needs_a_result_from_the_same_run_and_rework_replaces_it() {
+        let mut mission = mission_with_chain();
+        let run = RunId::from_u128(10);
+        mission
+            .start_package(&id("persistence"), run, at(3))
+            .unwrap();
+        assert!(matches!(
+            mission.observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Completed,
+                None,
+                None,
+                at(4)
+            ),
+            Err(MissionError::MissingResult { .. })
+        ));
+        assert!(matches!(
+            mission.observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Completed,
+                None,
+                result_of(RunId::from_u128(11)),
+                at(4)
+            ),
+            Err(MissionError::StaleRun { .. })
+        ));
+        let mut first = result_of(run).unwrap();
+        first.bottom_line = Some("first delivery".to_owned());
+        mission
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Completed,
+                None,
+                Some(first),
+                at(4),
+            )
+            .unwrap();
+        assert_eq!(
+            mission
+                .package(&id("persistence"))
+                .unwrap()
+                .result()
+                .unwrap()
+                .bottom_line
+                .as_deref(),
+            Some("first delivery")
+        );
+
+        // A fix cycle puts the same run back to work: reworked, then blocked
+        // by the run in one observation, and the old result stays until the
+        // next delivery replaces it.
+        let change = mission
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::NeedsUser,
+                None,
+                None,
+                at(5),
+            )
+            .unwrap();
+        assert!(matches!(
+            kinds(&change).as_slice(),
+            [
+                MissionEventKind::PackageReworked { .. },
+                MissionEventKind::PackageBlocked { .. }
+            ]
+        ));
+        assert_eq!(
+            mission.package(&id("persistence")).unwrap().status(),
+            WorkPackageStatus::Blocked
+        );
+        let mut second = result_of(run).unwrap();
+        second.bottom_line = Some("second delivery".to_owned());
+        mission
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Completed,
+                None,
+                Some(second),
+                at(6),
+            )
+            .unwrap();
+        assert_eq!(
+            mission
+                .package(&id("persistence"))
+                .unwrap()
+                .result()
+                .unwrap()
+                .bottom_line
+                .as_deref(),
+            Some("second delivery")
+        );
+        // Applied after delivery is not rework.
+        assert!(
+            !mission
+                .observe_run(
+                    &id("persistence"),
+                    run,
+                    RunStatus::Applied,
+                    None,
+                    None,
+                    at(7)
+                )
+                .unwrap()
+                .changed()
+        );
+        // A rework that fails takes the stale result with it.
+        let mut failing = mission.clone();
+        failing
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Failed,
+                None,
+                None,
+                at(8),
+            )
+            .unwrap();
+        let failed = failing.package(&id("persistence")).unwrap();
+        assert_eq!(failed.status(), WorkPackageStatus::Failed);
+        assert!(failed.result().is_none());
+        failing.validate_invariants().unwrap();
+
+        // A run that grew and completed before anyone looked is re-delivered
+        // from the fresh capture; the same capture again is silent.
+        let mut grown = result_of(run).unwrap();
+        grown.stage_count = 5;
+        let change = mission
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Completed,
+                None,
+                Some(grown.clone()),
+                at(8),
+            )
+            .unwrap();
+        assert!(matches!(
+            kinds(&change).as_slice(),
+            [
+                MissionEventKind::PackageReworked { .. },
+                MissionEventKind::PackageDelivered { .. }
+            ]
+        ));
+        assert!(
+            !mission
+                .observe_run(
+                    &id("persistence"),
+                    run,
+                    RunStatus::Completed,
+                    None,
+                    Some(grown),
+                    at(9)
+                )
+                .unwrap()
+                .changed()
+        );
         mission.validate_invariants().unwrap();
     }
 
@@ -1661,6 +2060,7 @@ mod tests {
                 run,
                 RunStatus::Failed,
                 Some("provider error"),
+                None,
                 at(4),
             )
             .unwrap();
@@ -1824,7 +2224,14 @@ mod tests {
             Err(MissionError::InvalidPackageTransition { .. })
         ));
         mission
-            .observe_run(&id("persistence"), run, RunStatus::Failed, None, at(5))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Failed,
+                None,
+                None,
+                at(5),
+            )
             .unwrap();
         let change = mission.cancel("stop", at(6)).unwrap();
         assert_eq!(change.events.len(), 3);
@@ -1841,7 +2248,14 @@ mod tests {
         ));
         assert!(
             !mission
-                .observe_run(&id("persistence"), run, RunStatus::Completed, None, at(8))
+                .observe_run(
+                    &id("persistence"),
+                    run,
+                    RunStatus::Completed,
+                    None,
+                    result_of(run),
+                    at(8)
+                )
                 .unwrap()
                 .changed()
         );
@@ -1856,7 +2270,14 @@ mod tests {
             .start_package(&id("persistence"), run, at(3))
             .unwrap();
         mission
-            .observe_run(&id("persistence"), run, RunStatus::Applied, None, at(4))
+            .observe_run(
+                &id("persistence"),
+                run,
+                RunStatus::Applied,
+                None,
+                result_of(run),
+                at(4),
+            )
             .unwrap();
         mission
             .integrate_package(&id("persistence"), IntegrationEvidence::NoChanges, at(5))
@@ -1905,6 +2326,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one scenario, start to finish")]
     fn rehydration_rejects_states_the_aggregate_could_not_reach() {
         let mission = mission_with_chain();
         let data = |mutate: &dyn Fn(&mut MissionRehydrationData)| {
@@ -1921,6 +2343,7 @@ mod tests {
                         status: package.status(),
                         runs: package.runs().to_vec(),
                         reason: package.reason().map(str::to_owned),
+                        result: package.result().cloned(),
                         created_at: *package.created_at(),
                         updated_at: *package.updated_at(),
                     })
@@ -1980,6 +2403,15 @@ mod tests {
         assert!(matches!(
             Mission::rehydrate(data(&|d| d.packages[1].id = id("persistence"))),
             Err(MissionInvariantError::DuplicatePackage(_))
+        ));
+        assert!(matches!(
+            Mission::rehydrate(data(&|d| {
+                d.status = MissionStatus::Active;
+                d.packages[0].status = WorkPackageStatus::Delivered;
+                d.packages[0].runs = vec![RunId::from_u128(1)];
+                d.packages[0].result = result_of(RunId::from_u128(2));
+            })),
+            Err(MissionInvariantError::ResultMismatch(_))
         ));
     }
 

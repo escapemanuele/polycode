@@ -110,20 +110,21 @@ watch agents work?
 - Tests: aggregate rules, restart rehydration, CAS and event integrity,
   purge refusal, end-to-end on the fake provider.
 
-### M2 — Handoff and result model
+### M2 — Handoff and result model (this branch)
 
-- Persist the handoff as an immutable record beside the child run
-  (`mission_handoffs`: package contract hash, rendered bytes hash,
-  dependency artifacts included), so what a worker was told is evidence.
-- `WorkPackageResult`: changed files, verification outcome, review
-  outcome, bottom line, unresolved questions, quoted from the run's
-  artifacts and diff, never composed.
-- Upstream artifacts: a package may name which dependency artifacts (plan,
-  decision) are injected into its handoff.
-- Package remediation through the child run's fix/continue cycles, driven
-  from the mission.
-- Fan-out/fan-in: several `Ready` packages may run at once (the CLI cap
-  becomes a mission policy); integration stays sequential and explicit.
+- Done: the handoff persisted as an immutable record beside the child run
+  (`mission_handoffs`: contract hash, task hash and size, dependencies and
+  decisions named), committed with the bind.
+- Done: `WorkPackageResult` captured at delivery from the run store —
+  changed files, verify/review/decision statuses, bottom lines and
+  follow-ups quoted verbatim — kept in the mission snapshot (v2).
+- Done: rework through the run's own fix/continue cycles (`mission fix`,
+  `mission continue`), including cycles started outside the mission.
+- Done: fan-in with `mission resume`; fan-out is starting several ready
+  packages on native providers, whose runs return at "waiting for
+  provider".
+- Deferred to M6: injecting dependency artifacts (plan, decision) into a
+  handoff, and a mission-level concurrency policy.
 
 ### M3 — Lead conversation and plan changes
 

@@ -17,11 +17,15 @@ use crate::domain::{
     RunStatus, WorkPackage, WorkPackageContract, WorkPackageId, WorkPackageStatus,
 };
 use crate::git::GitRepository;
-use crate::store::{LoadedMission, MissionInput, MissionRevision, SqliteStore, database_file};
+use crate::store::{
+    LoadedMission, MissionHandoffRecord, MissionInput, MissionRevision, SqliteStore,
+    contract_sha256, database_file, sha256_hex, worktree_root,
+};
 use crate::workspace::WorkspaceStatus;
 
 use super::mission_query::{self, MissionDetails, MissionListItem};
-use super::provider_factory::{ProviderFactory, ProviderResolver};
+use super::mission_result;
+use super::provider_factory::ProviderFactory;
 use super::{
     AppError, EffortRequest, ExecutionReport, ExecutionSelection, ImageGenerationPlan, RunService,
     StartProgress, query,
@@ -31,6 +35,9 @@ use super::{
 /// [`RunService`], so several processes can share one database.
 pub struct MissionService {
     database: PathBuf,
+    /// Root of the managed worktrees, read to capture a delivered run's
+    /// delta; never written from here.
+    worktrees: PathBuf,
 }
 
 /// One package as the lead or user describes it before it exists.
@@ -41,18 +48,31 @@ pub struct NewWorkPackage {
     pub dependencies: Vec<WorkPackageId>,
 }
 
+/// How a delivered package goes back to work on its own run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rework {
+    /// Answer the run's own review findings.
+    Fix,
+    /// Carry an operator instruction.
+    Continue(String),
+}
+
 impl MissionService {
     #[must_use]
-    pub const fn new(database: PathBuf) -> Self {
-        Self { database }
+    pub const fn new(database: PathBuf, worktrees: PathBuf) -> Self {
+        Self {
+            database,
+            worktrees,
+        }
     }
 
-    /// Resolves the database from the environment, as the CLI does.
+    /// Resolves the database and worktree root from the environment, as the
+    /// CLI does.
     ///
     /// # Errors
     /// Returns path resolution errors.
     pub fn from_environment() -> Result<Self, AppError> {
-        Ok(Self::new(database_file()?))
+        Ok(Self::new(database_file()?, worktree_root()?))
     }
 
     /// Creates one mission over a Git checkout, recording where it began.
@@ -97,7 +117,9 @@ impl MissionService {
     /// Returns persistence errors.
     pub fn list_missions(&self) -> Result<Vec<MissionListItem>, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
-        mission_query::list(&mut store, observe_runs)
+        mission_query::list(&mut store, |store, id| {
+            observe_runs(store, &self.worktrees, id)
+        })
     }
 
     /// One mission with its packages in dependency order.
@@ -111,7 +133,7 @@ impl MissionService {
     /// Returns not-found or persistence errors.
     pub fn inspect_mission(&self, mission_id: MissionId) -> Result<MissionDetails, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
-        let loaded = observe_runs(&mut store, mission_id)?;
+        let loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
         mission_query::details(&mut store, &loaded)
     }
 
@@ -200,6 +222,24 @@ impl MissionService {
             .into());
         }
         let task = handoff_task(&loaded, package);
+        // The run stores its input trimmed; hash exactly what it will hold.
+        let stored_task = task.trim();
+        let handoff = MissionHandoffRecord {
+            run_id: RunId::from_u128(0),
+            mission_id,
+            package_id: package_id.clone(),
+            contract_sha256: contract_sha256(package.contract())?,
+            task_sha256: sha256_hex(stored_task.as_bytes()),
+            task_size: stored_task.len() as u64,
+            dependencies: package.dependencies().to_vec(),
+            decision_ids: loaded
+                .mission
+                .decisions()
+                .iter()
+                .map(|decision| decision.id)
+                .collect(),
+            created_at: now(),
+        };
         let workflow = package.contract().workflow;
         let repository = PathBuf::from(loaded.input.source_repo_path());
         drop(store);
@@ -216,9 +256,11 @@ impl MissionService {
                 if let StartProgress::PreparingWorkspace(run_id) = progress
                     && bound.borrow().is_none()
                 {
-                    let outcome = self.mutate_quietly(mission_id, |mission, now| {
-                        mission.start_package(package_id, run_id, now)
-                    });
+                    let handoff = MissionHandoffRecord {
+                        run_id,
+                        ..handoff.clone()
+                    };
+                    let outcome = self.bind_run(mission_id, package_id, run_id, Some(&handoff));
                     *bound.borrow_mut() = Some(outcome.map(|_| ()));
                 }
             },
@@ -270,9 +312,120 @@ impl MissionService {
             });
         }
         drop(store);
-        self.mutate(mission_id, |mission, now| {
-            mission.start_package(package_id, run_id, now)
-        })
+        self.bind_run(mission_id, package_id, run_id, None)?;
+        self.inspect_mission(mission_id)
+    }
+
+    /// Sends a delivered package's run back to work: a fix cycle, or a
+    /// continue cycle carrying an instruction. The run grows its cycle
+    /// exactly as `polycode fix` / the TUI's continue would; the package
+    /// reads in progress again on the same run and delivers afresh.
+    ///
+    /// # Errors
+    /// Returns run-side refusals (no decision stage, not completed) and
+    /// persistence errors.
+    pub fn rework_package<F>(
+        &self,
+        runs: &RunService<F>,
+        mission_id: MissionId,
+        package_id: &WorkPackageId,
+        rework: Rework,
+    ) -> Result<(ExecutionReport, MissionDetails), AppError>
+    where
+        F: ProviderFactory,
+    {
+        let mut store = SqliteStore::open(&self.database)?;
+        let loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
+        let package = loaded
+            .mission
+            .package(package_id)
+            .ok_or_else(|| AppError::PackageNotFound(mission_id, package_id.clone()))?;
+        if package.status() != WorkPackageStatus::Delivered {
+            return Err(crate::domain::MissionError::InvalidPackageTransition {
+                package_id: package_id.clone(),
+                status: package.status(),
+                action: "reworking",
+                expected: "a delivered package",
+            }
+            .into());
+        }
+        let run_id = package
+            .current_run()
+            .ok_or_else(|| AppError::PackageNotFound(mission_id, package_id.clone()))?;
+        drop(store);
+        // The run grows its cycle first; the next observation sees either a
+        // run at work (the package is reworked and in progress) or a run that
+        // finished with more stages than the result covers (re-delivered from
+        // a fresh capture). Either way the old result never stands for the
+        // run's current state.
+        let report = match rework {
+            Rework::Fix => runs.request_fix(run_id)?,
+            Rework::Continue(instruction) => runs.request_continue(run_id, instruction)?,
+        };
+        let details = self.inspect_mission(mission_id)?;
+        Ok((report, details))
+    }
+
+    /// Resumes every package run that is prepared, suspended, or interrupted,
+    /// then observes the mission: the fan-in for packages started with
+    /// native providers, whose runs outlive the command that started them.
+    ///
+    /// # Errors
+    /// Returns the first run-side failure, or persistence errors.
+    pub fn resume_mission<F>(
+        &self,
+        runs: &RunService<F>,
+        mission_id: MissionId,
+    ) -> Result<(Vec<ExecutionReport>, MissionDetails), AppError>
+    where
+        F: ProviderFactory,
+    {
+        let mut store = SqliteStore::open(&self.database)?;
+        let loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
+        let active: Vec<RunId> = loaded
+            .mission
+            .packages()
+            .iter()
+            .filter(|package| package.status().has_active_run())
+            .filter_map(WorkPackage::current_run)
+            .collect();
+        drop(store);
+        let mut reports = Vec::new();
+        for run_id in active {
+            let status = SqliteStore::open(&self.database)?
+                .load_run(run_id)?
+                .run
+                .status();
+            if matches!(
+                status,
+                RunStatus::Ready | RunStatus::Running | RunStatus::Paused | RunStatus::Interrupted
+            ) {
+                reports.push(runs.resume_run(run_id)?);
+            }
+        }
+        let details = self.inspect_mission(mission_id)?;
+        Ok((reports, details))
+    }
+
+    /// Binds one run to one package in a single commit, with its handoff
+    /// when the mission rendered the run's task.
+    fn bind_run(
+        &self,
+        mission_id: MissionId,
+        package_id: &WorkPackageId,
+        run_id: RunId,
+        handoff: Option<&MissionHandoffRecord>,
+    ) -> Result<MissionRevision, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        let mut loaded = store.load_mission(mission_id)?;
+        let now = now().max(*loaded.mission.updated_at());
+        let change = loaded.mission.start_package(package_id, run_id, now)?;
+        Ok(store.commit_mission_update_with(
+            &loaded.mission,
+            loaded.revision,
+            &change.events,
+            handoff,
+        )?)
     }
 
     /// Records that a delivered package's change reached the source
@@ -284,17 +437,13 @@ impl MissionService {
     /// # Errors
     /// Returns domain rule violations, missing evidence, or persistence
     /// errors.
-    pub fn integrate_package<F>(
+    pub fn integrate_package(
         &self,
-        runs: &RunService<F>,
         mission_id: MissionId,
         package_id: &WorkPackageId,
-    ) -> Result<MissionDetails, AppError>
-    where
-        F: ProviderResolver,
-    {
+    ) -> Result<MissionDetails, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
-        let loaded = observe_runs(&mut store, mission_id)?;
+        let loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
         let package = loaded
             .mission
             .package(package_id)
@@ -306,7 +455,6 @@ impl MissionService {
         let workspace = store
             .load_workspace(run_id)?
             .map(|workspace| workspace.status());
-        drop(store);
         let evidence = match status {
             RunStatus::Applied => IntegrationEvidence::Applied,
             // A completed run's worktree is released by exactly one path:
@@ -317,7 +465,7 @@ impl MissionService {
                 IntegrationEvidence::NoChanges
             }
             RunStatus::Completed if workspace == Some(WorkspaceStatus::Ready) => {
-                let preview = runs.preview_run_diff(run_id)?;
+                let preview = mission_result::preview_delta(&mut store, &self.worktrees, run_id)?;
                 if preview.total_bytes == 0 && preview.changed_files.is_empty() {
                     IntegrationEvidence::NoChanges
                 } else {
@@ -339,6 +487,7 @@ impl MissionService {
                 });
             }
         };
+        drop(store);
         self.mutate(mission_id, |mission, now| {
             mission.integrate_package(package_id, evidence, now)
         })
@@ -424,7 +573,7 @@ impl MissionService {
         ) -> Result<MissionChange, crate::domain::MissionError>,
     ) -> Result<MissionDetails, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
-        let mut loaded = observe_runs(&mut store, mission_id)?;
+        let mut loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
         let now = now().max(*loaded.mission.updated_at());
         let change = operation(&mut loaded.mission, now)?;
         if change.changed() {
@@ -432,30 +581,9 @@ impl MissionService {
             // The operation may have bound a run that already has a
             // committed outcome (attach); observe once more so the
             // projection never shows a package behind its run.
-            loaded = observe_runs(&mut store, mission_id)?;
+            loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
         }
         mission_query::details(&mut store, &loaded)
-    }
-
-    /// One domain operation without the observe pass or projection, for use
-    /// inside another operation's progress callback.
-    fn mutate_quietly(
-        &self,
-        mission_id: MissionId,
-        operation: impl FnOnce(
-            &mut Mission,
-            DateTime<Utc>,
-        ) -> Result<MissionChange, crate::domain::MissionError>,
-    ) -> Result<MissionRevision, AppError> {
-        let mut store = SqliteStore::open(&self.database)?;
-        let mut loaded = store.load_mission(mission_id)?;
-        let now = now().max(*loaded.mission.updated_at());
-        let change = operation(&mut loaded.mission, now)?;
-        if change.changed() {
-            loaded.revision =
-                store.commit_mission_update(&loaded.mission, loaded.revision, &change.events)?;
-        }
-        Ok(loaded.revision)
     }
 }
 
@@ -464,21 +592,35 @@ fn now() -> DateTime<Utc> {
 }
 
 /// Reports every package's current run status to the mission and commits
-/// whatever moved. Reads run state only; never drives a run.
-fn observe_runs(store: &mut SqliteStore, mission_id: MissionId) -> Result<LoadedMission, AppError> {
+/// whatever moved. Reads run state only; never drives a run. Delivery
+/// evidence is captured from the run store at the moment a completion is
+/// first observed, and only then.
+fn observe_runs(
+    store: &mut SqliteStore,
+    worktrees: &Path,
+    mission_id: MissionId,
+) -> Result<LoadedMission, AppError> {
     let mut loaded = store.load_mission(mission_id)?;
     if loaded.mission.status().is_closed() {
         return Ok(loaded);
     }
-    let observed: Vec<(WorkPackageId, RunId)> = loaded
+    let observed: Vec<(WorkPackageId, RunId, WorkPackageStatus)> = loaded
         .mission
         .packages()
         .iter()
-        .filter(|package| package.status().has_active_run())
-        .filter_map(|package| Some((package.id().clone(), package.current_run()?)))
+        .filter(|package| {
+            package.status().has_active_run() || package.status() == WorkPackageStatus::Delivered
+        })
+        .filter_map(|package| {
+            Some((
+                package.id().clone(),
+                package.current_run()?,
+                package.status(),
+            ))
+        })
         .collect();
     let mut events = Vec::new();
-    for (package_id, run_id) in observed {
+    for (package_id, run_id, package_status) in observed {
         let run = store.load_run(run_id)?.run;
         let status = run.status();
         let reason = match status {
@@ -491,10 +633,28 @@ fn observe_runs(store: &mut SqliteStore, mission_id: MissionId) -> Result<Loaded
             _ => None,
         };
         let now = now().max(*loaded.mission.updated_at());
-        let change =
-            loaded
-                .mission
-                .observe_run(&package_id, run_id, status, reason.as_deref(), now)?;
+        let delivered_stages = loaded
+            .mission
+            .package(&package_id)
+            .and_then(WorkPackage::result)
+            .map(|result| result.stage_count);
+        let result = match status {
+            RunStatus::Completed | RunStatus::Applied
+                if package_status != WorkPackageStatus::Delivered
+                    || delivered_stages != Some(run.stages().len()) =>
+            {
+                Some(mission_result::capture(store, worktrees, run_id, now)?)
+            }
+            _ => None,
+        };
+        let change = loaded.mission.observe_run(
+            &package_id,
+            run_id,
+            status,
+            reason.as_deref(),
+            result,
+            now,
+        )?;
         events.extend(change.events);
     }
     if !events.is_empty() {
@@ -612,7 +772,10 @@ mod tests {
         }
 
         fn missions(&self) -> MissionService {
-            MissionService::new(self.database.clone())
+            MissionService::new(
+                self.database.clone(),
+                self.temp.path().join("data/worktrees"),
+            )
         }
 
         fn runs(&self) -> RunService<DevelopmentFakeProviderFactory> {
@@ -714,6 +877,28 @@ mod tests {
         assert_eq!(summary.status, WorkPackageStatus::Delivered);
         assert_eq!(summary.current_run, Some(run_id));
         assert_eq!(summary.run_status, Some(RunStatus::Completed));
+        // The handoff record hashes exactly what the run holds as its input.
+        let handoff = summary
+            .handoff
+            .as_ref()
+            .expect("a started package has a handoff");
+        assert_eq!(handoff.task_sha256, sha256_hex(task.as_bytes()));
+        assert_eq!(handoff.task_size, task.len() as u64);
+        assert!(handoff.contract_current);
+        // The result is committed run evidence: the fake changed nothing,
+        // and Fast's verify stage really ran.
+        let result = summary
+            .result
+            .as_ref()
+            .expect("a delivered package has a result");
+        assert_eq!(result.run_id, run_id);
+        assert!(result.changed_files.is_empty());
+        assert!(result.changes_complete);
+        assert_eq!(
+            result.verification.as_ref().map(|v| v.status),
+            Some(crate::domain::StageStatus::Completed)
+        );
+        assert!(result.reviews.is_empty());
         assert_eq!(details.status, MissionStatus::Active);
         assert_eq!(
             details.attention.awaiting_integration,
@@ -731,7 +916,7 @@ mod tests {
         // The fake provider changes nothing, so the completed run's empty
         // delta is the integration evidence; apply reports the same.
         let details = missions
-            .integrate_package(&runs, mission.id, &persistence)
+            .integrate_package(mission.id, &persistence)
             .unwrap();
         assert_eq!(
             details.package(&persistence).unwrap().status,
@@ -758,9 +943,7 @@ mod tests {
         ));
         let (outcome, _) = runs.apply_run(report.details.id).unwrap();
         assert_eq!(outcome, crate::app::ApplyOutcome::NoChanges);
-        missions
-            .integrate_package(&runs, mission.id, &memory)
-            .unwrap();
+        missions.integrate_package(mission.id, &memory).unwrap();
         let details = missions.complete_mission(mission.id).unwrap();
         assert_eq!(details.status, MissionStatus::Completed);
         assert_eq!(details.packages.len(), 2);
@@ -779,6 +962,74 @@ mod tests {
             events.last().unwrap().event.kind(),
             crate::domain::MissionEventKind::MissionCompleted
         ));
+    }
+
+    #[test]
+    fn a_standard_package_is_reworked_through_a_fix_cycle_and_delivers_again() {
+        let fixture = Fixture::new();
+        let missions = fixture.missions();
+        let runs = fixture.runs();
+        let mission = missions
+            .create_mission("JEV", "goal", &fixture.repo)
+            .unwrap();
+        let a = WorkPackageId::new("a").unwrap();
+        missions
+            .add_package(
+                mission.id,
+                NewWorkPackage {
+                    id: a.clone(),
+                    contract: contract("A", WorkflowKind::Standard),
+                    dependencies: vec![],
+                },
+            )
+            .unwrap();
+        let (report, details) = missions
+            .start_package(
+                &runs,
+                mission.id,
+                &a,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        assert_eq!(report.details.status, RunStatus::Completed);
+        let result = details.package(&a).unwrap().result.clone().unwrap();
+        assert_eq!(result.reviews.len(), 2, "standard runs two reviews");
+        assert!(result.decision.is_some());
+        let captured_at = result.captured_at;
+
+        // A fix cycle reuses the run; the package delivers again with a
+        // fresh result, and the mission's history says it was reworked.
+        let (report, details) = missions
+            .rework_package(&runs, mission.id, &a, Rework::Fix)
+            .unwrap();
+        assert_eq!(report.details.status, RunStatus::Completed);
+        let reworked = details.package(&a).unwrap();
+        assert_eq!(reworked.status, WorkPackageStatus::Delivered);
+        assert_eq!(reworked.runs.len(), 1);
+        assert!(reworked.result.as_ref().unwrap().captured_at >= captured_at);
+        let events = SqliteStore::open(&fixture.database)
+            .unwrap()
+            .load_mission_events(mission.id)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.event.kind(),
+            crate::domain::MissionEventKind::PackageReworked { .. }
+        )));
+        let delivered = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event.kind(),
+                    crate::domain::MissionEventKind::PackageDelivered { .. }
+                )
+            })
+            .count();
+        assert_eq!(delivered, 2);
+
+        // Nothing to resume on a quiescent mission; the call is a no-op.
+        let (reports, _) = missions.resume_mission(&runs, mission.id).unwrap();
+        assert!(reports.is_empty());
     }
 
     #[test]
@@ -806,11 +1057,12 @@ mod tests {
         let details = missions
             .attach_run(mission.id, &a, report.details.id)
             .unwrap();
-        // A completed run attached to a ready package is observed at once.
-        assert_eq!(
-            details.package(&a).unwrap().status,
-            WorkPackageStatus::Delivered
-        );
+        // A completed run attached to a ready package is observed at once,
+        // with its result but no handoff: nobody rendered its task.
+        let attached = details.package(&a).unwrap();
+        assert_eq!(attached.status, WorkPackageStatus::Delivered);
+        assert!(attached.result.is_some());
+        assert!(attached.handoff.is_none());
 
         let other = fixture.temp.path().join("other");
         fs::create_dir(&other).unwrap();
