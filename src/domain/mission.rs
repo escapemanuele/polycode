@@ -581,7 +581,7 @@ pub enum MissionInvariantError {
     ReadyWithUnintegratedDependency(WorkPackageId, WorkPackageId),
     #[error("package {0} is {1:?} without a reason")]
     MissingReason(WorkPackageId, WorkPackageStatus),
-    #[error("package {0} is delivered or integrated without a result from its current run")]
+    #[error("package {0} carries a result from a run other than its current one")]
     ResultMismatch(WorkPackageId),
     #[error("mission is {0:?} but package {1} is {2:?}")]
     PackageStatusConflictsWithMission(MissionStatus, WorkPackageId, WorkPackageStatus),
@@ -795,9 +795,15 @@ impl Mission {
                         package.status,
                     ));
                 }
+                // A result, when there is one, is the current run's. There
+                // may be none: packages delivered before results were
+                // captured (snapshot v1) carry nothing, and the observe pass
+                // fills a delivered one in on its next look.
                 WorkPackageStatus::Delivered | WorkPackageStatus::Integrated
-                    if package.result.as_ref().map(|result| result.run_id)
-                        != package.current_run() =>
+                    if package
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| Some(result.run_id) != package.current_run()) =>
                 {
                     return Err(MissionInvariantError::ResultMismatch(package.id.clone()));
                 }
@@ -1218,8 +1224,18 @@ impl Mission {
             if package.result.as_ref().map(|r| r.stage_count) == Some(fresh.stage_count) {
                 return Ok(MissionChange { events: Vec::new() });
             }
+            // A delivery that never had its result captured is not a
+            // rework: the evidence is simply late. The delivery is recorded
+            // again, now with it, and nothing says the package went back.
+            let first_capture = package.result.is_none();
             package.result = Some(fresh);
             package.updated_at = now;
+            if first_capture {
+                let events =
+                    vec![self.event(Some(id), MissionEventKind::PackageDelivered { run_id }, now)];
+                self.touch(now);
+                return Ok(MissionChange { events });
+            }
             let events = vec![
                 self.event(Some(id), MissionEventKind::PackageReworked { run_id }, now),
                 self.event(Some(id), MissionEventKind::PackageDelivered { run_id }, now),
@@ -1641,6 +1657,37 @@ mod tests {
         })
     }
 
+    /// The rehydration data of `mission`, after `mutate` has had its way.
+    fn rehydration_data(
+        mission: &Mission,
+        mutate: &dyn Fn(&mut MissionRehydrationData),
+    ) -> MissionRehydrationData {
+        let mut data = MissionRehydrationData {
+            id: mission.id(),
+            status: mission.status(),
+            packages: mission
+                .packages()
+                .iter()
+                .map(|package| WorkPackageRehydrationData {
+                    id: package.id().clone(),
+                    contract: package.contract().clone(),
+                    dependencies: package.dependencies().to_vec(),
+                    status: package.status(),
+                    runs: package.runs().to_vec(),
+                    reason: package.reason().map(str::to_owned),
+                    result: package.result().cloned(),
+                    created_at: *package.created_at(),
+                    updated_at: *package.updated_at(),
+                })
+                .collect(),
+            decisions: mission.decisions().to_vec(),
+            created_at: *mission.created_at(),
+            updated_at: *mission.updated_at(),
+        };
+        mutate(&mut data);
+        data
+    }
+
     fn kinds(change: &MissionChange) -> Vec<&MissionEventKind> {
         change.events.iter().map(MissionEvent::kind).collect()
     }
@@ -2047,6 +2094,62 @@ mod tests {
         mission.validate_invariants().unwrap();
     }
 
+    /// A package delivered before results were captured (snapshot v1)
+    /// rehydrates without one, and the first observe that brings a result
+    /// records the delivery again with it rather than as a rework.
+    #[test]
+    fn a_delivery_without_a_result_is_legacy_not_corruption_and_fills_in_once() {
+        let chain = mission_with_chain();
+        let mut mission = Mission::rehydrate(rehydration_data(&chain, &|d| {
+            d.status = MissionStatus::Active;
+            d.packages[0].status = WorkPackageStatus::Delivered;
+            d.packages[0].runs = vec![RunId::from_u128(1)];
+            d.packages[0].result = None;
+        }))
+        .unwrap();
+        assert!(
+            mission
+                .package(&id("persistence"))
+                .unwrap()
+                .result()
+                .is_none()
+        );
+
+        let change = mission
+            .observe_run(
+                &id("persistence"),
+                RunId::from_u128(1),
+                RunStatus::Completed,
+                None,
+                result_of(RunId::from_u128(1)),
+                at(9),
+            )
+            .unwrap();
+        assert!(matches!(
+            kinds(&change).as_slice(),
+            [MissionEventKind::PackageDelivered { .. }]
+        ));
+        assert!(
+            mission
+                .package(&id("persistence"))
+                .unwrap()
+                .result()
+                .is_some()
+        );
+        let change = mission
+            .observe_run(
+                &id("persistence"),
+                RunId::from_u128(1),
+                RunStatus::Completed,
+                None,
+                result_of(RunId::from_u128(1)),
+                at(10),
+            )
+            .unwrap();
+        assert!(change.events.is_empty(), "a repeat capture changes nothing");
+        mission.validate_invariants().unwrap();
+    }
+
     #[test]
     fn a_failed_package_is_retried_into_a_fresh_ready_state_with_history_kept() {
         let mut mission = mission_with_chain();
@@ -2329,32 +2432,8 @@ mod tests {
     #[allow(clippy::too_many_lines, reason = "one scenario, start to finish")]
     fn rehydration_rejects_states_the_aggregate_could_not_reach() {
         let mission = mission_with_chain();
-        let data = |mutate: &dyn Fn(&mut MissionRehydrationData)| {
-            let mut data = MissionRehydrationData {
-                id: mission.id(),
-                status: mission.status(),
-                packages: mission
-                    .packages()
-                    .iter()
-                    .map(|package| WorkPackageRehydrationData {
-                        id: package.id().clone(),
-                        contract: package.contract().clone(),
-                        dependencies: package.dependencies().to_vec(),
-                        status: package.status(),
-                        runs: package.runs().to_vec(),
-                        reason: package.reason().map(str::to_owned),
-                        result: package.result().cloned(),
-                        created_at: *package.created_at(),
-                        updated_at: *package.updated_at(),
-                    })
-                    .collect(),
-                decisions: mission.decisions().to_vec(),
-                created_at: *mission.created_at(),
-                updated_at: *mission.updated_at(),
-            };
-            mutate(&mut data);
-            data
-        };
+        let data =
+            |mutate: &dyn Fn(&mut MissionRehydrationData)| rehydration_data(&mission, mutate);
 
         assert_eq!(Mission::rehydrate(data(&|_| {})).unwrap(), mission);
         assert!(matches!(
