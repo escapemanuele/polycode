@@ -138,6 +138,14 @@ ulid_id!(
     /// Stable identity for one semantic domain event.
     EventId
 );
+ulid_id!(
+    /// Stable identity for one mission: a project goal several runs serve.
+    MissionId
+);
+ulid_id!(
+    /// Stable identity for one recorded mission decision.
+    DecisionId
+);
 
 string_id!(
     /// Stable workflow-local identity for one stage.
@@ -146,6 +154,10 @@ string_id!(
 string_id!(
     /// Identity of immutable effective configuration bound to a run.
     ConfigSnapshotId
+);
+string_id!(
+    /// Stable mission-local identity for one work package.
+    WorkPackageId
 );
 string_id!(
     /// Extensible provider identity such as a native CLI adapter name.
