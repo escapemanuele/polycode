@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::domain::{AttentionRequestId, RunId, StageId};
+use crate::domain::{AttentionRequestId, MissionId, RunId, StageId, WorkPackageId};
 
 /// Orchestrate native coding agents as a specialized engineering team.
 #[derive(Debug, Parser)]
@@ -45,6 +45,11 @@ pub enum Command {
     InstallSourceOf { executable: Option<PathBuf> },
     /// Open interactive local control room.
     Tui,
+    /// Plan and direct a multi-package mission above individual runs.
+    Mission {
+        #[command(subcommand)]
+        command: MissionCommand,
+    },
     /// Experimental role-specific provider/model evaluation tools.
     Eval {
         #[command(subcommand)]
@@ -139,6 +144,146 @@ pub struct UpdateArgs {
     /// Install without the interactive confirmation prompt.
     #[arg(long)]
     pub yes: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum MissionCommand {
+    /// Create a mission over a Git checkout.
+    New {
+        title: String,
+        #[arg(long)]
+        goal: String,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// List missions.
+    List,
+    /// Show one mission: packages in dependency order, decisions, attention.
+    Show { mission_id: MissionId },
+    /// Add a work package to the plan.
+    Add {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        #[command(flatten)]
+        contract: ContractArgs,
+        /// Package ids this one depends on (repeatable).
+        #[arg(long = "depends-on")]
+        depends_on: Vec<WorkPackageId>,
+    },
+    /// Replace the contract of a package nothing has run for. Only the given
+    /// fields change.
+    Revise {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        #[command(flatten)]
+        contract: ReviseArgs,
+    },
+    /// Replace the dependency list of a package nothing has run for.
+    Depends {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        #[arg(long = "on")]
+        on: Vec<WorkPackageId>,
+    },
+    /// Start a child run for a ready package; its task is the package
+    /// handoff.
+    Start {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        #[arg(long, conflicts_with = "profile")]
+        provider: Option<String>,
+        #[arg(long, conflicts_with = "provider")]
+        profile: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+    },
+    /// Bind an existing run to a ready package.
+    Attach {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        run_id: RunId,
+    },
+    /// Record that a delivered package's run was applied to the checkout.
+    Integrate {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+    },
+    /// Return a failed package to the plan so a new run can serve it.
+    Retry {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+    },
+    /// Cancel a package nothing depends on and no run is serving.
+    CancelPackage {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        #[arg(long, default_value = "cancelled by the operator")]
+        reason: String,
+    },
+    /// Record a design decision the plan rests on.
+    Decide {
+        mission_id: MissionId,
+        title: String,
+        #[arg(long)]
+        why: String,
+        /// Who made the decision (`user`|`lead`).
+        #[arg(long, default_value = "user")]
+        by: String,
+    },
+    /// Complete a mission whose packages are all integrated or cancelled.
+    Complete { mission_id: MissionId },
+    /// Cancel a mission and every open package (stop running packages
+    /// first).
+    Cancel {
+        mission_id: MissionId,
+        #[arg(long, default_value = "cancelled by the operator")]
+        reason: String,
+    },
+}
+
+/// The engineering contract for a new work package.
+#[derive(Clone, Debug, PartialEq, Eq, Args)]
+pub struct ContractArgs {
+    #[arg(long)]
+    pub title: String,
+    #[arg(long)]
+    pub goal: String,
+    /// Why the package exists in the plan.
+    #[arg(long)]
+    pub why: Option<String>,
+    /// Expected or permitted scope; omitted means the goal bounds it.
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Acceptance criteria (repeatable).
+    #[arg(long = "accept")]
+    pub accept: Vec<String>,
+    /// Verification the lead expects beyond the repository's own checks.
+    #[arg(long)]
+    pub verify: Option<String>,
+    /// Built-in workflow that delivers the package (fast|standard|deep|review).
+    #[arg(long, default_value = "fast")]
+    pub workflow: String,
+}
+
+/// The engineering contract fields to overwrite on an existing package. Every
+/// field is optional: only what is given changes.
+#[derive(Clone, Debug, PartialEq, Eq, Args)]
+pub struct ReviseArgs {
+    #[arg(long)]
+    pub title: Option<String>,
+    #[arg(long)]
+    pub goal: Option<String>,
+    #[arg(long)]
+    pub why: Option<String>,
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Acceptance criteria (repeatable); omitted keeps the current criteria.
+    #[arg(long = "accept")]
+    pub accept: Vec<String>,
+    #[arg(long)]
+    pub verify: Option<String>,
+    #[arg(long)]
+    pub workflow: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
@@ -271,6 +416,60 @@ mod tests {
             Some(Command::Eval {
                 command: EvalCommand::Run(EvalRunArgs { repeat: 3, .. })
             })
+        ));
+    }
+
+    #[test]
+    fn parses_mission_commands() {
+        let mission = MissionId::new().to_string();
+        let cli = Cli::try_parse_from([
+            "polycode",
+            "mission",
+            "add",
+            &mission,
+            "persistence",
+            "--title",
+            "T",
+            "--goal",
+            "G",
+            "--accept",
+            "a",
+            "--accept",
+            "b",
+            "--depends-on",
+            "x",
+            "--workflow",
+            "standard",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mission {
+                command: MissionCommand::Add {
+                    contract: ContractArgs { ref accept, ref workflow, .. },
+                    ref depends_on,
+                    ..
+                }
+            }) if accept == &["a".to_owned(), "b".to_owned()]
+                && workflow == "standard"
+                && depends_on == &[WorkPackageId::new("x").unwrap()]
+        ));
+
+        let cli = Cli::try_parse_from([
+            "polycode",
+            "mission",
+            "start",
+            &mission,
+            "persistence",
+            "--provider",
+            "fake",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mission {
+                command: MissionCommand::Start { provider: Some(ref provider), .. }
+            }) if provider == "fake"
         ));
     }
 }

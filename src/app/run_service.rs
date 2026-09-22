@@ -902,6 +902,16 @@ where
         if matches!(summary.status, RunStatus::Running | RunStatus::NeedsUser) {
             return Err(AppError::RunNotDeletable(run_id, summary.status));
         }
+        // Checked before anything is released: the store refuses the purge
+        // too, but by then the run would already be discarded and its files
+        // gone, which is exactly the loss a bound run is protected from.
+        if let Some(binding) = store.mission_of_run(run_id)? {
+            return Err(StoreError::RunBoundToMission {
+                run_id,
+                mission_id: binding.mission_id,
+            }
+            .into());
+        }
         self.release_owned_resources(&mut store, run_id)?;
         let run_directory = process_root()?.join(run_id.to_string());
         let files_removed = match std::fs::remove_dir_all(&run_directory) {

@@ -3,13 +3,20 @@ use clap::CommandFactory;
 
 use crate::app::{
     AppError, ApplyOutcome, BlockedDependencyRef, ExecutionReport, ExecutionSelection,
-    QuiescentState, RetryRoute, RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef,
-    StageWaitingSummary, UniformProvider,
+    MissionDetails, MissionListItem, MissionService, NewWorkPackage, QuiescentState, RetryRoute,
+    RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef, StageWaitingSummary,
+    UniformProvider, WorkPackageSummary,
 };
-use crate::domain::{DependencyOutcome, DomainEventKind, ModelId, StageStatus, WorkflowKind};
+use crate::domain::{
+    DecisionAuthor, DependencyOutcome, DomainEventKind, ModelId, StageStatus, WorkPackageContract,
+    WorkPackageStatus, WorkflowKind,
+};
 use crate::process::ProcessBackend;
 
-use super::{Cli, Command, EvalCommand, EvalRunArgs, RunArgs, UpdateArgs};
+use super::{
+    Cli, Command, ContractArgs, EvalCommand, EvalRunArgs, MissionCommand, ReviseArgs, RunArgs,
+    UpdateArgs,
+};
 
 #[allow(
     clippy::too_many_lines,
@@ -35,6 +42,7 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
         }
         Some(Command::InstallSourceOf { executable }) => install_source_of(executable.as_deref()),
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
+        Some(Command::Mission { command }) => mission(command),
         Some(Command::Eval { command }) => eval(command),
         Some(Command::Update(args)) => update(*args),
         Some(Command::Doctor) => doctor(),
@@ -205,20 +213,7 @@ fn service() -> Result<RunService<RuntimeProviderFactory>> {
 }
 
 fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
-    // Omitting both flags means Recommended, the same default the TUI's new-run
-    // composer already starts on. It is a routing profile, not a provider: it
-    // resolves to authenticated Claude Code or Codex and refuses to fall back
-    // to the development FakeProvider, so the default can fail to start but
-    // can never quietly run a task against something that only looks like
-    // work. Fake stays something you ask for by name.
-    let selection = match (args.provider.as_deref(), args.profile.as_deref()) {
-        (Some(provider), None) => ExecutionSelection::Uniform(UniformProvider::try_from(provider)?),
-        (None, Some("recommended") | None) => ExecutionSelection::Recommended,
-        (None, Some(other)) => {
-            anyhow::bail!("unsupported profile {other:?}; supported profiles: recommended")
-        }
-        (Some(_), Some(_)) => unreachable!("clap rejects conflicting selection flags"),
-    };
+    let selection = execution_selection(args.provider.as_deref(), args.profile.as_deref())?;
     let effort = parse_effort(args.effort.as_deref())?;
     let image = if args.allow_image_generation {
         crate::app::ImageGenerationPlan::implementer_only()
@@ -229,12 +224,32 @@ fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
         workflow,
         args.task.clone(),
         &args.repo,
-        Some(selection),
+        selection,
         effort,
         &image,
     )?;
     print_report(&report);
     Ok(())
+}
+
+/// Omitting both flags means Recommended, the same default the TUI's new-run
+/// composer already starts on. It is a routing profile, not a provider: it
+/// resolves to authenticated Claude Code or Codex and refuses to fall back to
+/// the development `FakeProvider`, so the default can fail to start but can
+/// never quietly run a task against something that only looks like work.
+/// Fake stays something you ask for by name.
+fn execution_selection(
+    provider: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Option<ExecutionSelection>> {
+    Ok(Some(match (provider, profile) {
+        (Some(provider), None) => ExecutionSelection::Uniform(UniformProvider::try_from(provider)?),
+        (None, Some("recommended") | None) => ExecutionSelection::Recommended,
+        (None, Some(other)) => {
+            anyhow::bail!("unsupported profile {other:?}; supported profiles: recommended")
+        }
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting selection flags"),
+    }))
 }
 
 /// The `--effort` grammar. Omitted is the routing profile's own policy; one
@@ -672,6 +687,315 @@ fn runs() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn missions() -> Result<MissionService> {
+    Ok(MissionService::from_environment()?)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dispatch table, one arm per subcommand"
+)]
+fn mission(command: &MissionCommand) -> Result<()> {
+    let missions = missions()?;
+    match command {
+        MissionCommand::New { title, goal, repo } => {
+            let details = missions.create_mission(title.clone(), goal.clone(), repo)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::List => {
+            print_mission_list(&missions.list_missions()?);
+            Ok(())
+        }
+        MissionCommand::Show { mission_id } => {
+            print_mission(&missions.inspect_mission(*mission_id)?);
+            Ok(())
+        }
+        MissionCommand::Add {
+            mission_id,
+            package_id,
+            contract,
+            depends_on,
+        } => {
+            let package = NewWorkPackage {
+                id: package_id.clone(),
+                contract: build_contract(contract)?,
+                dependencies: depends_on.clone(),
+            };
+            let details = missions.add_package(*mission_id, package)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Revise {
+            mission_id,
+            package_id,
+            contract,
+        } => {
+            let current = missions.inspect_mission(*mission_id)?;
+            let summary = current.package(package_id).ok_or_else(|| {
+                anyhow::anyhow!("mission {mission_id} has no package {package_id}")
+            })?;
+            let revised = revise_contract(summary, contract)?;
+            let details = missions.revise_package(*mission_id, package_id, revised)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Depends {
+            mission_id,
+            package_id,
+            on,
+        } => {
+            let details = missions.set_dependencies(*mission_id, package_id, on.clone())?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Start {
+            mission_id,
+            package_id,
+            provider,
+            profile,
+            effort,
+        } => {
+            let selection = execution_selection(provider.as_deref(), profile.as_deref())?;
+            let effort = parse_effort(effort.as_deref())?;
+            let (report, details) =
+                missions.start_package(&service()?, *mission_id, package_id, selection, effort)?;
+            print_report(&report);
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Attach {
+            mission_id,
+            package_id,
+            run_id,
+        } => {
+            let details = missions.attach_run(*mission_id, package_id, *run_id)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Integrate {
+            mission_id,
+            package_id,
+        } => {
+            let details = missions.integrate_package(&service()?, *mission_id, package_id)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Retry {
+            mission_id,
+            package_id,
+        } => {
+            let details = missions.retry_package(*mission_id, package_id)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::CancelPackage {
+            mission_id,
+            package_id,
+            reason,
+        } => {
+            let details = missions.cancel_package(*mission_id, package_id, reason.clone())?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Decide {
+            mission_id,
+            title,
+            why,
+            by,
+        } => {
+            let author = parse_decision_author(by)?;
+            let details =
+                missions.record_decision(*mission_id, title.clone(), why.clone(), author)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Complete { mission_id } => {
+            let details = missions.complete_mission(*mission_id)?;
+            print_mission(&details);
+            Ok(())
+        }
+        MissionCommand::Cancel { mission_id, reason } => {
+            let details = missions.cancel_mission(*mission_id, reason.clone())?;
+            print_mission(&details);
+            Ok(())
+        }
+    }
+}
+
+/// Builds a new package's contract from its CLI arguments.
+fn build_contract(args: &ContractArgs) -> Result<WorkPackageContract> {
+    Ok(WorkPackageContract {
+        title: args.title.clone(),
+        goal: args.goal.clone(),
+        rationale: args.why.clone().unwrap_or_default(),
+        scope: args.scope.clone().unwrap_or_default(),
+        acceptance_criteria: args.accept.clone(),
+        verification: args.verify.clone().unwrap_or_default(),
+        workflow: parse_workflow(&args.workflow)?,
+    })
+}
+
+/// Overwrites only the fields `--revise` was given, keeping the rest of the
+/// current contract.
+fn revise_contract(current: &WorkPackageSummary, args: &ReviseArgs) -> Result<WorkPackageContract> {
+    Ok(WorkPackageContract {
+        title: args.title.clone().unwrap_or_else(|| current.title.clone()),
+        goal: args.goal.clone().unwrap_or_else(|| current.goal.clone()),
+        rationale: args
+            .why
+            .clone()
+            .unwrap_or_else(|| current.rationale.clone()),
+        scope: args.scope.clone().unwrap_or_else(|| current.scope.clone()),
+        acceptance_criteria: if args.accept.is_empty() {
+            current.acceptance_criteria.clone()
+        } else {
+            args.accept.clone()
+        },
+        verification: args
+            .verify
+            .clone()
+            .unwrap_or_else(|| current.verification.clone()),
+        workflow: match args.workflow.as_deref() {
+            Some(word) => parse_workflow(word)?,
+            None => current.workflow,
+        },
+    })
+}
+
+fn parse_workflow(word: &str) -> Result<WorkflowKind> {
+    match word {
+        "fast" => Ok(WorkflowKind::Fast),
+        "standard" => Ok(WorkflowKind::Standard),
+        "deep" => Ok(WorkflowKind::Deep),
+        "review" => Ok(WorkflowKind::Review),
+        other => {
+            anyhow::bail!("unsupported workflow {other:?}; supported: fast, standard, deep, review")
+        }
+    }
+}
+
+fn parse_decision_author(word: &str) -> Result<DecisionAuthor> {
+    match word {
+        "user" => Ok(DecisionAuthor::User),
+        "lead" => Ok(DecisionAuthor::Lead),
+        other => anyhow::bail!("unsupported decision author {other:?}; supported: user, lead"),
+    }
+}
+
+fn print_mission_list(items: &[MissionListItem]) {
+    if items.is_empty() {
+        println!("No missions yet.");
+        return;
+    }
+    for item in items {
+        println!(
+            "{}  {}  {}/{} integrated  {} active  {} need you  {}",
+            item.id,
+            enum_text(item.status),
+            item.integrated,
+            item.packages,
+            item.active,
+            item.attention,
+            item.title
+        );
+    }
+}
+
+fn print_mission(details: &MissionDetails) {
+    println!("Mission {}: {}", details.id, details.title);
+    println!(
+        "Status: {}   Repository: {}   Base: {}",
+        enum_text(details.status),
+        details.repository.display(),
+        &details.base_commit[..details.base_commit.len().min(12)]
+    );
+    println!("Goal: {}", details.goal);
+    println!();
+
+    let integrated = details
+        .packages
+        .iter()
+        .filter(|package| package.status == WorkPackageStatus::Integrated)
+        .count();
+    let active = details
+        .packages
+        .iter()
+        .filter(|package| package.status.has_active_run())
+        .count();
+    println!(
+        "Packages ({integrated}/{} integrated, {active} active)",
+        details.packages.len()
+    );
+    for package in &details.packages {
+        println!(
+            "  {:<10} {}  {}",
+            enum_text(package.status),
+            package.id,
+            package.title
+        );
+        println!("      goal: {}", package.goal);
+        if !package.dependencies.is_empty() {
+            println!(
+                "      depends on: {}",
+                package
+                    .dependencies
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if let Some(run_id) = package.current_run {
+            println!(
+                "      run: {run_id} ({})",
+                package
+                    .run_status
+                    .map_or_else(|| "unknown".to_owned(), enum_text)
+            );
+        }
+        if let Some(reason) = package.reason.as_deref() {
+            println!("      reason: {reason}");
+        }
+    }
+
+    if !details.decisions.is_empty() {
+        println!();
+        println!("Decisions");
+        for decision in &details.decisions {
+            println!(
+                "  - {} ({}): {}",
+                decision.title,
+                enum_text(decision.author),
+                decision.rationale
+            );
+        }
+    }
+
+    println!();
+    println!("Needs you");
+    if details.attention.is_empty() {
+        println!("Nothing needs you.");
+    } else {
+        for (package_id, reason) in &details.attention.blocked {
+            println!("  - {package_id} is blocked: {reason}");
+        }
+        for (package_id, reason) in &details.attention.failed {
+            println!("  - {package_id} failed: {reason}");
+        }
+        for package_id in &details.attention.awaiting_integration {
+            let run_id = details
+                .package(package_id)
+                .and_then(|package| package.current_run)
+                .map_or_else(|| "unknown".to_owned(), |run_id| run_id.to_string());
+            println!(
+                "  - {package_id} is delivered and waits for integration: apply run {run_id}, then `polycode mission integrate {} {package_id}`",
+                details.id
+            );
+        }
+    }
 }
 
 fn print_report(report: &ExecutionReport) {

@@ -28,6 +28,45 @@ pub enum AppError {
     #[error(transparent)]
     RunTransition(#[from] crate::domain::RunTransitionError),
     #[error(transparent)]
+    Mission(#[from] crate::domain::MissionError),
+    #[error(transparent)]
+    MissionInput(#[from] crate::store::MissionInputError),
+    #[error("mission {0} has no package {1}")]
+    PackageNotFound(crate::domain::MissionId, crate::domain::WorkPackageId),
+    #[error("run {run_id} works in {actual:?}, not in the mission's repository {expected}")]
+    MissionRepositoryMismatch {
+        run_id: RunId,
+        expected: std::path::PathBuf,
+        actual: Option<std::path::PathBuf>,
+    },
+    #[error(
+        "run {run_id} is {status:?} with {changed_files} changed file(s) still in its worktree; \
+apply it (`polycode apply {run_id}`) before integrating the package"
+    )]
+    PackageNotIntegrated {
+        run_id: RunId,
+        status: crate::domain::RunStatus,
+        changed_files: usize,
+    },
+    #[error(
+        "run {run_id} completed but its worktree is {workspace:?}, so its delta cannot be read; \
+`polycode resume {run_id}` reconciles the workspace, or discard the run and retry the package"
+    )]
+    PackageWorkspaceUnavailable {
+        run_id: RunId,
+        workspace: Option<crate::workspace::WorkspaceStatus>,
+    },
+    #[error(
+        "run {run_id} started but could not be bound to package {package_id} of mission \
+{mission_id}: {reason}. Attach it with `polycode mission attach {mission_id} {package_id} {run_id}`."
+    )]
+    PackageRunUnbound {
+        mission_id: crate::domain::MissionId,
+        package_id: crate::domain::WorkPackageId,
+        run_id: RunId,
+        reason: String,
+    },
+    #[error(transparent)]
     FakeScenario(#[from] FakeScenarioError),
     #[error(transparent)]
     Claude(#[from] ClaudeProviderError),

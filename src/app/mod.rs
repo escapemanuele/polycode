@@ -1,12 +1,16 @@
 //! Application use cases coordinating domain, persistence, Git, and providers.
 
 mod error;
+pub(crate) mod mission_query;
+mod mission_service;
 mod provider_factory;
 pub(crate) mod query;
 mod routing;
 mod run_service;
 
 pub use error::AppError;
+pub use mission_query::{DecisionSummary, MissionDetails, MissionListItem, WorkPackageSummary};
+pub use mission_service::{MissionService, NewWorkPackage};
 pub use provider_factory::{
     DevelopmentFakeProviderFactory, ProviderFactory, ProviderResolver, RoutedProvider,
     RuntimeProvider, RuntimeProviderFactory,
