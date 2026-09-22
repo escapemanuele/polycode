@@ -1544,16 +1544,29 @@ impl TuiApp {
                 self.state.set_error(error.to_string());
             }
         }
-        if let Ok(artifacts) = self.reader.list_artifacts(run_id) {
-            let complete: Vec<_> = artifacts
-                .into_iter()
-                .filter(|artifact| artifact.status == crate::domain::ArtifactStatus::Complete)
-                .collect();
-            self.state.stages_with_artifacts = complete
-                .iter()
-                .map(|artifact| artifact.stage_id.clone())
-                .collect();
-            self.refresh_headline(run_id, &complete);
+        match self.reader.list_artifacts(run_id) {
+            Ok(artifacts) => {
+                let complete: Vec<_> = artifacts
+                    .into_iter()
+                    .filter(|artifact| artifact.status == crate::domain::ArtifactStatus::Complete)
+                    .collect();
+                self.state.stages_with_artifacts = complete
+                    .iter()
+                    .map(|artifact| artifact.stage_id.clone())
+                    .collect();
+                self.state.artifacts_unavailable = None;
+                self.refresh_headline(run_id, &complete);
+            }
+            Err(error) => {
+                // A store that cannot be read says so. Swallowing this once
+                // rendered every completed stage of a finished run as "No
+                // verified artifact" while the database had merely been
+                // migrated past this build; see run 01M34EB4YY6G7J3HE2XT2G5KFP.
+                self.state.stages_with_artifacts.clear();
+                self.state.headline = None;
+                self.state.artifacts_unavailable = Some(error.to_string());
+                self.state.set_error(error.to_string());
+            }
         }
         self.refresh_evidence();
     }

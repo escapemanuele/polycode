@@ -1089,6 +1089,12 @@ fn result_lines(state: &TuiState, selected: &StageSummary, width: u16) -> Vec<Li
         )));
         return lines;
     }
+    if let Some(reason) = &state.artifacts_unavailable {
+        return vec![Line::from(Span::styled(
+            format!("Results unavailable — {reason}"),
+            Style::default().fg(theme::danger()),
+        ))];
+    }
     // Expected absence stays informational; only a completed stage without an
     // artifact is a real problem, and opening it reports that as an error.
     let text = match selected.status {
@@ -4249,6 +4255,18 @@ mod tests {
         let text = render_text(&completed, 160, 40);
         assert!(text.contains("✓ Implementation ready"));
         assert!(text.contains(" Enter/o  Open result"));
+    }
+
+    /// A store the panel cannot read is not a stage that produced nothing.
+    #[test]
+    fn an_unreadable_artifact_listing_says_so_instead_of_claiming_absence() {
+        let mut state = completed_state();
+        state.artifacts_unavailable = Some(
+            "database schema version 10 is newer than this Polycode build supports".to_owned(),
+        );
+        let text = render_text(&state, 160, 40);
+        assert!(text.contains("Results unavailable — database schema version 10"));
+        assert!(!text.contains("No verified artifact"));
     }
 
     /// The panel quotes the artifact of the stage the operator is looking at,
