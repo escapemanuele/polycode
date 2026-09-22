@@ -639,6 +639,11 @@ pub(crate) struct TuiState {
     pub task_expanded: bool,
     pub evidence: Option<StageExecutionEvidence>,
     pub stages_with_artifacts: HashSet<StageId>,
+    /// Why the artifact listing could not be read, when it could not. An
+    /// unreadable store must never render as "no artifact": that is the
+    /// difference between a stage that produced nothing and a panel that
+    /// cannot see what it produced.
+    pub artifacts_unavailable: Option<String>,
     /// What the selected stage's artifact says about itself, in one line.
     /// Absent until a stage with a verified artifact is selected.
     pub headline: Option<StageHeadline>,
@@ -738,6 +743,7 @@ impl TuiState {
             task_expanded: false,
             evidence: None,
             stages_with_artifacts: HashSet::new(),
+            artifacts_unavailable: None,
             headline: None,
             logs: None,
             diff: None,
