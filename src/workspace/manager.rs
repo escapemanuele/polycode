@@ -38,10 +38,11 @@ pub struct PublishReceipt {
     pub branch: String,
     pub commit: String,
     pub pull_request: PullRequestStatus,
-    /// Why the run's own branch was pushed even though its task named a pull
-    /// request, when that happened. A run that reviewed a pull request and
-    /// then fixed it expects its commits to land on that pull request, so
-    /// opening a second one instead is never left unexplained.
+    /// What the publish had to do beyond pushing the run's commit as it
+    /// stood: replay it on a pull request that moved, or fall back to the
+    /// run's own branch. A run that reviewed a pull request and then fixed it
+    /// expects its commits to land on that pull request, so neither a rewrite
+    /// nor a fallback is ever left unexplained.
     pub note: Option<String>,
 }
 
@@ -60,9 +61,24 @@ enum PublishTarget {
     /// The head branch of the pull request the run was asked to fix, whose
     /// commits the run is built on.
     PullRequestBranch { branch: String, url: String },
+    /// The head branch of the pull request the run was asked to fix, which
+    /// gained commits while the run worked. The run's delta is replayed on
+    /// its tip before it is pushed, because that pull request is still where
+    /// the work belongs.
+    RebaseOntoPullRequest(MovedPullRequest),
     /// The branch the run owns, with the reason the named pull request could
     /// not be updated when there was one.
     OwnBranch(Option<String>),
+}
+
+/// A pull request the run was asked to fix that gained commits while it
+/// worked: its head branch, its URL, and the tip the run's delta has to be
+/// replayed on to reach it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MovedPullRequest {
+    branch: String,
+    url: String,
+    tip: String,
 }
 
 /// The pull-request half of a publish, which is allowed to fall short without
@@ -675,7 +691,7 @@ impl WorkspaceManager {
         if loaded.run.status() != RunStatus::Completed {
             return Err(invalid_run_status(&loaded.run, "publish"));
         }
-        let workspace = Self::ready_workspace(store, run_id)?;
+        let mut workspace = Self::ready_workspace(store, run_id)?;
         if workspace.mode() != WorkspaceMode::Branch {
             return Err(WorkspaceError::ReviewWorkspaceNotApplicable);
         }
@@ -685,7 +701,10 @@ impl WorkspaceManager {
             .branch_name()
             .ok_or(WorkspaceError::MissingBranch(workspace.mode()))?
             .to_owned();
-        let worktree = workspace.worktree_path();
+        // Owned, because replaying onto a pull request that moved writes the
+        // new base back through `workspace` while the path is still needed.
+        let worktree_path = workspace.worktree_path().to_path_buf();
+        let worktree = worktree_path.as_path();
         // The same gate cleanup honors: a run stranded mid-apply-recovery has
         // an operation whose outcome is not yet known, and nothing else may
         // move until apply resolves it.
@@ -715,7 +734,7 @@ impl WorkspaceManager {
             || publish_title(task.as_deref(), run_id),
             |draft| bounded_title(&draft.title),
         );
-        let commit = if tree_is_clean(&self.git, worktree)? {
+        let mut commit = if tree_is_clean(&self.git, worktree)? {
             inspect_worktree(&self.git, worktree)?.head_commit
         } else {
             let message = format!("{title}\n\nPolycode run {run_id}");
@@ -733,22 +752,25 @@ impl WorkspaceManager {
                     push_commit_to_branch(&self.git, worktree, "origin", &commit, &head_branch)?;
                     (head_branch, PullRequestStatus::AlreadyExists(url), None)
                 }
+                PublishTarget::RebaseOntoPullRequest(moved) => self.land_on_moved_pull_request(
+                    store,
+                    run_id,
+                    &mut workspace,
+                    &branch,
+                    &mut commit,
+                    moved,
+                )?,
                 PublishTarget::OwnBranch(note) => {
                     push_branch(&self.git, worktree, "origin", &branch)?;
-                    let pull_request = match gh.existing_pull_request(worktree, &branch) {
-                        Ok(Some(url)) => PullRequestStatus::AlreadyExists(url),
-                        Ok(None) => {
-                            let body = draft.filter(|draft| !draft.body.is_empty()).map_or_else(
-                                || publish_body(task.as_deref(), run_id),
-                                |draft| draft.body.clone(),
-                            );
-                            match gh.create_pull_request(worktree, &branch, &title, &body) {
-                                Ok(url) => PullRequestStatus::Created(url),
-                                Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
-                            }
-                        }
-                        Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
-                    };
+                    let pull_request = open_pull_request(
+                        gh,
+                        worktree,
+                        &branch,
+                        &title,
+                        draft,
+                        task.as_deref(),
+                        run_id,
+                    );
                     (branch, pull_request, note)
                 }
             };
@@ -760,6 +782,102 @@ impl WorkspaceManager {
         })
     }
 
+    /// Lands this publish on a pull request that moved: replays the run's
+    /// delta on the new tip and pushes it there, or — when the two changes
+    /// really do disagree — leaves the pull request alone and keeps the work
+    /// on the run's own branch.
+    ///
+    /// The fallback opens no pull request of its own. Everywhere else a
+    /// fallback does, because the run's work needs somewhere to be read; here
+    /// the place to read it already exists and is named in the run's task, so
+    /// a second one would be the duplicate this whole path exists to avoid.
+    /// The note says where the work is and what to do about it instead.
+    ///
+    /// `commit` is rewritten when the replay succeeds, because the commit
+    /// that reached the remote is then the replayed one.
+    ///
+    /// # Errors
+    /// Returns persistence and Git errors, including a failed push.
+    fn land_on_moved_pull_request(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        workspace: &mut RunWorkspace,
+        own_branch: &str,
+        commit: &mut String,
+        moved: MovedPullRequest,
+    ) -> Result<(String, PullRequestStatus, Option<String>), WorkspaceError> {
+        let MovedPullRequest { branch, url, tip } = moved;
+        let worktree = workspace.worktree_path().to_path_buf();
+        match self.replay_onto_pull_request(store, run_id, workspace, &tip)? {
+            Ok(replayed) => {
+                push_commit_to_branch(&self.git, &worktree, "origin", &replayed, &branch)?;
+                *commit = replayed;
+                let note = format!(
+                    "{url} had moved ahead of this run, so the change was replayed on {branch} before the push. Verification ran on the old base, so it has to run again before apply."
+                );
+                Ok((branch, PullRequestStatus::AlreadyExists(url), Some(note)))
+            }
+            Err(conflict) => {
+                push_branch(&self.git, &worktree, "origin", own_branch)?;
+                let reason =
+                    format!("replaying this run's change on {branch} hit a conflict: {conflict}");
+                let note = format!(
+                    "{url} moved ahead of this run and the replay conflicted, so the work is on {own_branch} and no second pull request was opened for it. Resolve the conflict, then publish again."
+                );
+                Ok((
+                    own_branch.to_owned(),
+                    PullRequestStatus::Unavailable(reason),
+                    Some(note),
+                ))
+            }
+        }
+    }
+
+    /// Replays the run's delta on `tip`, the current head of the pull request
+    /// the run was asked to fix, and records the base it now stands on.
+    ///
+    /// A review and the fix cycle after it are built on the pull request as
+    /// it stood when the run started. The pull request is free to gain
+    /// commits in the meantime, and the change still belongs on it, so the
+    /// delta is replayed — `git rebase --onto <tip> <base>`, the same move
+    /// [`Self::rebase`] makes onto a checkout that walked on. A conflict
+    /// aborts, changes nothing, and comes back as the reason the publish
+    /// falls back to the run's own branch.
+    ///
+    /// The new base is written through the same transaction [`Self::rebase`]
+    /// uses, because the workspace's recorded base is what apply diffs
+    /// against: leaving it on a commit the branch no longer descends from
+    /// would make a later apply carry the pull request's own commits as if
+    /// this run had written them. Verification pays for it the same way,
+    /// going stale against the new base.
+    ///
+    /// # Errors
+    /// Returns persistence and Git errors. A conflicting replay is `Ok(Err)`,
+    /// not an error: the publish still has somewhere to go.
+    fn replay_onto_pull_request(
+        &self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        workspace: &mut RunWorkspace,
+        tip: &str,
+    ) -> Result<Result<String, String>, WorkspaceError> {
+        let base = workspace.base_commit().to_owned();
+        let worktree = workspace.worktree_path().to_path_buf();
+        let replayed = match rebase_worktree_onto(&self.git, &worktree, &base, tip) {
+            Ok(head) => head,
+            Err(conflict) => return Ok(Err(conflict.to_string())),
+        };
+        let loaded = store.load_run(run_id)?;
+        let prior_revision = workspace.revision();
+        workspace.rebase_onto(tip.to_owned(), now());
+        let mut run = loaded.run;
+        let at = next_time(&run);
+        let event = run.workspace_rebased(metadata(at), base, tip.to_owned())?;
+        store.rebase_workspace_base(workspace, prior_revision, &run, loaded.revision, &event)?;
+        Ok(Ok(replayed))
+    }
+
     /// Decides whether this publish belongs on a pull request the run was
     /// asked to fix, rather than on a branch of its own.
     ///
@@ -769,11 +887,17 @@ impl WorkspaceManager {
     /// request for the same work, which is never what the operator asked for.
     ///
     /// Before Polycode writes to a branch it does not own, the pull request
-    /// has to resolve (see [`Self::pull_request_tip`]) and the branch's tip
-    /// must be an ancestor of the commit being published, so the push
-    /// fast-forwards. Each failure is an explanation rather than an error,
-    /// because publishing to the run's own branch remains a correct outcome.
-    /// Nothing here force-pushes and nothing rewrites a branch that moved.
+    /// has to resolve (see [`Self::pull_request_tip`]). A tip that is already
+    /// an ancestor of the commit being published is pushed onto directly. A
+    /// tip that is not — the pull request gained commits while the run worked
+    /// — is replayed onto instead (see [`Self::replay_onto_pull_request`]),
+    /// because the second pull request that a plain fallback would open is
+    /// the one outcome the operator never asked for. A pull request that does
+    /// not resolve at all is an explanation rather than an error, because
+    /// publishing to the run's own branch remains a correct outcome there.
+    /// Nothing here force-pushes and nothing rewrites a branch that moved:
+    /// the replay moves the run's own commits, and the push that follows
+    /// still fast-forwards.
     fn publish_target(
         &self,
         gh: &GhClient,
@@ -790,10 +914,11 @@ impl WorkspaceManager {
         };
         let url = reference.url();
         if !is_ancestor(&self.git, worktree, &tip.commit, commit)? {
-            return Ok(PublishTarget::OwnBranch(Some(format!(
-                "{url} moved ahead of this run: {} carries commits this run is not built on, so pushing to it would need a merge or a rebase.",
-                tip.branch
-            ))));
+            return Ok(PublishTarget::RebaseOntoPullRequest(MovedPullRequest {
+                branch: tip.branch,
+                url,
+                tip: tip.commit,
+            }));
         }
         Ok(PublishTarget::PullRequestBranch {
             branch: tip.branch,
@@ -1474,6 +1599,34 @@ impl FaultPoint {
 /// often a link and little else — `Work on <issue url>` names nothing in a
 /// list of pull requests. Links are dropped, and when what remains is too
 /// thin to be a title the issue behind the link supplies one.
+/// The pull request for a branch the run owns: the one already open for it,
+/// or a new one. Never an error — by the time this runs the branch is on the
+/// remote, so a `gh` that is missing or unauthenticated costs the convenience
+/// and nothing else.
+fn open_pull_request(
+    gh: &GhClient,
+    worktree: &Path,
+    branch: &str,
+    title: &str,
+    draft: Option<&PullRequestDraft>,
+    task: Option<&str>,
+    run_id: RunId,
+) -> PullRequestStatus {
+    match gh.existing_pull_request(worktree, branch) {
+        Ok(Some(url)) => PullRequestStatus::AlreadyExists(url),
+        Ok(None) => {
+            let body = draft
+                .filter(|draft| !draft.body.is_empty())
+                .map_or_else(|| publish_body(task, run_id), |draft| draft.body.clone());
+            match gh.create_pull_request(worktree, branch, title, &body) {
+                Ok(url) => PullRequestStatus::Created(url),
+                Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
+            }
+        }
+        Err(unavailable) => PullRequestStatus::Unavailable(unavailable.0),
+    }
+}
+
 fn publish_title(task: Option<&str>, run_id: RunId) -> String {
     let Some(first_line) = task
         .map(str::trim)
@@ -3856,11 +4009,11 @@ mod tests {
         assert!(!workspace.worktree_path().join("change.txt").exists());
     }
 
-    /// A pull request whose branch moved on is somebody else's work: the run
-    /// keeps its own branch, and says why rather than opening a duplicate
-    /// silently.
+    /// A pull request that gained commits while the run worked is still where
+    /// that work belongs: the change is replayed on the new tip and pushed
+    /// onto it, rather than becoming a second pull request for the same fix.
     #[test]
-    fn a_pull_request_branch_that_moved_ahead_falls_back_with_a_reason() {
+    fn a_pull_request_branch_that_moved_ahead_is_replayed_onto_and_pushed() {
         let mut fixture = Fixture::with_task(
             WorkflowKind::Standard,
             &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
@@ -3878,6 +4031,70 @@ mod tests {
             &fixture.source,
             ["push", "origin", "HEAD:refs/heads/pull-request-branch"],
         );
+        let tip = git_text(&fixture.source, ["rev-parse", "HEAD"]);
+        fs::write(workspace.worktree_path().join("README.md"), "fixed\n").unwrap();
+
+        let receipt = fixture
+            .manager()
+            .publish_with(&mut fixture.store, fixture.run_id, None, &gh)
+            .unwrap();
+
+        assert_eq!(receipt.branch, "pull-request-branch");
+        assert_eq!(
+            receipt.pull_request,
+            PullRequestStatus::AlreadyExists(REVIEWED_PULL_REQUEST.to_owned())
+        );
+        assert!(
+            !fixture.temp.path().join("create-args").exists(),
+            "a second pull request was opened for the change"
+        );
+        assert_eq!(
+            git_text(&origin, ["rev-parse", "refs/heads/pull-request-branch"]),
+            receipt.commit
+        );
+        // The commit that arrived while the run worked is the parent of what
+        // was pushed: the replay moved this run's work, and nothing was
+        // force-pushed over somebody else's.
+        assert_eq!(
+            git_text(&origin, ["rev-parse", "refs/heads/pull-request-branch^"]),
+            tip
+        );
+        let note = receipt.note.expect("the replay went unexplained");
+        assert!(note.contains(REVIEWED_PULL_REQUEST), "{note}");
+        // The recorded base moved with the worktree, so what apply would diff
+        // is still this run's delta and not the pull request's own commits.
+        assert_eq!(
+            WorkspaceManager::ready_workspace(&fixture.store, fixture.run_id)
+                .unwrap()
+                .base_commit(),
+            tip
+        );
+    }
+
+    /// A replay the two changes really do disagree about aborts, and the work
+    /// goes to the run's own branch — without a pull request, because the one
+    /// this run was asked to fix is still where the change belongs.
+    #[test]
+    fn a_conflicting_replay_keeps_the_run_branch_and_opens_no_pull_request() {
+        let mut fixture = Fixture::with_task(
+            WorkflowKind::Standard,
+            &format!("Review {REVIEWED_PULL_REQUEST} and fix what it finds"),
+        );
+        let origin = add_origin(&fixture);
+        let gh = stub_gh(fixture.temp.path());
+        arrange_reviewed_pull_request(&fixture, fixture.temp.path(), false);
+        let workspace = fixture.prepare();
+        fixture.complete();
+        // Somebody rewrote the same lines this run is about to change.
+        fs::write(fixture.source.join("README.md"), "theirs\n").unwrap();
+        git(&fixture.source, ["add", "-A"]);
+        git(&fixture.source, ["commit", "-m", "theirs"]);
+        git(
+            &fixture.source,
+            ["push", "origin", "HEAD:refs/heads/pull-request-branch"],
+        );
+        let tip = git_text(&fixture.source, ["rev-parse", "HEAD"]);
+        let base = workspace.base_commit().to_owned();
         fs::write(workspace.worktree_path().join("README.md"), "fixed\n").unwrap();
 
         let receipt = fixture
@@ -3886,20 +4103,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(receipt.branch, own_branch(&fixture));
+        let PullRequestStatus::Unavailable(reason) = &receipt.pull_request else {
+            panic!(
+                "a second pull request was opened: {:?}",
+                receipt.pull_request
+            );
+        };
+        assert!(reason.contains("conflict"), "{reason}");
+        assert!(
+            !fixture.temp.path().join("create-args").exists(),
+            "a second pull request was opened for the change"
+        );
         let note = receipt.note.expect("the fallback went unexplained");
         assert!(note.contains(REVIEWED_PULL_REQUEST), "{note}");
-        assert!(note.contains("moved ahead"), "{note}");
-        assert_eq!(
-            receipt.pull_request,
-            PullRequestStatus::Created("https://example.invalid/pull/7".to_owned())
-        );
+        // The work is safe on the run's own branch, the pull request keeps
+        // the tip it had, and the aborted replay left the base where it was.
         let reference = format!("refs/heads/{}", own_branch(&fixture));
         assert_eq!(git_text(&origin, ["rev-parse", &reference]), receipt.commit);
-        // The pull request's branch is untouched: nothing was force-pushed
-        // over the commit that arrived while the run was working.
-        assert_ne!(
+        assert_eq!(
             git_text(&origin, ["rev-parse", "refs/heads/pull-request-branch"]),
-            receipt.commit
+            tip
+        );
+        assert_eq!(
+            WorkspaceManager::ready_workspace(&fixture.store, fixture.run_id)
+                .unwrap()
+                .base_commit(),
+            base
         );
     }
 
