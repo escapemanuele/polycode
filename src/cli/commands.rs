@@ -975,10 +975,10 @@ fn print_mission(details: &MissionDetails) {
     }
 
     println!();
-    println!("Needs you");
     if details.attention.is_empty() {
         println!("Nothing needs you.");
     } else {
+        println!("Needs you");
         for (package_id, reason) in &details.attention.blocked {
             println!("  - {package_id} is blocked: {reason}");
         }

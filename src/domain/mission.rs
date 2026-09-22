@@ -415,6 +415,13 @@ impl MissionChange {
     }
 }
 
+fn join_ids(ids: &[WorkPackageId]) -> String {
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum MissionError {
     #[error("mission {mission_id} is {status:?} and accepts no further changes")]
@@ -447,7 +454,10 @@ pub enum MissionError {
         action: &'static str,
         expected: &'static str,
     },
-    #[error("package {package_id} is still depended on by {dependents:?}")]
+    #[error(
+        "package {package_id} is still depended on by {}",
+        join_ids(dependents)
+    )]
     PackageHasDependents {
         package_id: WorkPackageId,
         dependents: Vec<WorkPackageId>,
