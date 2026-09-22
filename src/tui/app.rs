@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyEventKind};
 
 use crate::app::{
-    AppError, ArtifactSummary, RunListItem, RunService, RuntimeProviderFactory, StartProgress,
+    AppError, ArtifactSummary, MissionService, RunListItem, RunService, RuntimeProviderFactory,
+    StartProgress,
 };
-use crate::domain::{RunId, RunStatus, StageId, StageStatus};
+use crate::domain::{RunId, RunStatus, StageId, StageStatus, WorkPackageStatus};
 use crate::update::{InstallSource, UpdateInfo};
 
 use super::bottom_line;
@@ -37,6 +38,8 @@ type InstallOutcome = Result<String, String>;
 pub(crate) struct TuiApp {
     state: TuiState,
     reader: RunService<RuntimeProviderFactory>,
+    /// Mission reads: the list and the open mission, observed on refresh.
+    missions: MissionService,
     worker: Worker,
     /// Delivers the background update check exactly once. Startup never waits
     /// on it, and a dropped sender simply means no update will be offered.
@@ -77,7 +80,8 @@ impl TuiApp {
         Ok(Self {
             state: TuiState::new(repository),
             reader,
-            worker: Worker::spawn(actions),
+            missions: MissionService::from_environment()?,
+            worker: Worker::spawn(actions, MissionService::from_environment()?),
             update: spawn_update_check(),
             installing: None,
             last_refresh: Instant::now()
@@ -251,6 +255,25 @@ impl TuiApp {
             Intent::Enter | Intent::Right if self.state.screen == Screen::Runs => {
                 self.open_selected_run();
             }
+            Intent::Enter | Intent::Right if self.state.screen == Screen::Missions => {
+                self.open_selected_mission();
+            }
+            Intent::Enter | Intent::Right if self.state.screen == Screen::MissionDetail => {
+                self.open_selected_package_run();
+            }
+            Intent::Missions => {
+                self.state.screen = Screen::Missions;
+                self.state.overlay = None;
+                self.state.scroll = 0;
+                self.state.run_opened_from_mission = false;
+                self.refresh_missions();
+            }
+            Intent::StartPackage if self.state.screen == Screen::MissionDetail => {
+                self.start_selected_package();
+            }
+            Intent::Integrate if self.state.screen == Screen::MissionDetail => {
+                self.open_integrate_confirmation();
+            }
             // Enter on a stage opens its primary result; open_artifact keeps
             // expected absence informational, so this never mutates anything.
             Intent::Enter | Intent::Right if self.state.screen == Screen::RunDetail => {
@@ -265,11 +288,13 @@ impl TuiApp {
                 self.state.screen = Screen::NewRun;
                 self.state.overlay = None;
                 self.state.message = None;
+                self.state.run_opened_from_mission = false;
             }
             Intent::Runs => {
                 self.state.screen = Screen::Runs;
                 self.state.overlay = None;
                 self.state.scroll = 0;
+                self.state.run_opened_from_mission = false;
             }
             Intent::Resume => self.resume(),
             Intent::Stop => self.stop(),
@@ -346,6 +371,18 @@ impl TuiApp {
                     self.state.overlay = None;
                 }
             }
+            Overlay::IntegrateConfirm if intent == Intent::Enter => {
+                if let (Some(mission_id), Some(package_id)) = (
+                    self.state.selected_mission,
+                    self.state.selected_package.clone(),
+                ) {
+                    self.dispatch(WorkerCommand::IntegratePackage {
+                        mission_id,
+                        package_id,
+                    });
+                    self.state.overlay = None;
+                }
+            }
             Overlay::RebaseConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
                     self.dispatch(WorkerCommand::RebaseRun { run_id });
@@ -380,6 +417,7 @@ impl TuiApp {
             }
             Overlay::Help
             | Overlay::ApplyConfirm
+            | Overlay::IntegrateConfirm
             | Overlay::RebaseConfirm
             | Overlay::PublishConfirm
             | Overlay::DiscardConfirm
@@ -667,6 +705,7 @@ impl TuiApp {
     /// is blocking it.
     fn open_selected_run(&mut self) {
         if self.state.selected_run.is_some() {
+            self.state.run_opened_from_mission = false;
             self.state.screen = Screen::RunDetail;
             self.refresh_selected();
             self.state.focus_blocking_failure();
@@ -688,6 +727,11 @@ impl TuiApp {
                 };
             }
             Screen::NewRun => {}
+            Screen::Missions => {
+                self.state.move_mission(forward);
+                self.refresh_selected_mission();
+            }
+            Screen::MissionDetail => self.state.move_package(forward),
         }
     }
 
@@ -695,9 +739,127 @@ impl TuiApp {
         self.state.overlay = None;
         self.state.scroll = 0;
         self.state.screen = match self.state.screen {
-            Screen::Runs | Screen::RunDetail | Screen::NewRun => Screen::Runs,
+            Screen::RunDetail if self.state.run_opened_from_mission => {
+                self.state.run_opened_from_mission = false;
+                self.refresh_selected_mission();
+                Screen::MissionDetail
+            }
+            Screen::Runs | Screen::RunDetail | Screen::NewRun | Screen::Missions => {
+                self.state.run_opened_from_mission = false;
+                Screen::Runs
+            }
             Screen::Artifact | Screen::Logs | Screen::Diff => Screen::RunDetail,
+            Screen::MissionDetail => Screen::Missions,
         };
+    }
+
+    fn open_selected_mission(&mut self) {
+        if self.state.selected_mission.is_some() {
+            self.state.screen = Screen::MissionDetail;
+            self.refresh_selected_mission();
+        }
+    }
+
+    /// Enter on a package opens its current run: the run is one level down
+    /// from the package, exactly as a stage's artifact is from the run.
+    fn open_selected_package_run(&mut self) {
+        let Some(package) = self.state.selected_package_summary() else {
+            return;
+        };
+        let Some(run_id) = package.current_run else {
+            self.state.notify(
+                UiMessageKind::Info,
+                format!("No run has served {} yet — S starts one.", package.id),
+            );
+            return;
+        };
+        self.state.selected_run = Some(run_id);
+        self.state.run_opened_from_mission = true;
+        self.state.screen = Screen::RunDetail;
+        self.refresh_selected();
+        self.state.focus_blocking_failure();
+    }
+
+    /// Starts the selected package's child run with the composer's current
+    /// execution and effort choices, so `n` and `S` mean the same provider.
+    fn start_selected_package(&mut self) {
+        let Some(mission_id) = self.state.selected_mission else {
+            return;
+        };
+        let Some(package) = self.state.selected_package_summary() else {
+            return;
+        };
+        if package.status != WorkPackageStatus::Ready {
+            self.state.notify(
+                UiMessageKind::Info,
+                start_package_unavailable_reason(package.status, &package.id),
+            );
+            return;
+        }
+        let package_id = package.id.clone();
+        let title = package.title.clone();
+        if let Some(ticket) = self.dispatch_ticketed(WorkerCommand::StartPackage {
+            mission_id,
+            package_id,
+            selection: self.state.new_run.execution.selection(),
+            effort: self.state.new_run.effort.into(),
+        }) {
+            self.state.starting = Some(StartInFlight {
+                ticket,
+                task: title,
+                started: Instant::now(),
+                progress: None,
+            });
+            self.state.start_failure = None;
+            self.state.overlay = Some(Overlay::Starting);
+        }
+    }
+
+    fn open_integrate_confirmation(&mut self) {
+        let Some(package) = self.state.selected_package_summary() else {
+            return;
+        };
+        if package.status != WorkPackageStatus::Delivered {
+            self.state.notify(
+                UiMessageKind::Info,
+                format!(
+                    "{} is {}; only a delivered package can be integrated.",
+                    package.id,
+                    package_status_word(package.status)
+                ),
+            );
+            return;
+        }
+        self.state.overlay = Some(Overlay::IntegrateConfirm);
+    }
+
+    fn refresh_missions(&mut self) {
+        match self.missions.list_missions() {
+            Ok(missions) => self.state.replace_missions(missions),
+            Err(error) => self.state.set_error(error.to_string()),
+        }
+        self.refresh_selected_mission();
+    }
+
+    fn refresh_selected_mission(&mut self) {
+        let Some(mission_id) = self.state.selected_mission else {
+            self.state.mission = None;
+            return;
+        };
+        match self.missions.inspect_mission(mission_id) {
+            Ok(details) => self.state.replace_mission(details),
+            Err(error) => {
+                if self
+                    .state
+                    .mission
+                    .as_ref()
+                    .is_some_and(|mission| mission.id != mission_id)
+                {
+                    self.state.mission = None;
+                }
+                self.state.set_error(error.to_string());
+            }
+        }
     }
 
     fn resume(&mut self) {
@@ -1223,7 +1385,13 @@ impl TuiApp {
         match update.progress {
             StartProgress::Running(run_id) => {
                 self.state.starting = None;
-                if self.state.overlay == Some(Overlay::Starting) {
+                if self.state.overlay == Some(Overlay::Starting)
+                    && self.state.screen == Screen::MissionDetail
+                {
+                    // A package's run is one level down from where the
+                    // operator is standing; the package row says it started.
+                    self.state.overlay = None;
+                } else if self.state.overlay == Some(Overlay::Starting) {
                     self.state.overlay = None;
                     self.state.selected_run = Some(run_id);
                     self.state.screen = Screen::RunDetail;
@@ -1337,6 +1505,11 @@ impl TuiApp {
                     self.refresh();
                     return;
                 }
+                if let WorkerSuccess::Integrated(_) | WorkerSuccess::PackageStarted(..) = &success {
+                    self.settle_mission_outcome(success);
+                    self.refresh();
+                    return;
+                }
                 let Some(report) = success.report() else {
                     return;
                 };
@@ -1385,7 +1558,10 @@ impl TuiApp {
                         short_commit(&receipt.to_base),
                         receipt.commits_gained
                     ),
-                    WorkerSuccess::Execution(_) | WorkerSuccess::Purged(_) => {
+                    WorkerSuccess::Execution(_)
+                    | WorkerSuccess::Purged(_)
+                    | WorkerSuccess::PackageStarted(..)
+                    | WorkerSuccess::Integrated(_) => {
                         format!("{} finished for {run_id}", result.action.label())
                     }
                 };
@@ -1405,6 +1581,27 @@ impl TuiApp {
             }
         }
         self.refresh();
+    }
+
+    /// A mission action finishing is news about the package, not the run:
+    /// the mission comes back current and the operator stays where they are.
+    fn settle_mission_outcome(&mut self, success: WorkerSuccess) {
+        match success {
+            WorkerSuccess::Integrated(details) => {
+                let package = self.state.selected_package.clone();
+                self.state.replace_mission(*details);
+                self.state.set_message(match package {
+                    Some(id) => format!("{id} integrated."),
+                    None => "Package integrated.".to_owned(),
+                });
+            }
+            WorkerSuccess::PackageStarted(report, details) => {
+                self.state.replace_mission(*details);
+                self.state
+                    .set_message(format!("Run {} finished its start.", report.details.id));
+            }
+            _ => {}
+        }
     }
 
     /// Archives the selected run out of the default list, or brings it back
@@ -1496,6 +1693,13 @@ impl TuiApp {
             && let Ok(logs) = self.reader.read_process_log_tail(run_id, &stage_id)
         {
             self.state.logs = Some(logs);
+        }
+        // The list observes every mission's runs; the open mission needs
+        // only its own, so the detail screen skips the list.
+        match self.state.screen {
+            Screen::Missions => self.refresh_missions(),
+            Screen::MissionDetail => self.refresh_selected_mission(),
+            _ => {}
         }
         self.last_refresh = Instant::now();
     }
@@ -1649,6 +1853,48 @@ fn continue_unavailable_reason(state: &TuiState) -> String {
         );
     }
     "This workflow has no decision stage, so there is nothing to continue.".to_owned()
+}
+
+/// Why `S` cannot start the selected package right now.
+fn start_package_unavailable_reason(
+    status: WorkPackageStatus,
+    package_id: &crate::domain::WorkPackageId,
+) -> String {
+    match status {
+        WorkPackageStatus::Planned => {
+            format!("{package_id} waits on packages it depends on; integrate those first.")
+        }
+        WorkPackageStatus::Running | WorkPackageStatus::Blocked => {
+            format!("{package_id} already has a run — Enter opens it.")
+        }
+        WorkPackageStatus::Delivered => {
+            format!("{package_id} is delivered — I integrates it once its run is applied.")
+        }
+        WorkPackageStatus::Failed => {
+            format!("{package_id} failed; retry it from the CLI (polycode mission retry).")
+        }
+        WorkPackageStatus::Integrated | WorkPackageStatus::Cancelled => {
+            format!(
+                "{package_id} is {}; nothing left to start.",
+                package_status_word(status)
+            )
+        }
+        WorkPackageStatus::Ready => String::new(),
+    }
+}
+
+/// The package status in the words `polycode mission show` uses.
+fn package_status_word(status: WorkPackageStatus) -> &'static str {
+    match status {
+        WorkPackageStatus::Planned => "planned",
+        WorkPackageStatus::Ready => "ready",
+        WorkPackageStatus::Running => "running",
+        WorkPackageStatus::Blocked => "blocked",
+        WorkPackageStatus::Delivered => "delivered",
+        WorkPackageStatus::Integrated => "integrated",
+        WorkPackageStatus::Failed => "failed",
+        WorkPackageStatus::Cancelled => "cancelled",
+    }
 }
 
 /// Explains, in operational language, why apply is not offered yet.
@@ -1813,7 +2059,7 @@ mod tests {
     use super::*;
     use crate::app::{RunDetails, RunListItem, StageSummary};
     use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
-    use crate::tui::state::CONCURRENT_AGENTS;
+    use crate::tui::state::{CONCURRENT_AGENTS, ExecutionChoice};
 
     /// A `TuiApp` wired to an empty temporary store: enough to drive intents
     /// without touching the user's data directory or any provider.
@@ -1855,7 +2101,11 @@ mod tests {
         let app = TuiApp {
             state,
             reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
-            worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            missions: MissionService::new(database.clone(), worktrees.clone()),
+            worker: Worker::spawn(
+                RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
+                MissionService::new(database, worktrees),
+            ),
             // Tests never check for updates: an immediately dropped sender
             // reads as "no update will ever arrive".
             update: mpsc::channel().1,
@@ -2162,7 +2412,11 @@ mod tests {
         let mut app = TuiApp {
             state,
             reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
-            worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            missions: MissionService::new(database.clone(), worktrees.clone()),
+            worker: Worker::spawn(
+                RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
+                MissionService::new(database, worktrees),
+            ),
             // Tests never check for updates: an immediately dropped sender
             // reads as "no update will ever arrive".
             update: mpsc::channel().1,
@@ -2367,7 +2621,11 @@ mod tests {
         TuiApp {
             state,
             reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
-            worker: Worker::spawn(RunService::new(database, worktrees, RuntimeProviderFactory)),
+            missions: MissionService::new(database.clone(), worktrees.clone()),
+            worker: Worker::spawn(
+                RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
+                MissionService::new(database, worktrees),
+            ),
             update: mpsc::channel().1,
             installing: None,
             last_refresh: Instant::now(),
@@ -3768,5 +4026,167 @@ mod tests {
         let (mut app, _fixture) = app_with(running);
         app.handle_intent(Intent::Retry);
         assert_eq!(app.state.overlay, None);
+    }
+
+    /// The mission path from the control room: `M` lists missions, Enter
+    /// opens one, `S` starts a ready package on the fake provider, Enter
+    /// opens the package's run and Esc comes back to the mission, and `I`
+    /// records the delivered package as integrated — readying the package
+    /// that depended on it.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one mission, start to finish")]
+    fn a_mission_is_driven_from_the_tui_start_open_its_run_and_integrate() {
+        let (fixture, database, worktrees, repo, _) = real_completed_standard_run();
+        let missions = MissionService::new(database.clone(), worktrees.clone());
+        let mission = missions
+            .create_mission("Greeting tool", "greet by name", &repo)
+            .unwrap();
+        let contract = |title: &str| crate::domain::WorkPackageContract {
+            title: title.to_owned(),
+            goal: format!("deliver {title}"),
+            rationale: String::new(),
+            scope: String::new(),
+            acceptance_criteria: vec![],
+            verification: String::new(),
+            workflow: WorkflowKind::Fast,
+        };
+        let core = crate::domain::WorkPackageId::new("core").unwrap();
+        let docs = crate::domain::WorkPackageId::new("docs").unwrap();
+        missions
+            .add_package(
+                mission.id,
+                crate::app::NewWorkPackage {
+                    id: core.clone(),
+                    contract: contract("Core"),
+                    dependencies: vec![],
+                },
+            )
+            .unwrap();
+        missions
+            .add_package(
+                mission.id,
+                crate::app::NewWorkPackage {
+                    id: docs.clone(),
+                    contract: contract("Docs"),
+                    dependencies: vec![core.clone()],
+                },
+            )
+            .unwrap();
+        let mut app = TuiApp {
+            state: TuiState::new(fixture.path()),
+            reader: RunService::new(database.clone(), worktrees.clone(), RuntimeProviderFactory),
+            missions,
+            worker: Worker::spawn(
+                RunService::new(
+                    database.clone(),
+                    worktrees.clone(),
+                    crate::app::DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
+                ),
+                MissionService::new(database, worktrees),
+            ),
+            update: mpsc::channel().1,
+            installing: None,
+            last_refresh: Instant::now(),
+            started: Instant::now(),
+            orphaned: None,
+            titles: TitleLookups::default(),
+        };
+
+        app.handle_intent(Intent::Missions);
+        assert_eq!(app.state.screen, Screen::Missions);
+        assert_eq!(app.state.selected_mission, Some(mission.id));
+        assert_eq!(app.state.missions.len(), 1);
+
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.screen, Screen::MissionDetail);
+        assert_eq!(app.state.selected_package, Some(core.clone()));
+
+        // A package whose dependency is not integrated cannot start.
+        app.handle_intent(Intent::Down);
+        assert_eq!(app.state.selected_package, Some(docs.clone()));
+        app.handle_intent(Intent::StartPackage);
+        assert!(app.state.in_flight.is_empty());
+        assert!(
+            app.state
+                .message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("waits on")),
+            "{:?}",
+            app.state.message
+        );
+        app.handle_intent(Intent::Up);
+
+        app.state.new_run.execution = ExecutionChoice::Fake;
+        app.handle_intent(Intent::StartPackage);
+        assert_eq!(app.state.overlay, Some(Overlay::Starting));
+        assert!(
+            app.state
+                .in_flight
+                .iter()
+                .any(|entry| entry.action == ActionKind::StartPackage)
+        );
+        wait_for_worker(&mut app);
+        assert_eq!(app.state.screen, Screen::MissionDetail);
+        assert_eq!(app.state.overlay, None);
+        let package = app.state.selected_package_summary().unwrap().clone();
+        assert_eq!(package.status, WorkPackageStatus::Delivered);
+        let run_id = package.current_run.expect("the package names its run");
+
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.screen, Screen::RunDetail);
+        assert_eq!(app.state.selected_run, Some(run_id));
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.screen, Screen::MissionDetail);
+        assert!(!app.state.run_opened_from_mission);
+
+        // Leaving the mission by another door forgets it: a run opened from
+        // the Runs list goes back to the Runs list.
+        app.handle_intent(Intent::Enter);
+        app.handle_intent(Intent::NewRun);
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.screen, Screen::Runs);
+        app.refresh();
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.screen, Screen::RunDetail);
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.screen, Screen::Runs);
+        app.handle_intent(Intent::Missions);
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.screen, Screen::MissionDetail);
+        assert_eq!(app.state.selected_package, Some(core.clone()));
+
+        app.handle_intent(Intent::Integrate);
+        assert_eq!(app.state.overlay, Some(Overlay::IntegrateConfirm));
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, None);
+        wait_for_worker(&mut app);
+        let mission = app.state.mission.as_ref().unwrap();
+        assert_eq!(
+            mission.package(&core).unwrap().status,
+            WorkPackageStatus::Integrated
+        );
+        assert_eq!(
+            mission.package(&docs).unwrap().status,
+            WorkPackageStatus::Ready
+        );
+        assert!(
+            app.state
+                .message
+                .as_ref()
+                .is_some_and(|message| message.text == "core integrated."),
+            "{:?}",
+            app.state.message
+        );
+    }
+
+    /// Pumps the loop's receive steps until nothing is in flight.
+    fn wait_for_worker(app: &mut TuiApp) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while !app.state.in_flight.is_empty() {
+            assert!(Instant::now() < deadline, "worker result timed out");
+            app.receive_start_progress();
+            app.receive_worker_results();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

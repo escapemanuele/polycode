@@ -4,6 +4,7 @@ Watch and drive every run from one terminal screen without touching the database
 
 ## Sub-features
 - runs-screen: list of runs; archive/unarchive runs; delete an archived run for good; Enter opens detail.
+- missions-screen: `M` lists every mission with its integrated/total packages and how many need you; the right column shows the selected mission's goal, its packages as one line of engineering state each, and its "Needs you". Enter opens the mission: packages as a rail, the selected package's contract, run and delivered evidence on the right. `S` starts a ready package's child run with the composer's current Execution and Effort choices, `I` records a delivered package as integrated (confirmation; the run must already be applied, or have completed with nothing to apply), Enter opens the package's run in run detail, and Esc from there returns to the mission. Everything else about a mission (planning, revising, deciding, retrying, cancelling) is CLI-only for now.
 - run-detail: stage timeline, routes, attention, usage; `i` toggles the technical (evidence) view; `e` expands the rail's one-line task to the whole thing, offered only when that line dropped something. Opening a failed run lands the selection on the blocking failed stage, whose hero carries a `WHY IT FAILED` section with the whole (sanitized, 200-char capped) provider reason; the Runs-screen overview shows the same section for a failed run before it is opened.
 - activity-strip: one prose sentence for what is happening now — a failed stage's own reason ("Implementation failed: compile failed"), or why a stage has not started ("Waiting on: Architecture", "Blocked: Quality review failed, Spec review was skipped", "Waiting on you", "Stage suspended", "Stage skipped by the workflow").
 - viewers: artifact (`o`/Enter, `m` raw/rendered), raw process logs (`l`), workspace diff (`d`).
@@ -20,7 +21,8 @@ Run `polycode` with no arguments in an interactive terminal, or `polycode tui`. 
 polycode
 polycode tui
 ```
-Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home`/`End` top/bottom in viewers, `Enter` or `→` open/confirm (one level in: a run from the list, a stage's result from run detail), `Esc` or `←` back/close (one level out; the composer keeps its own arrows, so `Esc` alone leaves it), `n` new run, `R` runs screen, `x` dismiss notification, `?` help, `q` or `Ctrl-C` quit/detach.
+Global: `↑`/`↓` or `j`/`k` navigate, `PageUp`/`PageDown` scroll by 10, `Home`/`End` top/bottom in viewers, `Enter` or `→` open/confirm (one level in: a run from the list, a stage's result from run detail, a mission from the missions list, a package's run from the mission), `Esc` or `←` back/close (one level out; the composer keeps its own arrows, so `Esc` alone leaves it), `n` new run, `R` runs screen, `M` missions screen, `x` dismiss notification, `?` help, `q` or `Ctrl-C` quit/detach.
+Mission: `↑`/`↓` select a package, `Enter` open its current run, `S` start a run for the selected ready package (uses the composer's Execution and Effort; the starting card follows it, and the package row says when it is running), `I` integrate the selected delivered package (Enter confirms).
 Run detail: `Enter`/`o` open selected stage artifact, `r` resume/recover, `s` stop, `t` retry selected failed stage (chooser: Configured provider / Claude / Codex, Enter retries; a stage whose model Codex refused also gets `Codex on <fallback model>`, highlighted on open), `u` attention overlay, `A` arm/disarm automatic approval of this run's permission requests, `l` raw logs, `d` workspace diff, `a` apply (Enter confirms), `b` rebase the run's change onto the checkout's current HEAD (Enter confirms; a conflict changes nothing, and verification has to run again before apply), `P` pull request (Enter confirms; a spinning card times the publish, Esc hides it without stopping it; the result card holds the URL until dismissed: `o` opens it in the browser, `y` copies it, Enter/Esc close and leave the summary in the footer), `X` discard (Enter confirms), `f` fix, `c` continue, `w` follow-ups, `e` expand the task in the rail, `i` technical details.
 Runs list: `h` archive/unarchive selected run, `H` show/hide archived runs, `D` delete an archived run for good (POD stands at the plunger; a second `D` goes through, Esc cancels). Only an archived run offers `D`.
 Artifact viewer: `m` toggle raw/rendered Markdown.
@@ -30,7 +32,9 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 ## Where it lives
 - `src/tui/input.rs` — `map_key` / `map_text_key`: the only key-to-intent tables.
 - `src/tui/app.rs` — `handle_intent`, overlay handlers, composer submit, eligibility messages (`stop_unavailable_reason`, `fix_unavailable_reason`, `continue_unavailable_reason`).
-- `src/tui/state.rs` — `Screen`, `Overlay`, `NewRunForm`, `ExecutionChoice`, `EFFORT_CHOICES`/`effort_label`, `CONCURRENT_AGENTS` (4).
+- `src/tui/state.rs` — `Screen`, `Overlay`, `NewRunForm`, `ExecutionChoice`, `EFFORT_CHOICES`/`effort_label`, `CONCURRENT_AGENTS` (4); `replace_missions`/`replace_mission`/`move_package` hold the missions screen's cursor.
+- `src/tui/render.rs` — `render_missions`, `render_mission_detail`, `package_hero`, `mission_visual`/`package_visual`, `render_integrate_confirmation`.
+- `src/tui/worker.rs` — `WorkerCommand::StartPackage` / `IntegratePackage` run through `MissionService` on the worker thread.
 - `src/tui/render.rs` — rendering incl. the help overlay text; `status_sentences`, `waiting_message`, `blocked_message` compose the activity strip; `failed_stage_reason` / `failure_reason_lines` render the failure block in the hero and the Runs overview.
 - `src/tui/state.rs` — `focus_blocking_failure` moves the selection onto the blocking failed stage when a run is opened from the Runs screen.
 - `src/tui/worker.rs` — `WorkerCommand` enum; one standard thread serializes all mutations.
@@ -47,4 +51,5 @@ Update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss for th
 - The TUI caps concurrently working agents at 4 (`CONCURRENT_AGENTS`); a booked fix that cannot start yet stays booked silently. The CLI has no such cap.
 - Attention overlays outrank the update overlay; the update prompt is shown at most once per process.
 - The activity strip is width-bounded: a long provider reason is cut with an ellipsis, and the prefix naming the stage always survives the cut. The full text is in the failed stage's hero (`WHY IT FAILED`), the Runs-screen overview, the logs (`l`) and `polycode status`.
-- Stop dispatches without confirmation; apply, rebase, publish and discard require Enter in a confirmation overlay.
+- Stop dispatches without confirmation; apply, rebase, publish, discard and integrate require Enter in a confirmation overlay.
+- The mission screens observe their runs on every refresh (the same committed-status pass `polycode mission show` makes); they never drive a run. A package's run started from the TUI counts against `CONCURRENT_AGENTS` like any other start.

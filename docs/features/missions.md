@@ -17,7 +17,7 @@ Plan a project goal above individual runs, break it into work packages with depe
 - run-binding: a run bound to a package (`mission start` or `mission attach`) cannot be deleted (`AppError`/`StoreError::RunBoundToMission`) while the binding stands.
 - decisions: `mission decide` records one design decision (title, rationale, author `user`|`lead`); insert-only, quoted into every later package's handoff.
 - attention: `mission show`'s "Needs you" section lists every package that is `Blocked` (with its run's pending attention summary), `Failed` (with its reason), or `Delivered` and awaiting `mission integrate`.
-- no-tui-screen: missions have no TUI screen yet; drive them from the CLI only.
+- tui: the control room's `M` screen lists missions and opens one; from there `S` starts a ready package, `I` integrates a delivered one, and Enter opens a package's run (see control-room.md). Planning commands stay CLI-only.
 
 ## How to get to it (user POV)
 Create a mission over a Git checkout with `polycode mission new`, add work packages with their dependencies, and start a ready package with `polycode mission start`; that drives its child run to quiescence in the foreground, exactly like `polycode fast` would, then reports the mission. Once a package's run is `Applied` (or completed with nothing to apply), run `polycode mission integrate` to mark it delivered into the checkout, which readies any package that depended on it. `polycode mission show` at any point prints every package, its current run, recorded decisions, and what needs you.
@@ -54,6 +54,7 @@ Every command prints the mission after the change: status, repository, goal, pac
 - `src/store/mission.rs` — `MissionHandoffRecord`, `commit_mission_update_with`, `list_mission_handoffs`, `contract_sha256`; `migrate_v11` creates `mission_handoffs`.
 - `src/cli/mod.rs` — `MissionCommand`, `ContractArgs`, `ReviseArgs`.
 - `src/cli/commands.rs` — `mission` dispatch, `print_mission`, `print_mission_list`, `build_contract`, `revise_contract`, `parse_workflow`, `parse_decision_author`.
+- `src/tui/render.rs` — `render_missions`, `render_mission_detail`; `src/tui/app.rs` — `start_selected_package`, `open_integrate_confirmation`, `refresh_missions`.
 
 ## Gotchas
 - `mission fix` needs what `polycode fix` needs: a `Completed` run with a decision stage. A `fast` package's run has none, so the fix is refused by the run and the package stays delivered; use `mission continue` on a `standard`/`deep` package, or retry the package on a new run.

@@ -146,9 +146,10 @@ dependencies, the decisions it rests on, and the runs that deliver each
 package. Polycode owns the coordination the user otherwise does by hand —
 the handoff a worker receives is rendered from mission state, package state
 follows committed run evidence, and integration is recorded only when a run
-was applied (or changed nothing). Today missions are driven from the CLI
-(`polycode mission ...`); the lead conversation, command-center TUI and
-progress brief follow in later milestones. See
+was applied (or changed nothing). Missions are planned from the CLI
+(`polycode mission ...`); the control room's `M` screen lists them, starts a
+ready package, integrates a delivered one and opens a package's run. The
+lead conversation and the progress brief follow in later milestones. See
 [docs/features/missions.md](docs/features/missions.md) and
 [docs/missions-roadmap.md](docs/missions-roadmap.md).
 

@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::{
-    ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, ProviderFactory,
-    PurgeReceipt, RetryRoute, RunService, StartProgress,
+    ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, MissionDetails,
+    MissionService, ProviderFactory, PurgeReceipt, RetryRoute, RunService, StartProgress,
 };
-use crate::domain::{AttentionRequestId, RunId, StageId, WorkflowKind};
+use crate::domain::{AttentionRequestId, MissionId, RunId, StageId, WorkPackageId, WorkflowKind};
 use crate::workspace::{PublishReceipt, RebaseReceipt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,12 +23,18 @@ pub(crate) enum ActionKind {
     Publish,
     Discard,
     Purge,
+    /// A mission package's child run being started.
+    StartPackage,
+    /// A delivered package being recorded as integrated.
+    Integrate,
 }
 
 impl ActionKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Start => "starting run",
+            Self::StartPackage => "starting package",
+            Self::Integrate => "integrating package",
             Self::Resume => "resuming run",
             Self::Stop => "stopping run",
             Self::Retry => "retrying stage",
@@ -52,6 +58,7 @@ impl ActionKind {
     pub(crate) const fn drives_a_provider(self) -> bool {
         match self {
             Self::Start
+            | Self::StartPackage
             | Self::Resume
             | Self::Retry
             | Self::Fix
@@ -62,7 +69,8 @@ impl ActionKind {
             | Self::Rebase
             | Self::Publish
             | Self::Discard
-            | Self::Purge => false,
+            | Self::Purge
+            | Self::Integrate => false,
         }
     }
 }
@@ -118,6 +126,19 @@ pub(crate) enum WorkerCommand {
     PurgeRun {
         run_id: RunId,
     },
+    /// Starts a child run for a ready package; its task is the handoff the
+    /// mission renders.
+    StartPackage {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+        selection: ExecutionSelection,
+        effort: EffortRequest,
+    },
+    /// Records a delivered package as integrated, on its run's evidence.
+    IntegratePackage {
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+    },
 }
 
 impl WorkerCommand {
@@ -135,12 +156,16 @@ impl WorkerCommand {
             Self::PublishRun { .. } => ActionKind::Publish,
             Self::DiscardRun { .. } => ActionKind::Discard,
             Self::PurgeRun { .. } => ActionKind::Purge,
+            Self::StartPackage { .. } => ActionKind::StartPackage,
+            Self::IntegratePackage { .. } => ActionKind::Integrate,
         }
     }
 
     pub(crate) const fn run_id(&self) -> Option<RunId> {
         match self {
-            Self::StartRun { .. } => None,
+            Self::StartRun { .. } | Self::StartPackage { .. } | Self::IntegratePackage { .. } => {
+                None
+            }
             Self::ResumeRun { run_id }
             | Self::StopRun { run_id }
             | Self::RetryStage { run_id, .. }
@@ -165,6 +190,10 @@ pub(crate) enum WorkerSuccess {
     /// A purge leaves no run to report on: the rows it would describe are
     /// the ones it deleted.
     Purged(PurgeReceipt),
+    /// A package's run started; the mission it belongs to came back current.
+    PackageStarted(ExecutionReport, Box<MissionDetails>),
+    /// A package was recorded as integrated.
+    Integrated(Box<MissionDetails>),
 }
 
 impl WorkerSuccess {
@@ -174,8 +203,9 @@ impl WorkerSuccess {
             Self::Execution(report)
             | Self::Applied(_, report)
             | Self::Published(_, report)
-            | Self::Rebased(_, report) => Some(report),
-            Self::Purged(_) => None,
+            | Self::Rebased(_, report)
+            | Self::PackageStarted(report, _) => Some(report),
+            Self::Purged(_) | Self::Integrated(_) => None,
         }
     }
 }
@@ -273,7 +303,7 @@ impl Drop for Report {
 }
 
 impl Worker {
-    pub(crate) fn spawn<F>(service: RunService<F>) -> Self
+    pub(crate) fn spawn<F>(service: RunService<F>, missions: MissionService) -> Self
     where
         F: ProviderFactory + Send + Sync + 'static,
         F::Provider: Send + 'static,
@@ -281,10 +311,12 @@ impl Worker {
         // Shared rather than owned by one thread: every action gets the same
         // service, and they no longer take turns holding it.
         let service = Arc::new(service);
+        let missions = Arc::new(missions);
         let (results, receiver) = mpsc::channel::<WorkerResult>();
         let (progress, progress_receiver) = mpsc::channel::<StartUpdate>();
         let start: Start = Box::new(move |ticket, command, results, progress| {
             let service = Arc::clone(&service);
+            let missions = Arc::clone(&missions);
             std::thread::spawn(move || {
                 let mut report = Report::new(ticket, command.kind(), command.run_id(), results);
                 let observe = |update| {
@@ -294,8 +326,8 @@ impl Worker {
                         progress: update,
                     });
                 };
-                let outcome =
-                    execute(&service, command, &observe).map_err(|error| error.to_string());
+                let outcome = execute(&service, &missions, command, &observe)
+                    .map_err(|error| error.to_string());
                 report.settle(outcome);
             });
         });
@@ -340,6 +372,7 @@ impl Worker {
 
 fn execute<F>(
     service: &RunService<F>,
+    missions: &MissionService,
     command: WorkerCommand,
     observe: &dyn Fn(StartProgress),
 ) -> Result<WorkerSuccess, crate::app::AppError>
@@ -404,6 +437,27 @@ where
             service.discard_run(run_id).map(WorkerSuccess::Execution)
         }
         WorkerCommand::PurgeRun { run_id } => service.purge_run(run_id).map(WorkerSuccess::Purged),
+        WorkerCommand::StartPackage {
+            mission_id,
+            package_id,
+            selection,
+            effort,
+        } => missions
+            .start_package_observed(
+                service,
+                mission_id,
+                &package_id,
+                Some(selection),
+                effort,
+                observe,
+            )
+            .map(|(report, details)| WorkerSuccess::PackageStarted(report, Box::new(details))),
+        WorkerCommand::IntegratePackage {
+            mission_id,
+            package_id,
+        } => missions
+            .integrate_package(mission_id, &package_id)
+            .map(|details| WorkerSuccess::Integrated(Box::new(details))),
     }
 }
 
@@ -430,11 +484,17 @@ mod tests {
         fs::write(repo.join("README.md"), "baseline\n").unwrap();
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "-qm", "initial"]);
-        let worker = Worker::spawn(RunService::new(
-            fixture.path().join("polycode.db"),
-            fixture.path().join("worktrees"),
-            DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
-        ));
+        let worker = Worker::spawn(
+            RunService::new(
+                fixture.path().join("polycode.db"),
+                fixture.path().join("worktrees"),
+                DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
+            ),
+            MissionService::new(
+                fixture.path().join("polycode.db"),
+                fixture.path().join("worktrees"),
+            ),
+        );
         worker.send(WorkerCommand::StartRun {
             workflow: WorkflowKind::Standard,
             task: "worker integration".to_owned(),
@@ -462,11 +522,17 @@ mod tests {
     #[test]
     fn worker_propagates_owned_action_error() {
         let fixture = TempDir::new().unwrap();
-        let worker = Worker::spawn(RunService::new(
-            fixture.path().join("polycode.db"),
-            fixture.path().join("worktrees"),
-            DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
-        ));
+        let worker = Worker::spawn(
+            RunService::new(
+                fixture.path().join("polycode.db"),
+                fixture.path().join("worktrees"),
+                DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
+            ),
+            MissionService::new(
+                fixture.path().join("polycode.db"),
+                fixture.path().join("worktrees"),
+            ),
+        );
         worker.send(WorkerCommand::StartRun {
             workflow: WorkflowKind::Fast,
             task: "invalid repository".to_owned(),
@@ -510,11 +576,17 @@ mod tests {
     #[test]
     fn two_actions_started_together_both_report_back() {
         let fixture = TempDir::new().unwrap();
-        let worker = Worker::spawn(RunService::new(
-            fixture.path().join("polycode.db"),
-            fixture.path().join("worktrees"),
-            DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
-        ));
+        let worker = Worker::spawn(
+            RunService::new(
+                fixture.path().join("polycode.db"),
+                fixture.path().join("worktrees"),
+                DevelopmentFakeProviderFactory::new(fixture.path().join("runs")),
+            ),
+            MissionService::new(
+                fixture.path().join("polycode.db"),
+                fixture.path().join("worktrees"),
+            ),
+        );
         for task in ["first", "second"] {
             worker.send(WorkerCommand::StartRun {
                 workflow: WorkflowKind::Fast,

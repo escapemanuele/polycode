@@ -206,6 +206,26 @@ impl MissionService {
     where
         F: ProviderFactory,
     {
+        self.start_package_observed(runs, mission_id, package_id, selection, effort, &|_| {})
+    }
+
+    /// [`Self::start_package`], reporting each step of the start to
+    /// `observe` as the run service does, so an interface can show the wait.
+    ///
+    /// # Errors
+    /// As [`Self::start_package`].
+    pub fn start_package_observed<F>(
+        &self,
+        runs: &RunService<F>,
+        mission_id: MissionId,
+        package_id: &WorkPackageId,
+        selection: Option<ExecutionSelection>,
+        effort: EffortRequest,
+        observe: &dyn Fn(StartProgress),
+    ) -> Result<(ExecutionReport, MissionDetails), AppError>
+    where
+        F: ProviderFactory,
+    {
         let mut store = SqliteStore::open(&self.database)?;
         let loaded = store.load_mission(mission_id)?;
         let package = loaded
@@ -253,6 +273,7 @@ impl MissionService {
             effort,
             &ImageGenerationPlan::disabled(),
             &|progress| {
+                observe(progress.clone());
                 if let StartProgress::PreparingWorkspace(run_id) = progress
                     && bound.borrow().is_none()
                 {

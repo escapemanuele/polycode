@@ -6,11 +6,14 @@ use super::mascot::{self, MascotState};
 use super::motion::{self, MotionFrame};
 use super::worker::{ActionKind, WorkerCommand};
 use crate::app::{
-    ArtifactSummary, ArtifactView, ExecutionSelection, ProcessLogView, QuiescentState, RetryRoute,
-    RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, StartProgress,
-    UniformProvider,
+    ArtifactSummary, ArtifactView, ExecutionSelection, MissionDetails, MissionListItem,
+    ProcessLogView, QuiescentState, RetryRoute, RunDetails, RunDiffPreview, RunListItem,
+    StageExecutionEvidence, StartProgress, UniformProvider, WorkPackageSummary,
 };
-use crate::domain::{AttentionRequestId, EffortSetting, ModelId, RunId, StageId, WorkflowKind};
+use crate::domain::{
+    AttentionRequestId, EffortSetting, MissionId, ModelId, RunId, StageId, WorkPackageId,
+    WorkflowKind,
+};
 use crate::workspace::PullRequestStatus;
 
 /// How long POD reacts to a change before settling into the new state. Long
@@ -26,6 +29,10 @@ pub(crate) enum Screen {
     Logs,
     Diff,
     NewRun,
+    /// Every mission, with the selected one's plan beside the list.
+    Missions,
+    /// One mission: its packages as engineering state, runs one level down.
+    MissionDetail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +40,8 @@ pub(crate) enum Overlay {
     Help,
     Attention,
     ApplyConfirm,
+    /// The last stop before a delivered package is recorded as integrated.
+    IntegrateConfirm,
     /// The last stop before a run's change is replayed on a newer base.
     RebaseConfirm,
     PublishConfirm,
@@ -634,6 +643,16 @@ pub(crate) struct TuiState {
     pub screen: Screen,
     pub overlay: Option<Overlay>,
     pub runs: Vec<RunListItem>,
+    pub missions: Vec<MissionListItem>,
+    pub selected_mission: Option<MissionId>,
+    pub selected_mission_index: usize,
+    /// The selected mission, current as of the last refresh.
+    pub mission: Option<MissionDetails>,
+    pub selected_package: Option<WorkPackageId>,
+    pub selected_package_index: usize,
+    /// Whether the open run detail was reached from a mission, so leaving it
+    /// returns to that mission rather than to the Runs list.
+    pub run_opened_from_mission: bool,
     /// Whether archived runs are shown in the Runs list. Off by default;
     /// toggled by the operator, never persisted.
     pub show_archived: bool,
@@ -739,6 +758,13 @@ impl TuiState {
             screen: Screen::Runs,
             overlay: None,
             runs: Vec::new(),
+            missions: Vec::new(),
+            selected_mission: None,
+            selected_mission_index: 0,
+            mission: None,
+            selected_package: None,
+            selected_package_index: 0,
+            run_opened_from_mission: false,
             show_archived: false,
             archived_count: 0,
             selected_run: None,
@@ -809,6 +835,84 @@ impl TuiState {
             .and_then(|id| self.runs.iter().position(|run| run.id == id))
             .unwrap_or_else(|| previous_index.min(self.runs.len() - 1));
         self.selected_run = Some(self.runs[self.selected_run_index].id);
+    }
+
+    pub(crate) fn replace_missions(&mut self, missions: Vec<MissionListItem>) {
+        let previous_index = self.selected_mission_index;
+        let previous_id = self.selected_mission;
+        self.missions = missions;
+        if self.missions.is_empty() {
+            self.selected_mission = None;
+            self.selected_mission_index = 0;
+            self.mission = None;
+            return;
+        }
+        self.selected_mission_index = previous_id
+            .and_then(|id| self.missions.iter().position(|mission| mission.id == id))
+            .unwrap_or_else(|| previous_index.min(self.missions.len() - 1));
+        self.selected_mission = Some(self.missions[self.selected_mission_index].id);
+    }
+
+    /// Installs the selected mission's details, keeping the package cursor
+    /// on the same package when it is still there.
+    pub(crate) fn replace_mission(&mut self, details: MissionDetails) {
+        if self
+            .mission
+            .as_ref()
+            .is_some_and(|current| current.id != details.id)
+        {
+            self.selected_package = None;
+            self.selected_package_index = 0;
+        }
+        let previous = self.selected_package.clone();
+        self.mission = Some(details);
+        let packages = &self.mission.as_ref().expect("just set").packages;
+        if packages.is_empty() {
+            self.selected_package = None;
+            self.selected_package_index = 0;
+            return;
+        }
+        self.selected_package_index = previous
+            .as_ref()
+            .and_then(|id| packages.iter().position(|package| &package.id == id))
+            .unwrap_or_else(|| self.selected_package_index.min(packages.len() - 1));
+        self.selected_package = Some(packages[self.selected_package_index].id.clone());
+    }
+
+    pub(crate) fn move_mission(&mut self, forward: bool) {
+        if self.missions.is_empty() {
+            return;
+        }
+        let last = self.missions.len() - 1;
+        self.selected_mission_index = if forward {
+            (self.selected_mission_index + 1).min(last)
+        } else {
+            self.selected_mission_index.saturating_sub(1)
+        };
+        self.selected_mission = Some(self.missions[self.selected_mission_index].id);
+    }
+
+    pub(crate) fn move_package(&mut self, forward: bool) {
+        let Some(mission) = self.mission.as_ref() else {
+            return;
+        };
+        if mission.packages.is_empty() {
+            return;
+        }
+        let last = mission.packages.len() - 1;
+        self.selected_package_index = if forward {
+            (self.selected_package_index + 1).min(last)
+        } else {
+            self.selected_package_index.saturating_sub(1)
+        };
+        self.selected_package = Some(mission.packages[self.selected_package_index].id.clone());
+    }
+
+    /// The package the cursor is on, when a mission is open.
+    pub(crate) fn selected_package_summary(&self) -> Option<&WorkPackageSummary> {
+        let mission = self.mission.as_ref()?;
+        let id = self.selected_package.as_ref()?;
+        mission.package(id)
     }
 
     pub(crate) fn replace_details(&mut self, details: RunDetails) {
@@ -1000,7 +1104,8 @@ impl TuiState {
     pub(crate) fn run_is_held(&self, run_id: RunId) -> bool {
         self.in_flight.iter().any(|entry| {
             entry.run_id == Some(run_id)
-                || (entry.action == ActionKind::Start && entry.run_id.is_none())
+                || (matches!(entry.action, ActionKind::Start | ActionKind::StartPackage)
+                    && entry.run_id.is_none())
         })
     }
 

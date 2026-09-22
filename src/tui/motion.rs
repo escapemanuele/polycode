@@ -165,7 +165,9 @@ pub(crate) const fn surface_ceiling(screen: Screen, overlay: Option<Overlay>) ->
     match screen {
         // Operating surfaces: what they show is work in progress, so time is
         // part of the information.
-        Screen::Runs | Screen::RunDetail => MotionAllowance::ActiveStateAndTransitions,
+        Screen::Runs | Screen::RunDetail | Screen::Missions | Screen::MissionDetail => {
+            MotionAllowance::ActiveStateAndTransitions
+        }
         // Reading surfaces: prose, logs, a diff, a form being filled in.
         Screen::Artifact | Screen::Logs | Screen::Diff | Screen::NewRun => {
             MotionAllowance::Disabled
