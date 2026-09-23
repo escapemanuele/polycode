@@ -741,17 +741,23 @@ impl TuiApp {
             self.state.set_error("Selected stage is not failed");
             return;
         }
-        self.state.retry_route_choice = RetryRouteChoice::Configured;
+        // A plain retry of a stage whose model Codex refused fails the same
+        // way, so the fallback row starts highlighted when there is one.
+        self.state.retry_route_choice = stage
+            .model_fallback()
+            .map_or(RetryRouteChoice::Configured, RetryRouteChoice::CodexModel);
         self.state.overlay = Some(Overlay::RetryRoute);
     }
 
     fn handle_retry_route_intent(&mut self, intent: Intent) {
         match intent {
             Intent::Down => {
-                self.state.retry_route_choice = self.state.retry_route_choice.next();
+                let choices = self.state.retry_route_choices();
+                self.state.retry_route_choice = self.state.retry_route_choice.next(&choices);
             }
             Intent::Up => {
-                self.state.retry_route_choice = self.state.retry_route_choice.previous();
+                let choices = self.state.retry_route_choices();
+                self.state.retry_route_choice = self.state.retry_route_choice.previous(&choices);
             }
             Intent::Enter => {
                 let Some(run_id) = self.state.selected_run else {
@@ -3682,6 +3688,36 @@ mod tests {
             1,
             "an orphan is resumed exactly once"
         );
+    }
+
+    /// When Codex refused the stage's model, a plain retry fails the same
+    /// way, so the chooser opens on the fallback model row and Enter sends
+    /// the stage there.
+    #[test]
+    fn retry_opens_on_the_fallback_model_when_codex_refused_the_model() {
+        let mut failed = details(RunStatus::Failed, WorkflowKind::Fast);
+        failed.stages[0].status = StageStatus::Failed;
+        failed.stages[0].failure_reason = Some(
+            "The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account."
+                .to_owned(),
+        );
+        let (mut app, _fixture) = app_with(failed);
+
+        app.handle_intent(Intent::Retry);
+        let fallback = RetryRouteChoice::CodexModel(crate::app::CODEX_FALLBACK_MODEL);
+        assert_eq!(app.state.retry_route_choice, fallback);
+        assert_eq!(
+            app.state.retry_route_choice.route(),
+            Some(crate::app::RetryRoute::new(
+                crate::app::UniformProvider::Codex,
+                Some(crate::domain::ModelId::new(crate::app::CODEX_FALLBACK_MODEL).unwrap()),
+            ))
+        );
+        app.handle_intent(Intent::Up);
+        assert_eq!(app.state.retry_route_choice, RetryRouteChoice::Configured);
+        app.handle_intent(Intent::Down);
+        app.handle_intent(Intent::Down);
+        assert_eq!(app.state.retry_route_choice, RetryRouteChoice::Claude);
     }
 
     /// `t` asks where the failed stage goes before retrying it. The first

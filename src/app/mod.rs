@@ -12,10 +12,10 @@ pub use provider_factory::{
     RuntimeProvider, RuntimeProviderFactory,
 };
 pub use query::{
-    ArtifactSummary, ArtifactView, AttentionSummary, BlockedDependencyRef, ChangedFileSummary,
-    CommittedEvent, ImageGenerationSummary, ProcessLogStream, ProcessLogView, ProviderUsage,
-    RouteSummary, RunDetails, RunDiffPreview, RunListItem, RunUsage, StageDependencyRef,
-    StageExecutionEvidence, StageSummary, StageWaitingSummary, UsageSummary,
+    ArtifactSummary, ArtifactView, AttentionSummary, BlockedDependencyRef, CODEX_FALLBACK_MODEL,
+    ChangedFileSummary, CommittedEvent, ImageGenerationSummary, ProcessLogStream, ProcessLogView,
+    ProviderUsage, RouteSummary, RunDetails, RunDiffPreview, RunListItem, RunUsage,
+    StageDependencyRef, StageExecutionEvidence, StageSummary, StageWaitingSummary, UsageSummary,
 };
 pub(crate) use routing::resolve_eval_config;
 pub use routing::{
