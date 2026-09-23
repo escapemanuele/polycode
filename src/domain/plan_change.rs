@@ -157,6 +157,8 @@ pub enum PlanChangeParseError {
     UnknownItem { line: usize, text: String },
     #[error("line {line}: a field belongs under an item, found {text:?}")]
     FieldWithoutItem { line: usize, text: String },
+    #[error("line {line}: a field is `key: value`, found {text:?}")]
+    MalformedField { line: usize, text: String },
     #[error("line {line}: unknown field {field:?} for `{item}`")]
     UnknownField {
         line: usize,
@@ -355,7 +357,7 @@ impl Item {
 
     fn field(&mut self, line: usize, text: &str) -> Result<(), PlanChangeParseError> {
         let Some((key, value)) = text.split_once(':') else {
-            return Err(PlanChangeParseError::FieldWithoutItem {
+            return Err(PlanChangeParseError::MalformedField {
                 line,
                 text: text.to_owned(),
             });
@@ -708,6 +710,10 @@ Ignored.
             (
                 "## Plan changes\n  goal: orphan\n",
                 "line 2: a field belongs under an item, found \"goal: orphan\"",
+            ),
+            (
+                "## Plan changes\n- add `x`: X\n  goal g\n",
+                "line 3: a field is `key: value`, found \"goal g\"",
             ),
             (
                 "## Plan changes\n- rename `x`\n",

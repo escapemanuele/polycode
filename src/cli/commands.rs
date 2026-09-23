@@ -816,8 +816,15 @@ fn mission(command: &MissionCommand) -> Result<()> {
             effort,
             apply,
         } => {
+            let routed = provider.is_some() || profile.is_some() || effort.is_some();
             let selection = execution_selection(provider.as_deref(), profile.as_deref())?;
             let effort = parse_effort(effort.as_deref())?;
+            let continuing = missions.inspect_mission(*mission_id)?.lead.is_some();
+            if continuing && routed {
+                println!(
+                    "Note: the lead session already runs on its own configuration; --provider, --profile and --effort apply to the first message only."
+                );
+            }
             let (turn, details) =
                 missions.ask_lead(&service()?, *mission_id, message, selection, effort)?;
             print_lead_turn(&turn, *mission_id);

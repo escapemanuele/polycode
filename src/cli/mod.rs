@@ -232,10 +232,14 @@ pub enum MissionCommand {
     Ask {
         mission_id: MissionId,
         message: String,
+        /// Provider for the lead session; read on the first message only,
+        /// later turns run on the session's own configuration.
         #[arg(long, conflicts_with = "profile")]
         provider: Option<String>,
+        /// Routing profile for the lead session (first message only).
         #[arg(long, conflicts_with = "provider")]
         profile: Option<String>,
+        /// Effort for the lead session (first message only).
         #[arg(long)]
         effort: Option<String>,
         /// Apply the answer's plan changes straight away.

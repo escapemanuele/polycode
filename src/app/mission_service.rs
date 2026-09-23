@@ -143,7 +143,9 @@ impl MissionService {
     /// lead session as a run over the mission's checkout; every later one
     /// appends a turn to it. Each turn's instruction is the brief rendered
     /// from the mission's current state plus the message, so the lead
-    /// always answers over the truth and never over a chat log.
+    /// always answers over the truth and never over a chat log. `selection`
+    /// and `effort` route the session when it starts; a later turn runs on
+    /// the session's own sealed configuration and ignores them.
     ///
     /// # Errors
     /// Returns an error when the lead is still at work on an earlier turn,
@@ -304,16 +306,21 @@ impl MissionService {
                             .contract()
                             .clone();
                         let contract = WorkPackageContract {
-                            title: title.unwrap_or(current.title),
-                            goal: goal.unwrap_or(current.goal),
-                            rationale: rationale.unwrap_or(current.rationale),
-                            scope: scope.unwrap_or(current.scope),
+                            title: title.unwrap_or_else(|| current.title.clone()),
+                            goal: goal.unwrap_or_else(|| current.goal.clone()),
+                            rationale: rationale.unwrap_or_else(|| current.rationale.clone()),
+                            scope: scope.unwrap_or_else(|| current.scope.clone()),
                             acceptance_criteria: acceptance_criteria
-                                .unwrap_or(current.acceptance_criteria),
-                            verification: verification.unwrap_or(current.verification),
+                                .unwrap_or_else(|| current.acceptance_criteria.clone()),
+                            verification: verification
+                                .unwrap_or_else(|| current.verification.clone()),
                             workflow: workflow.unwrap_or(current.workflow),
                         };
-                        let mut change = mission.revise_contract(&id, contract, now)?;
+                        let mut change = if contract == current {
+                            MissionChange { events: Vec::new() }
+                        } else {
+                            mission.revise_contract(&id, contract, now)?
+                        };
                         if let Some(dependencies) = dependencies {
                             change
                                 .events

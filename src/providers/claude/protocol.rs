@@ -1555,6 +1555,7 @@ mod tests {
             StageKind::Decision,
             StageKind::Fix,
             StageKind::FollowUp,
+            StageKind::Lead,
         ] {
             let workflow = WorkflowDefinition::new(
                 WorkflowKind::Standard,

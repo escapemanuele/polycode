@@ -477,6 +477,9 @@ impl SqliteStore {
                 mission_id: binding.mission_id,
             });
         }
+        if let Some(mission_id) = super::mission::mission_of_lead_run(&transaction, run_id)? {
+            return Err(StoreError::RunBoundToMission { run_id, mission_id });
+        }
         // Deepest dependents first: provider sessions point at managed
         // processes, apply operations point at workspaces, and everything
         // points at the run.

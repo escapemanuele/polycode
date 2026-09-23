@@ -768,20 +768,27 @@ impl SqliteStore {
     /// # Errors
     /// Returns persistence errors.
     pub fn mission_of_lead_run(&self, run_id: RunId) -> Result<Option<MissionId>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT mission_id FROM mission_leads WHERE run_id = ?1",
-                [run_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|mission_id| {
-                mission_id
-                    .parse()
-                    .map_err(|_| StoreError::SnapshotProjectionMismatch("mission ID"))
-            })
-            .transpose()
+        mission_of_lead_run(&self.connection, run_id)
     }
+}
+
+pub(crate) fn mission_of_lead_run(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<MissionId>, StoreError> {
+    connection
+        .query_row(
+            "SELECT mission_id FROM mission_leads WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|mission_id| {
+            mission_id
+                .parse()
+                .map_err(|_| StoreError::SnapshotProjectionMismatch("mission ID"))
+        })
+        .transpose()
 }
 
 pub(crate) fn mission_of_run(

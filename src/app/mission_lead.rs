@@ -168,8 +168,10 @@ pub(crate) fn turn(brief: &str, message: &str) -> String {
 }
 
 /// The lead run's latest finished turn, or `None` while it has not
-/// answered yet. An artifact that fails its integrity check is an error,
-/// never a silent blank.
+/// answered yet. A turn still at work, or one that failed, does not hide
+/// the answer before it: the newest completed turn is the answer. An
+/// artifact that fails its integrity check is an error, never a silent
+/// blank.
 pub(crate) fn latest_answer(
     store: &mut SqliteStore,
     run_id: RunId,
@@ -181,12 +183,14 @@ pub(crate) fn latest_answer(
         .iter()
         .filter(|stage| stage.kind() == StageKind::Lead)
         .collect();
-    let Some(last) = turns.last() else {
+    let Some((turn, last)) = turns
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, stage)| stage.status() == StageStatus::Completed)
+    else {
         return Ok(None);
     };
-    if last.status() != StageStatus::Completed {
-        return Ok(None);
-    }
     let view = match query::read_artifact(store, run_id, last.id()) {
         Ok(view) => view,
         Err(AppError::ArtifactNotFound { .. }) => return Ok(None),
@@ -195,7 +199,7 @@ pub(crate) fn latest_answer(
     Ok(Some(LeadAnswer {
         run_id,
         stage_id: last.id().clone(),
-        turn: turns.len(),
+        turn: turn + 1,
         bottom_line: section::extract_verbatim(&view.text, "bottomline"),
         proposals: parse_plan_changes(&view.text),
         text: view.text,
