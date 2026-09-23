@@ -655,12 +655,10 @@ pub(crate) struct TuiState {
     pub run_opened_from_mission: bool,
     /// Missions whose package runs this session approves permission
     /// requests for. An intention held here, like `fix_when_finished`: it
-    /// arms each run the session starts for the mission and the runs it has
-    /// now, and is forgotten with the session.
+    /// arms the runs the mission has now and each run this session starts
+    /// for it (the start carries the flag, so the run is armed before its
+    /// first stage can ask), and is forgotten with the session.
     pub auto_approve_missions: HashSet<MissionId>,
-    /// Package starts in flight, by worker ticket, so the run they bring up
-    /// can be armed the moment it exists.
-    pub mission_starts: Vec<(u64, MissionId)>,
     /// Whether archived runs are shown in the Runs list. Off by default;
     /// toggled by the operator, never persisted.
     pub show_archived: bool,
@@ -774,7 +772,6 @@ impl TuiState {
             selected_package_index: 0,
             run_opened_from_mission: false,
             auto_approve_missions: HashSet::new(),
-            mission_starts: Vec::new(),
             show_archived: false,
             archived_count: 0,
             selected_run: None,

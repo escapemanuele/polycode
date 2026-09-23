@@ -133,6 +133,9 @@ pub(crate) enum WorkerCommand {
         package_id: WorkPackageId,
         selection: ExecutionSelection,
         effort: EffortRequest,
+        /// Arm the run to approve grantable permission requests as soon as
+        /// it exists, because its mission is armed.
+        auto_approve: bool,
     },
     /// Records a delivered package as integrated, on its run's evidence.
     IntegratePackage {
@@ -442,13 +445,15 @@ where
             package_id,
             selection,
             effort,
+            auto_approve,
         } => missions
-            .start_package_observed(
+            .start_package_with(
                 service,
                 mission_id,
                 &package_id,
                 Some(selection),
                 effort,
+                auto_approve,
                 observe,
             )
             .map(|(report, details)| WorkerSuccess::PackageStarted(report, Box::new(details))),

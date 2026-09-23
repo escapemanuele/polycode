@@ -226,6 +226,35 @@ impl MissionService {
     where
         F: ProviderFactory,
     {
+        self.start_package_with(
+            runs, mission_id, package_id, selection, effort, false, observe,
+        )
+    }
+
+    /// [`Self::start_package_observed`] with the run armed to approve
+    /// grantable permission requests from the moment it exists, before its
+    /// first stage can ask. The flag is written on the starting thread, in
+    /// the step that binds the run, not by whoever observes the progress.
+    ///
+    /// # Errors
+    /// As [`Self::start_package`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one start, every choice it takes"
+    )]
+    pub fn start_package_with<F>(
+        &self,
+        runs: &RunService<F>,
+        mission_id: MissionId,
+        package_id: &WorkPackageId,
+        selection: Option<ExecutionSelection>,
+        effort: EffortRequest,
+        auto_approve: bool,
+        observe: &dyn Fn(StartProgress),
+    ) -> Result<(ExecutionReport, MissionDetails), AppError>
+    where
+        F: ProviderFactory,
+    {
         let mut store = SqliteStore::open(&self.database)?;
         let loaded = store.load_mission(mission_id)?;
         let package = loaded
@@ -281,8 +310,17 @@ impl MissionService {
                         run_id,
                         ..handoff.clone()
                     };
-                    let outcome = self.bind_run(mission_id, package_id, run_id, Some(&handoff));
-                    *bound.borrow_mut() = Some(outcome.map(|_| ()));
+                    let outcome = self
+                        .bind_run(mission_id, package_id, run_id, Some(&handoff))
+                        .map(|_| ())
+                        .and_then(|()| {
+                            if auto_approve {
+                                runs.set_run_auto_approve(run_id, true)
+                            } else {
+                                Ok(())
+                            }
+                        });
+                    *bound.borrow_mut() = Some(outcome);
                 }
             },
         )?;
@@ -838,6 +876,34 @@ mod tests {
                 .map(|dependency| WorkPackageId::new(*dependency).unwrap())
                 .collect(),
         }
+    }
+
+    /// A start carrying the mission's auto-approve arms the run in the step
+    /// that binds it, so the flag is on the run before its first stage.
+    #[test]
+    fn an_armed_start_leaves_the_run_auto_approving() {
+        let fixture = Fixture::new();
+        let missions = fixture.missions();
+        let runs = fixture.runs();
+        let mission = missions
+            .create_mission("JEV", "goal", &fixture.repo)
+            .unwrap();
+        let core = WorkPackageId::new("core").unwrap();
+        missions
+            .add_package(mission.id, package("core", "Core", &[]))
+            .unwrap();
+        let (report, _) = missions
+            .start_package_with(
+                &runs,
+                mission.id,
+                &core,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+                true,
+                &|_| {},
+            )
+            .unwrap();
+        assert!(runs.inspect_run(report.details.id).unwrap().auto_approve);
     }
 
     /// Integrating a package whose run still holds its change applies the

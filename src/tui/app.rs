@@ -892,8 +892,8 @@ impl TuiApp {
             package_id,
             selection: self.state.new_run.execution.selection(),
             effort: self.state.new_run.effort.into(),
+            auto_approve: self.state.auto_approve_missions.contains(&mission_id),
         }) {
-            self.state.mission_starts.push((ticket, mission_id));
             self.state.starting = Some(StartInFlight {
                 ticket,
                 task: title,
@@ -1490,32 +1490,12 @@ impl TuiApp {
                 }
                 self.refresh();
             }
-            StartProgress::PreparingWorkspace(run_id) => {
+            StartProgress::PreparingWorkspace(_) => {
                 starting.progress = Some(update.progress);
-                self.arm_mission_run(update.ticket, run_id);
                 // The run exists now; let the list show it.
                 self.refresh();
             }
             progress => starting.progress = Some(progress),
-        }
-    }
-
-    /// A package run that just came into being inherits its mission's
-    /// auto-approve, before any stage can ask.
-    fn arm_mission_run(&mut self, ticket: u64, run_id: RunId) {
-        let Some(index) = self
-            .state
-            .mission_starts
-            .iter()
-            .position(|(start, _)| *start == ticket)
-        else {
-            return;
-        };
-        let (_, mission_id) = self.state.mission_starts.remove(index);
-        if self.state.auto_approve_missions.contains(&mission_id)
-            && let Err(error) = self.reader.set_run_auto_approve(run_id, true)
-        {
-            self.state.set_error(error.to_string());
         }
     }
 

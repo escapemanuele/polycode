@@ -492,7 +492,7 @@ fn render_mission_overview(
         theme::section("PACKAGES"),
     ];
     for package in &mission.packages {
-        lines.push(package_line(package, false, width));
+        lines.push(package_line(mission, package, false, width));
     }
     lines.push(Line::from(""));
     lines.extend(attention_lines(mission, false));
@@ -512,12 +512,13 @@ fn render_mission_overview(
 /// One package as a line: state glyph, title, then what it is doing in
 /// plain words. The id stays for the CLI, quietly on the right.
 fn package_line(
+    mission: &crate::app::MissionDetails,
     package: &crate::app::WorkPackageSummary,
     selected: bool,
     width: u16,
 ) -> Line<'static> {
     let visual = package_visual(package.status);
-    let phrase = package_phrase(package);
+    let phrase = package_phrase(mission, package);
     let id = package.id.to_string();
     let title_width = (width as usize)
         .saturating_sub(phrase.chars().count() + id.chars().count() + 9)
@@ -542,19 +543,30 @@ fn package_line(
     theme::spread(left, vec![Span::styled(id, theme::muted())], width)
 }
 
-/// What a package is doing, said the way the operator would say it.
-fn package_phrase(package: &crate::app::WorkPackageSummary) -> String {
+/// What a package is doing, said the way the operator would say it. A
+/// planned package names only the dependencies still outstanding.
+fn package_phrase(
+    mission: &crate::app::MissionDetails,
+    package: &crate::app::WorkPackageSummary,
+) -> String {
     match package.status {
-        WorkPackageStatus::Planned => match package.dependencies.as_slice() {
-            [] => "not started".to_owned(),
-            deps => format!(
-                "waits on {}",
-                deps.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        },
+        WorkPackageStatus::Planned => {
+            let outstanding: Vec<String> = package
+                .dependencies
+                .iter()
+                .filter(|id| {
+                    mission
+                        .package(id)
+                        .is_none_or(|dependency| dependency.status != WorkPackageStatus::Integrated)
+                })
+                .map(ToString::to_string)
+                .collect();
+            if outstanding.is_empty() {
+                "not started".to_owned()
+            } else {
+                format!("waits on {}", outstanding.join(", "))
+            }
+        }
         WorkPackageStatus::Ready => "ready to start".to_owned(),
         WorkPackageStatus::Running => "working".to_owned(),
         WorkPackageStatus::Blocked => "needs you".to_owned(),
@@ -685,6 +697,7 @@ fn render_mission_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
     for (index, package) in mission.packages.iter().enumerate() {
         rail.push(package_line(
+            mission,
             package,
             index == state.selected_package_index,
             rail_width,
