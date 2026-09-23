@@ -808,6 +808,60 @@ fn mission(command: &MissionCommand) -> Result<()> {
             print_mission(&details);
             Ok(())
         }
+        MissionCommand::Ask {
+            mission_id,
+            message,
+            provider,
+            profile,
+            effort,
+            apply,
+        } => {
+            let selection = execution_selection(provider.as_deref(), profile.as_deref())?;
+            let effort = parse_effort(effort.as_deref())?;
+            let (turn, details) =
+                missions.ask_lead(&service()?, *mission_id, message, selection, effort)?;
+            print_lead_turn(&turn, *mission_id);
+            if *apply
+                && turn.answer.as_ref().is_some_and(
+                    |answer| matches!(&answer.proposals, Ok(changes) if !changes.is_empty()),
+                )
+            {
+                let details = missions.apply_lead_proposals(*mission_id)?;
+                println!();
+                println!("Applied.");
+                print_mission(&details);
+            } else {
+                println!();
+                print_mission(&details);
+            }
+            Ok(())
+        }
+        MissionCommand::Apply { mission_id } => {
+            let answer = missions
+                .latest_lead_answer(*mission_id)?
+                .ok_or(crate::app::AppError::NoLeadAnswer(*mission_id))?;
+            match &answer.proposals {
+                Ok(changes) if changes.is_empty() => {
+                    println!("The lead proposed no plan changes; nothing to apply.");
+                    Ok(())
+                }
+                Ok(changes) => {
+                    for change in changes {
+                        println!("  - {change}");
+                    }
+                    let details = missions.apply_lead_proposals(*mission_id)?;
+                    println!("Applied.");
+                    print_mission(&details);
+                    Ok(())
+                }
+                Err(source) => Err(crate::app::AppError::LeadProposalUnreadable {
+                    run_id: answer.run_id,
+                    stage_id: answer.stage_id.clone(),
+                    source: source.clone(),
+                }
+                .into()),
+            }
+        }
         MissionCommand::Resume { mission_id } => {
             let (reports, details) = missions.resume_mission(&service()?, *mission_id)?;
             for report in &reports {
@@ -985,6 +1039,42 @@ fn print_mission_list(items: &[MissionListItem]) {
     }
 }
 
+/// The lead's answer as the user reads it: prose first, then the plan
+/// changes as a list with the command that applies them.
+fn print_lead_turn(turn: &crate::app::LeadTurn, mission_id: crate::domain::MissionId) {
+    let run = &turn.report.details;
+    match turn.answer.as_ref() {
+        None => {
+            println!(
+                "The lead (run {}) is {}; no answer yet. `polycode status {}` shows where it is.",
+                run.id,
+                enum_text(run.status),
+                run.id
+            );
+        }
+        Some(answer) => {
+            println!("Lead (run {}, turn {}):", answer.run_id, answer.turn);
+            println!();
+            println!("{}", answer.prose());
+            println!();
+            match &answer.proposals {
+                Ok(changes) if changes.is_empty() => println!("No plan changes proposed."),
+                Ok(changes) => {
+                    println!("Proposed plan changes:");
+                    for change in changes {
+                        println!("  - {change}");
+                    }
+                    println!("Apply them with `polycode mission apply {mission_id}`.");
+                }
+                Err(crate::domain::PlanChangeParseError::MissingSection) => {
+                    println!("No plan changes proposed.");
+                }
+                Err(error) => println!("The answer's plan changes could not be read: {error}"),
+            }
+        }
+    }
+}
+
 fn print_mission(details: &MissionDetails) {
     println!("Mission {}: {}", details.id, details.title);
     println!(
@@ -994,6 +1084,14 @@ fn print_mission(details: &MissionDetails) {
         &details.base_commit[..details.base_commit.len().min(12)]
     );
     println!("Goal: {}", details.goal);
+    if let Some(lead) = details.lead.as_ref() {
+        println!(
+            "Lead: run {} ({}), {} turn(s)",
+            lead.run_id,
+            enum_text(lead.run_status),
+            lead.turns
+        );
+    }
     println!();
 
     let integrated = details

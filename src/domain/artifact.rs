@@ -18,6 +18,8 @@ pub enum ArtifactKind {
     Fix,
     Synthesis,
     FollowUp,
+    /// One turn of a mission lead's conversation.
+    Lead,
     /// The Markdown record of one verification pass: every command run,
     /// its exit code, and its bounded output.
     Verify,
@@ -191,6 +193,18 @@ mod tests {
 
     /// Additive like `Fix` before it: the new variant round-trips through
     /// the same inspectable snake-case shape.
+    #[test]
+    fn lead_artifact_kind_round_trips_through_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ArtifactKind::Lead).unwrap(),
+            "\"lead\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ArtifactKind>("\"lead\"").unwrap(),
+            ArtifactKind::Lead
+        );
+    }
+
     #[test]
     fn follow_up_artifact_kind_round_trips_through_snake_case() {
         assert_eq!(

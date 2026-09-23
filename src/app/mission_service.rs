@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    DecisionAuthor, DecisionId, IntegrationEvidence, Mission, MissionChange, MissionId, RunId,
-    RunStatus, WorkPackage, WorkPackageContract, WorkPackageId, WorkPackageStatus,
+    DecisionAuthor, DecisionId, IntegrationEvidence, Mission, MissionChange, MissionError,
+    MissionId, PlanChange, RunId, RunStatus, WorkPackage, WorkPackageContract, WorkPackageId,
+    WorkPackageStatus, WorkflowKind,
 };
 use crate::git::GitRepository;
 use crate::store::{
@@ -23,6 +24,7 @@ use crate::store::{
 };
 use crate::workspace::WorkspaceStatus;
 
+use super::mission_lead::{self, LeadAnswer, LeadTurn};
 use super::mission_query::{self, MissionDetails, MissionListItem};
 use super::mission_result;
 use super::provider_factory::ProviderFactory;
@@ -135,6 +137,205 @@ impl MissionService {
         let mut store = SqliteStore::open(&self.database)?;
         let loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
         mission_query::details(&mut store, &loaded)
+    }
+
+    /// One exchange with the mission's lead. The first message starts the
+    /// lead session as a run over the mission's checkout; every later one
+    /// appends a turn to it. Each turn's instruction is the brief rendered
+    /// from the mission's current state plus the message, so the lead
+    /// always answers over the truth and never over a chat log.
+    ///
+    /// # Errors
+    /// Returns an error when the lead is still at work on an earlier turn,
+    /// or when the run service, provider, or store refuse.
+    pub fn ask_lead<F>(
+        &self,
+        runs: &RunService<F>,
+        mission_id: MissionId,
+        message: &str,
+        selection: Option<ExecutionSelection>,
+        effort: EffortRequest,
+    ) -> Result<(LeadTurn, MissionDetails), AppError>
+    where
+        F: ProviderFactory,
+    {
+        let mut store = SqliteStore::open(&self.database)?;
+        let loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
+        let details = mission_query::details(&mut store, &loaded)?;
+        let instruction = mission_lead::turn(&mission_lead::brief(&details), message);
+        let repository = PathBuf::from(loaded.input.source_repo_path());
+        let current = match store.mission_lead(mission_id)? {
+            Some(binding) => {
+                let status = store.load_run(binding.run_id)?.run.status();
+                match status {
+                    RunStatus::Completed => Some(binding.run_id),
+                    // A lead that failed or was discarded is history; the
+                    // next message opens a fresh session.
+                    RunStatus::Failed | RunStatus::Discarded => None,
+                    status => {
+                        return Err(AppError::LeadBusy {
+                            mission_id,
+                            run_id: binding.run_id,
+                            status,
+                        });
+                    }
+                }
+            }
+            None => None,
+        };
+        drop(store);
+        let report = if let Some(run_id) = current {
+            runs.request_lead_turn(run_id, &instruction)?
+        } else {
+            let bound: RefCell<Option<Result<(), AppError>>> = RefCell::new(None);
+            let report = runs.start_run_observed(
+                WorkflowKind::Lead,
+                instruction,
+                &repository,
+                selection,
+                effort,
+                &ImageGenerationPlan::disabled(),
+                &|progress| {
+                    if let StartProgress::PreparingWorkspace(run_id) = progress
+                        && bound.borrow().is_none()
+                    {
+                        let outcome = SqliteStore::open(&self.database)
+                            .and_then(|mut store| {
+                                store.bind_mission_lead(mission_id, run_id, &now())
+                            })
+                            .map_err(AppError::from);
+                        *bound.borrow_mut() = Some(outcome);
+                    }
+                },
+            )?;
+            match bound.into_inner() {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    return Err(AppError::LeadRunUnbound {
+                        mission_id,
+                        run_id: report.details.id,
+                        reason: error.to_string(),
+                    });
+                }
+                None => {
+                    return Err(AppError::LeadRunUnbound {
+                        mission_id,
+                        run_id: report.details.id,
+                        reason: "the run never reported being persisted".to_owned(),
+                    });
+                }
+            }
+            report
+        };
+        let mut store = SqliteStore::open(&self.database)?;
+        let answer = mission_lead::latest_answer(&mut store, report.details.id)?;
+        drop(store);
+        let details = self.inspect_mission(mission_id)?;
+        Ok((LeadTurn { report, answer }, details))
+    }
+
+    /// The lead's latest finished answer, with the proposals it carries.
+    ///
+    /// # Errors
+    /// Returns persistence or artifact integrity errors.
+    pub fn latest_lead_answer(
+        &self,
+        mission_id: MissionId,
+    ) -> Result<Option<LeadAnswer>, AppError> {
+        let mut store = SqliteStore::open(&self.database)?;
+        match store.mission_lead(mission_id)? {
+            Some(binding) => mission_lead::latest_answer(&mut store, binding.run_id),
+            None => Ok(None),
+        }
+    }
+
+    /// Applies the lead's latest proposals to the plan, all in one commit:
+    /// either every change lands or none does.
+    ///
+    /// # Errors
+    /// Returns an error when there is no answer, when the answer's section
+    /// cannot be read, or when a change is refused by the plan.
+    pub fn apply_lead_proposals(&self, mission_id: MissionId) -> Result<MissionDetails, AppError> {
+        let answer = self
+            .latest_lead_answer(mission_id)?
+            .ok_or(AppError::NoLeadAnswer(mission_id))?;
+        let changes = answer
+            .proposals
+            .map_err(|source| AppError::LeadProposalUnreadable {
+                run_id: answer.run_id,
+                stage_id: answer.stage_id.clone(),
+                source,
+            })?;
+        self.apply_plan_changes(mission_id, &changes)
+    }
+
+    /// Applies a list of plan changes atomically, in order.
+    ///
+    /// # Errors
+    /// Returns the first change the plan refuses; nothing is committed.
+    pub fn apply_plan_changes(
+        &self,
+        mission_id: MissionId,
+        changes: &[PlanChange],
+    ) -> Result<MissionDetails, AppError> {
+        self.mutate(mission_id, |mission, now| {
+            let mut events = Vec::new();
+            for change in changes {
+                let change = match change.clone() {
+                    PlanChange::AddPackage {
+                        id,
+                        contract,
+                        dependencies,
+                    } => mission.add_package(id, contract, dependencies, now)?,
+                    PlanChange::RevisePackage {
+                        id,
+                        title,
+                        goal,
+                        rationale,
+                        scope,
+                        acceptance_criteria,
+                        verification,
+                        workflow,
+                        dependencies,
+                    } => {
+                        let current = mission
+                            .package(&id)
+                            .ok_or_else(|| MissionError::PackageNotFound(mission.id(), id.clone()))?
+                            .contract()
+                            .clone();
+                        let contract = WorkPackageContract {
+                            title: title.unwrap_or(current.title),
+                            goal: goal.unwrap_or(current.goal),
+                            rationale: rationale.unwrap_or(current.rationale),
+                            scope: scope.unwrap_or(current.scope),
+                            acceptance_criteria: acceptance_criteria
+                                .unwrap_or(current.acceptance_criteria),
+                            verification: verification.unwrap_or(current.verification),
+                            workflow: workflow.unwrap_or(current.workflow),
+                        };
+                        let mut change = mission.revise_contract(&id, contract, now)?;
+                        if let Some(dependencies) = dependencies {
+                            change
+                                .events
+                                .extend(mission.set_dependencies(&id, dependencies, now)?.events);
+                        }
+                        change
+                    }
+                    PlanChange::CancelPackage { id, reason } => {
+                        mission.cancel_package(&id, reason, now)?
+                    }
+                    PlanChange::RecordDecision { title, rationale } => mission.record_decision(
+                        DecisionId::new(),
+                        title,
+                        rationale,
+                        DecisionAuthor::Lead,
+                        now,
+                    )?,
+                };
+                events.extend(change.events);
+            }
+            Ok(MissionChange { events })
+        })
     }
 
     /// Adds one package to the plan.
@@ -803,7 +1004,7 @@ mod tests {
 
     use super::*;
     use crate::app::{DevelopmentFakeProviderFactory, UniformProvider};
-    use crate::domain::{MissionStatus, WorkflowKind};
+    use crate::domain::{MissionStatus, StageId, StageKind, WorkflowKind};
 
     struct Fixture {
         temp: TempDir,
@@ -904,6 +1105,174 @@ mod tests {
             )
             .unwrap();
         assert!(runs.inspect_run(report.details.id).unwrap().auto_approve);
+    }
+
+    /// Writes one Markdown artifact for a lead turn straight into the run
+    /// store, as the fake provider writes none: real content behind a real
+    /// record, through the same integrity-checked read path.
+    fn write_lead_artifact(fixture: &Fixture, run_id: RunId, stage_id: &StageId, text: &str) {
+        let path = fixture.temp.path().join(format!("{run_id}-{stage_id}.md"));
+        fs::write(&path, text).unwrap();
+        let created_at = now();
+        let metadata = crate::domain::ArtifactMetadata::new(
+            crate::domain::ArtifactId::new(),
+            run_id,
+            stage_id.clone(),
+            crate::domain::ArtifactKind::Lead,
+            crate::domain::Role::EngineeringLead,
+            crate::domain::ArtifactStatus::Complete,
+            created_at,
+        )
+        .with_provider(crate::domain::ProviderId::new("fake").unwrap(), None);
+        let bytes = text.as_bytes();
+        let artifact = crate::providers::ArtifactRecord::new(
+            metadata,
+            1,
+            path,
+            sha256_hex(bytes),
+            u64::try_from(bytes.len()).unwrap(),
+            created_at,
+        )
+        .unwrap();
+        SqliteStore::open(&fixture.database)
+            .unwrap()
+            .insert_artifact(&artifact)
+            .unwrap();
+    }
+
+    /// The lead is one run per mission: the first question starts it, each
+    /// later one appends a turn, and its answer's proposals land on the plan
+    /// only when applied, all together or not at all.
+    #[test]
+    #[allow(clippy::too_many_lines, reason = "one conversation, start to finish")]
+    fn the_lead_answers_over_one_run_and_its_proposals_apply_atomically() {
+        let fixture = Fixture::new();
+        let missions = fixture.missions();
+        let runs = fixture.runs();
+        let mission = missions
+            .create_mission("JEV", "characters keep living", &fixture.repo)
+            .unwrap();
+        let fake = Some(ExecutionSelection::Uniform(UniformProvider::Fake));
+
+        let (turn, details) = missions
+            .ask_lead(
+                &runs,
+                mission.id,
+                "How should we split this?",
+                fake,
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        let lead_run = turn.report.details.id;
+        assert_eq!(turn.report.details.workflow, WorkflowKind::Lead);
+        assert_eq!(turn.report.details.status, RunStatus::Completed);
+        assert!(
+            turn.answer.is_none(),
+            "the fake provider writes no artifact"
+        );
+        assert!(
+            turn.report
+                .details
+                .task
+                .as_deref()
+                .unwrap()
+                .contains("# Mission brief: JEV")
+        );
+        let lead = details.lead.expect("the mission has a lead now");
+        assert_eq!(lead.run_id, lead_run);
+        assert_eq!(lead.turns, 1);
+        assert!(missions.latest_lead_answer(mission.id).unwrap().is_none());
+        assert!(matches!(
+            missions.apply_lead_proposals(mission.id),
+            Err(AppError::NoLeadAnswer(_))
+        ));
+
+        // The second question is a turn on the same run.
+        let (turn, details) = missions
+            .ask_lead(
+                &runs,
+                mission.id,
+                "Go on.",
+                fake,
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        assert_eq!(turn.report.details.id, lead_run);
+        assert_eq!(details.lead.unwrap().turns, 2);
+        let lead_2 = StageId::new("lead_2").unwrap();
+        assert!(
+            turn.report
+                .details
+                .stages
+                .iter()
+                .any(|stage| stage.id == lead_2 && stage.kind == StageKind::Lead)
+        );
+
+        write_lead_artifact(
+            &fixture,
+            lead_run,
+            &lead_2,
+            "## Bottom line\n\nTwo packages, one decision.\n\n## Why\n\nSplit persistence from memory.\n\n## Plan changes\n\n- add `persistence`: Persistence\n  goal: persist every character between sessions\n  accept: a character survives a restart\n  workflow: standard\n- add `memory`: Memory\n  goal: characters remember what happened\n  depends on: persistence\n- decide: Persist before memory\n  why: memory needs a durable substrate\n",
+        );
+        let answer = missions.latest_lead_answer(mission.id).unwrap().unwrap();
+        assert_eq!(answer.turn, 2);
+        assert_eq!(
+            answer.bottom_line.as_deref(),
+            Some("Two packages, one decision.")
+        );
+        assert_eq!(answer.proposals.as_ref().unwrap().len(), 3);
+        assert!(!answer.prose().contains("## Plan changes"));
+        assert!(answer.prose().contains("Split persistence from memory."));
+
+        let details = missions.apply_lead_proposals(mission.id).unwrap();
+        let persistence = WorkPackageId::new("persistence").unwrap();
+        let memory = WorkPackageId::new("memory").unwrap();
+        assert_eq!(
+            details.package(&persistence).unwrap().status,
+            WorkPackageStatus::Ready
+        );
+        assert_eq!(
+            details.package(&memory).unwrap().status,
+            WorkPackageStatus::Planned
+        );
+        assert_eq!(details.decisions.len(), 1);
+        assert_eq!(details.decisions[0].author, DecisionAuthor::Lead);
+
+        // A third turn whose proposals include one the plan refuses lands
+        // nothing at all.
+        let (turn, _) = missions
+            .ask_lead(
+                &runs,
+                mission.id,
+                "And?",
+                fake,
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        let lead_3 = StageId::new("lead_3").unwrap();
+        write_lead_artifact(
+            &fixture,
+            turn.report.details.id,
+            &lead_3,
+            "## Plan changes\n\n- add `journal`: Journal\n  goal: keep a journal\n- cancel `nope`: never existed\n",
+        );
+        assert!(missions.apply_lead_proposals(mission.id).is_err());
+        let details = missions.inspect_mission(mission.id).unwrap();
+        assert!(
+            details
+                .package(&WorkPackageId::new("journal").unwrap())
+                .is_none(),
+            "a refused batch applies none of its changes"
+        );
+
+        // The lead run belongs to the mission; it cannot be deleted.
+        runs.set_run_archived(lead_run, true).unwrap();
+        assert!(matches!(
+            runs.purge_run(lead_run),
+            Err(AppError::Store(
+                crate::store::StoreError::RunBoundToMission { .. }
+            ))
+        ));
     }
 
     /// Integrating a package whose run still holds its change applies the

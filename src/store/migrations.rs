@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 11;
+pub const DATABASE_SCHEMA_VERSION: u32 = 12;
 
 /// Every schema step in order; index `n` takes a version-`n` database to
 /// version `n + 1`.
@@ -20,6 +20,7 @@ const MIGRATIONS: [Migration; DATABASE_SCHEMA_VERSION as usize] = [
     migrate_v9,
     migrate_v10,
     migrate_v11,
+    migrate_v12,
 ];
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
@@ -609,6 +610,31 @@ fn migrate_v11(connection: &Connection) -> Result<(), StoreError> {
          END;
          CREATE INDEX mission_handoffs_mission_idx ON mission_handoffs(mission_id, package_id);
          PRAGMA user_version = 11;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// v12: the lead session of a mission. One run per row, insert-only; the
+/// newest row is the mission's current lead. A lead run cannot be deleted
+/// while the row stands, for the same reason as a package run.
+fn migrate_v12(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE mission_leads (
+             run_id TEXT PRIMARY KEY,
+             mission_id TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE RESTRICT
+         );
+         CREATE TRIGGER mission_leads_immutable
+         BEFORE UPDATE ON mission_leads
+         BEGIN
+             SELECT RAISE(ABORT, 'mission lead bindings are immutable');
+         END;
+         CREATE INDEX mission_leads_mission_idx ON mission_leads(mission_id, created_at);
+         PRAGMA user_version = 12;
          COMMIT;",
     )?;
     Ok(())

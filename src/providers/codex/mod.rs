@@ -196,7 +196,7 @@ impl<B: ProcessBackend> CodexProvider<B> {
         &self,
         request: &ProviderRequest,
     ) -> Result<Option<String>, CodexProviderError> {
-        if request.stage_kind() != StageKind::FollowUp {
+        if !matches!(request.stage_kind(), StageKind::FollowUp | StageKind::Lead) {
             return Ok(None);
         }
         Ok(crate::providers::continue_instruction::read(

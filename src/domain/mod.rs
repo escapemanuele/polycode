@@ -8,6 +8,7 @@ mod effort;
 mod event;
 mod ids;
 mod mission;
+mod plan_change;
 mod rehydration;
 mod role;
 mod run;
@@ -28,6 +29,7 @@ pub use mission::{
     MissionRehydrationData, MissionStatus, StageOutcome, WorkPackage, WorkPackageContract,
     WorkPackageRehydrationData, WorkPackageResult, WorkPackageStatus,
 };
+pub use plan_change::{PLAN_CHANGES_HEADING, PlanChange, PlanChangeParseError, parse_plan_changes};
 pub use rehydration::{
     RunRehydrationData, RunResumeStatus, StageRehydrationData, StageResumeStatus,
     StageSuspensionOwner,
@@ -46,5 +48,5 @@ pub use stage::{
 pub use workflow::{
     Dependency, DependencyKind, StageDefinition, StageKind, WorkflowDefinition,
     WorkflowDefinitionError, WorkflowKind, continue_cycle_stages, fix_cycle_stages,
-    next_follow_up_stage_id,
+    lead_turn_stages, next_follow_up_stage_id, next_lead_stage_id,
 };

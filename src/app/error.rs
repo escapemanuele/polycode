@@ -53,6 +53,33 @@ pub enum AppError {
         workspace: Option<crate::workspace::WorkspaceStatus>,
     },
     #[error(
+        "the lead of mission {mission_id} (run {run_id}) is {status:?}; wait for it, resume it, or discard it before asking again"
+    )]
+    LeadBusy {
+        mission_id: crate::domain::MissionId,
+        run_id: RunId,
+        status: crate::domain::RunStatus,
+    },
+    #[error(
+        "run {run_id} started as the lead of mission {mission_id} but could not be bound to it: {reason}"
+    )]
+    LeadRunUnbound {
+        mission_id: crate::domain::MissionId,
+        run_id: RunId,
+        reason: String,
+    },
+    #[error("mission {0} has no lead answer to apply; ask the lead first (`polycode mission ask`)")]
+    NoLeadAnswer(crate::domain::MissionId),
+    #[error(
+        "the lead's answer (run {run_id}, stage {stage_id}) proposes nothing that can be applied: {source}"
+    )]
+    LeadProposalUnreadable {
+        run_id: RunId,
+        stage_id: StageId,
+        #[source]
+        source: crate::domain::PlanChangeParseError,
+    },
+    #[error(
         "run {run_id} started but could not be bound to package {package_id} of mission \
 {mission_id}: {reason}. Attach it with `polycode mission attach {mission_id} {package_id} {run_id}`."
     )]

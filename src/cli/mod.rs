@@ -226,6 +226,24 @@ pub enum MissionCommand {
     },
     /// Resume every package run that is waiting to be driven, then observe.
     Resume { mission_id: MissionId },
+    /// Ask the mission's lead something. The first message opens the lead
+    /// session; later ones continue it. The answer's plan changes are
+    /// listed, and applied only with `--apply` or `mission apply`.
+    Ask {
+        mission_id: MissionId,
+        message: String,
+        #[arg(long, conflicts_with = "profile")]
+        provider: Option<String>,
+        #[arg(long, conflicts_with = "provider")]
+        profile: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        /// Apply the answer's plan changes straight away.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Apply the plan changes the lead proposed in its latest answer.
+    Apply { mission_id: MissionId },
     /// Cancel a package nothing depends on and no run is serving.
     CancelPackage {
         mission_id: MissionId,

@@ -12,6 +12,7 @@ use crate::domain::{
 use crate::store::{LoadedMission, MissionHandoffRecord, MissionRevision, SqliteStore};
 
 use super::AppError;
+use super::mission_lead::{self, LeadSummary};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MissionListItem {
@@ -88,6 +89,8 @@ pub struct MissionDetails {
     pub packages: Vec<WorkPackageSummary>,
     pub decisions: Vec<DecisionSummary>,
     pub attention: MissionAttention,
+    /// The mission's lead session, once one has been asked.
+    pub lead: Option<LeadSummary>,
     pub revision: MissionRevision,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -167,6 +170,10 @@ pub(crate) fn details(
             })
             .collect(),
         attention: mission.attention(),
+        lead: match store.mission_lead(mission.id())? {
+            Some(binding) => Some(mission_lead::summary(store, binding.run_id)?),
+            None => None,
+        },
         revision: loaded.revision,
         created_at: *mission.created_at(),
         updated_at: *mission.updated_at(),

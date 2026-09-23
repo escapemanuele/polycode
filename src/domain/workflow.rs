@@ -13,6 +13,10 @@ pub enum WorkflowKind {
     Standard,
     Deep,
     Review,
+    /// A mission's lead session: one read-only stage per exchange with the
+    /// user, each answering over the current mission state. Never started
+    /// from the run composer; a mission opens it.
+    Lead,
 }
 
 /// Semantic work performed by a stage, independent from assigned role.
@@ -35,6 +39,10 @@ pub enum StageKind {
     Synthesis,
     Decision,
     Fix,
+    /// One turn of a mission's lead conversation: reads the mission brief
+    /// and the user's message, answers in prose and a `## Plan changes`
+    /// section. Read-only, like a review.
+    Lead,
     /// A continue cycle's implementer stage, carrying an operator-supplied
     /// instruction rather than answering blocking findings. Additive: it
     /// changes no persisted snapshot or database shape, the same way `Fix`
@@ -183,6 +191,7 @@ impl WorkflowDefinition {
             WorkflowKind::Standard => standard_stages(),
             WorkflowKind::Deep => deep_stages(),
             WorkflowKind::Review => review_stages(),
+            WorkflowKind::Lead => lead_stages(),
         };
         Self::new(kind, stages).expect("built-in workflow must remain a valid DAG")
     }
@@ -416,6 +425,46 @@ fn deep_stages() -> Vec<StageDefinition> {
             ],
         ),
     ]
+}
+
+fn lead_stages() -> Vec<StageDefinition> {
+    vec![stage(
+        "lead_1",
+        StageKind::Lead,
+        Role::EngineeringLead,
+        vec![],
+    )]
+}
+
+fn lead_id(index: u32) -> StageId {
+    StageId::new(format!("lead_{index}")).expect("lead stage ID must remain valid")
+}
+
+/// The stage of one further exchange with a mission's lead: it depends on
+/// the previous turn, so the lead always answers with its earlier answer in
+/// evidence and never two turns at once.
+#[must_use]
+pub fn lead_turn_stages(index: u32, after: &StageId) -> Vec<StageDefinition> {
+    vec![StageDefinition::new(
+        lead_id(index),
+        StageKind::Lead,
+        Role::EngineeringLead,
+        vec![Dependency::required(after.clone())],
+    )]
+}
+
+/// The stage identity the next lead turn on this workflow would use, for
+/// the same reason as [`next_follow_up_stage_id`]: the user's message is
+/// persisted under it before the stage exists.
+#[must_use]
+pub fn next_lead_stage_id(workflow: &WorkflowDefinition) -> Option<StageId> {
+    let count = workflow
+        .stages()
+        .iter()
+        .filter(|stage| stage.kind() == StageKind::Lead)
+        .count();
+    let index = u32::try_from(count).ok()?.checked_add(1)?;
+    Some(lead_id(index))
 }
 
 fn review_stages() -> Vec<StageDefinition> {
@@ -706,6 +755,24 @@ fn validate_acyclic(stages: &[StageDefinition]) -> Result<(), WorkflowDefinition
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lead session is one stage, and every further turn is one more
+    /// stage after the last, named by its number.
+    #[test]
+    fn a_lead_session_grows_one_turn_at_a_time() {
+        let workflow = WorkflowDefinition::built_in(WorkflowKind::Lead);
+        assert_eq!(workflow.stages().len(), 1);
+        assert_eq!(workflow.stages()[0].kind(), StageKind::Lead);
+        assert!(!workflow.requires_writable_workspace());
+        let next = next_lead_stage_id(&workflow).unwrap();
+        assert_eq!(next.to_string(), "lead_2");
+        let grown = workflow
+            .extended(lead_turn_stages(2, workflow.stages()[0].id()))
+            .unwrap();
+        assert_eq!(grown.stages().len(), 2);
+        assert_eq!(grown.stages()[1].id(), &next);
+        assert_eq!(next_lead_stage_id(&grown).unwrap().to_string(), "lead_3");
+    }
 
     fn id(value: &str) -> StageId {
         StageId::new(value).unwrap()

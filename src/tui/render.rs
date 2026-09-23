@@ -1740,6 +1740,7 @@ const fn result_statement(kind: StageKind) -> &'static str {
         StageKind::Decision => "Decision reached",
         StageKind::Fix => "Fix ready",
         StageKind::FollowUp => "Follow-up ready",
+        StageKind::Lead => "Lead answered",
         StageKind::Verify => "Verification result in",
     }
 }
@@ -1963,6 +1964,7 @@ const fn stage_title(kind: StageKind) -> &'static str {
         StageKind::Decision => "Decision",
         StageKind::Fix => "Fix",
         StageKind::FollowUp => "Follow-up",
+        StageKind::Lead => "Lead",
         StageKind::Verify => "Verify",
     }
 }
@@ -6103,6 +6105,7 @@ mod tests {
             ],
             decisions: vec![],
             attention,
+            lead: None,
             revision: crate::store::MissionRevision::initial(),
             created_at: at,
             updated_at: at,

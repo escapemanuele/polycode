@@ -19,8 +19,8 @@ pub use image::ImageGenerationRecord;
 pub use migrations::DATABASE_SCHEMA_VERSION;
 pub use mission::{
     LoadedMission, MISSION_INPUT_SCHEMA_VERSION, MISSION_SNAPSHOT_SCHEMA_VERSION,
-    MissionHandoffRecord, MissionInput, MissionInputError, MissionRevision, MissionRunBinding,
-    MissionSummary, SequencedMissionEvent, contract_sha256, sha256_hex,
+    MissionHandoffRecord, MissionInput, MissionInputError, MissionLeadBinding, MissionRevision,
+    MissionRunBinding, MissionSummary, SequencedMissionEvent, contract_sha256, sha256_hex,
 };
 pub use path::{
     database_file, install_receipt_file, process_root, update_cache_file, worktree_root,

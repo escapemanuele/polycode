@@ -834,7 +834,7 @@ impl<B: ProcessBackend> ClaudeProvider<B> {
         &self,
         request: &ProviderRequest,
     ) -> Result<Option<String>, ClaudeProviderError> {
-        if request.stage_kind() != StageKind::FollowUp {
+        if !matches!(request.stage_kind(), StageKind::FollowUp | StageKind::Lead) {
             return Ok(None);
         }
         Ok(crate::providers::continue_instruction::read(

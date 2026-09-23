@@ -606,6 +606,43 @@ where
         self.settle(&mut store, run_id, before, Some(&status))
     }
 
+    /// One more exchange with a mission's lead session: appends a lead
+    /// stage carrying `message` and drives the run to quiescence.
+    ///
+    /// # Errors
+    /// Returns an error when the run is not a lead session, is not
+    /// completed, or when the engine, provider, or store refuse.
+    pub fn request_lead_turn(
+        &self,
+        run_id: RunId,
+        message: &str,
+    ) -> Result<ExecutionReport, AppError> {
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            return Err(AppError::EmptyContinueInstruction(run_id));
+        }
+        let mut store = SqliteStore::open(&self.database)?;
+        let before = last_sequence(&store, run_id)?;
+        self.reconcile(&mut store, run_id)?;
+        let loaded = store.load_run(run_id)?;
+        if loaded.run.workflow().kind() != WorkflowKind::Lead {
+            return Err(crate::engine::EngineError::Fix(
+                crate::domain::RunFixError::NotALeadSession,
+            )
+            .into());
+        }
+        if loaded.run.status() != RunStatus::Completed {
+            return Err(crate::engine::EngineError::Fix(
+                crate::domain::RunFixError::RunNotCompleted(loaded.run.status()),
+            )
+            .into());
+        }
+        let mut engine = self.engine(&mut store, run_id)?;
+        engine.request_lead_turn(&mut store, run_id, &message)?;
+        let status = drive_attached(&mut engine, &mut store, run_id)?;
+        self.settle(&mut store, run_id, before, Some(&status))
+    }
+
     /// Applies completed workspace changes to source checkout.
     ///
     /// # Errors
@@ -911,6 +948,9 @@ where
                 mission_id: binding.mission_id,
             }
             .into());
+        }
+        if let Some(mission_id) = store.mission_of_lead_run(run_id)? {
+            return Err(StoreError::RunBoundToMission { run_id, mission_id }.into());
         }
         self.release_owned_resources(&mut store, run_id)?;
         let run_directory = process_root()?.join(run_id.to_string());
