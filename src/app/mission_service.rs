@@ -27,8 +27,8 @@ use super::mission_query::{self, MissionDetails, MissionListItem};
 use super::mission_result;
 use super::provider_factory::ProviderFactory;
 use super::{
-    AppError, EffortRequest, ExecutionReport, ExecutionSelection, ImageGenerationPlan, RunService,
-    StartProgress, query,
+    AppError, ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection,
+    ImageGenerationPlan, RunService, StartProgress, query,
 };
 
 /// Use-case boundary for missions. Opens the store per call, like
@@ -458,11 +458,15 @@ impl MissionService {
     /// # Errors
     /// Returns domain rule violations, missing evidence, or persistence
     /// errors.
-    pub fn integrate_package(
+    pub fn integrate_package<F>(
         &self,
+        runs: &RunService<F>,
         mission_id: MissionId,
         package_id: &WorkPackageId,
-    ) -> Result<MissionDetails, AppError> {
+    ) -> Result<MissionDetails, AppError>
+    where
+        F: ProviderFactory,
+    {
         let mut store = SqliteStore::open(&self.database)?;
         let loaded = observe_runs(&mut store, &self.worktrees, mission_id)?;
         let package = loaded
@@ -485,16 +489,14 @@ impl MissionService {
             RunStatus::Completed if workspace == Some(WorkspaceStatus::Removed) => {
                 IntegrationEvidence::NoChanges
             }
+            // A completed run with its worktree still in place is applied
+            // here: integrating is bringing the change in, and apply is the
+            // one path that moves it, with its own verification gate.
             RunStatus::Completed if workspace == Some(WorkspaceStatus::Ready) => {
-                let preview = mission_result::preview_delta(&mut store, &self.worktrees, run_id)?;
-                if preview.total_bytes == 0 && preview.changed_files.is_empty() {
-                    IntegrationEvidence::NoChanges
-                } else {
-                    return Err(AppError::PackageNotIntegrated {
-                        run_id,
-                        status,
-                        changed_files: preview.changed_files.len(),
-                    });
+                drop(store);
+                match runs.apply_run(run_id)?.0 {
+                    ApplyOutcome::Applied => IntegrationEvidence::Applied,
+                    ApplyOutcome::NoChanges => IntegrationEvidence::NoChanges,
                 }
             }
             RunStatus::Completed => {
@@ -504,11 +506,9 @@ impl MissionService {
                 return Err(AppError::PackageNotIntegrated {
                     run_id,
                     status: other,
-                    changed_files: 0,
                 });
             }
         };
-        drop(store);
         self.mutate(mission_id, |mission, now| {
             mission.integrate_package(package_id, evidence, now)
         })
@@ -840,6 +840,58 @@ mod tests {
         }
     }
 
+    /// Integrating a package whose run still holds its change applies the
+    /// run: the checkout gains the change, the run reads applied, and the
+    /// package is in on that evidence.
+    #[test]
+    fn integrating_applies_a_run_whose_change_is_still_in_its_worktree() {
+        let fixture = Fixture::new();
+        let missions = fixture.missions();
+        let runs = fixture.runs();
+        let mission = missions
+            .create_mission("JEV", "goal", &fixture.repo)
+            .unwrap();
+        let core = WorkPackageId::new("core").unwrap();
+        missions
+            .add_package(mission.id, package("core", "Core", &[]))
+            .unwrap();
+        let (report, _) = missions
+            .start_package(
+                &runs,
+                mission.id,
+                &core,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        let run_id = report.details.id;
+        let worktree = SqliteStore::open(&fixture.database)
+            .unwrap()
+            .load_workspace(run_id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        std::fs::write(worktree.join("README.md"), "changed by the package\n").unwrap();
+
+        let details = missions
+            .integrate_package(&runs, mission.id, &core)
+            .unwrap();
+
+        assert_eq!(
+            details.package(&core).unwrap().status,
+            WorkPackageStatus::Integrated
+        );
+        assert_eq!(
+            details.package(&core).unwrap().run_status,
+            Some(RunStatus::Applied)
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
+            "changed by the package\n"
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines, reason = "one mission, start to finish")]
     fn a_package_runs_on_the_fake_provider_and_integration_readies_its_dependent() {
@@ -937,7 +989,7 @@ mod tests {
         // The fake provider changes nothing, so the completed run's empty
         // delta is the integration evidence; apply reports the same.
         let details = missions
-            .integrate_package(mission.id, &persistence)
+            .integrate_package(&runs, mission.id, &persistence)
             .unwrap();
         assert_eq!(
             details.package(&persistence).unwrap().status,
@@ -962,9 +1014,15 @@ mod tests {
         assert!(report.details.task.unwrap().contains(
             "## Already integrated before this package\n\n- Persistence (persistence): deliver Persistence"
         ));
-        let (outcome, _) = runs.apply_run(report.details.id).unwrap();
-        assert_eq!(outcome, crate::app::ApplyOutcome::NoChanges);
-        missions.integrate_package(mission.id, &memory).unwrap();
+        // Integrating applies the run itself when it still has to.
+        missions
+            .integrate_package(&runs, mission.id, &memory)
+            .unwrap();
+        assert_eq!(
+            runs.inspect_run(report.details.id).unwrap().status,
+            RunStatus::Completed,
+            "an empty delta leaves the run completed, as apply does"
+        );
         let details = missions.complete_mission(mission.id).unwrap();
         assert_eq!(details.status, MissionStatus::Completed);
         assert_eq!(details.packages.len(), 2);

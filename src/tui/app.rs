@@ -245,6 +245,10 @@ impl TuiApp {
             self.handle_new_run_intent(intent);
             return;
         }
+        if matches!(self.state.screen, Screen::Missions | Screen::MissionDetail) {
+            self.handle_mission_intent(intent);
+            return;
+        }
         match intent {
             Intent::Up => self.move_selection(false),
             Intent::Down => self.move_selection(true),
@@ -255,25 +259,7 @@ impl TuiApp {
             Intent::Enter | Intent::Right if self.state.screen == Screen::Runs => {
                 self.open_selected_run();
             }
-            Intent::Enter | Intent::Right if self.state.screen == Screen::Missions => {
-                self.open_selected_mission();
-            }
-            Intent::Enter | Intent::Right if self.state.screen == Screen::MissionDetail => {
-                self.open_selected_package_run();
-            }
-            Intent::Missions => {
-                self.state.screen = Screen::Missions;
-                self.state.overlay = None;
-                self.state.scroll = 0;
-                self.state.run_opened_from_mission = false;
-                self.refresh_missions();
-            }
-            Intent::StartPackage if self.state.screen == Screen::MissionDetail => {
-                self.start_selected_package();
-            }
-            Intent::Integrate if self.state.screen == Screen::MissionDetail => {
-                self.open_integrate_confirmation();
-            }
+            Intent::Missions => self.show_missions(),
             // Enter on a stage opens its primary result; open_artifact keeps
             // expected absence informational, so this never mutates anything.
             Intent::Enter | Intent::Right if self.state.screen == Screen::RunDetail => {
@@ -753,6 +739,109 @@ impl TuiApp {
         };
     }
 
+    /// The mission screens take only the keys that mean something there.
+    /// Run actions (`s`, `a`, `X`, …) are not offered: the selected run is
+    /// whatever was last opened, which is not necessarily the package's.
+    fn handle_mission_intent(&mut self, intent: Intent) {
+        let detail = self.state.screen == Screen::MissionDetail;
+        match intent {
+            Intent::Up => self.move_selection(false),
+            Intent::Down => self.move_selection(true),
+            Intent::Enter | Intent::Right if detail => self.open_selected_package_run(),
+            Intent::Enter | Intent::Right => self.open_selected_mission(),
+            Intent::Escape | Intent::Left => self.back(),
+            Intent::NewRun => {
+                self.state.screen = Screen::NewRun;
+                self.state.overlay = None;
+                self.state.message = None;
+            }
+            Intent::Runs => {
+                self.state.screen = Screen::Runs;
+                self.state.overlay = None;
+                self.state.scroll = 0;
+            }
+            Intent::Missions => self.show_missions(),
+            Intent::StartPackage if detail => self.start_selected_package(),
+            Intent::Integrate if detail => self.open_integrate_confirmation(),
+            Intent::Attention if detail => self.open_package_attention(),
+            Intent::AutoApprove if detail => self.toggle_mission_auto_approve(),
+            Intent::DismissMessage => self.state.dismiss_message(),
+            Intent::Help => self.state.overlay = Some(Overlay::Help),
+            _ => {}
+        }
+    }
+
+    fn show_missions(&mut self) {
+        self.state.screen = Screen::Missions;
+        self.state.overlay = None;
+        self.state.scroll = 0;
+        self.state.run_opened_from_mission = false;
+        self.refresh_missions();
+    }
+
+    /// `u` on a package: answer its run's pending request without leaving
+    /// the mission. The overlay reads the selected run's details, so the
+    /// package's run becomes the selected run first.
+    fn open_package_attention(&mut self) {
+        let Some(package) = self.state.selected_package_summary() else {
+            return;
+        };
+        let Some(run_id) = package.current_run else {
+            self.state.notify(
+                UiMessageKind::Info,
+                format!("{} has no run yet, so nothing is asking.", package.title),
+            );
+            return;
+        };
+        if package.status != WorkPackageStatus::Blocked {
+            self.state.notify(
+                UiMessageKind::Info,
+                format!("{} is not waiting on you right now.", package.title),
+            );
+            return;
+        }
+        self.state.selected_run = Some(run_id);
+        self.refresh_selected();
+        self.open_attention();
+    }
+
+    /// `A` on a mission: approve grantable permission requests for every
+    /// run serving its packages, now and for runs this session starts.
+    fn toggle_mission_auto_approve(&mut self) {
+        let Some(mission) = self.state.mission.as_ref() else {
+            return;
+        };
+        let mission_id = mission.id;
+        let arm = !self.state.auto_approve_missions.contains(&mission_id);
+        let live: Vec<RunId> = mission
+            .packages
+            .iter()
+            .filter(|package| package.status.has_active_run())
+            .filter_map(|package| package.current_run)
+            .collect();
+        for run_id in &live {
+            if let Err(error) = self.reader.set_run_auto_approve(*run_id, arm) {
+                self.state.set_error(error.to_string());
+                return;
+            }
+        }
+        if arm {
+            self.state.auto_approve_missions.insert(mission_id);
+            self.state.set_message(
+                "Auto-approve on — grantable permission requests are approved for this mission's runs. Questions still stop them.".to_owned(),
+            );
+            // A run already waiting on a request it may now approve.
+            for run_id in live {
+                self.dispatch(WorkerCommand::ResumeRun { run_id });
+            }
+        } else {
+            self.state.auto_approve_missions.remove(&mission_id);
+            self.state
+                .set_message("Auto-approve off — permission requests wait for you.".to_owned());
+        }
+        self.refresh_selected_mission();
+    }
+
     fn open_selected_mission(&mut self) {
         if self.state.selected_mission.is_some() {
             self.state.screen = Screen::MissionDetail;
@@ -804,6 +893,7 @@ impl TuiApp {
             selection: self.state.new_run.execution.selection(),
             effort: self.state.new_run.effort.into(),
         }) {
+            self.state.mission_starts.push((ticket, mission_id));
             self.state.starting = Some(StartInFlight {
                 ticket,
                 task: title,
@@ -823,7 +913,7 @@ impl TuiApp {
             self.state.notify(
                 UiMessageKind::Info,
                 format!(
-                    "{} is {}; only a delivered package can be integrated.",
+                    "{} is {}; only a finished package can be brought in.",
                     package.id,
                     package_status_word(package.status)
                 ),
@@ -1400,12 +1490,32 @@ impl TuiApp {
                 }
                 self.refresh();
             }
-            StartProgress::PreparingWorkspace(_) => {
+            StartProgress::PreparingWorkspace(run_id) => {
                 starting.progress = Some(update.progress);
+                self.arm_mission_run(update.ticket, run_id);
                 // The run exists now; let the list show it.
                 self.refresh();
             }
             progress => starting.progress = Some(progress),
+        }
+    }
+
+    /// A package run that just came into being inherits its mission's
+    /// auto-approve, before any stage can ask.
+    fn arm_mission_run(&mut self, ticket: u64, run_id: RunId) {
+        let Some(index) = self
+            .state
+            .mission_starts
+            .iter()
+            .position(|(start, _)| *start == ticket)
+        else {
+            return;
+        };
+        let (_, mission_id) = self.state.mission_starts.remove(index);
+        if self.state.auto_approve_missions.contains(&mission_id)
+            && let Err(error) = self.reader.set_run_auto_approve(run_id, true)
+        {
+            self.state.set_error(error.to_string());
         }
     }
 
@@ -1591,8 +1701,8 @@ impl TuiApp {
                 let package = self.state.selected_package.clone();
                 self.state.replace_mission(*details);
                 self.state.set_message(match package {
-                    Some(id) => format!("{id} integrated."),
-                    None => "Package integrated.".to_owned(),
+                    Some(id) => format!("{id} is in."),
+                    None => "Package is in.".to_owned(),
                 });
             }
             WorkerSuccess::PackageStarted(report, details) => {
@@ -1862,13 +1972,13 @@ fn start_package_unavailable_reason(
 ) -> String {
     match status {
         WorkPackageStatus::Planned => {
-            format!("{package_id} waits on packages it depends on; integrate those first.")
+            format!("{package_id} waits on the packages it depends on; bring those in first.")
         }
         WorkPackageStatus::Running | WorkPackageStatus::Blocked => {
-            format!("{package_id} already has a run — Enter opens it.")
+            format!("{package_id} is already being worked on — Enter opens its run.")
         }
         WorkPackageStatus::Delivered => {
-            format!("{package_id} is delivered — I integrates it once its run is applied.")
+            format!("{package_id} is done — I brings it in.")
         }
         WorkPackageStatus::Failed => {
             format!("{package_id} failed; retry it from the CLI (polycode mission retry).")
@@ -4173,7 +4283,7 @@ mod tests {
             app.state
                 .message
                 .as_ref()
-                .is_some_and(|message| message.text == "core integrated."),
+                .is_some_and(|message| message.text == "core is in."),
             "{:?}",
             app.state.message
         );

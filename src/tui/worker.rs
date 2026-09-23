@@ -456,7 +456,7 @@ where
             mission_id,
             package_id,
         } => missions
-            .integrate_package(mission_id, &package_id)
+            .integrate_package(service, mission_id, &package_id)
             .map(|details| WorkerSuccess::Integrated(Box::new(details))),
     }
 }

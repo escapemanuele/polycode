@@ -343,11 +343,11 @@ A package is ready when every package it depends on is integrated, so the run th
 _Avoid_: Unblocked, schedulable
 
 **Delivered**:
-The package's current run completed. Its change is in the run's worktree, not yet in the source checkout.
-_Avoid_: Done, merged
+The package's current run completed. Its change is in the run's worktree, not yet in the source checkout. The control room says `done, bring it in` for it; that is the operator's phrase, not a status name.
+_Avoid_: Done (in code and docs), merged
 
 **Integrated**:
-The delivered package's change reached the source checkout, on run evidence: the run is applied, or it completed with an empty delta. Dependents may become ready.
+The delivered package's change reached the source checkout, on run evidence: the run is applied, or it completed with an empty delta. `mission integrate` and the control room's `I` apply the run first when its change is still in the worktree. Dependents may become ready. The control room says `in`.
 _Avoid_: Merged, accepted, applied package
 
 **Mission decision**:

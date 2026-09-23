@@ -495,7 +495,7 @@ fn render_mission_overview(
         lines.push(package_line(package, false, width));
     }
     lines.push(Line::from(""));
-    lines.extend(attention_lines(mission));
+    lines.extend(attention_lines(mission, false));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!("mission {}", mission.id),
@@ -509,28 +509,26 @@ fn render_mission_overview(
     );
 }
 
-/// One package as a line: state glyph, id, title; the run's own state when
-/// a run is serving it.
+/// One package as a line: state glyph, title, then what it is doing in
+/// plain words. The id stays for the CLI, quietly on the right.
 fn package_line(
     package: &crate::app::WorkPackageSummary,
     selected: bool,
     width: u16,
 ) -> Line<'static> {
     let visual = package_visual(package.status);
-    let meta = package
-        .run_status
-        .map(|status| run_visual(status).label.to_lowercase())
-        .unwrap_or_default();
+    let phrase = package_phrase(package);
+    let id = package.id.to_string();
     let title_width = (width as usize)
-        .saturating_sub(meta.chars().count() + package.id.to_string().chars().count() + 9);
-    let title = format::truncate_title(&package.title, title_width.max(8));
+        .saturating_sub(phrase.chars().count() + id.chars().count() + 9)
+        .max(8);
+    let title = format::truncate_title(&package.title, title_width);
     let left = vec![
         Span::styled(
             if selected { "▸ " } else { "  " },
             Style::default().fg(theme::accent()),
         ),
         visual.glyph(),
-        Span::styled(format!("{}  ", package.id), theme::muted()),
         Span::styled(
             title,
             if selected {
@@ -539,12 +537,38 @@ fn package_line(
                 theme::text()
             },
         ),
+        Span::styled(format!("  {phrase}"), theme::muted()),
     ];
-    theme::spread(left, vec![Span::styled(meta, theme::muted())], width)
+    theme::spread(left, vec![Span::styled(id, theme::muted())], width)
+}
+
+/// What a package is doing, said the way the operator would say it.
+fn package_phrase(package: &crate::app::WorkPackageSummary) -> String {
+    match package.status {
+        WorkPackageStatus::Planned => match package.dependencies.as_slice() {
+            [] => "not started".to_owned(),
+            deps => format!(
+                "waits on {}",
+                deps.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+        WorkPackageStatus::Ready => "ready to start".to_owned(),
+        WorkPackageStatus::Running => "working".to_owned(),
+        WorkPackageStatus::Blocked => "needs you".to_owned(),
+        WorkPackageStatus::Delivered => "done, bring it in".to_owned(),
+        WorkPackageStatus::Integrated => "in".to_owned(),
+        WorkPackageStatus::Failed => "failed".to_owned(),
+        WorkPackageStatus::Cancelled => "cancelled".to_owned(),
+    }
 }
 
 /// The mission's "Needs you" block, or the one line that says nothing does.
-fn attention_lines(mission: &crate::app::MissionDetails) -> Vec<Line<'static>> {
+/// Each line is a sentence naming the package by title and the key that
+/// answers it, so the operator acts from here without descending.
+fn attention_lines(mission: &crate::app::MissionDetails, with_keys: bool) -> Vec<Line<'static>> {
     let attention = &mission.attention;
     if attention.is_empty() {
         return vec![Line::from(Span::styled(
@@ -552,29 +576,66 @@ fn attention_lines(mission: &crate::app::MissionDetails) -> Vec<Line<'static>> {
             theme::muted(),
         ))];
     }
+    let title = |id: &crate::domain::WorkPackageId| {
+        mission
+            .package(id)
+            .map_or_else(|| id.to_string(), |package| package.title.clone())
+    };
+    let key = |key: &str, label: &str| -> Vec<Span<'static>> {
+        if with_keys {
+            let mut spans = vec![Span::raw("   ")];
+            spans.extend(theme::action(key, label, theme::accent()));
+            spans
+        } else {
+            Vec::new()
+        }
+    };
     let mut lines = vec![theme::section("NEEDS YOU")];
     for (package_id, reason) in &attention.blocked {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled("⚠ ", Style::default().fg(theme::attention())),
-            Span::styled(format!("{package_id} is blocked: {reason}"), theme::text()),
-        ]));
+            Span::styled(
+                format!("{} asks: {}", title(package_id), plain_reason(reason)),
+                theme::text(),
+            ),
+        ];
+        spans.extend(key("u", "answer"));
+        lines.push(Line::from(spans));
     }
     for (package_id, reason) in &attention.failed {
         lines.push(Line::from(vec![
             Span::styled("✗ ", Style::default().fg(theme::danger())),
-            Span::styled(format!("{package_id} failed: {reason}"), theme::text()),
-        ]));
-    }
-    for package_id in &attention.awaiting_integration {
-        lines.push(Line::from(vec![
-            Span::styled("✓ ", Style::default().fg(theme::success())),
             Span::styled(
-                format!("{package_id} is delivered and waits for integration"),
+                format!("{} failed: {reason}", title(package_id)),
                 theme::text(),
             ),
         ]));
     }
+    for package_id in &attention.awaiting_integration {
+        let mut spans = vec![
+            Span::styled("◆ ", Style::default().fg(theme::success())),
+            Span::styled(format!("{} is done", title(package_id)), theme::text()),
+        ];
+        spans.extend(key("I", "bring it in"));
+        lines.push(Line::from(spans));
+    }
     lines
+}
+
+/// The observe pass writes a blocked reason as `Permission: Claude Code
+/// requests permission for: …`; the operator only needs what is asked.
+fn plain_reason(reason: &str) -> String {
+    let reason = reason
+        .strip_prefix("Permission: ")
+        .or_else(|| reason.strip_prefix("Question: "))
+        .unwrap_or(reason);
+    let reason = reason
+        .strip_prefix("Claude Code requests permission for: ")
+        .or_else(|| reason.strip_prefix("Codex requests permission for: "))
+        .unwrap_or(reason);
+    // The provider's own note on how the request can be answered belongs
+    // to the attention overlay, where those answers are given.
+    reason.split(" — ").next().unwrap_or(reason).to_owned()
 }
 
 /// One mission: the packages as a rail on the left, the selected package's
@@ -630,7 +691,7 @@ fn render_mission_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ));
     }
     rail.push(Line::from(""));
-    rail.extend(attention_lines(mission));
+    rail.extend(attention_lines(mission, true));
     frame.render_widget(
         Paragraph::new(rail).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -728,16 +789,19 @@ fn package_hero(
     lines.push(Line::from(""));
     match package.status {
         WorkPackageStatus::Ready => {
+            lines.push(Line::from(theme::action("S", "Start it", theme::accent())));
+        }
+        WorkPackageStatus::Blocked => {
             lines.push(Line::from(theme::action(
-                "S",
-                "Start a run for it",
-                theme::accent(),
+                "u",
+                "Answer what it asks",
+                theme::attention(),
             )));
         }
         WorkPackageStatus::Delivered => {
             lines.push(Line::from(theme::action(
                 "I",
-                "Record it as integrated (apply the run first)",
+                "Bring it in (applies the run, records the package)",
                 theme::success(),
             )));
         }
@@ -746,7 +810,7 @@ fn package_hero(
     if package.current_run.is_some() {
         lines.push(Line::from(theme::action(
             "Enter",
-            "Open its run",
+            "Open its run for the details",
             theme::accent(),
         )));
     }
@@ -853,8 +917,8 @@ fn package_visual(status: WorkPackageStatus) -> StatusVisual {
     }
 }
 
-/// The last stop before a package is recorded as integrated: what it is,
-/// which run's evidence backs it, and that the checkout is not touched here.
+/// The last stop before a finished package is brought in: what it is,
+/// which run carries the change, and what happens to the checkout.
 fn render_integrate_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let Some(package) = state.selected_package_summary() else {
         return;
@@ -863,26 +927,29 @@ fn render_integrate_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiS
         .current_run
         .map_or_else(|| "no run".to_owned(), |run_id| run_id.to_string());
     let lines = vec![
-        Line::from(theme::chip("INTEGRATE", theme::success())),
+        Line::from(theme::chip("BRING IT IN", theme::success())),
         Line::from(""),
         Line::from(Span::styled(
-            format!("{}  {}", package.id, package.title),
+            package.title.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(format!("run {run}"), theme::muted())),
+        Line::from(Span::styled(
+            format!("{} · run {run}", package.id),
+            theme::muted(),
+        )),
         Line::from(""),
         Line::from(Span::styled(
-            "Records the package as integrated on the run's evidence: an applied run, or a completed run with nothing to apply. Nothing here writes the checkout; a run whose change is still in its worktree is refused.",
+            "Applies the run's change to the checkout, if it is not applied yet, and records the package as in. Packages that waited on it become ready. A run whose verification failed is refused.",
             theme::text(),
         )),
         Line::from(""),
-        Line::from(theme::action("Enter", "Integrate", theme::success())),
+        Line::from(theme::action("Enter", "Bring it in", theme::success())),
         Line::from(theme::action("Esc", "Cancel", theme::muted_color())),
     ];
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(overlay_block(" Integrate package ", theme::success())),
+            .block(overlay_block(" Bring it in ", theme::success())),
         area,
     );
 }
@@ -2448,14 +2515,27 @@ fn mission_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Co
     if let Some(package) = state.selected_package_summary() {
         match package.status {
             WorkPackageStatus::Ready => push("S", "Start", theme::accent()),
-            WorkPackageStatus::Delivered => push("I", "Integrate", theme::success()),
+            WorkPackageStatus::Blocked => push("u", "Answer", theme::attention()),
+            WorkPackageStatus::Delivered => push("I", "Bring in", theme::success()),
             _ => {}
         }
         if package.current_run.is_some() {
             push("Enter", "Open run", theme::accent());
         }
     }
-    push("M", "Missions", theme::muted_color());
+    let armed = state
+        .mission
+        .as_ref()
+        .is_some_and(|mission| state.auto_approve_missions.contains(&mission.id));
+    push(
+        "A",
+        if armed {
+            "Auto-approve off"
+        } else {
+            "Auto-approve"
+        },
+        theme::muted_color(),
+    );
 }
 
 /// Quiet navigation, in full and compact shapes. Navigation is what gets
@@ -2610,7 +2690,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation; the result card takes o open / y copy URL)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nMission\n  Enter open the selected package's run\n  S start a run for the selected ready package (composer's Execution/Effort)\n  I record the selected delivered package as integrated (confirmation)\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation; the result card takes o open / y copy URL)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nMission\n  Enter open the selected package's run\n  S start the selected package (composer's Execution/Effort)\n  u answer what the selected package's run asks\n  I bring the selected finished package in: apply its run, record it (confirmation)\n  A auto-approve permission requests for this mission's runs\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -6058,25 +6138,40 @@ mod tests {
         state.screen = Screen::MissionDetail;
         let text = render_text(&state, 110, 32);
         assert!(text.contains("READY"), "{text}");
-        assert!(text.contains("Start a run for it"), "{text}");
-        assert!(!text.contains("Record it as integrated"), "{text}");
+        assert!(text.contains("ready to start"), "{text}");
+        assert!(text.contains("Start it"), "{text}");
+        assert!(!text.contains("Bring it in"), "{text}");
         assert!(text.contains("ACCEPTANCE"), "{text}");
 
         let mut state = mission_state(WorkPackageStatus::Delivered);
         state.screen = Screen::MissionDetail;
         let text = render_text(&state, 110, 32);
         assert!(text.contains("DELIVERED"), "{text}");
-        assert!(text.contains("Record it as integrated"), "{text}");
+        assert!(text.contains("done, bring it in"), "{text}");
+        assert!(text.contains("Bring it in"), "{text}");
         assert!(text.contains("NEEDS YOU"), "{text}");
-        assert!(text.contains("core is delivered and waits for"), "{text}");
+        assert!(text.contains("Core is done"), "{text}");
         assert!(text.contains("Open its run"), "{text}");
         let actions = footer_line(Screen::MissionDetail, &state, 110)
             .spans
             .iter()
             .map(|span| span.content.to_string())
             .collect::<String>();
-        assert!(actions.contains("Integrate"), "{actions}");
+        assert!(actions.contains("Bring in"), "{actions}");
         assert!(!actions.contains("Start"), "{actions}");
+
+        let mut state = mission_state(WorkPackageStatus::Blocked);
+        state.mission.as_mut().unwrap().attention.blocked.push((
+            crate::domain::WorkPackageId::new("core").unwrap(),
+            "Permission: Claude Code requests permission for: Bash ./greet.sh Bob — this cannot be granted as a permission rule"
+                .to_owned(),
+        ));
+        state.screen = Screen::MissionDetail;
+        let text = render_text(&state, 110, 32);
+        assert!(text.contains("needs you"), "{text}");
+        assert!(text.contains("Core asks: Bash ./greet.sh Bob"), "{text}");
+        assert!(!text.contains("cannot be granted"), "{text}");
+        assert!(text.contains("answer"), "{text}");
     }
 
     /// Package states, like run states, must survive losing every colour.
