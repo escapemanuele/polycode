@@ -831,6 +831,12 @@ fn print_details(details: &RunDetails) {
         if let Some(reason) = stage.failure_reason.as_deref() {
             println!("    reason: {reason}");
         }
+        if let Some(model) = stage.model_fallback() {
+            println!(
+                "    try: polycode retry {} {} --provider codex --model {model}",
+                details.id, stage.id
+            );
+        }
     }
     println!();
     println!("Attention");

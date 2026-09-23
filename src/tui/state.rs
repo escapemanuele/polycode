@@ -10,7 +10,7 @@ use crate::app::{
     RunDetails, RunDiffPreview, RunListItem, StageExecutionEvidence, StartProgress,
     UniformProvider,
 };
-use crate::domain::{AttentionRequestId, EffortSetting, RunId, StageId, WorkflowKind};
+use crate::domain::{AttentionRequestId, EffortSetting, ModelId, RunId, StageId, WorkflowKind};
 use crate::workspace::PullRequestStatus;
 
 /// How long POD reacts to a change before settling into the new state. Long
@@ -170,37 +170,51 @@ impl PublishOutcome {
 pub(crate) enum RetryRouteChoice {
     /// Retry where the stage was configured to run, no override recorded.
     Configured,
+    /// Codex on a named model, offered only when Codex refused the model the
+    /// stage ran on; see [`crate::app::StageSummary::model_fallback`].
+    CodexModel(&'static str),
     Claude,
     Codex,
 }
 
 impl RetryRouteChoice {
-    pub(crate) const ALL: [Self; 3] = [Self::Configured, Self::Claude, Self::Codex];
+    /// The rows for a stage, in display order. `fallback` adds the Codex
+    /// model row right under the configured one.
+    pub(crate) fn choices(fallback: Option<&'static str>) -> Vec<Self> {
+        let mut choices = vec![Self::Configured];
+        choices.extend(fallback.map(Self::CodexModel));
+        choices.extend([Self::Claude, Self::Codex]);
+        choices
+    }
 
     /// The override to record, if this choice is one; `Configured` records
     /// nothing so a plain retry stays a plain retry.
     pub(crate) fn route(self) -> Option<RetryRoute> {
         match self {
             Self::Configured => None,
+            Self::CodexModel(model) => Some(RetryRoute::new(
+                UniformProvider::Codex,
+                ModelId::new(model).ok(),
+            )),
             Self::Claude => Some(RetryRoute::new(UniformProvider::Claude, None)),
             Self::Codex => Some(RetryRoute::new(UniformProvider::Codex, None)),
         }
     }
 
-    pub(crate) fn next(self) -> Self {
-        let index = Self::ALL
+    pub(crate) fn next(self, choices: &[Self]) -> Self {
+        let index = choices
             .iter()
             .position(|choice| *choice == self)
             .unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
+        choices[(index + 1) % choices.len()]
     }
 
-    pub(crate) fn previous(self) -> Self {
-        let index = Self::ALL
+    pub(crate) fn previous(self, choices: &[Self]) -> Self {
+        let index = choices
             .iter()
             .position(|choice| *choice == self)
             .unwrap_or(0);
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+        choices[(index + choices.len() - 1) % choices.len()]
     }
 }
 
@@ -1033,6 +1047,16 @@ impl TuiState {
                     crate::domain::RunStatus::NeedsUser | crate::domain::RunStatus::Failed
                 )
             })
+    }
+
+    /// The `[t]` chooser rows for the selected stage.
+    pub(crate) fn retry_route_choices(&self) -> Vec<RetryRouteChoice> {
+        RetryRouteChoice::choices(
+            self.details
+                .as_ref()
+                .and_then(|details| details.stages.get(self.selected_stage_index))
+                .and_then(crate::app::StageSummary::model_fallback),
+        )
     }
 
     /// Whether Stop is offered for the selected run.

@@ -2361,13 +2361,16 @@ fn render_retry_route(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ]));
         lines.push(Line::from(""));
     }
-    for choice in RetryRouteChoice::ALL {
+    for choice in state.retry_route_choices() {
         let highlighted = state.retry_route_choice == choice;
         let label = match choice {
             RetryRouteChoice::Configured => selected.map_or_else(
                 || "Configured provider".to_owned(),
                 |stage| format!("Configured provider ({})", stage.configured_provider),
             ),
+            RetryRouteChoice::CodexModel(model) => {
+                format!("Codex on {model} (the account refused the model it ran on)")
+            }
             RetryRouteChoice::Claude => "Claude (native default model)".to_owned(),
             RetryRouteChoice::Codex => "Codex (native default model)".to_owned(),
         };
@@ -5299,6 +5302,67 @@ mod tests {
         let text = render_text(&state, 120, 30);
         assert!(text.contains("PUBLISH FAILED"), "{text}");
         assert!(text.contains("remote rejected the push"), "{text}");
+    }
+
+    /// Verbatim from a real Codex `turn.failed` on a subscription account whose
+    /// `~/.codex/config.toml` named a model the account cannot use.
+    const REFUSED_MODEL_REASON: &str = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT account."}}"#;
+
+    #[test]
+    fn model_fallback_is_offered_only_for_a_codex_stage_whose_model_was_refused() {
+        let mut refused = stage(
+            "implementation",
+            StageKind::Implementation,
+            Role::Implementer,
+            StageStatus::Failed,
+        );
+        refused.failure_reason = Some(REFUSED_MODEL_REASON.to_owned());
+        assert_eq!(
+            refused.model_fallback(),
+            Some(crate::app::CODEX_FALLBACK_MODEL)
+        );
+        assert!(
+            crate::domain::ModelId::new(crate::app::CODEX_FALLBACK_MODEL).is_ok(),
+            "the fallback must survive ModelId, or the row retries on the native default"
+        );
+
+        let mut other = refused.clone();
+        other.failure_reason = Some("You've hit your usage limit.".to_owned());
+        assert_eq!(other.model_fallback(), None, "any other failure");
+
+        let mut claude = refused.clone();
+        claude.actual_provider = Some("claude".to_owned());
+        assert_eq!(claude.model_fallback(), None, "not a Codex stage");
+
+        let mut on_fallback = refused.clone();
+        on_fallback.configured_model = Some(crate::app::CODEX_FALLBACK_MODEL.to_owned());
+        assert_eq!(
+            on_fallback.model_fallback(),
+            None,
+            "the fallback itself was refused; offering it again only fails again"
+        );
+
+        let mut pending = refused;
+        pending.status = StageStatus::Pending;
+        assert_eq!(pending.model_fallback(), None, "nothing to retry");
+    }
+
+    #[test]
+    fn retry_route_chooser_offers_the_fallback_model_when_codex_refused_it() {
+        let mut state = completed_state();
+        let details = state.details.as_mut().unwrap();
+        details.stages[state.selected_stage_index].status = StageStatus::Failed;
+        details.stages[state.selected_stage_index].failure_reason =
+            Some(REFUSED_MODEL_REASON.to_owned());
+        state.retry_route_choice = RetryRouteChoice::CodexModel(crate::app::CODEX_FALLBACK_MODEL);
+        state.overlay = Some(Overlay::RetryRoute);
+        let text = render_text(&state, 120, 30);
+        assert!(
+            text.contains(&format!("→ Codex on {}", crate::app::CODEX_FALLBACK_MODEL)),
+            "{text}"
+        );
+        assert!(text.contains("Configured provider ("), "{text}");
+        assert!(text.contains("Claude (native default model)"), "{text}");
     }
 
     #[test]

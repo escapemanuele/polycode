@@ -85,6 +85,45 @@ pub struct StageSummary {
     pub blocking: bool,
 }
 
+/// The Codex model a retry is offered when the runtime refused the model the
+/// stage ran on. An account signed in through a subscription cannot use every
+/// model the Codex CLI can be configured with, so a `model = ...` in
+/// `~/.codex/config.toml` the account is not entitled to fails every Codex
+/// stage the same way, and a plain retry fails again. Bump it when the subscription line moves.
+pub const CODEX_FALLBACK_MODEL: &str = "gpt-5.6-luna";
+
+impl StageSummary {
+    /// The model worth retrying this stage on, when it failed because Codex
+    /// refused its model. `None` for any other failure, for a stage that did
+    /// not run on Codex, and for one already on the fallback, since offering
+    /// the model that just failed would only fail again.
+    #[must_use]
+    pub fn model_fallback(&self) -> Option<&'static str> {
+        let provider = self
+            .actual_provider
+            .as_deref()
+            .unwrap_or(&self.configured_provider);
+        let refused = self
+            .failure_reason
+            .as_deref()
+            .is_some_and(is_unsupported_model_reason);
+        (self.status == StageStatus::Failed
+            && provider == "codex"
+            && refused
+            && self.configured_model.as_deref() != Some(CODEX_FALLBACK_MODEL))
+        .then_some(CODEX_FALLBACK_MODEL)
+    }
+}
+
+/// Codex relays the API's refusal verbatim, as
+/// `The 'gpt-6-sol' model is not supported when using Codex with a ChatGPT
+/// account.` inside a JSON error body.
+fn is_unsupported_model_reason(reason: &str) -> bool {
+    reason
+        .to_ascii_lowercase()
+        .contains("model is not supported")
+}
+
 /// One dependency stage referenced from a [`StageWaitingSummary`] bucket,
 /// carrying its kind so a caller can render a human title without a second
 /// lookup against the run's stage list.

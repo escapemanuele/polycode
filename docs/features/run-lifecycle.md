@@ -34,7 +34,7 @@ polycode resolve <run-id> <attention-id> --response "<answer>"   # answer a ques
 polycode auto-approve <run-id>            # stop asking about this run's permission requests
 polycode auto-approve <run-id> --off      # go back to being asked
 ```
-TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage (↑/↓ pick Configured provider / Claude / Codex, Enter retries), `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves), `A` arm or disarm automatic approval.
+TUI keys on the run detail screen: `r` resume/recover, `s` stop, `t` retry selected failed stage (↑/↓ pick Configured provider / Claude / Codex, plus a fallback Codex model when Codex refused the stage's model; Enter retries), `u` open attention overlay (↑/↓ pick request, type a response, Enter resolves), `A` arm or disarm automatic approval.
 
 ## Approving without being asked
 Answering the same permission request all day is a cost, not a safety property, so a run can be armed to approve them itself: `A` on the run detail screen, or `polycode auto-approve <run-id>`. The flag lives on that run — it survives a restart, reaches no other run, and no existing run is armed by upgrading. While it is armed the header carries an `AUTO-APPROVE` chip and the footer offers `A` to withdraw it.
