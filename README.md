@@ -139,6 +139,19 @@ A command may carry `{base_commit}`, which Polycode replaces with the commit the
 
 Two `package.json` shapes get no guess at all: a workspaces root, where `npm test` runs every package in the monorepo rather than anything about the change, and a manifest with no `test` script, where `npm test` fails on the missing script alone. Both complete having checked nothing, and the artifact names the file and says to add a `[verify]` table — a fifteen-minute red that no change caused is worse than an honest nothing. Commands are argv, not shell — no pipes or `&&` — and the sequence stops at the first failure.
 
+## Missions (foundation)
+
+A mission is a project goal above the run: a plan of work packages with
+dependencies, the decisions it rests on, and the runs that deliver each
+package. Polycode owns the coordination the user otherwise does by hand —
+the handoff a worker receives is rendered from mission state, package state
+follows committed run evidence, and integration is recorded only when a run
+was applied (or changed nothing). Today missions are driven from the CLI
+(`polycode mission ...`); the lead conversation, command-center TUI and
+progress brief follow in later milestones. See
+[docs/features/missions.md](docs/features/missions.md) and
+[docs/missions-roadmap.md](docs/missions-roadmap.md).
+
 ## Local control room
 
 Run Polycode without arguments in an interactive terminal:

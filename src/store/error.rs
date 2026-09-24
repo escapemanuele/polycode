@@ -4,11 +4,13 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::domain::{
-    ConfigSnapshotId, EventId, RunId, RunInvariantError, RunRehydrationError, StageId,
+    ConfigSnapshotId, EventId, MissionId, MissionInvariantError, RunId, RunInvariantError,
+    RunRehydrationError, StageId, WorkPackageId,
 };
 use crate::providers::{ArtifactRecordError, ProviderSessionRecordId};
 
 use super::RunInputError;
+use super::mission::MissionInputError;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -42,6 +44,43 @@ pub enum StoreError {
     RunInputNotFound(RunId),
     #[error("run input for {0} is immutable and stored content differs")]
     RunInputConflict(RunId),
+    #[error("persisted mission violates an invariant: {0}")]
+    InvalidMission(#[from] MissionInvariantError),
+    #[error(transparent)]
+    MissionInput(#[from] MissionInputError),
+    #[error("mission {0} does not exist")]
+    MissionNotFound(MissionId),
+    #[error("mission {0} already exists")]
+    MissionAlreadyExists(MissionId),
+    #[error("mission input for {0} does not exist")]
+    MissionInputNotFound(MissionId),
+    #[error("mission {mission_id} changed since revision {expected}")]
+    MissionConcurrentModification {
+        mission_id: MissionId,
+        expected: u64,
+    },
+    #[error("event {event_id} belongs to mission {actual}, not {expected}")]
+    EventMissionMismatch {
+        event_id: EventId,
+        expected: MissionId,
+        actual: MissionId,
+    },
+    #[error("event {event_id} names package {package_id}, which the mission does not have")]
+    EventPackageMismatch {
+        event_id: EventId,
+        package_id: WorkPackageId,
+    },
+    #[error("mission {mission_id} event sequence gap: expected {expected}, found {actual}")]
+    MissionEventSequenceGap {
+        mission_id: MissionId,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("run {run_id} belongs to mission {mission_id}")]
+    RunBoundToMission {
+        run_id: RunId,
+        mission_id: MissionId,
+    },
     #[error("config snapshot {0} does not exist")]
     ConfigSnapshotNotFound(ConfigSnapshotId),
     #[error("config snapshot {0} is immutable and stored content differs")]

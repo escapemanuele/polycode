@@ -325,3 +325,35 @@ _Avoid_: Test stage, CI, check
 **Verifier**:
 The role every Verify stage carries, always served by the deterministic `verify` provider through an implicit route that no configuration snapshot names.
 _Avoid_: Tester, validator, agent
+
+**Mission**:
+A durable project goal above the run, made of work packages with dependencies between them, the decisions the plan rests on, and the child runs that deliver each package. Persisted and restart-safe like a run; its lifecycle is Planning, Active, Completed, Cancelled.
+_Avoid_: Project, epic, swarm, session
+
+**Work package**:
+One engineering contract inside a mission — title, goal, why it exists, scope, acceptance criteria, verification expectations, delivering workflow — with a lifecycle of its own and at most one current child run. Its contract freezes once a run serves it.
+_Avoid_: Task, ticket, prompt, subtask
+
+**Handoff**:
+The child run's immutable input rendered from canonical mission state: mission goal, package contract, integrated dependencies, and recorded decisions. Never typed by hand and never composed by an agent.
+_Avoid_: Prompt, brief, delegation message
+
+**Package readiness**:
+A package is ready when every package it depends on is integrated, so the run that serves it starts on a checkout that already carries their changes.
+_Avoid_: Unblocked, schedulable
+
+**Delivered**:
+The package's current run completed. Its change is in the run's worktree, not yet in the source checkout.
+_Avoid_: Done, merged
+
+**Integrated**:
+The delivered package's change reached the source checkout, on run evidence: the run is applied, or it completed with an empty delta. Dependents may become ready.
+_Avoid_: Merged, accepted, applied package
+
+**Mission decision**:
+An insert-only record of a design choice the plan rests on, with its rationale and author (user or lead). A reversed decision is a new decision.
+_Avoid_: Note, comment, plan change
+
+**Mission attention**:
+What the user must look at, derived on every read from package state: blocked packages (their run needs the user), failed packages, and delivered packages awaiting integration. Never stored.
+_Avoid_: Notification, alert, inbox

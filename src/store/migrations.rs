@@ -2,76 +2,35 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 9;
+pub const DATABASE_SCHEMA_VERSION: u32 = 10;
+
+/// Every schema step in order; index `n` takes a version-`n` database to
+/// version `n + 1`.
+type Migration = fn(&Connection) -> Result<(), StoreError>;
+
+const MIGRATIONS: [Migration; DATABASE_SCHEMA_VERSION as usize] = [
+    migrate_v1,
+    migrate_v2,
+    migrate_v3,
+    migrate_v4,
+    migrate_v5,
+    migrate_v6,
+    migrate_v7,
+    migrate_v8,
+    migrate_v9,
+    migrate_v10,
+];
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
     let version =
         connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
-    match version {
-        DATABASE_SCHEMA_VERSION => Ok(()),
-        0 => {
-            migrate_v1(connection)?;
-            migrate_v2(connection)?;
-            migrate_v3(connection)?;
-            migrate_v4(connection)?;
-            migrate_v5(connection)?;
-            migrate_v6(connection)?;
-            migrate_v7(connection)?;
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        1 => {
-            migrate_v2(connection)?;
-            migrate_v3(connection)?;
-            migrate_v4(connection)?;
-            migrate_v5(connection)?;
-            migrate_v6(connection)?;
-            migrate_v7(connection)?;
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        2 => {
-            migrate_v3(connection)?;
-            migrate_v4(connection)?;
-            migrate_v5(connection)?;
-            migrate_v6(connection)?;
-            migrate_v7(connection)?;
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        3 => {
-            migrate_v4(connection)?;
-            migrate_v5(connection)?;
-            migrate_v6(connection)?;
-            migrate_v7(connection)?;
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        4 => {
-            migrate_v5(connection)?;
-            migrate_v6(connection)?;
-            migrate_v7(connection)?;
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        5 => {
-            migrate_v6(connection)?;
-            migrate_v7(connection)?;
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        6 => {
-            migrate_v7(connection)?;
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        7 => {
-            migrate_v8(connection)?;
-            migrate_v9(connection)
-        }
-        8 => migrate_v9(connection),
-        unsupported => Err(StoreError::UnsupportedDatabaseVersion(unsupported)),
+    if version > DATABASE_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedDatabaseVersion(version));
     }
+    for step in &MIGRATIONS[version as usize..] {
+        step(connection)?;
+    }
+    Ok(())
 }
 
 fn migrate_v1(connection: &Connection) -> Result<(), StoreError> {
@@ -546,6 +505,74 @@ fn migrate_v9(connection: &Connection) -> Result<(), StoreError> {
         "BEGIN IMMEDIATE;
          ALTER TABLE runs ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0;
          PRAGMA user_version = 9;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Missions: the plan above the run.
+///
+/// `missions` holds the validated aggregate snapshot under compare-and-swap
+/// exactly as `runs` does; `mission_inputs` is the immutable intent;
+/// `mission_events` is the mission's own semantic history; `mission_runs`
+/// indexes which package a run serves so a run can be traced upward without
+/// decoding every mission. A run a mission remembers cannot be purged
+/// (`ON DELETE RESTRICT`): the mission's history is the reason the run
+/// existed.
+fn migrate_v10(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE missions (
+             id TEXT PRIMARY KEY,
+             status TEXT NOT NULL,
+             snapshot_schema_version INTEGER NOT NULL,
+             snapshot_json TEXT NOT NULL,
+             revision INTEGER NOT NULL DEFAULT 0,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE TABLE mission_inputs (
+             mission_id TEXT PRIMARY KEY,
+             schema_version INTEGER NOT NULL,
+             title TEXT NOT NULL,
+             goal TEXT NOT NULL,
+             source_repo_path TEXT NOT NULL,
+             base_commit TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE RESTRICT
+         );
+         CREATE TRIGGER mission_inputs_no_update
+         BEFORE UPDATE ON mission_inputs
+         BEGIN
+             SELECT RAISE(ABORT, 'mission inputs are immutable');
+         END;
+         CREATE TABLE mission_events (
+             mission_id TEXT NOT NULL,
+             sequence INTEGER NOT NULL CHECK (sequence > 0),
+             event_id TEXT NOT NULL UNIQUE,
+             event_type TEXT NOT NULL,
+             payload_json TEXT NOT NULL,
+             occurred_at TEXT NOT NULL,
+             recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+             PRIMARY KEY (mission_id, sequence),
+             FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE RESTRICT
+         );
+         CREATE TABLE mission_runs (
+             run_id TEXT PRIMARY KEY,
+             mission_id TEXT NOT NULL,
+             package_id TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT,
+             FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE RESTRICT
+         );
+         CREATE TRIGGER mission_runs_immutable
+         BEFORE UPDATE ON mission_runs
+         BEGIN
+             SELECT RAISE(ABORT, 'mission run bindings are immutable');
+         END;
+         CREATE INDEX missions_status_updated_idx ON missions(status, updated_at DESC);
+         CREATE INDEX mission_runs_mission_idx ON mission_runs(mission_id, package_id);
+         PRAGMA user_version = 10;
          COMMIT;",
     )?;
     Ok(())

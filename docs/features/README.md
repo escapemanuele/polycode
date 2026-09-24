@@ -9,6 +9,7 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 | Feature | Purpose | File |
 |---|---|---|
 | Run lifecycle | Start, inspect, stop, resume, recover, retry and resolve one run | [run-lifecycle.md](run-lifecycle.md) |
+| Missions | Plan a multi-package project above runs, with dependencies, decisions, and integration | [missions.md](missions.md) |
 | Workflows | Built-in Fast/Standard/Deep/Review graphs plus fix and continue cycles | [workflows.md](workflows.md) |
 | Control room | Ratatui TUI: screens, overlays, exact keys | [control-room.md](control-room.md) |
 | Workspace | Isolated worktrees, apply, discard, pull request | [workspace.md](workspace.md) |

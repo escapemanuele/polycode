@@ -120,6 +120,18 @@ Candidate usage is computed from existing `ProviderUsageUpdated` events filtered
 
 Results separate benchmark failure from infrastructure failure. Failed tests, scope violations, missed findings, false positives, and incorrect mismatch behavior describe candidate outcomes. Provider discovery/auth, tmux/protocol, artifact integrity, apply, fixture, and read-only safety failures remain infrastructure outcomes and are not scored as model failures. Reports group by suite version and target, expose V2/V3 duplicate/severity metrics, and never average incompatible versions. Existing result files remain readable; no production routing, scheduler, provider, database, or TUI path reads evaluation evidence.
 
+## Mission boundary (M1)
+
+```text
+Mission (goal, packages, dependencies, decisions)      SQLite: missions / mission_inputs /
+   └── WorkPackage (contract, status, runs)                    mission_events / mission_runs
+          └── child Run  ── ordinary workflow, worktree, review, verify, apply
+```
+
+A mission is the durable plan several runs serve; a run stays the bounded engineering operation. The `Mission` aggregate owns its work packages exactly as `Run` owns its stages, so the invariants between packages — unique ids, acyclic dependencies, a package `Ready` only when every dependency is `Integrated`, run bound to at most one package, a `Blocked` or `Failed` package always carrying a reason, a `Completed` mission having integrated at least one package — are checked in one place, on every rehydration (`MissionSnapshotV1` → `MissionRehydrationData` → `Mission::rehydrate`) and before every commit. Persistence copies the run pattern: validated snapshot under compare-and-swap, a per-mission sequenced event log committed in the same transaction, an insert-only `mission_inputs` row for the immutable title, goal, repository and starting commit, and `mission_runs` as an indexed projection of the packages' run lists, synchronised inside the same transaction so a run traces up to its package without decoding every mission. A run a mission binds cannot be purged (`ON DELETE RESTRICT` plus `StoreError::RunBoundToMission`).
+
+Package state follows run evidence and nothing else. `MissionService` observes the committed status of every active package's current run on every read and mutation and reports it to the aggregate (`Mission::observe_run`): `NeedsUser` blocks, `Completed`/`Applied` delivers, `Failed`/`Discarded` fails, anything else is progress; repeating an observation yields no event. Integration is recorded on `IntegrationEvidence` read from the run store — the run is `Applied`, or it completed with an empty delta (the same delta apply and the diff preview compute) — never on a report. Mission attention is derived from package state on every read and is not stored. The service never drives a run: `start_package` renders the handoff from canonical mission state (`handoff_task`: mission goal, contract, integrated dependencies, decisions) and starts an ordinary run through `RunService`, binding it to the package the moment `StartProgress::PreparingWorkspace` reports it persisted. Missions add no Git state, no routing state and no attention kind; a package chooses a workflow, and the child run resolves provider, model, effort, worktree and verification as any run does. The roadmap for handoff records, the lead session, the command-center TUI and the progress brief is in [docs/missions-roadmap.md](docs/missions-roadmap.md).
+
 ## State and events
 
 Runs, stages, and attention requests use explicit typed state. Artifacts carry typed metadata; provider sessions use neutral identities; usage has a provider-neutral signal. Important changes return common semantic events. Future persistence, scheduling, UI, notification, and journals can consume those events instead of independently inferring state from files or provider-specific JSON.
@@ -498,6 +510,8 @@ src/
 │   └── commands.rs  thin use-case dispatch and committed-state rendering
 ├── app/
 │   ├── run_service.rs orchestration use cases and quiescence policy
+│   ├── mission_service.rs mission use cases, run observation, handoff rendering
+│   ├── mission_query.rs mission read models
 │   ├── provider_factory.rs restart-stable provider construction
 │   ├── query.rs      CLI-facing read models
 │   └── error.rs      typed application failures
@@ -515,6 +529,7 @@ src/
 │   ├── role.rs      provider/model-independent responsibility
 │   ├── effort.rs    provider-neutral resource intent
 │   ├── rehydration.rs persistence-neutral reconstruction data
+│   ├── mission.rs   mission aggregate: work packages, dependencies, decisions, derived attention
 │   └── ids.rs       strong domain identities
 ├── engine/
 │   ├── scheduler.rs deterministic DAG evaluation and guarded commits
@@ -553,6 +568,7 @@ src/
 │   ├── migrations.rs SQLite schema lifecycle
 │   ├── config_snapshot.rs immutable config and canonical hash
 │   ├── image.rs     insert-only image-generation evidence rows
+│   ├── mission.rs   mission input, snapshot codec, event log, run index
 │   ├── run_input.rs immutable normalized task input
 │   ├── process.rs   process lifecycle and output-cursor CAS persistence
 │   ├── provider.rs  provider-session/artifact persistence and atomic commits
@@ -645,3 +661,5 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - TUI is an ephemeral projection/control surface; canonical state and all execution remain below application boundary.
 - TUI read APIs are side-effect free: no reconciliation, output acknowledgement, apply intent, real-index mutation, or semantic event.
 - Blocking application actions are serialized on one standard thread; frontend detach never implies provider interruption or run disposition.
+- A mission is a plan above runs, not a new execution model: packages are delivered by ordinary runs, package state follows committed run status, and integration is recorded on run evidence (`Applied` or an empty delta), never on an agent's report.
+- Package readiness requires integrated dependencies, so a child run's base commit already carries what it builds on; a contract freezes once a run serves it.

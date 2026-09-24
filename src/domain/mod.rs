@@ -7,6 +7,7 @@ mod attention;
 mod effort;
 mod event;
 mod ids;
+mod mission;
 mod rehydration;
 mod role;
 mod run;
@@ -18,8 +19,13 @@ pub use attention::{AttentionError, AttentionKind, AttentionRequest, AttentionSt
 pub use effort::{EffortLevel, EffortParseError, EffortSetting};
 pub use event::{DomainEvent, DomainEventKind, EventMetadata, NativeModelUsage};
 pub use ids::{
-    ArtifactId, AttentionRequestId, ConfigSnapshotId, EventId, IdError, ModelId, ProviderId,
-    ProviderSessionId, RunId, StageId,
+    ArtifactId, AttentionRequestId, ConfigSnapshotId, DecisionId, EventId, IdError, MissionId,
+    ModelId, ProviderId, ProviderSessionId, RunId, StageId, WorkPackageId,
+};
+pub use mission::{
+    DecisionAuthor, IntegrationEvidence, Mission, MissionAttention, MissionChange, MissionDecision,
+    MissionError, MissionEvent, MissionEventKind, MissionInvariantError, MissionRehydrationData,
+    MissionStatus, WorkPackage, WorkPackageContract, WorkPackageRehydrationData, WorkPackageStatus,
 };
 pub use rehydration::{
     RunRehydrationData, RunResumeStatus, StageRehydrationData, StageResumeStatus,

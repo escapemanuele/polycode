@@ -471,6 +471,12 @@ impl SqliteStore {
     pub fn purge_run(&mut self, run_id: RunId) -> Result<(), StoreError> {
         let id = run_id.to_string();
         let transaction = self.connection.transaction()?;
+        if let Some(binding) = super::mission::mission_of_run(&transaction, run_id)? {
+            return Err(StoreError::RunBoundToMission {
+                run_id,
+                mission_id: binding.mission_id,
+            });
+        }
         // Deepest dependents first: provider sessions point at managed
         // processes, apply operations point at workspaces, and everything
         // points at the run.
