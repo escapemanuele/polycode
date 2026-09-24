@@ -243,20 +243,22 @@ impl PermissionDenial {
                 .tool_input
                 .get("command")
                 .and_then(Value::as_str)
+                .ok_or(BashRefusal::Unreadable)
                 .and_then(bash_rules)
-                .or_else(|| {
-                    // Surface the command itself: the user sees *which* Bash
-                    // call cannot be granted exactly, not a bare tool name.
+                .map_err(|refusal| {
+                    // Surface the command itself and why it was refused: the
+                    // user sees *which* Bash call cannot be granted exactly,
+                    // and what to change, not a bare tool name.
                     let command = self
                         .tool_input
                         .get("command")
                         .and_then(Value::as_str)
                         .unwrap_or("<missing command>");
                     unsafe_bash = Some(format!(
-                        "Bash command cannot be granted as an exact rule (shell this parser will not read: command substitution, subshell, or heredoc); type a response to continue without granting it, or stop the run: {command}"
+                        "Bash command cannot be granted as an exact rule ({refusal}); type a response to continue without granting it, or stop the run: {command}"
                     ));
-                    None
-                }),
+                })
+                .ok(),
             "WebFetch" => self
                 .tool_input
                 .get("url")
@@ -280,37 +282,76 @@ impl PermissionDenial {
     }
 }
 
-/// The exact rules that grant one denied Bash command, or `None` when the
-/// line cannot be expressed as rules.
+/// Why one denied Bash command cannot be granted as exact rules.
+#[derive(Debug, PartialEq)]
+enum BashRefusal {
+    /// Shell the parser does not read: substitution, subshells, heredocs,
+    /// unbalanced quotes.
+    Unreadable,
+    /// A part that is only a redirection, which no rule can name.
+    BareRedirection(String),
+    /// A part carrying rule syntax: a wildcard would widen the rule past the
+    /// denied call, and `)` would end it early.
+    RuleSyntax { part: String, character: char },
+}
+
+impl std::fmt::Display for BashRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable => formatter.write_str(
+                "shell this parser will not read: command substitution, subshell, or heredoc",
+            ),
+            Self::BareRedirection(part) => {
+                write!(formatter, "a part is only a redirection: {part}")
+            }
+            Self::RuleSyntax { part, character } => write!(
+                formatter,
+                "'{character}' is permission-rule syntax and would grant more than this call, in: {part}"
+            ),
+        }
+    }
+}
+
+/// The exact rules that grant one denied Bash command, or why the line
+/// cannot be expressed as rules.
 ///
 /// A compound line becomes one rule per simple command, built from the
 /// *original* source text of each part — quote removal is lossy, and a rule
 /// has to match the command Claude Code will re-read character for
 /// character. A part that is only a redirection, or that carries rule
 /// syntax, makes the whole line ungrantable rather than partly granted.
-fn bash_rules(command: &str) -> Option<Vec<String>> {
-    if command.trim().is_empty() {
-        return None;
-    }
+fn bash_rules(command: &str) -> Result<Vec<String>, BashRefusal> {
     // Every line goes through the parser, single command included: a rule may
     // only name shell that was read and understood, never text waved through
     // because it happened to hold no separator.
-    let segments = split_simple_commands(command)?;
+    let segments = split_simple_commands(command).ok_or(BashRefusal::Unreadable)?;
     if segments.is_empty() {
-        return None;
+        return Err(BashRefusal::Unreadable);
     }
     segments
         .iter()
         .map(|segment| {
+            let text = command
+                .get(segment.source.clone())
+                .ok_or(BashRefusal::Unreadable)?
+                .trim();
             if segment.words.iter().all(|word| word.redirect) {
-                return None;
+                return Err(BashRefusal::BareRedirection(text.to_owned()));
             }
-            let text = command.get(segment.source.clone())?.trim();
+            if let Some(character) = rule_syntax(text) {
+                return Err(BashRefusal::RuleSyntax {
+                    part: text.to_owned(),
+                    character,
+                });
+            }
             // Re-read the slice rather than scanning it for separator
             // characters: `2>&1` is an `&` that separates nothing, and a rule
             // holding a real separator would grant more than one command.
-            let single = split_simple_commands(text).is_some_and(|parts| parts.len() == 1);
-            (single && safe_rule_value(text)).then(|| format!("Bash({text})"))
+            if split_simple_commands(text).is_some_and(|parts| parts.len() == 1) {
+                Ok(format!("Bash({text})"))
+            } else {
+                Err(BashRefusal::Unreadable)
+            }
         })
         .collect()
 }
@@ -775,10 +816,15 @@ pub(crate) fn superseded_requests(raw: &str) -> BTreeSet<String> {
 }
 
 fn safe_rule_value(value: &str) -> bool {
-    !value.is_empty()
-        && !value
-            .chars()
-            .any(|character| matches!(character, '*' | '?' | ')' | '\n' | '\r'))
+    !value.is_empty() && rule_syntax(value).is_none()
+}
+
+/// The first character in `value` that a permission rule would read as
+/// syntax rather than as itself.
+fn rule_syntax(value: &str) -> Option<char> {
+    value
+        .chars()
+        .find(|character| matches!(character, '*' | '?' | ')' | '\n' | '\r'))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1641,6 +1687,25 @@ mod tests {
     fn rule_syntax_in_a_segment_makes_the_whole_line_ungrantable() {
         assert!(bash("ls *.rs; echo done").exact_rules().is_err());
         assert!(bash("ls; ls ?").exact_rules().is_err());
+    }
+
+    /// A wildcard refusal names the wildcard and the part carrying it, not
+    /// shell the parser read perfectly well: the operator has to know what
+    /// to ask the agent to change.
+    #[test]
+    fn a_wildcard_refusal_names_the_wildcard_and_its_part() {
+        let denial = bash(
+            "gh pr diff 1 --name-only; git diff trunk...HEAD -- 'client/pages/*' ; ls ../wpcom 2>/dev/null | head -3",
+        );
+        let Err(ClaudeProviderError::UnsafePermission(message)) = denial.exact_rules() else {
+            panic!("a wildcard must not be grantable");
+        };
+        assert!(
+            message.contains("'*' is permission-rule syntax")
+                && message.contains("in: git diff trunk...HEAD -- 'client/pages/*'"),
+            "{message}"
+        );
+        assert!(!message.contains("subshell"), "{message}");
     }
 
     /// An MCP call is grantable as its own tool name: the rule names that one
