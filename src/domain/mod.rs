@@ -23,9 +23,10 @@ pub use ids::{
     ModelId, ProviderId, ProviderSessionId, RunId, StageId, WorkPackageId,
 };
 pub use mission::{
-    DecisionAuthor, IntegrationEvidence, Mission, MissionAttention, MissionChange, MissionDecision,
-    MissionError, MissionEvent, MissionEventKind, MissionInvariantError, MissionRehydrationData,
-    MissionStatus, WorkPackage, WorkPackageContract, WorkPackageRehydrationData, WorkPackageStatus,
+    ChangedFile, DecisionAuthor, IntegrationEvidence, Mission, MissionAttention, MissionChange,
+    MissionDecision, MissionError, MissionEvent, MissionEventKind, MissionInvariantError,
+    MissionRehydrationData, MissionStatus, StageOutcome, WorkPackage, WorkPackageContract,
+    WorkPackageRehydrationData, WorkPackageResult, WorkPackageStatus,
 };
 pub use rehydration::{
     RunRehydrationData, RunResumeStatus, StageRehydrationData, StageResumeStatus,

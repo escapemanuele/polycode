@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 10;
+pub const DATABASE_SCHEMA_VERSION: u32 = 11;
 
 /// Every schema step in order; index `n` takes a version-`n` database to
 /// version `n + 1`.
@@ -19,6 +19,7 @@ const MIGRATIONS: [Migration; DATABASE_SCHEMA_VERSION as usize] = [
     migrate_v8,
     migrate_v9,
     migrate_v10,
+    migrate_v11,
 ];
 
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
@@ -573,6 +574,41 @@ fn migrate_v10(connection: &Connection) -> Result<(), StoreError> {
          CREATE INDEX missions_status_updated_idx ON missions(status, updated_at DESC);
          CREATE INDEX mission_runs_mission_idx ON mission_runs(mission_id, package_id);
          PRAGMA user_version = 10;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Handoffs: what a package's worker was told, as evidence.
+///
+/// The child run's immutable input already holds the rendered text; this
+/// row binds it to the mission state it was rendered from — the contract's
+/// hash, the dependencies and decisions it named — so a later reader can
+/// tell whether the package the run served is still the package the plan
+/// holds. Insert-only, one per run; a run attached by hand has none.
+fn migrate_v11(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE mission_handoffs (
+             run_id TEXT PRIMARY KEY,
+             mission_id TEXT NOT NULL,
+             package_id TEXT NOT NULL,
+             contract_sha256 TEXT NOT NULL,
+             task_sha256 TEXT NOT NULL,
+             task_size INTEGER NOT NULL,
+             dependencies_json TEXT NOT NULL,
+             decision_ids_json TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             FOREIGN KEY (run_id) REFERENCES mission_runs(run_id) ON DELETE RESTRICT,
+             FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE RESTRICT
+         );
+         CREATE TRIGGER mission_handoffs_no_update
+         BEFORE UPDATE ON mission_handoffs
+         BEGIN
+             SELECT RAISE(ABORT, 'mission handoffs are immutable');
+         END;
+         CREATE INDEX mission_handoffs_mission_idx ON mission_handoffs(mission_id, package_id);
+         PRAGMA user_version = 11;
          COMMIT;",
     )?;
     Ok(())

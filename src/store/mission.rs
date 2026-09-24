@@ -13,17 +13,19 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehav
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use sha2::{Digest, Sha256};
+
 use crate::domain::{
-    Mission, MissionDecision, MissionEvent, MissionEventKind, MissionId, MissionRehydrationData,
-    MissionStatus, RunId, WorkPackageContract, WorkPackageId, WorkPackageRehydrationData,
-    WorkPackageStatus,
+    DecisionId, Mission, MissionDecision, MissionEvent, MissionEventKind, MissionId,
+    MissionRehydrationData, MissionStatus, RunId, WorkPackageContract, WorkPackageId,
+    WorkPackageRehydrationData, WorkPackageResult, WorkPackageStatus,
 };
 
 use super::sqlite::{format_timestamp, i64_to_u64, parse_timestamp, u64_to_i64};
 use super::{SqliteStore, StoreError};
 
 pub const MISSION_INPUT_SCHEMA_VERSION: u32 = 1;
-pub const MISSION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const MISSION_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 /// Immutable intent bound to one mission: what it is for and where it works.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,6 +161,44 @@ pub struct MissionRunBinding {
     pub package_id: WorkPackageId,
 }
 
+/// What one child run was told, bound to the mission state it came from.
+///
+/// The rendered text itself is the run's immutable input; this record holds
+/// its hash and the hash of the contract it was rendered from, plus the
+/// dependencies and decisions it named, so the handoff is checkable evidence
+/// rather than a string somebody remembers sending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissionHandoffRecord {
+    pub run_id: RunId,
+    pub mission_id: MissionId,
+    pub package_id: WorkPackageId,
+    pub contract_sha256: String,
+    pub task_sha256: String,
+    pub task_size: u64,
+    pub dependencies: Vec<WorkPackageId>,
+    pub decision_ids: Vec<DecisionId>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// SHA-256 of the contract's canonical (key-sorted, compact) JSON.
+///
+/// # Errors
+/// Returns JSON encoding failures.
+pub fn contract_sha256(contract: &WorkPackageContract) -> Result<String, StoreError> {
+    let value = super::config_snapshot::canonical_value(serde_json::to_value(contract)?);
+    Ok(sha256_hex(&serde_json::to_vec(&value)?))
+}
+
+/// SHA-256 of exact bytes, lowercase hex.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hash = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = std::fmt::Write::write_fmt(&mut hash, format_args!("{byte:02x}"));
+    }
+    hash
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct MissionSnapshotV1 {
     schema_version: u32,
@@ -183,21 +223,82 @@ struct PackageSnapshotV1 {
     updated_at: DateTime<Utc>,
 }
 
+/// v2 adds the delivery result. A v1 reader would drop it silently, so the
+/// version moves rather than the field being optional in place.
+#[derive(Debug, Serialize, Deserialize)]
+struct MissionSnapshotV2 {
+    schema_version: u32,
+    id: MissionId,
+    status: MissionStatus,
+    packages: Vec<PackageSnapshotV2>,
+    decisions: Vec<MissionDecision>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageSnapshotV2 {
+    id: WorkPackageId,
+    contract: WorkPackageContract,
+    dependencies: Vec<WorkPackageId>,
+    status: WorkPackageStatus,
+    runs: Vec<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<WorkPackageResult>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<PackageSnapshotV1> for PackageSnapshotV2 {
+    fn from(package: PackageSnapshotV1) -> Self {
+        Self {
+            id: package.id,
+            contract: package.contract,
+            dependencies: package.dependencies,
+            status: package.status,
+            runs: package.runs,
+            reason: package.reason,
+            result: None,
+            created_at: package.created_at,
+            updated_at: package.updated_at,
+        }
+    }
+}
+
+impl From<PackageSnapshotV2> for WorkPackageRehydrationData {
+    fn from(package: PackageSnapshotV2) -> Self {
+        Self {
+            id: package.id,
+            contract: package.contract,
+            dependencies: package.dependencies,
+            status: package.status,
+            runs: package.runs,
+            reason: package.reason,
+            result: package.result,
+            created_at: package.created_at,
+            updated_at: package.updated_at,
+        }
+    }
+}
+
 fn encode_mission(mission: &Mission) -> Result<String, StoreError> {
-    let snapshot = MissionSnapshotV1 {
+    let snapshot = MissionSnapshotV2 {
         schema_version: MISSION_SNAPSHOT_SCHEMA_VERSION,
         id: mission.id(),
         status: mission.status(),
         packages: mission
             .packages()
             .iter()
-            .map(|package| PackageSnapshotV1 {
+            .map(|package| PackageSnapshotV2 {
                 id: package.id().clone(),
                 contract: package.contract().clone(),
                 dependencies: package.dependencies().to_vec(),
                 status: package.status(),
                 runs: package.runs().to_vec(),
                 reason: package.reason().map(str::to_owned),
+                result: package.result().cloned(),
                 created_at: *package.created_at(),
                 updated_at: *package.updated_at(),
             })
@@ -222,32 +323,29 @@ fn decode_mission(snapshot_json: &str, column_version: u32) -> Result<Mission, S
             column: column_version,
         });
     }
-    let data = match envelope.schema_version {
-        MISSION_SNAPSHOT_SCHEMA_VERSION => {
+    let snapshot = match envelope.schema_version {
+        1 => {
             let snapshot: MissionSnapshotV1 = serde_json::from_str(snapshot_json)?;
-            MissionRehydrationData {
+            MissionSnapshotV2 {
+                schema_version: MISSION_SNAPSHOT_SCHEMA_VERSION,
                 id: snapshot.id,
                 status: snapshot.status,
-                packages: snapshot
-                    .packages
-                    .into_iter()
-                    .map(|package| WorkPackageRehydrationData {
-                        id: package.id,
-                        contract: package.contract,
-                        dependencies: package.dependencies,
-                        status: package.status,
-                        runs: package.runs,
-                        reason: package.reason,
-                        created_at: package.created_at,
-                        updated_at: package.updated_at,
-                    })
-                    .collect(),
+                packages: snapshot.packages.into_iter().map(Into::into).collect(),
                 decisions: snapshot.decisions,
                 created_at: snapshot.created_at,
                 updated_at: snapshot.updated_at,
             }
         }
+        MISSION_SNAPSHOT_SCHEMA_VERSION => serde_json::from_str(snapshot_json)?,
         unsupported => return Err(StoreError::UnsupportedSnapshotVersion(unsupported)),
+    };
+    let data = MissionRehydrationData {
+        id: snapshot.id,
+        status: snapshot.status,
+        packages: snapshot.packages.into_iter().map(Into::into).collect(),
+        decisions: snapshot.decisions,
+        created_at: snapshot.created_at,
+        updated_at: snapshot.updated_at,
     };
     Ok(Mission::rehydrate(data)?)
 }
@@ -410,7 +508,34 @@ impl SqliteStore {
         expected_revision: MissionRevision,
         events: &[MissionEvent],
     ) -> Result<MissionRevision, StoreError> {
+        self.commit_mission_update_with(mission, expected_revision, events, None)
+    }
+
+    /// [`Self::commit_mission_update`] that also records the handoff of a
+    /// run the update binds, in the same transaction, so a bound run never
+    /// exists without the evidence of what it was told.
+    ///
+    /// # Errors
+    /// As [`Self::commit_mission_update`]; a handoff naming a run the
+    /// mission does not bind is rejected.
+    pub fn commit_mission_update_with(
+        &mut self,
+        mission: &Mission,
+        expected_revision: MissionRevision,
+        events: &[MissionEvent],
+        handoff: Option<&MissionHandoffRecord>,
+    ) -> Result<MissionRevision, StoreError> {
         mission.validate_invariants()?;
+        if let Some(handoff) = handoff {
+            let bound = mission
+                .package(&handoff.package_id)
+                .is_some_and(|package| package.runs().contains(&handoff.run_id));
+            if handoff.mission_id != mission.id() || !bound {
+                return Err(StoreError::SnapshotProjectionMismatch(
+                    "handoff names a run the mission does not bind",
+                ));
+            }
+        }
         let snapshot_json = encode_mission(mission)?;
         let status = status_text(mission.status())?;
         let next_revision = expected_revision
@@ -462,8 +587,58 @@ impl SqliteStore {
             .ok_or(StoreError::IntegerRange("next mission event sequence"))?;
         insert_mission_events(&transaction, mission, events, first_sequence)?;
         sync_mission_runs(&transaction, mission)?;
+        if let Some(handoff) = handoff {
+            insert_handoff(&transaction, handoff)?;
+        }
         transaction.commit()?;
         Ok(MissionRevision(next_revision))
+    }
+
+    /// Every handoff recorded for one mission, oldest first.
+    ///
+    /// # Errors
+    /// Returns projection or `SQLite` errors.
+    pub fn list_mission_handoffs(
+        &self,
+        mission_id: MissionId,
+    ) -> Result<Vec<MissionHandoffRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, package_id, contract_sha256, task_sha256, task_size,
+                    dependencies_json, decision_ids_json, created_at
+             FROM mission_handoffs WHERE mission_id = ?1 ORDER BY created_at, run_id",
+        )?;
+        let rows = statement.query_map([mission_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (run_id, package_id, contract, task, size, dependencies, decisions, created_at) =
+                row?;
+            records.push(MissionHandoffRecord {
+                run_id: run_id
+                    .parse()
+                    .map_err(|_| StoreError::SnapshotProjectionMismatch("handoff run ID"))?,
+                mission_id,
+                package_id: WorkPackageId::new(package_id)
+                    .map_err(|_| StoreError::SnapshotProjectionMismatch("handoff package ID"))?,
+                contract_sha256: contract,
+                task_sha256: task,
+                task_size: i64_to_u64(size, "handoff task size")?,
+                dependencies: serde_json::from_str(&dependencies)?,
+                decision_ids: serde_json::from_str(&decisions)?,
+                created_at: parse_timestamp(&created_at)?,
+            });
+        }
+        Ok(records)
     }
 
     /// Every committed event of one mission in sequence order.
@@ -764,6 +939,30 @@ fn sync_mission_runs(transaction: &Transaction<'_>, mission: &Mission) -> Result
     Ok(())
 }
 
+fn insert_handoff(
+    transaction: &Transaction<'_>,
+    handoff: &MissionHandoffRecord,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT INTO mission_handoffs (
+             run_id, mission_id, package_id, contract_sha256, task_sha256, task_size,
+             dependencies_json, decision_ids_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            handoff.run_id.to_string(),
+            handoff.mission_id.to_string(),
+            handoff.package_id.as_str(),
+            handoff.contract_sha256,
+            handoff.task_sha256,
+            u64_to_i64(handoff.task_size, "handoff task size")?,
+            serde_json::to_string(&handoff.dependencies)?,
+            serde_json::to_string(&handoff.decision_ids)?,
+            format_timestamp(&handoff.created_at),
+        ],
+    )?;
+    Ok(())
+}
+
 fn status_text(status: MissionStatus) -> Result<String, StoreError> {
     serde_json::to_value(status)?
         .as_str()
@@ -959,7 +1158,25 @@ mod tests {
 
         // A second commit with the same binding is idempotent.
         let change = mission
-            .observe_run(&package("a"), run_id, RunStatus::Completed, None, at(3))
+            .observe_run(
+                &package("a"),
+                run_id,
+                RunStatus::Completed,
+                None,
+                Some(WorkPackageResult {
+                    run_id,
+                    captured_at: at(3),
+                    stage_count: 1,
+                    changed_files: vec![],
+                    changes_complete: true,
+                    bottom_line: None,
+                    verification: None,
+                    reviews: vec![],
+                    decision: None,
+                    open_questions: None,
+                }),
+                at(3),
+            )
             .unwrap();
         store
             .commit_mission_update(&mission, revision, &change.events)
@@ -992,6 +1209,88 @@ mod tests {
         // The run cannot be purged while a mission remembers it.
         let error = store.purge_run(run_id).unwrap_err();
         assert!(matches!(error, StoreError::RunBoundToMission { .. }));
+    }
+
+    #[test]
+    fn a_handoff_commits_with_the_bind_and_never_for_a_run_the_mission_lacks() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let run_id = RunId::from_u128(7);
+        create_run(&mut store, run_id);
+        let (mut mission, _, revision) = new_mission(&mut store);
+        let change = mission
+            .add_package(package("a"), contract("A"), vec![], at(1))
+            .unwrap();
+        let revision = store
+            .commit_mission_update(&mission, revision, &change.events)
+            .unwrap();
+        let handoff = MissionHandoffRecord {
+            run_id,
+            mission_id: mission.id(),
+            package_id: package("a"),
+            contract_sha256: contract_sha256(&contract("A")).unwrap(),
+            task_sha256: sha256_hex(b"task"),
+            task_size: 4,
+            dependencies: vec![],
+            decision_ids: vec![DecisionId::from_u128(3)],
+            created_at: at(2),
+        };
+        // Not bound yet: refused, nothing written.
+        assert!(matches!(
+            store.commit_mission_update_with(&mission, revision, &change.events, Some(&handoff)),
+            Err(StoreError::SnapshotProjectionMismatch(_))
+        ));
+        let change = mission.start_package(&package("a"), run_id, at(2)).unwrap();
+        store
+            .commit_mission_update_with(&mission, revision, &change.events, Some(&handoff))
+            .unwrap();
+        let recorded = store.list_mission_handoffs(mission.id()).unwrap();
+        assert_eq!(recorded, vec![handoff]);
+        assert_eq!(
+            contract_sha256(&contract("A")).unwrap(),
+            contract_sha256(&WorkPackageContract {
+                acceptance_criteria: vec!["done".to_owned()],
+                ..contract("A")
+            })
+            .unwrap()
+        );
+        assert_ne!(
+            contract_sha256(&contract("A")).unwrap(),
+            contract_sha256(&contract("B")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_v1_snapshot_still_loads_without_a_result() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (mission, _, _) = new_mission(&mut store);
+        let v1 = serde_json::json!({
+            "schema_version": 1,
+            "id": mission.id().to_string(),
+            "status": "planning",
+            "packages": [{
+                "id": "a",
+                "contract": {"title": "A", "goal": "g", "workflow": "fast"},
+                "dependencies": [],
+                "status": "ready",
+                "runs": [],
+                "created_at": "2026-09-22T12:00:00Z",
+                "updated_at": "2026-09-22T12:00:00Z"
+            }],
+            "decisions": [],
+            "created_at": "2026-09-22T12:00:00Z",
+            "updated_at": "2026-09-22T12:00:00Z"
+        });
+        store
+            .connection
+            .execute(
+                "UPDATE missions SET snapshot_json = ?1, snapshot_schema_version = 1 WHERE id = ?2",
+                params![v1.to_string(), mission.id().to_string()],
+            )
+            .unwrap();
+        let loaded = store.load_mission(mission.id()).unwrap();
+        let package = loaded.mission.package(&package("a")).unwrap();
+        assert_eq!(package.status(), WorkPackageStatus::Ready);
+        assert!(package.result().is_none());
     }
 
     #[test]

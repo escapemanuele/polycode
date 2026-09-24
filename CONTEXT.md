@@ -357,3 +357,15 @@ _Avoid_: Note, comment, plan change
 **Mission attention**:
 What the user must look at, derived on every read from package state: blocked packages (their run needs the user), failed packages, and delivered packages awaiting integration. Never stored.
 _Avoid_: Notification, alert, inbox
+
+**Handoff record**:
+The insert-only row binding a package's child run to the mission state its task was rendered from: contract hash, task hash and size, named dependencies and decisions. Evidence of what the worker was told; absent for a run attached by hand.
+_Avoid_: Prompt log, transcript
+
+**Package result**:
+Evidence captured from the run store when a package's run first finishes and kept with the package: changed files, verify, review and decision statuses, and the artifacts' own bottom lines and follow-ups quoted verbatim.
+_Avoid_: Summary, report, agent claim
+
+**Rework**:
+A delivered package going back to work on its own run through a fix or continue cycle. It is in progress again and delivers afresh; its previous result is replaced, never edited.
+_Avoid_: Retry (that is a new run), revision

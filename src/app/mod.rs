@@ -2,6 +2,7 @@
 
 mod error;
 pub(crate) mod mission_query;
+mod mission_result;
 mod mission_service;
 mod provider_factory;
 pub(crate) mod query;
@@ -9,8 +10,10 @@ mod routing;
 mod run_service;
 
 pub use error::AppError;
-pub use mission_query::{DecisionSummary, MissionDetails, MissionListItem, WorkPackageSummary};
-pub use mission_service::{MissionService, NewWorkPackage};
+pub use mission_query::{
+    DecisionSummary, HandoffSummary, MissionDetails, MissionListItem, WorkPackageSummary,
+};
+pub use mission_service::{MissionService, NewWorkPackage, Rework};
 pub use provider_factory::{
     DevelopmentFakeProviderFactory, ProviderFactory, ProviderResolver, RoutedProvider,
     RuntimeProvider, RuntimeProviderFactory,

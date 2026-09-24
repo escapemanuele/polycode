@@ -120,6 +120,36 @@ fn a_mission_is_planned_started_integrated_and_survives_every_restart() {
         String::from_utf8_lossy(&refused.stderr)
     );
 
+    // Delivery carries evidence, not a claim: the fake changed nothing and
+    // Fast's verify stage really ran.
+    let shown = fixture.polycode(&["mission", "show", &mission_id]);
+    assert_success(&shown);
+    let stdout = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        stdout.contains("delivered: 0 file(s) changed; verify completed; no reviews"),
+        "{stdout}"
+    );
+
+    // Nothing is waiting to be driven; resume is a no-op that reports so.
+    let resumed = fixture.polycode(&["mission", "resume", &mission_id]);
+    assert_success(&resumed);
+    assert!(
+        String::from_utf8_lossy(&resumed.stdout).contains("Resumed 0 run(s)."),
+        "{}",
+        String::from_utf8_lossy(&resumed.stdout)
+    );
+
+    // A fast run has no decision stage, so a fix cycle is refused by the
+    // run itself and the package stays delivered.
+    let refused = fixture.polycode(&["mission", "fix", &mission_id, "persistence"]);
+    assert_eq!(refused.status.code(), Some(1));
+    let shown = fixture.polycode(&["mission", "show", &mission_id]);
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("delivered  persistence"),
+        "{}",
+        String::from_utf8_lossy(&shown.stdout)
+    );
+
     let integrated = fixture.polycode(&["mission", "integrate", &mission_id, "persistence"]);
     assert_success(&integrated);
     let stdout = String::from_utf8_lossy(&integrated.stdout);
