@@ -93,7 +93,7 @@ fn a_mission_is_planned_started_integrated_and_survives_every_restart() {
     let stdout = String::from_utf8_lossy(&started.stdout);
     assert!(stdout.contains("delivered  persistence"), "{stdout}");
     assert!(stdout.contains("Status: active"), "{stdout}");
-    assert!(stdout.contains("waits for integration"), "{stdout}");
+    assert!(stdout.contains("brings it in"), "{stdout}");
     let run_id = stdout
         .lines()
         .find_map(|line| line.trim().strip_prefix("run: "))

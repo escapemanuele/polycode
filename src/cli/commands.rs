@@ -779,7 +779,7 @@ fn mission(command: &MissionCommand) -> Result<()> {
             mission_id,
             package_id,
         } => {
-            let details = missions.integrate_package(*mission_id, package_id)?;
+            let details = missions.integrate_package(&service()?, *mission_id, package_id)?;
             print_mission(&details);
             Ok(())
         }
@@ -1075,7 +1075,7 @@ fn print_mission(details: &MissionDetails) {
                 .and_then(|package| package.current_run)
                 .map_or_else(|| "unknown".to_owned(), |run_id| run_id.to_string());
             println!(
-                "  - {package_id} is delivered and waits for integration: apply run {run_id}, then `polycode mission integrate {} {package_id}`",
+                "  - {package_id} is done (run {run_id}); `polycode mission integrate {} {package_id}` brings it in",
                 details.id
             );
         }

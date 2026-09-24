@@ -139,7 +139,7 @@ watch agents work?
   decision (user confirms), blocker (prominent). Routine transitions stay
   automatic.
 
-### M4 — Calm command center
+### M4 — Calm command center (first slice on this branch: missions screen, start, integrate, open run)
 
 - Missions screen in the TUI: goal, health, progress, current focus,
   attention; packages as engineering state, runs one level down, logs and

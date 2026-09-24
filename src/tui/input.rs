@@ -25,6 +25,12 @@ pub(crate) enum Intent {
     DeleteWordBefore,
     NewRun,
     Runs,
+    /// The missions screen.
+    Missions,
+    /// Start a child run for the selected ready package.
+    StartPackage,
+    /// Record the selected delivered package as integrated.
+    Integrate,
     Resume,
     Retry,
     Stop,
@@ -86,6 +92,9 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Delete => Intent::Delete,
         KeyCode::Char('n') => Intent::NewRun,
         KeyCode::Char('R') => Intent::Runs,
+        KeyCode::Char('M') => Intent::Missions,
+        KeyCode::Char('S') => Intent::StartPackage,
+        KeyCode::Char('I') => Intent::Integrate,
         KeyCode::Char('r') => Intent::Resume,
         KeyCode::Char('t') => Intent::Retry,
         KeyCode::Char('s') => Intent::Stop,

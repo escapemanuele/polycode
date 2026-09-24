@@ -39,14 +39,10 @@ pub enum AppError {
         expected: std::path::PathBuf,
         actual: Option<std::path::PathBuf>,
     },
-    #[error(
-        "run {run_id} is {status:?} with {changed_files} changed file(s) still in its worktree; \
-apply it (`polycode apply {run_id}`) before integrating the package"
-    )]
+    #[error("run {run_id} is {status:?}; only a completed or applied run can be integrated")]
     PackageNotIntegrated {
         run_id: RunId,
         status: crate::domain::RunStatus,
-        changed_files: usize,
     },
     #[error(
         "run {run_id} completed but its worktree is {workspace:?}, so its delta cannot be read; \
