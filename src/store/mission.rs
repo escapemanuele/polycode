@@ -161,6 +161,15 @@ pub struct MissionRunBinding {
     pub package_id: WorkPackageId,
 }
 
+/// The lead session bound to a mission: one run, kept for the mission's
+/// life; a newer binding replaces it as current without deleting it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissionLeadBinding {
+    pub mission_id: MissionId,
+    pub run_id: RunId,
+    pub created_at: DateTime<Utc>,
+}
+
 /// What one child run was told, bound to the mission state it came from.
 ///
 /// The rendered text itself is the run's immutable input; this record holds
@@ -701,6 +710,85 @@ impl SqliteStore {
     pub fn mission_of_run(&self, run_id: RunId) -> Result<Option<MissionRunBinding>, StoreError> {
         mission_of_run(&self.connection, run_id)
     }
+
+    /// Binds a run as the mission's lead session. Insert-only: an older
+    /// lead stays on record and stops being current.
+    ///
+    /// # Errors
+    /// Returns persistence errors, including a run already bound.
+    pub fn bind_mission_lead(
+        &mut self,
+        mission_id: MissionId,
+        run_id: RunId,
+        now: &DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO mission_leads (run_id, mission_id, created_at) VALUES (?1, ?2, ?3)",
+            params![
+                run_id.to_string(),
+                mission_id.to_string(),
+                format_timestamp(now)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The mission's current lead session, if one was ever bound.
+    ///
+    /// # Errors
+    /// Returns persistence errors.
+    pub fn mission_lead(
+        &self,
+        mission_id: MissionId,
+    ) -> Result<Option<MissionLeadBinding>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT run_id, created_at FROM mission_leads
+                 WHERE mission_id = ?1
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT 1",
+                [mission_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(run_id, created_at)| {
+                Ok(MissionLeadBinding {
+                    mission_id,
+                    run_id: run_id
+                        .parse()
+                        .map_err(|_| StoreError::SnapshotProjectionMismatch("run ID"))?,
+                    created_at: parse_timestamp(&created_at)?,
+                })
+            })
+            .transpose()
+    }
+
+    /// The mission a run serves as lead, if any.
+    ///
+    /// # Errors
+    /// Returns persistence errors.
+    pub fn mission_of_lead_run(&self, run_id: RunId) -> Result<Option<MissionId>, StoreError> {
+        mission_of_lead_run(&self.connection, run_id)
+    }
+}
+
+pub(crate) fn mission_of_lead_run(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<Option<MissionId>, StoreError> {
+    connection
+        .query_row(
+            "SELECT mission_id FROM mission_leads WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|mission_id| {
+            mission_id
+                .parse()
+                .map_err(|_| StoreError::SnapshotProjectionMismatch("mission ID"))
+        })
+        .transpose()
 }
 
 pub(crate) fn mission_of_run(

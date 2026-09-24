@@ -126,7 +126,7 @@ watch agents work?
 - Deferred to M6: injecting dependency artifacts (plan, decision) into a
   handoff, and a mission-level concurrency policy.
 
-### M3 — Lead conversation and plan changes
+### M3 — Lead conversation and plan changes (this branch: lead session, `## Plan changes`, `mission ask`/`apply`; attention classes deferred)
 
 - Mission-scoped lead session: a run-like, restart-safe conversation
   (provider session + retained output) whose prompt is the canonical

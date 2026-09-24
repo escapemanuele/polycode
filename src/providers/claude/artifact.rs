@@ -112,6 +112,7 @@ const fn kind(stage: StageKind) -> ArtifactKind {
         StageKind::Decision => ArtifactKind::Decision,
         StageKind::Fix => ArtifactKind::Fix,
         StageKind::FollowUp => ArtifactKind::FollowUp,
+        StageKind::Lead => ArtifactKind::Lead,
         StageKind::Verify => ArtifactKind::Verify,
     }
 }

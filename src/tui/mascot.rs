@@ -125,7 +125,7 @@ pub(crate) const fn mascot_activity(kind: StageKind) -> MascotActivity {
         }
         StageKind::SpecReview => MascotActivity::SpecReview,
         StageKind::Verify => MascotActivity::Verify,
-        StageKind::Synthesis => MascotActivity::Synthesis,
+        StageKind::Synthesis | StageKind::Lead => MascotActivity::Synthesis,
         StageKind::Decision => MascotActivity::Decision,
     }
 }

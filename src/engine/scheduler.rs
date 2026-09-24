@@ -496,6 +496,54 @@ where
         })
     }
 
+    /// One more exchange with a mission's lead: stages the user's message
+    /// under the lead stage identity about to be created, then appends
+    /// that stage. Same ordering and same walk-back on refusal as
+    /// [`Self::request_continue`], for the same reasons.
+    ///
+    /// # Errors
+    /// Returns boundary, provider, lifecycle, or persistence failures.
+    pub fn request_lead_turn(
+        &mut self,
+        store: &mut SqliteStore,
+        run_id: RunId,
+        message: &str,
+    ) -> Result<EngineStatus, EngineError> {
+        let (mut loaded, _) = load_execution_boundary(store, run_id)?;
+        let lead_stage_id = crate::domain::next_lead_stage_id(loaded.run.workflow());
+        if let Some(stage_id) = &lead_stage_id {
+            self.provider.stage_continue_instruction(
+                store,
+                run_id,
+                stage_id,
+                Role::EngineeringLead,
+                message,
+            )?;
+        }
+        let metadata = self.metadata_for(&loaded.run);
+        let outcome = loaded
+            .run
+            .request_lead_turn(metadata)
+            .map_err(EngineError::from)
+            .and_then(|event| commit_execution(store, &loaded.run, loaded.revision, &[event]));
+        if let Err(error) = outcome {
+            if let Some(stage_id) = &lead_stage_id {
+                let claimed_by_someone_else = store
+                    .load_run(run_id)
+                    .map_or(true, |reloaded| reloaded.run.stage(stage_id).is_some());
+                if !claimed_by_someone_else {
+                    let _ = self
+                        .provider
+                        .discard_continue_instruction(store, run_id, stage_id);
+                }
+            }
+            return Err(error);
+        }
+        Ok(EngineStatus::Advanced {
+            run_status: loaded.run.status(),
+        })
+    }
+
     fn transition_stage(
         &mut self,
         store: &mut SqliteStore,

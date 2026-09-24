@@ -70,6 +70,7 @@ impl CodexSandbox {
             | StageKind::DeepAnalysis
             | StageKind::Synthesis
             | StageKind::Decision
+            | StageKind::Lead
             | StageKind::Verify => Self::ReadOnly,
         }
     }

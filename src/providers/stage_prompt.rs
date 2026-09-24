@@ -49,6 +49,14 @@ pub(crate) fn image_tool_section(tool_name: &str, max_generations: u32, remainin
     )
 }
 
+/// The lead of a mission, answering one message from the user. The
+/// message arrives as the operator instruction below the contract; it
+/// opens with the mission brief (goal, packages and their state,
+/// decisions, what needs the user), which is the canonical state and not
+/// a chat log. The lead's earlier answer, when there is one, is among the
+/// dependency artifacts.
+pub(crate) const LEAD_TURN: &str = "You are the engineering lead of the mission described in the operator instruction below. Read the brief first: it is the current plan, and it is the truth; your earlier answer, if attached, is history. Read the repository when the question needs it; you may not edit anything. Answer the user's message in plain conversational language, as a lead talking to the person who owns the project: what you recommend and why, tradeoffs named, no ceremony. When the message calls for changing the plan, close with a `## Plan changes` section in exactly this grammar and nothing else in it, one change per `- ` item, fields indented two spaces under it:\n\n- add `<id>`: <Title>\n  goal: <one sentence>\n  why: <one sentence>\n  accept: <one criterion>  (repeat the line per criterion)\n  workflow: fast|standard|deep|review\n  depends on: <id>, <id>\n- revise `<id>`\n  <goal|why|scope|accept|verify|workflow|depends on>: <new value>\n- cancel `<id>`: <reason>\n- decide: <Title>\n  why: <rationale>\n\nIds are lowercase words joined by hyphens or underscores. Only add a package that is a coherent, bounded piece of work one agent run can deliver; only name dependencies that must be in the checkout first. When nothing should change, write the section with the single item `- none`. When the message needs no plan change and asks none, omit the section. Never restate the brief and never invent state the brief does not show.";
+
 pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
     match (role, kind) {
         (Role::CodeQualityReviewer, StageKind::CodeQualityReview) => {
@@ -88,6 +96,7 @@ pub(crate) const fn instruction(role: Role, kind: StageKind) -> &'static str {
         (Role::EngineeringLead, StageKind::Decision) => {
             "Synthesize direct review evidence across two distinct axes: implementation quality and specification compliance. Do not count findings mechanically or infer approval from reviewer completion. Surface disagreements between reviewers and make an explicit engineering decision. When a previous decision and a fix answering it are both in evidence, judge whether that fix actually resolves the findings the previous decision called blocking; a fix artifact claiming a finding is resolved is a claim to verify against the code, not a resolution. When you see reasonable next steps that are not blocking findings — follow-on work, generalizations, or things worth doing but not required by this task — add an optional `## Follow-ups` section, one bullet per item, written as an instruction an operator could hand back to an agent verbatim. Omit the section entirely when there is nothing worth suggesting; never pad it to have something to say."
         }
+        (Role::EngineeringLead, StageKind::Lead) => LEAD_TURN,
         (Role::EngineeringLead, _) => {
             "Integrate direct dependency evidence into one actionable engineering result."
         }

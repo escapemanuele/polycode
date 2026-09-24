@@ -350,6 +350,18 @@ _Avoid_: Done (in code and docs), merged
 The delivered package's change reached the source checkout, on run evidence: the run is applied, or it completed with an empty delta. `mission integrate` and the control room's `I` apply the run first when its change is still in the worktree. Dependents may become ready. The control room says `in`.
 _Avoid_: Merged, accepted, applied package
 
+**Lead session**:
+The one run a mission talks through (`WorkflowKind::Lead`): every message from the user is a `lead_N` stage whose instruction is the mission brief plus the message, and every answer is that stage's artifact.
+_Avoid_: Chat, thread, conversation log
+
+**Mission brief**:
+The mission's canonical state rendered as text for the lead: goal, packages with state and evidence, decisions, what needs the user. Rendered fresh for every turn; never accumulated.
+_Avoid_: Context, history, transcript
+
+**Plan change**:
+One proposed operation on the plan (add, revise, cancel a package; record a decision) parsed from the lead answer's `## Plan changes` section. Proposed until `mission apply` lands it; a batch lands whole or not at all.
+_Avoid_: Suggestion, edit, patch
+
 **Mission decision**:
 An insert-only record of a design choice the plan rests on, with its rationale and author (user or lead). A reversed decision is a new decision.
 _Avoid_: Note, comment, plan change

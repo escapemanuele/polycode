@@ -688,6 +688,63 @@ impl Run {
         ))
     }
 
+    /// Appends one more turn to a lead session: a lead stage that depends
+    /// on the previous one. The run's status returns to `Running` so the
+    /// scheduler picks the turn up; the user's message is stage-private
+    /// content the provider embeds, persisted by the caller under the
+    /// identity [`super::next_lead_stage_id`] predicts.
+    ///
+    /// # Errors
+    /// Rejects runs that have not completed, runs with no lead stage, and
+    /// turns that cannot be numbered.
+    pub fn request_lead_turn(
+        &mut self,
+        metadata: EventMetadata,
+    ) -> Result<DomainEvent, RunFixError> {
+        if self.status != RunStatus::Completed {
+            return Err(RunFixError::RunNotCompleted(self.status));
+        }
+        let previous = self
+            .workflow
+            .stages()
+            .iter()
+            .rev()
+            .find(|stage| stage.kind() == StageKind::Lead)
+            .map(|stage| stage.id().clone())
+            .ok_or(RunFixError::NotALeadSession)?;
+        let index = u32::try_from(
+            self.workflow
+                .stages()
+                .iter()
+                .filter(|stage| stage.kind() == StageKind::Lead)
+                .count(),
+        )
+        .map_err(|_| RunFixError::TooManyCycles)?
+            + 1;
+        let additional = super::lead_turn_stages(index, &previous);
+        let stage_ids = additional
+            .iter()
+            .map(|stage| stage.id().clone())
+            .collect::<Vec<_>>();
+        let workflow = self.workflow.extended(additional)?;
+        let new_stages = workflow
+            .stages()
+            .iter()
+            .filter(|stage| stage_ids.contains(stage.id()))
+            .map(|definition| Stage::from_definition(self.id, definition))
+            .collect::<Vec<_>>();
+        self.workflow = workflow;
+        self.stages.extend(new_stages);
+        self.status = RunStatus::Running;
+        self.updated_at = metadata.occurred_at();
+        Ok(DomainEvent::new(
+            metadata,
+            self.id,
+            None,
+            DomainEventKind::RunContinueRequested { stage_ids },
+        ))
+    }
+
     /// Adds one pending attention request and moves stage/run to `NeedsUser`.
     ///
     /// # Errors
@@ -1301,6 +1358,8 @@ pub enum RunFixError {
     RunNotCompleted(RunStatus),
     #[error("run has no decision stage to answer")]
     NoDecisionToAnswer,
+    #[error("only a lead session takes another turn; this run has no lead stage")]
+    NotALeadSession,
     #[error("run has grown more remediation cycles than can be numbered")]
     TooManyCycles,
     #[error(transparent)]

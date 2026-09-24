@@ -148,8 +148,9 @@ the handoff a worker receives is rendered from mission state, package state
 follows committed run evidence, and integration is recorded only when a run
 was applied (or changed nothing). Missions are planned from the CLI
 (`polycode mission ...`); the control room's `M` screen lists them, starts a
-ready package, integrates a delivered one and opens a package's run. The
-lead conversation and the progress brief follow in later milestones. See
+ready package, integrates a delivered one and opens a package's run.
+`polycode mission ask` talks to the mission's lead, whose plan changes land
+only when you apply them. The progress brief follows in a later milestone. See
 [docs/features/missions.md](docs/features/missions.md) and
 [docs/missions-roadmap.md](docs/missions-roadmap.md).
 
