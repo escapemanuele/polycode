@@ -202,6 +202,20 @@ pub enum DomainEventKind {
         from_base: String,
         to_base: String,
     },
+    /// An operator pushed a completed run's delta to `origin`, onto `branch`
+    /// at `commit`, and — when GitHub answered — to the pull request at
+    /// `pull_request_url`.
+    ///
+    /// Transport, not disposition: the run stays `Completed`. Recorded so the
+    /// interface can say whether the run is already published and whether a
+    /// later fix, continue or rebase has left that publication behind; the
+    /// fact otherwise lives only on the remote.
+    RunPublished {
+        branch: String,
+        commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pull_request_url: Option<String>,
+    },
     UsageUpdated,
     /// What the native runtime's own records say it ran for this stage.
     ///

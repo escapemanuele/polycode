@@ -18,7 +18,7 @@ use super::input::{self, Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
 use super::state::{
-    Overlay, PublishInFlight, PublishOutcome, RetryRouteChoice, Screen, StageHeadline,
+    CycleChoice, Overlay, PublishInFlight, PublishOutcome, RetryRouteChoice, Screen, StageHeadline,
     StartFailure, StartInFlight, TuiState, UiMessageKind,
 };
 use super::terminal::TerminalSession;
@@ -292,7 +292,7 @@ impl TuiApp {
             Intent::Apply => self.open_apply_confirmation(),
             Intent::Rebase => self.open_rebase_confirmation(),
             Intent::Publish => self.open_publish_confirmation(),
-            Intent::Fix => self.request_fix(),
+            Intent::Fix => self.open_next_cycle(),
             Intent::Continue => self.open_continue(),
             Intent::FollowUps => self.open_follow_ups(),
             Intent::Discard => self.state.overlay = Some(Overlay::DiscardConfirm),
@@ -350,6 +350,7 @@ impl TuiApp {
             Overlay::Attention => self.handle_attention_intent(intent),
             Overlay::Continue => self.handle_continue_intent(intent),
             Overlay::FollowUps => self.handle_follow_ups_intent(intent),
+            Overlay::NextCycle => self.handle_next_cycle_intent(intent),
             Overlay::RetryRoute => self.handle_retry_route_intent(intent),
             Overlay::ApplyConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
@@ -1136,23 +1137,10 @@ impl TuiApp {
             );
             return;
         }
-        let Some(run_id) = self.state.selected_run else {
-            return;
-        };
-        let Some(decision_id) = self.state.details.as_ref().and_then(|details| {
-            details
-                .stages
-                .iter()
-                .rev()
-                .find(|stage| stage.kind == crate::domain::StageKind::Decision)
-                .map(|stage| stage.id.clone())
-        }) else {
-            return;
-        };
-        let text = match self.reader.read_artifact(run_id, &decision_id) {
-            Ok(artifact) => super::follow_ups::extract(&artifact.text),
+        let text = match self.decision_follow_ups() {
+            Ok(text) => text,
             Err(error) => {
-                self.state.set_error(error.to_string());
+                self.state.set_error(error);
                 return;
             }
         };
@@ -1166,6 +1154,94 @@ impl TuiApp {
         self.state.follow_ups_text = Some(text);
         self.state.follow_ups_as_new_run = false;
         self.state.overlay = Some(Overlay::FollowUps);
+    }
+
+    /// The selected run's latest decision's `## Follow-ups` section, if it
+    /// wrote one.
+    fn decision_follow_ups(&self) -> Result<Option<String>, String> {
+        let Some(run_id) = self.state.selected_run else {
+            return Ok(None);
+        };
+        let Some(decision_id) = self.state.details.as_ref().and_then(|details| {
+            details
+                .stages
+                .iter()
+                .rev()
+                .find(|stage| stage.kind == crate::domain::StageKind::Decision)
+                .map(|stage| stage.id.clone())
+        }) else {
+            return Ok(None);
+        };
+        self.reader
+            .read_artifact(run_id, &decision_id)
+            .map(|artifact| super::follow_ups::extract(&artifact.text))
+            .map_err(|error| error.to_string())
+    }
+
+    /// `[f]`: one key for every cycle a verdict can start.
+    ///
+    /// A run still working can only book a fix, so the key does that as it
+    /// always has. A finished run is offered each cycle it can take — fix,
+    /// continue, and Follow-ups only when the decision wrote them — and when
+    /// only one applies the picker is skipped.
+    fn open_next_cycle(&mut self) {
+        let fixable = self.state.run_can_be_fixed();
+        let continuable = self.state.run_can_be_continued();
+        if !fixable && !continuable {
+            self.request_fix();
+            return;
+        }
+        let mut choices = Vec::new();
+        if fixable {
+            choices.push(CycleChoice::Fix);
+        }
+        if continuable {
+            choices.push(CycleChoice::Continue);
+            // An unreadable decision only costs the picker this row; `[w]`
+            // still says why when pressed on its own.
+            if matches!(self.decision_follow_ups(), Ok(Some(_))) {
+                choices.push(CycleChoice::FollowUps);
+            }
+        }
+        if let [only] = choices[..] {
+            self.start_cycle(only);
+            return;
+        }
+        self.state.next_cycle_choices = choices;
+        self.state.next_cycle_selected = 0;
+        self.state.overlay = Some(Overlay::NextCycle);
+    }
+
+    fn handle_next_cycle_intent(&mut self, intent: Intent) {
+        let choices = self.state.next_cycle_choices.clone();
+        let picked = match intent {
+            Intent::Up => {
+                self.state.next_cycle_selected = self.state.next_cycle_selected.saturating_sub(1);
+                None
+            }
+            Intent::Down => {
+                self.state.next_cycle_selected =
+                    (self.state.next_cycle_selected + 1).min(choices.len().saturating_sub(1));
+                None
+            }
+            Intent::Enter => choices.get(self.state.next_cycle_selected).copied(),
+            Intent::Fix => Some(CycleChoice::Fix),
+            Intent::Continue => Some(CycleChoice::Continue),
+            Intent::FollowUps => Some(CycleChoice::FollowUps),
+            _ => None,
+        };
+        if let Some(choice) = picked.filter(|choice| choices.contains(choice)) {
+            self.state.overlay = None;
+            self.start_cycle(choice);
+        }
+    }
+
+    fn start_cycle(&mut self, choice: CycleChoice) {
+        match choice {
+            CycleChoice::Fix => self.request_fix(),
+            CycleChoice::Continue => self.open_continue(),
+            CycleChoice::FollowUps => self.open_follow_ups(),
+        }
     }
 
     fn handle_follow_ups_intent(&mut self, intent: Intent) {
@@ -1406,6 +1482,26 @@ impl TuiApp {
         if !self.state.run_is_applyable() {
             self.state
                 .notify(UiMessageKind::Info, apply_unavailable_reason(&self.state));
+            return;
+        }
+        // Already pushed with nothing newer: there is nothing to send, so the
+        // key goes to where the work already is.
+        let current_url = self
+            .state
+            .details
+            .as_ref()
+            .and_then(|details| details.publication.as_ref())
+            .filter(|publication| !publication.outdated)
+            .and_then(|publication| publication.pull_request_url.clone());
+        if let Some(url) = current_url {
+            match desktop::open_in_browser(&url) {
+                Ok(()) => self
+                    .state
+                    .set_message(format!("Already pushed — opened {url}")),
+                Err(reason) => self
+                    .state
+                    .set_error(format!("Could not open the browser: {reason}")),
+            }
             return;
         }
         match self.reader.preview_run_diff(run_id) {
@@ -2271,6 +2367,7 @@ mod tests {
             finished_at: None,
             failure_reason: None,
             image_generations: Vec::new(),
+            publication: None,
         }
     }
 
@@ -2336,6 +2433,12 @@ mod tests {
         ] {
             let (mut app, _fixture) = app_with(run);
             app.handle_intent(Intent::Fix);
+            // A run that can also continue gets the picker first; `f` there
+            // picks the fix.
+            if app.state.overlay == Some(Overlay::NextCycle) {
+                assert_eq!(app.state.next_cycle_choices[0], CycleChoice::Fix);
+                app.handle_intent(Intent::Fix);
+            }
             assert_eq!(
                 app.state.busy_label().as_deref(),
                 Some("fixing run"),
@@ -2572,6 +2675,37 @@ mod tests {
             let (app, _fixture) = app_with(run);
             assert!(!app.state.run_can_be_continued(), "{label}");
         }
+    }
+
+    /// `[f]` on a finished run that can take more than one cycle asks which;
+    /// the arrows and Enter pick, and so does each cycle's own key.
+    #[test]
+    fn next_cycle_offers_each_cycle_the_run_can_take() {
+        let (mut app, _fixture) = app_with(decided(details(
+            RunStatus::Completed,
+            WorkflowKind::Standard,
+        )));
+        app.handle_intent(Intent::Fix);
+        assert_eq!(app.state.overlay, Some(Overlay::NextCycle));
+        // No Follow-ups section was written, so none is offered.
+        assert_eq!(
+            app.state.next_cycle_choices,
+            vec![CycleChoice::Fix, CycleChoice::Continue]
+        );
+        app.handle_intent(Intent::Down);
+        app.handle_intent(Intent::Enter);
+        assert_eq!(app.state.overlay, Some(Overlay::Continue));
+
+        app.state.overlay = None;
+        app.handle_intent(Intent::Fix);
+        app.handle_intent(Intent::FollowUps);
+        assert_eq!(
+            app.state.overlay,
+            Some(Overlay::NextCycle),
+            "a cycle not on offer is not picked"
+        );
+        app.handle_intent(Intent::Continue);
+        assert_eq!(app.state.overlay, Some(Overlay::Continue));
     }
 
     /// `[c]` opens the overlay only where eligible, and explains itself

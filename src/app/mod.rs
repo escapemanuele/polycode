@@ -23,7 +23,7 @@ pub use provider_factory::{
 pub use query::{
     ArtifactSummary, ArtifactView, AttentionSummary, BlockedDependencyRef, CODEX_FALLBACK_MODEL,
     ChangedFileSummary, CommittedEvent, ImageGenerationSummary, ProcessLogStream, ProcessLogView,
-    ProviderUsage, RouteSummary, RunDetails, RunDiffPreview, RunListItem, RunUsage,
+    ProviderUsage, Publication, RouteSummary, RunDetails, RunDiffPreview, RunListItem, RunUsage,
     StageDependencyRef, StageExecutionEvidence, StageSummary, StageWaitingSummary, UsageSummary,
 };
 pub(crate) use routing::resolve_eval_config;

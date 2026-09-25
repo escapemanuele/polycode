@@ -557,6 +557,36 @@ impl Run {
         ))
     }
 
+    /// Records that the run's delta reached `origin`.
+    ///
+    /// Not a lifecycle transition: publishing is transport, and the run stays
+    /// `Completed` so apply, fix and discard all remain available after it.
+    ///
+    /// # Errors
+    /// Rejects runs that have not completed: only a completed run publishes.
+    pub fn published(
+        &mut self,
+        metadata: EventMetadata,
+        branch: String,
+        commit: String,
+        pull_request_url: Option<String>,
+    ) -> Result<DomainEvent, RunPublishError> {
+        if self.status != RunStatus::Completed {
+            return Err(RunPublishError::RunNotCompleted(self.status));
+        }
+        self.updated_at = metadata.occurred_at();
+        Ok(DomainEvent::new(
+            metadata,
+            self.id,
+            None,
+            DomainEventKind::RunPublished {
+                branch,
+                commit,
+                pull_request_url,
+            },
+        ))
+    }
+
     /// Grows a completed run by one remediation cycle and reopens it.
     ///
     /// A run whose decision the operator rejects has everything the fix needs
@@ -1364,6 +1394,12 @@ pub enum RunFixError {
     TooManyCycles,
     #[error(transparent)]
     Workflow(#[from] WorkflowDefinitionError),
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum RunPublishError {
+    #[error("only a completed run can be published; this run is {0:?}")]
+    RunNotCompleted(RunStatus),
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]

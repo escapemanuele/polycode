@@ -28,7 +28,7 @@ polycode pr <run-id>
 polycode discard <run-id>
 polycode status <run-id>      # Workspace and Base lines
 ```
-TUI run detail: `d` diff preview, `a` then Enter apply, `b` then Enter rebase onto HEAD, `P` then Enter push to PR (a "pushing to PR" card while it runs, then a result card with the PR URL: `o` open, `y` copy), `X` then Enter discard.
+TUI run detail: `d` diff preview, `a` then Enter apply, `b` then Enter rebase onto HEAD, `P` then Enter push to PR (a "pushing to PR" card while it runs, then a result card with the PR URL: `o` open, `y` copy), `X` then Enter discard. `b` is not on the action row; the apply refusal names it.
 
 CLI `pr` prints its progress line to stderr and the receipt (branch, commit, elapsed, PR URL on its own line) to stdout.
 
@@ -59,6 +59,7 @@ CLI `pr` prints its progress line to stderr and the receipt (branch, commit, ela
 - A resolved pull request whose remote tip is already an ancestor of the commit is pushed onto directly. A tip that is not — the pull request gained commits while the run worked, or the fix cycle's worktree was based on a checkout that was never on that branch — is **replayed onto**: `land_on_moved_pull_request` runs `git rebase --onto <tip> <base>` in the worktree (`replay_onto_pull_request`, the same move `rebase` makes onto a checkout that walked on), pushes the replayed commit onto the PR's branch, and says so in the note. The push still fast-forwards; nothing is force-pushed.
 - The replay records the new base through `rebase_workspace_base`, exactly as `rebase` does, because the recorded base is what apply diffs against — left behind, a later apply would carry the pull request's own commits as if the run had written them. Verification goes stale with it, so `apply` refuses until a later cycle's check passes on the new base.
 - A conflicting replay aborts and changes nothing: the work is pushed to the run's own branch and **no pull request is opened for it**. Everywhere else a fallback opens one; here the place to read the change already exists and is named in the run's task, so a second one would be the duplicate this path exists to avoid. The card reads `BRANCH PUSHED`, the reason names the conflict, and the note says where the work is.
+- publish-record: every successful push commits a `RunPublished { branch, commit, pull_request_url }` run event. `RunDetails::publication` folds the latest one and marks it `outdated` when a `RunFixRequested`, `RunContinueRequested` or `WorkspaceRebased` follows it; the TUI's `P` label reads from it, and `P` on a current publication with a URL opens the PR rather than pushing. Runs published before this event existed read as not pushed.
 - After `pr` the run stays `Completed`, so apply, fix and discard remain available; publishing again after a fix updates the same branch and PR. The PR body is only written on creation: a fix's fresh draft changes the commit subject but not an already-open PR's text.
 - The drafted title is cut at 72 characters; a corrupt latest editing artifact fails the publish (artifact integrity fails closed) rather than silently publishing from the task.
 - Discard commits the logical disposition before cleanup; cleanup is idempotent and retains process files. Branch deletion needs persisted ownership and an unchanged tip, otherwise the workspace turns `Broken` and the branch is kept.

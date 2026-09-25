@@ -774,6 +774,23 @@ impl WorkspaceManager {
                     (branch, pull_request, note)
                 }
             };
+        // Reloaded: a replay onto a moved pull request has already committed
+        // its rebase against the run loaded above.
+        let loaded = store.load_run(run_id)?;
+        let mut run = loaded.run;
+        let url = match &pull_request {
+            PullRequestStatus::Created(url) | PullRequestStatus::AlreadyExists(url) => {
+                Some(url.clone())
+            }
+            PullRequestStatus::Unavailable(_) => None,
+        };
+        let event = run.published(
+            metadata(next_time(&run)),
+            branch.clone(),
+            commit.clone(),
+            url,
+        )?;
+        store.commit_run_update(&run, loaded.revision, &[event])?;
         Ok(PublishReceipt {
             branch,
             commit,
@@ -1405,7 +1422,7 @@ impl WorkspaceManager {
                 );
                 format!(
                     "the checkout {moved} this run's base {}, and the two edits touch the same \
-                     lines — `polycode rebase {}` replays the change on the checkout's HEAD",
+                     lines — `polycode rebase {}` (`b` in the TUI) replays the change on the checkout's HEAD",
                     short(base),
                     workspace.run_id()
                 )
@@ -3727,6 +3744,15 @@ mod tests {
             fixture.store.load_run(fixture.run_id).unwrap().run.status(),
             RunStatus::Completed
         );
+        // And remembers where it went, so the interface can say so.
+        let events = fixture.store.load_events(fixture.run_id).unwrap();
+        assert!(events.iter().any(|sequenced| matches!(
+            sequenced.event.kind(),
+            DomainEventKind::RunPublished { branch: pushed, commit, pull_request_url }
+                if *pushed == branch
+                    && *commit == receipt.commit
+                    && pull_request_url.as_deref() == Some("https://example.invalid/pull/7")
+        )));
     }
 
     #[test]
