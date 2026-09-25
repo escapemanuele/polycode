@@ -27,7 +27,7 @@ polycode deep "<task>"
 polycode review "<task>"
 polycode fix <run-id>
 ```
-TUI run detail: `f` fix (or book a fix while the run is still working; press again to cancel the booking), `c` continue with a typed instruction (Enter submits, Esc cancels), `w` work on the decision's Follow-ups (↑/↓ toggles "in this run" / "as a new run", Enter confirms).
+TUI run detail: `f` next cycle — on a finished run a picker of Fix / Continue / Follow-ups (↑/↓ + Enter, or the cycle's own key; Follow-ups only when the decision wrote that section; skipped when only one applies), on a working run books a fix (press again to cancel the booking); `c` continue with a typed instruction (Enter submits, Esc cancels), `w` work on the decision's Follow-ups (↑/↓ toggles "in this run" / "as a new run", Enter confirms).
 
 ## Where it lives
 - `src/domain/workflow.rs` — `WorkflowKind`, `StageKind` (incl. `Fix`, `FollowUp`, `Verify`), built-in DAGs, `fix_cycle_stages`, `continue_cycle_stages`, `next_follow_up_stage_id`, `requires_writable_workspace`, `without_verification`.

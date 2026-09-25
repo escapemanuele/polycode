@@ -1314,8 +1314,8 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         return;
     };
     let applyable = state.run_is_applyable();
-    let fix = FixOffer::of(state);
-    let continuable = state.run_can_be_continued();
+    let cycle = cycle_label(state);
+    let publish = publish_action(details);
     let mut lines = if applyable {
         completed_hero(details, width, now)
     } else {
@@ -1344,7 +1344,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
         lines.push(Line::from(""));
         lines.push(Line::from(theme::chip("READY TO REVIEW", theme::success())));
         lines.push(Line::from(""));
-        lines.extend(hero_actions(applyable, fix, continuable, selected.status));
+        lines.extend(hero_actions(applyable, cycle, &publish, selected.status));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1378,7 +1378,7 @@ fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &Ru
             .map(|line| Line::from(Span::styled(line, theme::text()))),
     );
     if !applyable {
-        let actions = hero_actions(applyable, fix, continuable, selected.status);
+        let actions = hero_actions(applyable, cycle, &publish, selected.status);
         if actions
             .iter()
             .all(|line| span_width(&line.spans) <= width as usize)
@@ -1886,10 +1886,51 @@ impl FixOffer {
     }
 }
 
+/// The one key that starts another cycle on a run's verdict. A finished run
+/// may be fixed, continued or sent after its Follow-ups, and `[f]` opens the
+/// choice between them; a run still working can only book a fix.
+fn cycle_label(state: &TuiState) -> Option<&'static str> {
+    if state.run_can_be_fixed() || state.run_can_be_continued() {
+        Some("Next cycle…")
+    } else {
+        FixOffer::of(state).label()
+    }
+}
+
+/// What `[P]` does for this run, and how it says so: push a run never
+/// published, update a pull request a later cycle has left behind, or open
+/// the one that already carries everything.
+fn publish_action(details: &crate::app::RunDetails) -> (String, Color) {
+    match details.publication.as_ref() {
+        None => ("Push to PR · not pushed".to_owned(), theme::success()),
+        Some(publication) if publication.outdated => (
+            format!("Update {} · behind", publication_name(publication)),
+            theme::attention(),
+        ),
+        Some(publication) => (
+            format!("Pushed ✓ {}", publication_name(publication)),
+            theme::muted_color(),
+        ),
+    }
+}
+
+/// `PR #123` when the pull request is known, the branch otherwise.
+fn publication_name(publication: &crate::app::Publication) -> String {
+    publication
+        .pull_request_url
+        .as_deref()
+        .and_then(|url| url.rsplit('/').next())
+        .filter(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .map_or_else(
+            || publication.branch.clone(),
+            |number| format!("PR #{number}"),
+        )
+}
+
 fn hero_actions(
     applyable: bool,
-    fix: FixOffer,
-    continuable: bool,
+    cycle: Option<&'static str>,
+    publish: &(String, Color),
     status: StageStatus,
 ) -> Vec<Line<'static>> {
     let mut spans = Vec::new();
@@ -1898,14 +1939,11 @@ fn hero_actions(
         spans.push(Span::raw("   "));
         spans.extend(theme::action("a", "Apply changes", theme::success()));
         spans.push(Span::raw("   "));
-        spans.extend(theme::action("b", "Rebase onto HEAD", theme::attention()));
-        spans.push(Span::raw("   "));
-        spans.extend(theme::action("P", "Push to PR", theme::success()));
-        if let Some(label) = fix.label() {
+        spans.extend(theme::action("P", &publish.0, publish.1));
+        if let Some(label) = cycle {
             spans.push(Span::raw("   "));
             spans.extend(theme::action("f", label, theme::attention()));
         }
-        spans.extend(continue_action_spans(continuable));
         spans.push(Span::raw("   "));
         spans.extend(theme::action("X", "Discard", theme::danger()));
     } else if status == StageStatus::Failed {
@@ -1921,30 +1959,13 @@ fn hero_actions(
         spans.push(Span::raw("   "));
         spans.extend(theme::action("d", "Diff", theme::accent()));
         // A review reaches a verdict without ever becoming applyable, so this
-        // is the only place its fix and continue cycle are ever offered.
-        if let Some(label) = fix.label() {
+        // is the only place its next cycle is ever offered.
+        if let Some(label) = cycle {
             spans.push(Span::raw("   "));
             spans.extend(theme::action("f", label, theme::attention()));
         }
-        spans.extend(continue_action_spans(continuable));
     }
-    spans.push(Span::raw("   "));
-    spans.extend(theme::action("i", "Details", theme::muted_color()));
     vec![Line::from(spans)]
-}
-
-/// The `[c]`/`[w]` pair, offered together: both answer a decision the same
-/// way `[f]` Fix does, so whichever cycle the operator picks starts from the
-/// same completed-and-decided run.
-fn continue_action_spans(continuable: bool) -> Vec<Span<'static>> {
-    if !continuable {
-        return Vec::new();
-    }
-    let mut spans = vec![Span::raw("   ")];
-    spans.extend(theme::action("c", "Continue", theme::attention()));
-    spans.push(Span::raw("   "));
-    spans.extend(theme::action("w", "Follow-ups", theme::attention()));
-    spans
 }
 
 /// Human stage name for operational rows; technical mode keeps the raw
@@ -2437,14 +2458,12 @@ fn run_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)
     } else if state.run_is_applyable() {
         push("d", "Review diff", theme::accent());
         push("a", "Apply", theme::success());
-        push("b", "Rebase", theme::attention());
-        push("P", "Push to PR", theme::success());
-        if let Some(label) = FixOffer::of(state).label() {
-            push("f", label, theme::attention());
+        if let Some(details) = state.details.as_ref() {
+            let (label, color) = publish_action(details);
+            push("P", &label, color);
         }
-        if state.run_can_be_continued() {
-            push("c", "Continue", theme::attention());
-            push("w", "Follow-ups", theme::attention());
+        if let Some(label) = cycle_label(state) {
+            push("f", label, theme::attention());
         }
         push("X", "Discard", theme::danger());
     } else {
@@ -2454,12 +2473,8 @@ fn run_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)
         if stage_status == Some(StageStatus::Failed) {
             push("t", "Retry", theme::attention());
         }
-        if let Some(label) = FixOffer::of(state).label() {
+        if let Some(label) = cycle_label(state) {
             push("f", label, theme::attention());
-        }
-        if state.run_can_be_continued() {
-            push("c", "Continue", theme::attention());
-            push("w", "Follow-ups", theme::attention());
         }
         // A running run normally has its driver in this process and
         // needs no key; one nobody holds was left behind by a dead
@@ -2705,7 +2720,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  P pull request (push branch, confirmation; the result card takes o open / y copy URL)\n  X discard (confirmation)\n  f fix a completed run's decision\n  c continue a completed run with a new instruction\n  w work on a decision's Follow-ups\n\nMission\n  Enter open the selected package's run\n  S start the selected package (composer's Execution/Effort)\n  u answer what the selected package's run asks\n  I bring the selected finished package in: apply its run, record it (confirmation)\n  A auto-approve permission requests for this mission's runs\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  b rebase onto the checkout's HEAD, when apply says it moved (confirmation)\n  P pull request (push branch, confirmation; once pushed and current, opens it)\n  X discard (confirmation)\n  f next cycle: fix, continue or Follow-ups (books a fix while running)\n  c / w jump straight to continue / Follow-ups\n  i technical details\n\nMission\n  Enter open the selected package's run\n  S start the selected package (composer's Execution/Effort)\n  u answer what the selected package's run asks\n  I bring the selected finished package in: apply its run, record it (confirmation)\n  A auto-approve permission requests for this mission's runs\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -2720,6 +2735,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::DeleteConfirm => render_delete_confirmation(frame, popup, state),
         Overlay::Continue => render_continue(frame, popup, state),
         Overlay::FollowUps => render_follow_ups(frame, popup, state),
+        Overlay::NextCycle => render_next_cycle(frame, popup, state),
         Overlay::RetryRoute => render_retry_route(frame, popup, state),
         Overlay::Publishing => render_publishing(frame, area, state),
         Overlay::Published => render_published(frame, area, state),
@@ -3275,6 +3291,41 @@ fn render_continue(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 /// Two-option chooser for `[w]` Work on follow-ups: continue the operator's
 /// own extracted text in this run, or hand it to a new run's composer.
 /// Mirrors the update prompt's own up/down toggle.
+fn render_next_cycle(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let mut lines = vec![
+        Line::from(theme::chip("NEXT CYCLE", theme::attention())),
+        Line::from(""),
+    ];
+    for (index, choice) in state.next_cycle_choices.iter().enumerate() {
+        let selected = index == state.next_cycle_selected;
+        let mut spans = vec![Span::styled(
+            if selected { "  → " } else { "    " },
+            Style::default().fg(theme::attention()),
+        )];
+        spans.extend(theme::action(choice.key(), "", theme::attention()));
+        spans.push(Span::styled(
+            choice.label(),
+            if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                theme::muted()
+            },
+        ));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ choose · Enter or key confirm · Esc cancel",
+        theme::muted(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(" Start another cycle ", theme::attention())),
+        area,
+    );
+}
+
 fn render_follow_ups(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let mut lines = vec![
         Line::from(theme::chip("FOLLOW-UPS", theme::attention())),
@@ -3902,6 +3953,7 @@ mod tests {
             finished_at: None,
             failure_reason: None,
             image_generations: Vec::new(),
+            publication: None,
         }
     }
 
@@ -4859,11 +4911,11 @@ mod tests {
         assert!(!narrow.contains("? help"), "navigation yields first");
     }
 
-    /// A run whose sealed configuration routes both cycle roles offers `[c]`
-    /// Continue and `[w]` Follow-ups beside `[f]` Fix, in both the footer
-    /// and the hero panel; one that cannot route them offers neither.
+    /// Fix, continue and Follow-ups share one key: a run that can take any
+    /// of them offers `[f]` Next cycle in both the footer and the hero panel,
+    /// and never lists `[c]` or `[w]` beside it.
     #[test]
-    fn continue_and_follow_ups_hints_follow_the_same_gate_as_fix() {
+    fn every_cycle_is_offered_behind_the_one_next_cycle_key() {
         let mut continuable = completed_with_failure_details();
         continuable.routes.push(RouteSummary {
             role: Role::EngineeringLead,
@@ -4878,16 +4930,41 @@ mod tests {
         state.replace_details(continuable);
 
         let actions = actions_text(&state);
-        assert!(actions.contains(" c  Continue"));
-        assert!(actions.contains(" w  Follow-ups"));
+        assert!(actions.contains(" f  Next cycle…"));
         let text = render_text(&state, 160, 40);
-        assert!(text.contains(" c  Continue"));
-        assert!(text.contains(" w  Follow-ups"));
+        assert!(text.contains(" f  Next cycle…"));
+        for folded in [" c  Continue", " w  Follow-ups", " b  Rebase"] {
+            assert!(!actions.contains(folded), "footer lists {folded}");
+            assert!(!text.contains(folded), "panel lists {folded}");
+        }
+        // Details stays in the footer only; the panel's row is for decisions.
+        let hero: String = hero_actions(
+            true,
+            cycle_label(&state),
+            &publish_action(state.details.as_ref().unwrap()),
+            StageStatus::Completed,
+        )
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+        .collect();
+        assert!(!hero.contains("Details"));
+    }
 
-        // Without the EngineeringLead route, neither cycle can be offered.
-        let unroutable = actions_text(&completed_with_failure_state());
-        assert!(!unroutable.contains("Continue"));
-        assert!(!unroutable.contains("Follow-ups"));
+    /// `[P]` says whether the run is already on its pull request.
+    #[test]
+    fn push_to_pr_says_whether_the_run_is_already_pushed() {
+        let mut details = completed_with_failure_details();
+        assert_eq!(publish_action(&details).0, "Push to PR · not pushed");
+        details.publication = Some(crate::app::Publication {
+            branch: "polycode/run-3".to_owned(),
+            pull_request_url: Some("https://github.com/o/r/pull/123".to_owned()),
+            outdated: false,
+        });
+        assert_eq!(publish_action(&details).0, "Pushed ✓ PR #123");
+        details.publication.as_mut().unwrap().outdated = true;
+        assert_eq!(publish_action(&details).0, "Update PR #123 · behind");
+        details.publication.as_mut().unwrap().pull_request_url = None;
+        assert_eq!(publish_action(&details).0, "Update polycode/run-3 · behind");
     }
 
     #[test]

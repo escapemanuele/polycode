@@ -35,6 +35,35 @@ pub(crate) enum Screen {
     MissionDetail,
 }
 
+/// One way to answer a finished run's verdict with another cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CycleChoice {
+    /// Resolve the findings the decision called blocking.
+    Fix,
+    /// Carry on with an instruction of the operator's own.
+    Continue,
+    /// Work on the decision's own `## Follow-ups` section.
+    FollowUps,
+}
+
+impl CycleChoice {
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::Fix => "f",
+            Self::Continue => "c",
+            Self::FollowUps => "w",
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Fix => "Fix it — answer the verdict's findings",
+            Self::Continue => "Continue — give a new instruction",
+            Self::FollowUps => "Follow-ups — work on the decision's suggestions",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Overlay {
     Help,
@@ -53,6 +82,9 @@ pub(crate) enum Overlay {
     Update,
     /// Free-text "how should the agent continue?" prompt for `[c]`.
     Continue,
+    /// Which cycle `[f]` starts on a finished run's verdict: fix it, continue
+    /// with a new instruction, or work on its Follow-ups.
+    NextCycle,
     /// "In this run" or "as a new run" chooser for `[w]`, once a Follow-ups
     /// section has actually been extracted from the decision artifact.
     FollowUps,
@@ -697,6 +729,9 @@ pub(crate) struct TuiState {
     /// run", `true` for "as a new run". Mirrors the update prompt's own
     /// two-option toggle.
     pub follow_ups_as_new_run: bool,
+    /// The cycles the `[f]` picker offers, and the one under the cursor.
+    pub next_cycle_choices: Vec<CycleChoice>,
+    pub next_cycle_selected: usize,
     /// Which row the `[t]` chooser has highlighted.
     pub retry_route_choice: RetryRouteChoice,
     pub new_run: NewRunForm,
@@ -794,6 +829,8 @@ impl TuiState {
             continue_instruction: TextField::default(),
             follow_ups_text: None,
             follow_ups_as_new_run: false,
+            next_cycle_choices: Vec::new(),
+            next_cycle_selected: 0,
             retry_route_choice: RetryRouteChoice::Configured,
             new_run: NewRunForm::new(repository),
             in_flight: Vec::new(),

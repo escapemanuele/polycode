@@ -96,6 +96,8 @@ pub enum WorkspaceError {
     },
     #[error("run lifecycle rejected the rebase: {0}")]
     RunRebase(#[from] crate::domain::RunRebaseError),
+    #[error("run lifecycle rejected the publish: {0}")]
+    RunPublish(#[from] crate::domain::RunPublishError),
     /// The source checkout is not ahead of the run's base, so there is no
     /// newer `HEAD` to move onto.
     #[error("run {run_id} is already based on the source checkout's HEAD {base}")]

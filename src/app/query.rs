@@ -341,6 +341,50 @@ pub struct RunDetails {
     /// Every image the image-generation tool wrote for this run, in order.
     /// Empty for every run that never held the grant.
     pub image_generations: Vec<ImageGenerationSummary>,
+    /// The run's latest publish, if it was ever pushed.
+    pub publication: Option<Publication>,
+}
+
+/// Where a run's delta was last pushed, and whether that push still carries
+/// everything the run has produced since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Publication {
+    pub branch: String,
+    pub pull_request_url: Option<String>,
+    /// A fix or continue cycle, or a rebase, came after the push, so the
+    /// remote no longer has the run's latest work.
+    pub outdated: bool,
+}
+
+/// Folds the latest `RunPublished` out of the log, marking it outdated when
+/// any event that changes the delta — a new cycle or a rebase — follows it.
+fn publication(events: &[SequencedEvent]) -> Option<Publication> {
+    let (index, branch, pull_request_url) =
+        events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, sequenced)| match sequenced.event.kind() {
+                DomainEventKind::RunPublished {
+                    branch,
+                    pull_request_url,
+                    ..
+                } => Some((index, branch.clone(), pull_request_url.clone())),
+                _ => None,
+            })?;
+    let outdated = events[index + 1..].iter().any(|sequenced| {
+        matches!(
+            sequenced.event.kind(),
+            DomainEventKind::RunFixRequested { .. }
+                | DomainEventKind::RunContinueRequested { .. }
+                | DomainEventKind::WorkspaceRebased { .. }
+        )
+    });
+    Some(Publication {
+        branch,
+        pull_request_url,
+        outdated,
+    })
 }
 
 /// One image-generation evidence row as the operator sees it. Says which
@@ -624,6 +668,7 @@ pub(crate) fn inspect(store: &mut SqliteStore, run_id: RunId) -> Result<RunDetai
         .flatten();
     let auto_approve = store.run_auto_approve(run_id)?;
     Ok(RunDetails {
+        publication: publication(&events),
         id: loaded.run.id(),
         auto_approve,
         task: input.map(|input| input.task().to_owned()),
@@ -1933,5 +1978,56 @@ mod tests {
             task_summary(Some("See https://example.com/a/b/pull/3")),
             "See https://example.com/a/b/pull/3"
         );
+    }
+
+    #[test]
+    fn publication_is_outdated_once_a_later_cycle_or_rebase_moves_the_delta() {
+        use crate::domain::RunId;
+        let run_id = RunId::from_u128(1);
+        let event = |sequence: u64, kind: DomainEventKind| SequencedEvent {
+            sequence,
+            event: DomainEvent::new(
+                EventMetadata::new(EventId::new(), at(9, 0, 0)),
+                run_id,
+                None,
+                kind,
+            ),
+        };
+        let published = || DomainEventKind::RunPublished {
+            branch: "polycode/run-1".to_owned(),
+            commit: "abc".to_owned(),
+            pull_request_url: Some("https://github.com/o/r/pull/9".to_owned()),
+        };
+        assert_eq!(publication(&[]), None);
+        let current = publication(&[event(1, published())]).unwrap();
+        assert!(!current.outdated);
+        assert_eq!(
+            current.pull_request_url.as_deref(),
+            Some("https://github.com/o/r/pull/9")
+        );
+        for later in [
+            DomainEventKind::RunFixRequested { stage_ids: vec![] },
+            DomainEventKind::RunContinueRequested { stage_ids: vec![] },
+            DomainEventKind::WorkspaceRebased {
+                from_base: "a".to_owned(),
+                to_base: "b".to_owned(),
+            },
+        ] {
+            assert!(
+                publication(&[event(1, published()), event(2, later.clone())])
+                    .unwrap()
+                    .outdated
+            );
+            // Publishing again after it catches the remote up.
+            assert!(
+                !publication(&[
+                    event(1, published()),
+                    event(2, later),
+                    event(3, published())
+                ])
+                .unwrap()
+                .outdated
+            );
+        }
     }
 }
