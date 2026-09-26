@@ -1902,7 +1902,7 @@ fn cycle_label(state: &TuiState) -> Option<&'static str> {
 /// the one that already carries everything.
 fn publish_action(details: &crate::app::RunDetails) -> (String, Color) {
     match details.publication.as_ref() {
-        None => ("Push to PR · not pushed".to_owned(), theme::success()),
+        None => ("Push to PR".to_owned(), theme::success()),
         Some(publication) if publication.outdated => (
             format!("Update {} · behind", publication_name(publication)),
             theme::attention(),
@@ -1914,17 +1914,14 @@ fn publish_action(details: &crate::app::RunDetails) -> (String, Color) {
     }
 }
 
-/// `PR #123` when the pull request is known, the branch otherwise.
+/// `#123` when the pull request is known, the branch otherwise.
 fn publication_name(publication: &crate::app::Publication) -> String {
     publication
         .pull_request_url
         .as_deref()
         .and_then(|url| url.rsplit('/').next())
         .filter(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
-        .map_or_else(
-            || publication.branch.clone(),
-            |number| format!("PR #{number}"),
-        )
+        .map_or_else(|| publication.branch.clone(), |number| format!("#{number}"))
 }
 
 fn hero_actions(
@@ -1934,9 +1931,9 @@ fn hero_actions(
     status: StageStatus,
 ) -> Vec<Line<'static>> {
     let mut spans = Vec::new();
+    // The three ways a finished run can go. Its diff is one key away in
+    // either confirmation, and discard waits in the footer.
     if applyable {
-        spans.extend(theme::action("d", "Review diff", theme::accent()));
-        spans.push(Span::raw("   "));
         spans.extend(theme::action("a", "Apply changes", theme::success()));
         spans.push(Span::raw("   "));
         spans.extend(theme::action("P", &publish.0, publish.1));
@@ -1944,8 +1941,6 @@ fn hero_actions(
             spans.push(Span::raw("   "));
             spans.extend(theme::action("f", label, theme::attention()));
         }
-        spans.push(Span::raw("   "));
-        spans.extend(theme::action("X", "Discard", theme::danger()));
     } else if status == StageStatus::Failed {
         spans.extend(theme::action("l", "Logs", theme::accent()));
         spans.push(Span::raw("   "));
@@ -2456,15 +2451,8 @@ fn run_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)
         push("l", "Logs", theme::accent());
         push("s", "Stop", theme::attention());
     } else if state.run_is_applyable() {
-        push("d", "Review diff", theme::accent());
-        push("a", "Apply", theme::success());
-        if let Some(details) = state.details.as_ref() {
-            let (label, color) = publish_action(details);
-            push("P", &label, color);
-        }
-        if let Some(label) = cycle_label(state) {
-            push("f", label, theme::attention());
-        }
+        // The panel's own row carries apply, push and the next cycle; the
+        // footer holds only what that row leaves out.
         push("X", "Discard", theme::danger());
     } else {
         push("o", "Result", theme::accent());
@@ -2720,7 +2708,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  b rebase onto the checkout's HEAD, when apply says it moved (confirmation)\n  P pull request (push branch, confirmation; once pushed and current, opens it)\n  X discard (confirmation)\n  f next cycle: fix, continue or Follow-ups (books a fix while running)\n  c / w jump straight to continue / Follow-ups\n  i technical details\n\nMission\n  Enter open the selected package's run\n  S start the selected package (composer's Execution/Effort)\n  u answer what the selected package's run asks\n  I bring the selected finished package in: apply its run, record it (confirmation)\n  A auto-approve permission requests for this mission's runs\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only; also from the apply/push confirmation)\n  a apply (confirmation; a checkout that moved on is offered a rebase)\n  b rebase onto the checkout's HEAD (confirmation)\n  P pull request (push branch, confirmation; once pushed and current, opens it)\n  X discard (confirmation)\n  f next cycle: fix, continue or Follow-ups (books a fix while running)\n  c / w jump straight to continue / Follow-ups\n  i technical details\n\nMission\n  Enter open the selected package's run\n  S start the selected package (composer's Execution/Effort)\n  u answer what the selected package's run asks\n  I bring the selected finished package in: apply its run, record it (confirmation)\n  A auto-approve permission requests for this mission's runs\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -3380,6 +3368,25 @@ enum Confirmation {
     Discard,
 }
 
+/// Why the rebase confirmation is open, when an apply refusal opened it.
+fn apply_refusal_lines(state: &TuiState, confirmation: Confirmation) -> Vec<Line<'static>> {
+    let Some(reason) = state
+        .rebase_reason
+        .as_ref()
+        .filter(|_| confirmation == Confirmation::Rebase)
+    else {
+        return Vec::new();
+    };
+    vec![
+        Line::from(Span::styled(
+            "Apply was refused: the checkout moved on since this run started.",
+            theme::attention(),
+        )),
+        Line::from(Span::styled(reason.clone(), theme::muted())),
+        Line::from(""),
+    ]
+}
+
 fn render_confirmation(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3416,6 +3423,7 @@ fn render_confirmation(
         Line::from(Span::styled(format!("run {}", details.id), theme::muted())),
         Line::from(""),
     ];
+    lines.extend(apply_refusal_lines(state, confirmation));
     if confirmation == Confirmation::Discard {
         lines.push(Line::from(
             "Discard is logical disposition; owned cleanup follows application semantics.",
@@ -3457,7 +3465,7 @@ fn render_confirmation(
             lines.push(Line::from(""));
         }
         lines.push(Line::from(match confirmation {
-            Confirmation::Apply => "Review [d] diff first when needed. Enter confirms apply.",
+            Confirmation::Apply => "[d] shows the full diff. Enter confirms apply.",
             Confirmation::Rebase => {
                 "Replays this run's change on your checkout's current HEAD, on the run's own \
                  branch. A conflict stops and changes nothing. Verification has to run again \
@@ -3465,7 +3473,7 @@ fn render_confirmation(
             }
             _ => {
                 "Commits on the run's branch, pushes to origin, opens a pull request. \
-                 Your checkout is untouched. Enter confirms."
+                 Your checkout is untouched. [d] shows the full diff. Enter confirms."
             }
         }));
     }
@@ -4890,10 +4898,13 @@ mod tests {
         assert!(!actions.contains(" a  Apply"), "no apply while running");
         assert!(actions.contains(" o  Result"));
 
+        // A finished run's apply lives on the panel's own row; the footer
+        // keeps only what that row leaves out.
         let completed = completed_state();
         let actions = actions_text(&completed);
-        assert!(actions.contains(" a  Apply"));
+        assert!(!actions.contains(" a  Apply"));
         assert!(actions.contains(" X  Discard"));
+        assert!(render_text(&completed, 160, 40).contains(" a  Apply changes"));
 
         // Narrow terminals drop navigation, never the contextual actions.
         let wide: String = footer_line(Screen::RunDetail, &running, 200)
@@ -4930,7 +4941,6 @@ mod tests {
         state.replace_details(continuable);
 
         let actions = actions_text(&state);
-        assert!(actions.contains(" f  Next cycle…"));
         let text = render_text(&state, 160, 40);
         assert!(text.contains(" f  Next cycle…"));
         for folded in [" c  Continue", " w  Follow-ups", " b  Rebase"] {
@@ -4954,15 +4964,15 @@ mod tests {
     #[test]
     fn push_to_pr_says_whether_the_run_is_already_pushed() {
         let mut details = completed_with_failure_details();
-        assert_eq!(publish_action(&details).0, "Push to PR · not pushed");
+        assert_eq!(publish_action(&details).0, "Push to PR");
         details.publication = Some(crate::app::Publication {
             branch: "polycode/run-3".to_owned(),
             pull_request_url: Some("https://github.com/o/r/pull/123".to_owned()),
             outdated: false,
         });
-        assert_eq!(publish_action(&details).0, "Pushed ✓ PR #123");
+        assert_eq!(publish_action(&details).0, "Pushed ✓ #123");
         details.publication.as_mut().unwrap().outdated = true;
-        assert_eq!(publish_action(&details).0, "Update PR #123 · behind");
+        assert_eq!(publish_action(&details).0, "Update #123 · behind");
         details.publication.as_mut().unwrap().pull_request_url = None;
         assert_eq!(publish_action(&details).0, "Update polycode/run-3 · behind");
     }
@@ -5701,7 +5711,7 @@ mod tests {
         assert!(!running.contains("Apply") && !running.contains("Resolve"));
 
         let completed = actions_text(&completed_state());
-        assert!(completed.starts_with(" d  Review diff"));
+        assert!(completed.starts_with(" X  Discard"));
         assert!(!completed.contains(" o  Result"), "review, not monitoring");
 
         let mut technical = running_state();

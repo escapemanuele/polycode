@@ -518,9 +518,8 @@ impl WorkspaceManager {
                 Some("git apply --check failed"),
                 now(),
             )?;
-            return Err(WorkspaceError::PatchCheckFailed {
-                reason: self.patch_refusal_reason(&repository, &workspace),
-            });
+            let (reason, rebasable) = self.patch_refusal_reason(&repository, &workspace);
+            return Err(WorkspaceError::PatchCheckFailed { reason, rebasable });
         }
         if !source_is_clean(&self.git, &repository)? {
             store.update_apply_operation(
@@ -1404,14 +1403,22 @@ impl WorkspaceManager {
     /// Best effort by construction: this runs while an apply is already
     /// failing, and a Git call that fails here must not replace the real
     /// refusal with a worse one. Every probe that cannot answer is simply
-    /// left out of the sentence.
-    fn patch_refusal_reason(&self, repository: &GitRepository, workspace: &RunWorkspace) -> String {
+    /// left out of the sentence. The flag says whether a rebase answers it:
+    /// only a checkout that moved forward past the base can be met that way.
+    fn patch_refusal_reason(
+        &self,
+        repository: &GitRepository,
+        workspace: &RunWorkspace,
+    ) -> (String, bool) {
         let base = workspace.base_commit();
         let head = repository.head_commit();
         if head == base {
-            return "the checkout is still on this run's base, so the change conflicts with what \
-                    is already in it"
-                .to_owned();
+            return (
+                "the checkout is still on this run's base, so the change conflicts with what \
+                 is already in it"
+                    .to_owned(),
+                false,
+            );
         }
         let path = repository.source_path();
         match is_ancestor(&self.git, path, base, head) {
@@ -1420,21 +1427,30 @@ impl WorkspaceManager {
                     |_| "moved past".to_owned(),
                     |count| format!("moved {count} commit(s) past"),
                 );
-                format!(
-                    "the checkout {moved} this run's base {}, and the two edits touch the same \
-                     lines — `polycode rebase {}` (`b` in the TUI) replays the change on the checkout's HEAD",
-                    short(base),
-                    workspace.run_id()
+                (
+                    format!(
+                        "the checkout {moved} this run's base {}, and the two edits touch the \
+                         same lines — `polycode rebase {}` replays the change on the checkout's \
+                         HEAD",
+                        short(base),
+                        workspace.run_id()
+                    ),
+                    true,
                 )
             }
-            Ok(false) => format!(
-                "the checkout's HEAD {} does not contain this run's base {}",
-                short(head),
-                short(base)
+            Ok(false) => (
+                format!(
+                    "the checkout's HEAD {} does not contain this run's base {}",
+                    short(head),
+                    short(base)
+                ),
+                false,
             ),
-            Err(_) => {
-                "the checkout no longer matches the base this change was written against".to_owned()
-            }
+            Err(_) => (
+                "the checkout no longer matches the base this change was written against"
+                    .to_owned(),
+                false,
+            ),
         }
     }
 
@@ -2640,7 +2656,11 @@ mod tests {
 
         let result = fixture.manager().apply(&mut fixture.store, fixture.run_id);
 
-        let Err(WorkspaceError::PatchCheckFailed { reason }) = result else {
+        let Err(WorkspaceError::PatchCheckFailed {
+            reason,
+            rebasable: true,
+        }) = result
+        else {
             panic!("a source checkout that moved past the base must refuse the patch");
         };
         assert!(
