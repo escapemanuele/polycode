@@ -82,8 +82,11 @@ pub enum WorkspaceError {
     /// that was still working, so the message carries what is known about
     /// that — how far it moved, and the command that moves the run to meet
     /// it — rather than leaving the operator to diff two trees by hand.
+    ///
+    /// `rebasable` is set when the checkout moved forward past the run's
+    /// base, the one refusal a rebase answers, so an interface can offer it.
     #[error("patch cannot be applied cleanly: {reason}")]
-    PatchCheckFailed { reason: String },
+    PatchCheckFailed { reason: String, rebasable: bool },
     /// The run's verification passed over a base the workspace no longer
     /// stands on, because a rebase moved it afterwards.
     #[error(

@@ -352,6 +352,11 @@ impl TuiApp {
             Overlay::FollowUps => self.handle_follow_ups_intent(intent),
             Overlay::NextCycle => self.handle_next_cycle_intent(intent),
             Overlay::RetryRoute => self.handle_retry_route_intent(intent),
+            // The confirmation lists the files; `d` opens the whole diff.
+            Overlay::ApplyConfirm | Overlay::PublishConfirm if intent == Intent::Diff => {
+                self.state.overlay = None;
+                self.open_diff();
+            }
             Overlay::ApplyConfirm if intent == Intent::Enter => {
                 if let Some(run_id) = self.state.selected_run {
                     self.dispatch(WorkerCommand::ApplyRun { run_id });
@@ -1465,11 +1470,42 @@ impl TuiApp {
         if self.state.selected_run.is_none() {
             return;
         }
+        self.state.rebase_reason = None;
         if self.state.run_is_applyable() {
             self.state.overlay = Some(Overlay::RebaseConfirm);
         } else {
             self.state
                 .notify(UiMessageKind::Info, apply_unavailable_reason(&self.state));
+        }
+    }
+
+    fn settle_purge(&mut self, run_id: crate::domain::RunId) {
+        // The run this was looking at no longer exists; the list it came
+        // from is where the operator belongs.
+        if self.state.selected_run == Some(run_id) {
+            self.state.selected_run = None;
+            self.state.details = None;
+            self.state.screen = Screen::Runs;
+        }
+        self.state
+            .set_message(format!("Run {run_id} deleted for good."));
+        self.refresh();
+    }
+
+    /// An apply the moved checkout refused turns into the rebase that answers
+    /// it, offered in place, so the operator never has to know `[b]` exists.
+    /// Only when they are still looking at that run with nothing else open;
+    /// otherwise the reason goes to the footer like any other refusal.
+    fn offer_rebase(&mut self, run_id: crate::domain::RunId, reason: String) {
+        let free = self.state.overlay.is_none()
+            && self.state.screen == Screen::RunDetail
+            && self.state.selected_run == Some(run_id);
+        if free {
+            self.state.rebase_reason = Some(reason);
+            self.state.overlay = Some(Overlay::RebaseConfirm);
+        } else {
+            self.state
+                .set_error(format!("Patch cannot be applied cleanly: {reason}"));
         }
     }
 
@@ -1679,20 +1715,16 @@ impl TuiApp {
         match result.result {
             Ok(success) => {
                 if let WorkerSuccess::Purged(receipt) = success {
-                    // The run this was looking at no longer exists; the list
-                    // it came from is where the operator belongs.
-                    if self.state.selected_run == Some(receipt.run_id) {
-                        self.state.selected_run = None;
-                        self.state.details = None;
-                        self.state.screen = Screen::Runs;
-                    }
-                    self.state
-                        .set_message(format!("Run {} deleted for good.", receipt.run_id));
-                    self.refresh();
+                    self.settle_purge(receipt.run_id);
                     return;
                 }
                 if let WorkerSuccess::Integrated(_) | WorkerSuccess::PackageStarted(..) = &success {
                     self.settle_mission_outcome(success);
+                    self.refresh();
+                    return;
+                }
+                if let WorkerSuccess::ApplyNeedsRebase { run_id, reason } = success {
+                    self.offer_rebase(run_id, reason);
                     self.refresh();
                     return;
                 }
@@ -1740,11 +1772,13 @@ impl TuiApp {
                     // yet, which the operator would otherwise meet as a
                     // refusal the next time they press `a`.
                     WorkerSuccess::Rebased(receipt, _) => format!(
-                        "Change moved onto {}, {} commit(s) ahead — verify again before applying.",
+                        "Change moved onto {}, {} commit(s) ahead — verify again before \
+                         applying: [f] starts a cycle that does.",
                         short_commit(&receipt.to_base),
                         receipt.commits_gained
                     ),
                     WorkerSuccess::Execution(_)
+                    | WorkerSuccess::ApplyNeedsRebase { .. }
                     | WorkerSuccess::Purged(_)
                     | WorkerSuccess::PackageStarted(..)
                     | WorkerSuccess::Integrated(_) => {
@@ -3478,6 +3512,43 @@ mod tests {
             app.state.in_flight.is_empty(),
             "the finished action stopped holding its run"
         );
+    }
+
+    /// An apply the moved checkout refused opens the rebase that answers it,
+    /// with the reason, instead of leaving an error to decode.
+    #[test]
+    fn an_apply_refused_by_a_moved_checkout_offers_the_rebase() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let run_id = app.state.selected_run.unwrap();
+        app.handle_worker_result(WorkerResult {
+            ticket: u64::MAX,
+            action: ActionKind::Apply,
+            run_id: Some(run_id),
+            result: Ok(WorkerSuccess::ApplyNeedsRebase {
+                run_id,
+                reason: "the checkout moved 2 commit(s) past".to_owned(),
+            }),
+        });
+        assert_eq!(app.state.overlay, Some(Overlay::RebaseConfirm));
+        assert_eq!(
+            app.state.rebase_reason.as_deref(),
+            Some("the checkout moved 2 commit(s) past")
+        );
+
+        // Looking elsewhere, the same refusal is only reported.
+        app.state.overlay = None;
+        app.state.screen = Screen::Runs;
+        app.handle_worker_result(WorkerResult {
+            ticket: u64::MAX,
+            action: ActionKind::Apply,
+            run_id: Some(run_id),
+            result: Ok(WorkerSuccess::ApplyNeedsRebase {
+                run_id,
+                reason: "moved".to_owned(),
+            }),
+        });
+        assert_eq!(app.state.overlay, None);
+        assert!(app.state.message.is_some());
     }
 
     fn published(pull_request: crate::workspace::PullRequestStatus) -> WorkerResult {

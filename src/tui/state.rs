@@ -732,6 +732,8 @@ pub(crate) struct TuiState {
     /// The cycles the `[f]` picker offers, and the one under the cursor.
     pub next_cycle_choices: Vec<CycleChoice>,
     pub next_cycle_selected: usize,
+    /// Why apply was just refused, when the rebase overlay opened in answer.
+    pub rebase_reason: Option<String>,
     /// Which row the `[t]` chooser has highlighted.
     pub retry_route_choice: RetryRouteChoice,
     pub new_run: NewRunForm,
@@ -831,6 +833,7 @@ impl TuiState {
             follow_ups_as_new_run: false,
             next_cycle_choices: Vec::new(),
             next_cycle_selected: 0,
+            rebase_reason: None,
             retry_route_choice: RetryRouteChoice::Configured,
             new_run: NewRunForm::new(repository),
             in_flight: Vec::new(),

@@ -190,6 +190,12 @@ pub(crate) enum WorkerSuccess {
     Applied(ApplyOutcome, ExecutionReport),
     Published(PublishReceipt, ExecutionReport),
     Rebased(RebaseReceipt, ExecutionReport),
+    /// Apply was refused because the checkout moved past the run's base; a
+    /// rebase is the answer, so the interface offers it instead of an error.
+    ApplyNeedsRebase {
+        run_id: RunId,
+        reason: String,
+    },
     /// A purge leaves no run to report on: the rows it would describe are
     /// the ones it deleted.
     Purged(PurgeReceipt),
@@ -208,7 +214,7 @@ impl WorkerSuccess {
             | Self::Published(_, report)
             | Self::Rebased(_, report)
             | Self::PackageStarted(report, _) => Some(report),
-            Self::Purged(_) | Self::Integrated(_) => None,
+            Self::Purged(_) | Self::Integrated(_) | Self::ApplyNeedsRebase { .. } => None,
         }
     }
 }
@@ -427,9 +433,16 @@ where
         } => service
             .resolve_attention_with_response(run_id, attention_id, response.as_deref())
             .map(WorkerSuccess::Execution),
-        WorkerCommand::ApplyRun { run_id } => service
-            .apply_run(run_id)
-            .map(|(outcome, report)| WorkerSuccess::Applied(outcome, report)),
+        WorkerCommand::ApplyRun { run_id } => match service.apply_run(run_id) {
+            Ok((outcome, report)) => Ok(WorkerSuccess::Applied(outcome, report)),
+            Err(crate::app::AppError::Workspace(
+                crate::workspace::WorkspaceError::PatchCheckFailed {
+                    reason,
+                    rebasable: true,
+                },
+            )) => Ok(WorkerSuccess::ApplyNeedsRebase { run_id, reason }),
+            Err(error) => Err(error),
+        },
         WorkerCommand::RebaseRun { run_id } => service
             .rebase_run(run_id)
             .map(|(receipt, report)| WorkerSuccess::Rebased(receipt, report)),
