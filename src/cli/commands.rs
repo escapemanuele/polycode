@@ -15,7 +15,7 @@ use crate::process::ProcessBackend;
 
 use super::{
     Cli, Command, ContractArgs, EvalCommand, EvalRunArgs, MissionCommand, ReviseArgs, RunArgs,
-    UpdateArgs,
+    UpdateArgs, WorldArgs,
 };
 
 #[allow(
@@ -42,6 +42,7 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
         }
         Some(Command::InstallSourceOf { executable }) => install_source_of(executable.as_deref()),
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
+        Some(Command::World(args)) => world(args),
         Some(Command::Mission { command }) => mission(command),
         Some(Command::Eval { command }) => eval(command),
         Some(Command::Update(args)) => update(*args),
@@ -333,6 +334,12 @@ fn install_source_of(executable: Option<&std::path::Path>) -> Result<()> {
     };
     println!("{}", crate::update::classify_path(&executable)?.label());
     Ok(())
+}
+
+/// Opens the Senate: a local 3D view of the current campaign, served over
+/// HTTP to 127.0.0.1 only, and blocks until the user closes it (Ctrl-C).
+fn world(args: &WorldArgs) -> Result<()> {
+    crate::world::run(args)
 }
 
 /// Release-pipeline gate. Read-only and offline: it compares a candidate tag

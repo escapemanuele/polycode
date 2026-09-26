@@ -58,6 +58,8 @@ pub(crate) enum Intent {
     ToggleRaw,
     ExpandTask,
     TechnicalDetails,
+    /// Open the campaign's 3D view in the browser.
+    EnterSenate,
     Help,
     Character(char),
     /// Decline the selected permission request and let the task continue.
@@ -95,6 +97,7 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('M') => Intent::Missions,
         KeyCode::Char('S') => Intent::StartPackage,
         KeyCode::Char('I') => Intent::Integrate,
+        KeyCode::Char('W') => Intent::EnterSenate,
         KeyCode::Char('r') => Intent::Resume,
         KeyCode::Char('t') => Intent::Retry,
         KeyCode::Char('s') => Intent::Stop,

@@ -59,6 +59,7 @@ pub struct WorkPackageSummary {
     pub result: Option<WorkPackageResult>,
     /// What the current run was told, when the mission rendered its task.
     pub handoff: Option<HandoffSummary>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -222,6 +223,7 @@ fn package_summary(
         reason: package.reason().map(str::to_owned),
         result: package.result().cloned(),
         handoff,
+        created_at: *package.created_at(),
         updated_at: *package.updated_at(),
     })
 }

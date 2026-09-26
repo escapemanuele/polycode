@@ -14,6 +14,7 @@ pub mod store;
 pub mod tui;
 pub mod update;
 pub mod workspace;
+pub mod world;
 
 use anyhow::{Context, Result};
 use clap::Parser;

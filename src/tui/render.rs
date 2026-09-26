@@ -2526,6 +2526,7 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
         Screen::RunDetail => run_detail_actions(state, &mut push),
         Screen::Missions => {
             push("Enter", "Open", theme::accent());
+            push("W", "Enter the Senate", theme::muted_color());
             push("R", "Runs", theme::muted_color());
         }
         Screen::MissionDetail => mission_detail_actions(state, &mut push),
@@ -2566,6 +2567,7 @@ fn mission_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Co
         },
         theme::muted_color(),
     );
+    push("W", "Enter the Senate", theme::muted_color());
 }
 
 /// Quiet navigation, in full and compact shapes. Navigation is what gets
@@ -2720,7 +2722,7 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
     match overlay {
         Overlay::Help => frame.render_widget(
             Paragraph::new(
-                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  b rebase onto the checkout's HEAD, when apply says it moved (confirmation)\n  P pull request (push branch, confirmation; once pushed and current, opens it)\n  X discard (confirmation)\n  f next cycle: fix, continue or Follow-ups (books a fix while running)\n  c / w jump straight to continue / Follow-ups\n  i technical details\n\nMission\n  Enter open the selected package's run\n  S start the selected package (composer's Execution/Effort)\n  u answer what the selected package's run asks\n  I bring the selected finished package in: apply its run, record it (confirmation)\n  A auto-approve permission requests for this mission's runs\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
+                "Global\n  ↑/↓ or j/k  navigate\n  Enter or →   open/confirm\n  Esc or ←     back/close\n  n            new run\n  R            runs screen\n  M            missions screen\n  x            dismiss notification\n  ?            help\n  q / Ctrl-C   quit/detach\n\nRun\n  Enter/o open selected stage result\n  r resume/recover\n  s stop (keeps the run and its work)\n  t retry selected failed stage (choose provider)\n  u resolve selected attention (Ctrl-S in the overlay skips it)\n  A auto-approve this run's permission requests (questions still stop it)\n  l raw logs (read-only)\n  e show the run's full task in the rail\n  d workspace diff (read-only)\n  a apply (confirmation)\n  b rebase onto the checkout's HEAD, when apply says it moved (confirmation)\n  P pull request (push branch, confirmation; once pushed and current, opens it)\n  X discard (confirmation)\n  f next cycle: fix, continue or Follow-ups (books a fix while running)\n  c / w jump straight to continue / Follow-ups\n  i technical details\n\nMission\n  Enter open the selected package's run\n  S start the selected package (composer's Execution/Effort)\n  u answer what the selected package's run asks\n  I bring the selected finished package in: apply its run, record it (confirmation)\n  A auto-approve permission requests for this mission's runs\n  W enter the Senate: open this campaign's 3D view in the browser (optional; agents keep working when it closes)\n\nRuns list\n  h archive/unarchive selected run\n  H show/hide archived runs\n  D delete an archived run for good (confirmation)\n\nText fields (task, response, instruction)\n  Ctrl-U clear to line start\n  Ctrl-K clear to line end\n  Ctrl-W / Alt-Backspace delete previous word\n\nArtifact viewer\n  m toggle raw/rendered Markdown",
             )
             .block(overlay_block(" Help · Esc closes ", theme::muted_color())),
             popup,
@@ -6162,6 +6164,7 @@ mod tests {
                 reason: None,
                 result: None,
                 handoff: None,
+                created_at: at,
                 updated_at: at,
             }
         };

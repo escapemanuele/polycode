@@ -24,6 +24,7 @@ pub use mission::{
 };
 pub use path::{
     database_file, install_receipt_file, process_root, update_cache_file, worktree_root,
+    world_state_file,
 };
 pub use run_input::{RUN_INPUT_SCHEMA_VERSION, RunInput, RunInputError};
 pub use snapshot::RUN_SNAPSHOT_SCHEMA_VERSION;

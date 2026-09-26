@@ -32,6 +32,34 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
     Err(last)
 }
 
+/// Opens the Senate — the local 3D view of a campaign — by starting
+/// `polycode world` as a separate process. It outlives the terminal UI on
+/// purpose: closing either surface never stops the other, and never stops
+/// an agent. When a Senate server is already running, the command only
+/// opens a browser tab on it.
+///
+/// # Errors
+/// Returns a one-line reason when the process could not be started.
+pub(crate) fn enter_senate(mission: Option<crate::domain::MissionId>) -> Result<(), String> {
+    use std::os::unix::process::CommandExt as _;
+    let exe = std::env::current_exe().map_err(|source| format!("polycode: {source}"))?;
+    let mut command = Command::new(exe);
+    command.arg("world");
+    if let Some(mission) = mission {
+        command.arg("--mission").arg(mission.to_string());
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Its own process group: Ctrl-C in this terminal reaches the TUI,
+        // not the Senate server.
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+        .map_err(|source| format!("polycode world: {source}"))
+}
+
 /// Puts `text` on the system clipboard.
 ///
 /// # Errors

@@ -12,6 +12,7 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 | Missions | Plan a multi-package project above runs, with dependencies, decisions, and integration | [missions.md](missions.md) |
 | Workflows | Built-in Fast/Standard/Deep/Review graphs plus fix and continue cycles | [workflows.md](workflows.md) |
 | Control room | Ratatui TUI: screens, overlays, exact keys | [control-room.md](control-room.md) |
+| The Senate | `polycode world`: local-only HTTP server and browser 3D view of a campaign | [world.md](world.md) |
 | Workspace | Isolated worktrees, apply, discard, pull request | [workspace.md](workspace.md) |
 | Verification | Run the repository's own checks after the last edit; failed checks block completion and apply, not `pr` | [verification.md](verification.md) |
 | Routing | Roles to providers/models, `--provider`, `--profile recommended`, v1 frozen / v2 current, `retry --provider` per-stage override | [routing.md](routing.md) |
