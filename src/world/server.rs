@@ -48,7 +48,12 @@ pub fn run(args: &WorldArgs) -> anyhow::Result<()> {
     let state_path = crate::store::world_state_file()?;
 
     if let Some(existing) = existing_instance(&state_path) {
-        let url = browser_url(existing.port, &existing.token, args.demo.as_deref());
+        let url = browser_url(
+            existing.port,
+            &existing.token,
+            args.demo.as_deref(),
+            args.mission,
+        );
         if !args.no_open {
             open_browser(&url);
         }
@@ -74,7 +79,7 @@ pub fn run(args: &WorldArgs) -> anyhow::Result<()> {
         return Err(error.into());
     }
 
-    let url = browser_url(port, &token, args.demo.as_deref());
+    let url = browser_url(port, &token, args.demo.as_deref(), args.mission);
     if !args.no_open {
         open_browser(&url);
     }
@@ -123,8 +128,22 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn browser_url(port: u16, token: &str, demo: Option<&str>) -> String {
-    let query = demo.map_or_else(String::new, |scenario| format!("?demo={scenario}"));
+/// The tab's URL. A named mission rides in the query so a running server,
+/// whose own fallback mission was fixed when it started, still shows the
+/// one this `W` asked for.
+fn browser_url(port: u16, token: &str, demo: Option<&str>, mission: Option<MissionId>) -> String {
+    let mut params = Vec::new();
+    if let Some(scenario) = demo {
+        params.push(format!("demo={scenario}"));
+    }
+    if let Some(mission) = mission {
+        params.push(format!("mission={mission}"));
+    }
+    let query = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
     format!("http://127.0.0.1:{port}/{query}#token={token}")
 }
 
@@ -485,11 +504,13 @@ fn token_matches(candidate: &str, expected: &str) -> bool {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
-        _ => "Internal Server Error",
+        500 => "Internal Server Error",
+        _ => "",
     }
 }
 
@@ -551,13 +572,58 @@ mod tests {
     #[test]
     fn browser_url_puts_the_token_in_the_fragment_and_demo_before_it() {
         assert_eq!(
-            browser_url(4123, "deadbeef", None),
+            browser_url(4123, "deadbeef", None, None),
             "http://127.0.0.1:4123/#token=deadbeef"
         );
         assert_eq!(
-            browser_url(4123, "deadbeef", Some("review")),
+            browser_url(4123, "deadbeef", Some("review"), None),
             "http://127.0.0.1:4123/?demo=review#token=deadbeef"
         );
+    }
+
+    #[test]
+    fn browser_url_names_the_mission_and_the_server_routes_to_it() {
+        let asked = MissionId::from_u128(7);
+        let url = browser_url(4123, "deadbeef", None, Some(asked));
+        assert_eq!(
+            url,
+            format!("http://127.0.0.1:4123/?mission={asked}#token=deadbeef")
+        );
+        assert_eq!(
+            browser_url(4123, "deadbeef", Some("review"), Some(asked)),
+            format!("http://127.0.0.1:4123/?demo=review&mission={asked}#token=deadbeef")
+        );
+
+        // The page forwards its own query to the API, so a server started
+        // for another mission still answers for the one this tab names.
+        let request = HttpRequest {
+            method: "GET".to_owned(),
+            path: format!("/api/world?mission={asked}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(request.mission(), Some(asked));
+        assert_eq!(request.route_path(), "/api/world");
+    }
+
+    #[test]
+    fn accepted_goes_out_as_202_accepted() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut raw = String::new();
+            std::io::Read::read_to_string(&mut stream, &mut raw).unwrap();
+            raw
+        });
+        let (mut server_side, _) = listener.accept().unwrap();
+        let response = HttpResponse::json(202, &serde_json::json!({ "accepted": true }));
+        write_response(&mut server_side, &response).unwrap();
+        drop(server_side);
+
+        let raw = client.join().unwrap();
+        assert!(raw.starts_with("HTTP/1.1 202 Accepted\r\n"), "{raw}");
+        assert_eq!(reason_phrase(418), "", "unknown codes are not errors");
     }
 
     fn get(

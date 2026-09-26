@@ -10,13 +10,14 @@
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::sync::{LazyLock, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::app::{
-    AppError, MissionDetails, MissionService, RunDetails, RunService, RuntimeProviderFactory,
-    WorkPackageSummary,
+    AppError, ExecutionSelection, MissionDetails, MissionService, RunDetails, RunService,
+    RuntimeProviderFactory, WorkPackageSummary,
 };
 use crate::domain::{
     MissionId, MissionStatus, RunId, RunStatus, StageKind, StageStatus, WorkPackageId,
@@ -715,6 +716,9 @@ pub fn order_detail(
 pub struct ConsulLog {
     pub turns: Vec<Turn>,
     pub busy: bool,
+    /// Why the last message sent from the browser never reached the lead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -734,10 +738,11 @@ pub fn consul_log(mission: Option<MissionId>) -> Result<ConsulLog, AppError> {
         return Ok(ConsulLog {
             turns: Vec::new(),
             busy: false,
+            error: None,
         });
     };
     let details = missions.inspect_mission(id)?;
-    let busy = details
+    let lead_is_busy = details
         .lead
         .as_ref()
         .is_some_and(|lead| lead_busy(lead.run_status));
@@ -750,7 +755,64 @@ pub fn consul_log(mission: Option<MissionId>) -> Result<ConsulLog, AppError> {
             }]
         })
         .unwrap_or_default();
-    Ok(ConsulLog { turns, busy })
+    let (in_flight, error) = ask_state(id);
+    Ok(ConsulLog {
+        turns,
+        busy: lead_is_busy || in_flight,
+        error,
+    })
+}
+
+/// A browser message to one mission's lead: still on its way, or the reason
+/// the last one never arrived.
+enum AskState {
+    InFlight,
+    Failed(String),
+}
+
+/// The ask runs on a detached thread after the route has already answered
+/// 202, so this per-mission record is the only way its failure reaches the
+/// page. It lives as long as the server process.
+static ASKS: LazyLock<Mutex<HashMap<MissionId, AskState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn asks() -> std::sync::MutexGuard<'static, HashMap<MissionId, AskState>> {
+    ASKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks an ask as sent; `false` when one is already on its way.
+fn begin_ask(id: MissionId) -> bool {
+    let mut asks = asks();
+    if matches!(asks.get(&id), Some(AskState::InFlight)) {
+        return false;
+    }
+    asks.insert(id, AskState::InFlight);
+    true
+}
+
+fn finish_ask(id: MissionId, failure: Option<&AppError>) {
+    let mut asks = asks();
+    match failure {
+        None => {
+            asks.remove(&id);
+        }
+        Some(error) => {
+            tracing::warn!(%error, "the Consul could not take the message");
+            asks.insert(
+                id,
+                AskState::Failed(format!("The Consul could not take the message: {error}")),
+            );
+        }
+    }
+}
+
+/// Whether an ask is still on its way, and why the last one failed.
+fn ask_state(id: MissionId) -> (bool, Option<String>) {
+    match asks().get(&id) {
+        Some(AskState::InFlight) => (true, None),
+        Some(AskState::Failed(reason)) => (false, Some(reason.clone())),
+        None => (false, None),
+    }
 }
 
 /// Why a message to the Consul was not sent.
@@ -788,19 +850,22 @@ pub fn ask_consul(
     {
         return Ok(Err(AskRefused::Busy));
     }
+    if !begin_ask(id) {
+        return Ok(Err(AskRefused::Busy));
+    }
     std::thread::spawn(move || {
+        // The CLI's default: a first message, or one after the lead run
+        // failed, starts a new lead run, which needs a real selection.
         let outcome = RunService::from_environment(RuntimeProviderFactory).and_then(|runs| {
             missions.ask_lead(
                 &runs,
                 id,
                 &message,
-                None,
+                Some(ExecutionSelection::Recommended),
                 crate::app::EffortRequest::ProfileDefault,
             )
         });
-        if let Err(error) = outcome {
-            tracing::warn!(%error, "the Consul could not take the message");
-        }
+        finish_ask(id, outcome.as_ref().err());
     });
     Ok(Ok(()))
 }
@@ -1105,5 +1170,28 @@ mod tests {
             assert!(order.get(key).is_some(), "order missing {key}");
         }
         assert_eq!(json["campaign"]["needs_you"], 0);
+    }
+
+    #[test]
+    fn a_failed_ask_comes_back_as_the_consuls_error_and_a_new_ask_clears_it() {
+        let id = MissionId::from_u128(0x5e_4a7e);
+
+        assert!(begin_ask(id));
+        assert_eq!(ask_state(id), (true, None), "on its way reads as busy");
+        assert!(!begin_ask(id), "a second ask waits for the first");
+
+        finish_ask(id, Some(&AppError::NoProductionProvider));
+        let (in_flight, error) = ask_state(id);
+        assert!(!in_flight);
+        let error = error.expect("the failure is kept for the page");
+        assert!(
+            error.contains(&AppError::NoProductionProvider.to_string()),
+            "{error}"
+        );
+
+        assert!(begin_ask(id), "a failed ask does not block the next one");
+        assert_eq!(ask_state(id), (true, None));
+        finish_ask(id, None);
+        assert_eq!(ask_state(id), (false, None));
     }
 }
