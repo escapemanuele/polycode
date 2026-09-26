@@ -45,6 +45,9 @@ pub enum Command {
     InstallSourceOf { executable: Option<PathBuf> },
     /// Open interactive local control room.
     Tui,
+    /// Open the Senate: a local 3D view of the current campaign in your
+    /// browser.
+    World(WorldArgs),
     /// Plan and direct a multi-package mission above individual runs.
     Mission {
         #[command(subcommand)]
@@ -134,6 +137,24 @@ pub enum Command {
     Update(UpdateArgs),
     /// Check Polycode's local environment.
     Doctor,
+}
+
+/// `polycode world` flags.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Args)]
+pub struct WorldArgs {
+    /// Mission whose campaign the Senate shows; omitted shows none bound.
+    #[arg(long)]
+    pub mission: Option<MissionId>,
+    /// Port to bind; 0 (the default) lets the OS assign one.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Print the URL but do not launch a browser.
+    #[arg(long)]
+    pub no_open: bool,
+    /// Named scenario the browser loads instead of the live campaign,
+    /// carried as `?demo=<scenario>` in the URL.
+    #[arg(long)]
+    pub demo: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Args)]
@@ -391,6 +412,8 @@ pub struct RunArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr as _;
+
     use super::*;
 
     #[test]
@@ -432,6 +455,32 @@ mod tests {
 
         let cli = Cli::try_parse_from(["polycode", "tui"]).unwrap();
         assert_eq!(cli.command, Some(Command::Tui));
+
+        let mission = MissionId::new().to_string();
+        let cli = Cli::try_parse_from([
+            "polycode",
+            "world",
+            "--mission",
+            &mission,
+            "--port",
+            "4123",
+            "--no-open",
+            "--demo",
+            "review",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::World(WorldArgs {
+                mission: Some(MissionId::from_str(&mission).unwrap()),
+                port: 4123,
+                no_open: true,
+                demo: Some("review".to_owned()),
+            }))
+        );
+
+        let cli = Cli::try_parse_from(["polycode", "world"]).unwrap();
+        assert_eq!(cli.command, Some(Command::World(WorldArgs::default())));
 
         let cli = Cli::try_parse_from([
             "polycode",

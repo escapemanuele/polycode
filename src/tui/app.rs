@@ -771,9 +771,26 @@ impl TuiApp {
             Intent::Integrate if detail => self.open_integrate_confirmation(),
             Intent::Attention if detail => self.open_package_attention(),
             Intent::AutoApprove if detail => self.toggle_mission_auto_approve(),
+            Intent::EnterSenate => self.enter_senate(),
             Intent::DismissMessage => self.state.dismiss_message(),
             Intent::Help => self.state.overlay = Some(Overlay::Help),
             _ => {}
+        }
+    }
+
+    /// `W`: open the selected campaign in the Senate, the optional 3D view.
+    /// It reads the same mission state this screen shows and changes none.
+    fn enter_senate(&mut self) {
+        match super::desktop::enter_senate(self.state.selected_mission) {
+            Ok(()) => self.state.notify(
+                UiMessageKind::Info,
+                "Opening the Senate in your browser. Agents keep working if you close it."
+                    .to_owned(),
+            ),
+            Err(reason) => self.state.notify(
+                UiMessageKind::Error,
+                format!("Could not open the Senate: {reason}"),
+            ),
         }
     }
 

@@ -8,6 +8,7 @@ const WORKTREE_DIRECTORY: &str = "worktrees";
 const RUN_DIRECTORY: &str = "runs";
 const UPDATE_CACHE_FILE: &str = "update.json";
 const INSTALL_RECEIPT_FILE: &str = "install.json";
+const WORLD_STATE_FILE: &str = "world.json";
 
 /// Resolves default database path without creating directories or files.
 ///
@@ -55,6 +56,16 @@ pub fn install_receipt_file() -> Result<PathBuf, StoreError> {
 /// directory is available.
 pub fn process_root() -> Result<PathBuf, StoreError> {
     Ok(data_directory_with(|name| std::env::var_os(name))?.join(RUN_DIRECTORY))
+}
+
+/// Resolves the single-instance marker the Senate server writes while it
+/// runs, without creating it.
+///
+/// # Errors
+/// Returns [`StoreError::DataPathUnavailable`] when neither override nor home
+/// directory is available.
+pub fn world_state_file() -> Result<PathBuf, StoreError> {
+    Ok(data_directory_with(|name| std::env::var_os(name))?.join(WORLD_STATE_FILE))
 }
 
 #[cfg(test)]
